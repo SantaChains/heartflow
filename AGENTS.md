@@ -76,9 +76,9 @@ crates/
 - 版本语义:`feat:` → minor,`fix:` → patch,`!` 或 `BREAKING CHANGE:` → major;`chore/docs/test/ci/style/build` 不触发发版,在 plan job 秒级短路(文案与过滤规则见根目录 `cliff.toml`)。
 - 提交 scope 用 crate 名,如 `feat(tools): ...`;Release Notes 按中文分栏并加粗 scope。
 - 版本号唯一维护点在根 `Cargo.toml` 的 `[workspace.package]`;各 crate 一律 `version.workspace = true`,禁止写死版本号。
-- crates.io:api/runtime/mcp/tools/store/commands 裸名已被占用,内部 crate 统一挂 `heartflow-` 前缀发布,`[lib] name` 保持旧 extern 名,依赖经 `[workspace.dependencies]` 的 `package =` 重命名(源码 `use` 不变);publish job 按依赖拓扑逐个发,单 crate 失败自动重试 3 次(sparse index 传播延迟),认证走仓库 secret `CRATES_IO_TOKEN`;版本一次性,同版本不可重发。
+- crates.io:api/runtime/mcp/tools/store/commands 裸名已被占用,内部 crate 统一挂 `heartflow-` 前缀发布,`[lib] name` 保持旧 extern 名,依赖经 `[workspace.dependencies]` 的 `package =` 重命名(源码 `use` 不变);publish job 按依赖拓扑逐个发,单 crate 失败自动重试 5 次(429 限流 2 分钟退避,"already uploaded" 幂等跳过),认证走仓库 secret `CRATES_IO_TOKEN`;版本一次性,同版本不可重发。
 - 机器人提交 `chore(release): vX.Y.Z [skip ci]` 自动同步 Cargo.toml/Cargo.lock/CHANGELOG、打 tag、建 GitHub Release;勿手工仿写此类提交。
-- Windows amd64 便携 zip(hf.exe 置于压缩包根 + .sha256)随每次发布上传到 Release;本仓库 `bucket/` 目录兼作 scoop bucket,清单 `bucket/heartflow.json` 带 checkver/autoupdate,新 Release 即被 scoop 发现(用户先 `scoop bucket add heartflow <仓库url>` 再 `scoop install heartflow`)。
+- Windows amd64 便携 zip(hf.exe 置于压缩包根 + .sha256)随每次发布上传到 Release;本仓库 `bucket/` 目录兼作 scoop bucket,清单 `bucket/heartflow.json` 的 version 与 hash 由发布流水线写入实际值(scoop install 只认字符串 hash,url+find 形态仅 autoupdate 可解析,自托管 bucket 无自动更新机器人),checkver/autoupdate 块保留备用(用户先 `scoop bucket add heartflow <仓库url>` 再 `scoop install heartflow`)。
 - git-cliff 版本钉在 `.github/actions/install-git-cliff/action.yml`(模板引擎行为随版本变动,升级需显式改并先过本地 dry-run)。
 - 若 main 启用分支保护,需允许 GitHub Actions 直接推送;发布流水线不做代码检查。
 

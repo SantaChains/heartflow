@@ -81,6 +81,7 @@ jobs:
       - name: cargo build (hf.exe)
         run: cargo build --release -p heartflow --target x86_64-pc-windows-msvc
       - name: pack zip + sha256
+        id: pack
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -90,6 +91,7 @@ jobs:
           Compress-Archive -Path "target\x86_64-pc-windows-msvc\release\hf.exe" -DestinationPath $name -Force
           $sha = (Get-FileHash $name -Algorithm SHA256).Hash.ToLowerInvariant()
           "$sha  $name" | Set-Content "$name.sha256" -Encoding ascii
+          "sha=$sha" >> $Env:GITHUB_OUTPUT
       - name: upload zip + sha256 to release
         shell: pwsh
         env:
@@ -99,3 +101,19 @@ jobs:
           $v = ("${{ needs.plan.outputs.tag }}" -replace "^v", "")
           $name = "heartflow-$v-win-amd64.zip"
           gh release upload "${{ needs.plan.outputs.tag }}" $name "$name.sha256" --clobber
+      - name: update bucket manifest (version + hash)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # scoop install 只认字符串 hash;url+find 形态仅 autoupdate 可解析。
+          # 自托管 bucket 无自动更新机器人,由本流水线在每次发布时写入实际值。
+          $m = Get-Content bucket/heartflow.json -Raw | ConvertFrom-Json
+          $m.version = ("${{ needs.plan.outputs.tag }}" -replace "^v", "")
+          $m.architecture."64bit".hash = "${{ steps.pack.outputs.sha }}"
+          ($m | ConvertTo-Json -Depth 10) | Set-Content bucket/heartflow.json -Encoding utf8
+          git config user.name "github-actions[bot]"
+          git config user.email "418982825+github-actions[bot]@users.noreply.github.com"
+          git add bucket/heartflow.json
+          git commit -m "chore(bucket): update manifest for ${{ needs.plan.outputs.tag }} [skip ci]"
+          if ($LASTEXITCODE -ne 0) { exit 0 } # 同版本重传时 manifest 无变化
+          git push origin HEAD:main
