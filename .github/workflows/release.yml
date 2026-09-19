@@ -1,31 +1,33 @@
 name: Release
 
-# heartflow 自动发布(个性化设计,勿随意改语义):
-#   - 单一 ubuntu job 完成 semver 计算 / Cargo 版本同步 / CHANGELOG / tag / GitHub Release
-#   - 不引 Node、不用 semantic-release:为省 action 时长与 workspace 单一版本点定制
-#   - Windows amd64 安装包仅在 major(主版本)触发;构建步骤当前整段注释占位,启用即解开
-#   - 无 feat/fix/破坏性提交的 push(纯 chore/docs 等)在此快速退出,不产生任何版本动作
+# heartflow 自动发布,三段式:plan(dry) → publish → windows-installer(仅 major)
+#   - 零 Node:版本计算/CHANGELOG/Release 全部走 scripts/release.sh + git-cliff,本地可先行验证省 Actions
+#   - 语义:feat→minor、fix→patch、!/BREAKING CHANGE→major;chore 等 push 在 plan 秒级短路
+#   - Windows amd64 安装包仅在 major 触发;整条构建链路(含 upload)注释占位,启用即整体解开
+#   - 代码质量门由 ci.yml 独立负责,本流水线不做 fmt/clippy/test
+#   - 本地预检:bash scripts/release.sh plan;RELEASE_DRY_RUN=1 bash scripts/release.sh publish
 
 on:
   push:
     branches: [main]
-
-permissions:
-  contents: write
+  workflow_dispatch: # 仅用于发布失败后重试,concurrency 锁防与 push 重叠
 
 concurrency:
   group: release
   cancel-in-progress: false
+
+permissions:
+  contents: write
 
 env:
   GIT_AUTHOR_NAME: github-actions[bot]
   GIT_AUTHOR_EMAIL: 418982825+github-actions[bot]@users.noreply.github.com
 
 jobs:
-  release:
-    name: bump / tag / github-release
+  plan:
+    name: dry 算版本(只读)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     outputs:
       released: ${{ steps.plan.outputs.released }}
       bump: ${{ steps.plan.outputs.bump }}
@@ -34,107 +36,44 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - uses: ./.github/actions/install-git-cliff
+      - id: plan
+        run: bash scripts/release.sh plan
 
-      - name: install git-cliff
+  publish:
+    name: 版本落地 / tag / GitHub Release
+    needs: plan
+    if: needs.plan.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/install-git-cliff
+      - name: release.sh publish
         env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_BUMP: ${{ needs.plan.outputs.bump }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          V="$(gh release view -R orhun/git-cliff --json tagName -q .tagName)"
-          N="${V#v}"
-          curl -fsSL "https://github.com/orhun/git-cliff/releases/download/${V}/git-cliff-${N}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz
-          sudo mv "git-cliff-${N}/git-cliff" /usr/local/bin/git-cliff
-          git-cliff --version
-
-      - name: plan next version
-        id: plan
-        run: |
-          set -euo pipefail
-          LAST="$(git describe --tags --abbrev=0 2>/dev/null || true)"
-          if [ -n "$LAST" ]; then
-            LOG="$(git log "${LAST}..HEAD" --no-merges --pretty=%B)"
-          else
-            LOG="$(git log --no-merges --pretty=%B)"
-          fi
-          # 只有 feat/fix/破坏性变更参与发版;chore、docs、test、ci 等直接退出
-          if ! grep -qE '^(feat|fix)(\([^)]*\))?:|^[a-z]+(\([^)]*\))?!:|BREAKING CHANGE' <<<"$LOG"; then
-            echo "released=false" >>"$GITHUB_OUTPUT"
-            echo "::notice::无版本相关提交(相对 ${LAST:-仓库初始}),跳过发版"
-            exit 0
-          fi
-          BASE="${LAST:-v0.0.0}"
-          RAWNEXT="$(git-cliff --unreleased --bumped-version)"
-          N="${RAWNEXT#v}"
-          NEXT="v${N}"
-          if [ "$NEXT" = "$BASE" ]; then
-            echo "released=false" >>"$GITHUB_OUTPUT"
-            echo "::notice::git-cliff 未产生版本递增,跳过发版"
-            exit 0
-          fi
-          L="${BASE#v}"; LM="${L%%.*}"; LMI="$(cut -d. -f2 <<<"$L")"
-          NM="${N%%.*}"; NMI="$(cut -d. -f2 <<<"$N")"
-          if [ "$NM" != "$LM" ]; then BUMP=major
-          elif [ "$NMI" != "$LMI" ]; then BUMP=minor
-          else BUMP=patch; fi
-          {
-            echo "released=true"
-            echo "bump=$BUMP"
-            echo "tag=$NEXT"
-          } >>"$GITHUB_OUTPUT"
-          echo "${LAST:+${LAST} → }${NEXT} (${BUMP})"
-
-      - name: bump cargo / changelog / push tag
-        if: steps.plan.outputs.released == 'true'
-        run: |
-          set -euo pipefail
-          TAG="${{ steps.plan.outputs.tag }}"
-          VER="${TAG#v}"
-          # 单一版本点:根 [workspace.package];各 crate 经 version.workspace = true 继承
-          sed -i "0,/^version = \"/s/^version = \"[^\"]*\"/version = \"${VER}\"/" Cargo.toml
-          # 只同步 workspace 内部 crate 在 Cargo.lock 中的版本,离线不触碰外部依赖
-          cargo update --workspace --offline
-          git-cliff --unreleased --bump -o release-notes.md
-          git-cliff --unreleased --bump --prepend -o CHANGELOG.md
-          git config user.name "$GIT_AUTHOR_NAME"
-          git config user.email "$GIT_AUTHOR_EMAIL"
-          git add Cargo.toml Cargo.lock CHANGELOG.md
-          git commit -m "chore(release): ${TAG} [skip ci]"
-          git tag "$TAG"
-          git push origin "HEAD:main" "refs/tags/${TAG}"
-
-      - name: create github release
-        if: steps.plan.outputs.released == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          TAG="${{ steps.plan.outputs.tag }}"
-          case "${{ steps.plan.outputs.bump }}" in
-            major) LABEL=主版本 ;;
-            minor) LABEL=次版本 ;;
-            *) LABEL=修订 ;;
-          esac
-          gh release create "$TAG" \
-            --target main \
-            --title "heartflow ${TAG} (${LABEL})" \
-            --notes-file release-notes.md
+        run: bash scripts/release.sh publish
 
   windows-installer:
-    name: win-amd64 installer (仅 major)
-    needs: release
-    if: needs.release.outputs.released == 'true' && needs.release.outputs.bump == 'major'
+    name: win-amd64 安装包(仅 major)
+    needs: [plan, publish]
+    if: needs.plan.outputs.bump == 'major'
     runs-on: windows-latest
     timeout-minutes: 45
     permissions:
       contents: write
     steps:
-      - name: placeholder (启用打包时解开下方步骤)
+      - name: placeholder(启用打包时解开下方全部步骤,含 upload)
         shell: pwsh
         run: Write-Output "构建链路暂未启用;解开本 job 其余注释即生效。"
 
       # - uses: actions/checkout@v4
       #   with:
-      #     ref: ${{ needs.release.outputs.tag }}
+      #     ref: ${{ needs.plan.outputs.tag }}
       #     fetch-depth: 1
       # - uses: dtolnay/rust-toolchain@stable
       #   with:
@@ -148,7 +87,7 @@ jobs:
       #   shell: pwsh
       #   run: |
       #     $ErrorActionPreference = "Stop"
-      #     $v = ("${{ needs.release.outputs.tag }}" -replace "^v", "")
+      #     $v = ("${{ needs.plan.outputs.tag }}" -replace "^v", "")
       #     $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
       #     if (-not (Test-Path $iscc)) { $iscc = "$env:ProgramFiles\Inno Setup 6\ISCC.exe" }
       #     & $iscc "/DVersion=$v" "packaging\heartflow.iss"
@@ -159,10 +98,11 @@ jobs:
       #     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       #   run: |
       #     $ErrorActionPreference = "Stop"
-      #     $tag = "${{ needs.release.outputs.tag }}"
+      #     $tag = "${{ needs.plan.outputs.tag }}"
       #     $v = ($tag -replace "^v", "")
-      #     $exe = "packaging\dist\heartflow-$v-win-amd64-setup.exe"
+      #     $name = "heartflow-$v-win-amd64-setup.exe"
+      #     $exe = Join-Path "packaging\dist" $name
       #     if (-not (Test-Path $exe)) { throw "installer not found: $exe" }
-      #     $sha = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
-      #     "$sha  heartflow-$v-win-amd64-setup.exe" | Set-Content "$exe.sha256" -Encoding ascii
+      #     $sha = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+      #     "$sha  $name" | Set-Content "$exe.sha256" -Encoding ascii
       #     gh release upload $tag $exe "$exe.sha256" --clobber

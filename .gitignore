@@ -6,6 +6,9 @@ archive/
 target/
 .heartflow/
 
+# 发布脚本本地预演产物(scripts/release.sh),不入库
+release-notes.md
+
 # 本地个人笔记/参考资料,不随仓库发布
 openmemory.md
 ref.md

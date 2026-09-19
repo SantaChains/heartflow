@@ -15,11 +15,14 @@ set -euo pipefail
 
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
-log() { printf '%s\n' "$*" >&2; }
+log() {
+  # 日志一律 ASCII:Windows Git-Bash 本地预检时中文会被 GBK 写坏,CI 日志同理
+  LC_ALL=C printf '%s\n' "$*" >&2
+}
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
-    log "缺少依赖: $1(本地安装: cargo install git-cliff --locked;gh 仅 publish 需要)"
+    log "missing dep: $1 (local install: cargo install git-cliff --locked; gh only needed by publish)"
     exit 2
   }
 }
@@ -48,7 +51,7 @@ do_plan() {
   last="$(git describe --tags --abbrev=0 2>/dev/null || true)"
   if ! range_has_release_commit "${last:-}"; then
     emit_output released false
-    log "无版本相关提交(相对 ${last:-仓库初始}),跳过发版"
+    log "no release-related commits since ${last:-initial}, skip release"
     return 0
   fi
   need_cmd git-cliff
@@ -57,7 +60,7 @@ do_plan() {
   next="v${raw#v}"
   if [ "$next" = "$base" ]; then
     emit_output released false
-    log "git-cliff 未产生版本递增,跳过发版"
+    log "git-cliff produced no version increment, skip release"
     return 0
   fi
   l="${base#v}"; lm="${l%%.*}"; lmi="$(cut -d. -f2 <<<"$l")"
@@ -68,7 +71,7 @@ do_plan() {
   emit_output released true
   emit_output bump "$bump"
   emit_output tag "$next"
-  log "下一版本: ${last:+${last} → }${next} (${bump})"
+  log "next version: ${last:+${last} -> }${next} (${bump})"
 }
 
 do_publish() {
@@ -87,8 +90,8 @@ do_publish() {
 
   if [ "$dry" = "1" ]; then
     git restore Cargo.toml Cargo.lock
-    log "dry-run 完成:版本计算/notes 均正常,已还原 Cargo.toml/Cargo.lock,未 commit/未 push"
-    log "----- release-notes.md 预览 -----"
+    log "dry-run done: version calc + notes OK; Cargo.toml/Cargo.lock restored, no commit/push"
+    log "----- release-notes.md preview -----"
     sed -n '1,20p' release-notes.md >&2
     return 0
   fi
@@ -110,14 +113,14 @@ do_publish() {
     --target main \
     --title "heartflow ${tag} (${bump_label})" \
     --notes-file release-notes.md
-  log "已发布 ${tag}"
+  log "released ${tag}"
 }
 
 case "${1:-}" in
   plan) do_plan ;;
   publish) do_publish ;;
   *)
-    log "用法: bash scripts/release.sh plan|publish"
+    log "usage: bash scripts/release.sh plan|publish"
     exit 1
     ;;
 esac

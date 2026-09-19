@@ -70,14 +70,15 @@ crates/
 
 ## 发布流程(自动化)
 
-`.github/workflows/release.yml` 在 push main 时以 Conventional Commits 自动驱动版本与 GitHub Release(纯 ubuntu 轻量 job,不引 Node/semantic-release):
+`.github/workflows/release.yml` 在 push main 时以 Conventional Commits 自动驱动版本与 GitHub Release,三段式 `plan(dry) → publish → windows-installer(仅 major)`,零 Node(不引入 semantic-release/cargo 插件链):发布逻辑集中在 `scripts/release.sh`,CI 与本地共用同一事实源。
 
-- 版本语义:`feat:` → minor,`fix:` → patch,`!` 或 `BREAKING CHANGE:` → major;`chore/docs/test/ci/style/build` 不触发发版(文案与过滤规则见根目录 `cliff.toml`)。
+- 本地预检(必须先于 push,不得用 Actions 试错):`bash scripts/release.sh plan`;`RELEASE_DRY_RUN=1 bash scripts/release.sh publish`(只读预演);质量门 fmt/clippy/test 本地全绿后才 push,Actions 只跑真实发布。
+- 版本语义:`feat:` → minor,`fix:` → patch,`!` 或 `BREAKING CHANGE:` → major;`chore/docs/test/ci/style/build` 不触发发版,在 plan job 秒级短路(文案与过滤规则见根目录 `cliff.toml`)。
 - 提交 scope 用 crate 名,如 `feat(tools): ...`;Release Notes 按中文分栏并加粗 scope。
 - 版本号唯一维护点在根 `Cargo.toml` 的 `[workspace.package]`;各 crate 一律 `version.workspace = true`,禁止写死版本号。
 - 机器人提交 `chore(release): vX.Y.Z [skip ci]` 自动同步 Cargo.toml/Cargo.lock/CHANGELOG、打 tag、建 GitHub Release;勿手工仿写此类提交。
-- Windows amd64 安装包仅在 major 触发 windows job(Inno Setup 脚本 `packaging/heartflow.iss`,产物 `heartflow-<ver>-win-amd64-setup.exe` + SHA256 附件);当前构建步骤整段注释占位,启用时解开即可。
-- 若 main 启用分支保护,需允许 GitHub Actions 直接推送;`ci.yml` 质量门独立运行,发布不重复跑测试。
+- Windows amd64 安装包仅在 major 触发 windows job(Inno Setup 脚本 `packaging/heartflow.iss`,产物 `heartflow-<ver>-win-amd64-setup.exe` + SHA256 附件);当前构建与上传整条链路含 upload 均为注释占位,启用时整体解开(避免引用不存在产物的必红步骤)。
+- 若 main 启用分支保护,需允许 GitHub Actions 直接推送;`ci.yml` 质量门独立运行,发布流水线不做代码检查。
 
 ## 注意
 
