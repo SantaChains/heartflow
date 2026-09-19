@@ -649,7 +649,7 @@ enum Action {
 )]
 #[command(subcommand_precedence_over_arg = true)]
 #[command(
-    after_help = "INTERACTION CONTRACT\n  Interactive:  no args or `hf chat` opens the REPL (this is the only mode that can prompt for confirmation).\n  Non-interactive: subcommands (prompt/search/...) never block on a human. Because there is no tty to answer a confirmation, `prompt` runs tools under the permission mode from HEARTFLOW_PERMISSION_MODE, defaulting to `full` (auto-allow). Set HEARTFLOW_PERMISSION_MODE=read-only for an unattended, read-only pipe.\n\nEXIT CODES\n  0  success\n  1  runtime/provider error (stream, config resolution, failed turn)\n  2  usage error (bad arguments; emitted by the argument parser)"
+    after_help = "INTERACTION CONTRACT\n  Interactive:  no args or `hf chat` opens the REPL (this is the only mode that can prompt for confirmation).\n  Resume:       `hf --resume[=PATH] [--run \"/cmd\"]` reopens a saved session (PATH omitted = interactive picker; value form uses `=`).\n  Non-interactive: subcommands (prompt/search/...) never block on a human. Because there is no tty to answer a confirmation, `prompt` runs tools under the permission mode from HEARTFLOW_PERMISSION_MODE, defaulting to `full` (auto-allow). Set HEARTFLOW_PERMISSION_MODE=read-only for an unattended, read-only pipe.\n\nEXIT CODES\n  0  success\n  1  runtime/provider error (stream, config resolution, failed turn)\n  2  usage error (bad arguments; emitted by the argument parser)"
 )]
 struct Cli {
     /// Provider name (deepseek, anthropic, or a [provider] table entry).
@@ -658,15 +658,14 @@ struct Cli {
     /// Model override for the selected provider.
     #[arg(long, global = true)]
     model: Option<String>,
-    /// Resume a saved session; omit the path to pick interactively.
-    #[arg(long)]
-    resume: bool,
-    /// Saved session file to resume (requires --resume).
-    #[arg(requires = "resume")]
-    resume_session: Option<PathBuf>,
+    /// Resume a saved session; `--resume` alone picks interactively, `--resume=PATH`
+    /// opens a specific file. The value must use `=` so a bare `--resume` never
+    /// swallows a following subcommand token.
+    #[arg(long, num_args = 0..=1, require_equals = true, value_name = "PATH")]
+    resume: Option<Option<PathBuf>>,
     /// Slash command to run right after resuming (requires --resume).
-    #[arg(requires = "resume")]
-    resume_command: Option<String>,
+    #[arg(long, value_name = "CMD", requires = "resume")]
+    run: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -775,17 +774,17 @@ impl Cli {
             provider,
             model,
             resume,
-            resume_session,
-            resume_command,
+            run,
             command,
         } = self;
-        if resume {
+        if let Some(session_path) = resume {
             if command.is_some() {
                 return Err("--resume cannot be combined with a subcommand".to_string());
             }
             return Ok(Action::ResumeSession {
-                session_path: resume_session,
-                command: resume_command,
+                // `Some(None)` == bare `--resume` -> interactive picker.
+                session_path,
+                command: run,
             });
         }
         match command {
@@ -1362,7 +1361,7 @@ fn exit_with_resume_hint(runtime: &AgentRuntime) {
     match save_session(runtime.session()) {
         Ok(path) => {
             println!("session saved -> {}", path.display());
-            println!("to resume this section: hf --resume \"{}\"", path.display());
+            println!("to resume this section: hf --resume=\"{}\"", path.display());
         }
         Err(error) => println!("failed to save session: {error}"),
     }
@@ -4087,6 +4086,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_resume_flag_forms() {
+        // Bare `--resume` -> interactive picker, no path.
+        assert_eq!(
+            action(&["hf", "--resume"]),
+            Action::ResumeSession {
+                session_path: None,
+                command: None,
+            }
+        );
+        // `--resume=PATH --run CMD` is the single-flag carried form.
+        assert_eq!(
+            action(&["hf", "--resume=s.json", "--run", "/compact"]),
+            Action::ResumeSession {
+                session_path: Some(PathBuf::from("s.json")),
+                command: Some("/compact".to_string()),
+            }
+        );
+        // A bare flag must not swallow a following subcommand token.
+        assert!(Cli::try_parse_from(["hf", "--resume", "prompt", "hi"]).is_ok());
+        // --run is meaningless without --resume.
+        assert!(Cli::try_parse_from(["hf", "--run", "/compact"]).is_err());
+        // Combining resume with a subcommand is rejected at fold time.
+        assert!(Cli::try_parse_from(["hf", "--resume", "chat"])
+            .expect("parses")
+            .into_action()
+            .is_err());
+    }
+
+    #[test]
     fn write_agents_skeleton_creates_then_refuses_overwrite() {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4182,10 +4210,17 @@ mod tests {
     #[test]
     fn parses_resume_flag_with_slash_command() {
         assert_eq!(
-            action(&["hf", "--resume", "session.json", "/compact"]),
+            action(&["hf", "--resume=session.json", "--run", "/compact"]),
             Action::ResumeSession {
                 session_path: Some(PathBuf::from("session.json")),
                 command: Some("/compact".to_string()),
+            }
+        );
+        assert_eq!(
+            action(&["hf", "--resume=session.json"]),
+            Action::ResumeSession {
+                session_path: Some(PathBuf::from("session.json")),
+                command: None,
             }
         );
     }

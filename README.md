@@ -57,13 +57,13 @@ hf --provider deepseek
 ## CLI 用法
 
 ```text
-hf [--provider NAME] [--model MODEL]              进入交互 REPL
+hf [--provider NAME] [--model MODEL]              进入交互 REPL（等价 hf chat）
 hf [--provider NAME] [--model MODEL] prompt TEXT  单次提问，流式输出
 hf prompt -q|--quiet TEXT                         只打印答案（去掉进度/用量行，脚本友好）
 hf prompt --json TEXT                             输出 {text, usage, session_id} 结构化 JSON
 echo TEXT | hf prompt "指令"                       stdin 作为上下文与指令拼接（Unix 管道）
 hf search QUERY [--limit N] [--json]              跨会话全文检索历史（非交互，可管道）
-hf --resume [SESSION.json] [/compact|/pin]        恢复会话，可附带压缩或固定末条
+hf --resume[=SESSION.json] [--run /compact]       恢复会话（省略 PATH 进选择器），--run 恢复后立即执行 slash 命令
 hf config export [--output FILE]                  导出配置（不含密钥）
 hf config import FILE                             导入配置（自动备份 .bak）
 hf doctor [--fix]                                 诊断环境（含历史库完整性）；--fix 应用安全修复
