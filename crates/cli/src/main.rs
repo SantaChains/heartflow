@@ -19,10 +19,10 @@ use crossterm::style::Stylize;
 use inquire::{Confirm, MultiSelect, Select, Text};
 use mcp::{HttpTransport, McpClient, McpTool, StdioTransport, Transport};
 use runtime::{
-    load_system_prompt, normalize_tool_schema, should_compact, AgentEvent, CompactionConfig,
-    ContentBlock, ConversationMessage, ConversationRuntime, MessageRole, PermissionMode,
-    PermissionPolicy, PermissionPromptDecision, PermissionPrompter, PermissionRequest, Session,
-    TokenUsage, ToolError, ToolExecutor, ToolSpec,
+    load_system_prompt, normalize_tool_schema, should_compact, truncate_chars, AgentEvent,
+    CompactionConfig, ContentBlock, ConversationMessage, ConversationRuntime, MessageRole,
+    PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
+    PermissionRequest, Session, TokenUsage, ToolError, ToolExecutor, ToolSpec,
 };
 use store::{role_str, Integrity, SearchHit, SearchMethod, SessionMeta, Store};
 use tokio_util::sync::CancellationToken;
@@ -1148,13 +1148,17 @@ fn unix_secs() -> i64 {
         .unwrap_or_default()
 }
 
+fn unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or_default()
+}
+
 fn save_session(session: &Session) -> io::Result<PathBuf> {
     let dir = sessions_dir();
     fs::create_dir_all(&dir)?;
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_millis())
-        .unwrap_or_default();
+    let millis = unix_millis();
     let path = dir.join(format!("{millis}.json"));
     session
         .save_to_path(&path)
@@ -2247,15 +2251,6 @@ fn last_assistant_conclusion(messages: &[ConversationMessage]) -> Option<String>
     Some(truncate_chars(&text, 240))
 }
 
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
-    }
-    let mut truncated = value.chars().take(max_chars).collect::<String>();
-    truncated.push('…');
-    truncated
-}
-
 /// Run one interactive turn: stream events to the terminal, abort on Ctrl+C,
 /// and auto-save the session afterwards.
 ///
@@ -3043,10 +3038,7 @@ impl PermissionPrompter for BlockPrompter {
 fn plan_file_path(cwd: &Path, goal: &str) -> Result<PathBuf, String> {
     let dir = cwd.join(".heartflow").join("plans");
     fs::create_dir_all(&dir).map_err(|error| format!("{}: {error}", dir.display()))?;
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default();
+    let stamp = unix_secs();
     let slug: String = goal
         .to_lowercase()
         .chars()
@@ -3446,10 +3438,7 @@ fn write_reflection(
 ) -> io::Result<PathBuf> {
     let dir = reflections_dir(cwd);
     fs::create_dir_all(&dir)?;
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_millis())
-        .unwrap_or_default();
+    let stamp = unix_millis();
     let path = dir.join(format!("{stamp}.md"));
     let doc = build_reflection_doc(
         &format!("{stamp}ms since epoch (UTC)"),

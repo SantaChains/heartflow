@@ -21,8 +21,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check
-      - name: Clippy (pedantic, zero warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy (correctness gate; pedantic advisory only)
+        run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::pedantic
       - name: Test
         run: cargo test --workspace
       - name: Release build

@@ -182,10 +182,12 @@ fn summarize_block(block: &ContentBlock, max_chars: usize) -> String {
             if *is_error { "error " } else { "" }
         ),
     };
-    truncate_summary(&raw, max_chars)
+    truncate_chars(&raw, max_chars)
 }
 
-fn truncate_summary(content: &str, max_chars: usize) -> String {
+/// Clamp to `max_chars` code points (CJK-safe) with an ellipsis marker.
+#[must_use]
+pub fn truncate_chars(content: &str, max_chars: usize) -> String {
     if content.chars().count() <= max_chars {
         return content.to_string();
     }

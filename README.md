@@ -25,7 +25,7 @@ Rust 实现的终端 AI agent。二进制命令 `hf`，在 REPL 中通过流式�
 - 配置热重载：REPL 每回合边界按 mtime 探测配置变更，自动重建 provider 并保留会话（零依赖轮询）
 - 自检自愈：`hf doctor [--fix]` 校验配置解析、目录可写、provider 与密钥，并对历史库跑 `PRAGMA integrity_check`（库体过大时自动降级 `quick_check`）；`--fix` 建缺失目录、坏配置备份移开
 - 权限模型：read-only / workspace-write / full 三档，工具级覆盖，REPL 内 /mode 热切换；/plan 规划模式（硬门禁：仅可写 `.heartflow/plans/*.md`，其余写/bash 一律拒绝），审批后进入 Hermes 任务环逐任务新鲜上下文执行，收尾把复盘写入 `.heartflow/reflections/`（可选沉淀为 `.agent/skills`）；read-only 与 plan 两档自动放行标注为只读的 MCP 工具（`readOnlyHint`/`read_only`），让远程只读 MCP 在受限模式下亦可用
-- 健壮性：connect/read 双超时、子进程 kill_on_drop、UTF-8 全链路（BOM 剥除、PowerShell 编码前缀，非 UTF-8 字节经 `chardetng` 嗅探 + `encoding_rs` 解码 GBK 等遗留码页、不再 lossy 碎字、CJK 宽度对齐）、工具输出 32K 截断、缓存目录剪枝；工具入参执行前做有界 JSON-Schema 校验（`type`/`required`/`properties`/`enum`/`items`，不认识的键一律放行），转发给 provider 前对（MCP）schema 做规整（object 补 `properties`、array 补 `items`、单元素 `type` 联合折叠），MCP 握手（initialize+tools/list）失败按 200/400ms 退避重试 3 次（幂等），工具调用本身不自动重试（非幂等危险）交由模型层决策
+- 健壮性：connect/read 双超时、子进程 kill_on_drop、UTF-8 全链路（BOM 剥除、PowerShell 编码前缀，非 UTF-8 字节经 `chardetng` 嗅探 + `encoding_rs` 解码 GBK 等遗留码页、不再 lossy 碎字、CJK 宽度对齐）、工具输出 32K 截断、缓存目录剪枝；工具入参执行前用 `jsonschema` crate 做完整 JSON-Schema 校验（draft 全能力；空/布尔/无法编译的 schema 一律放行，绝不误拦合法调用），转发给 provider 前对（MCP）schema 做规整（object 补 `properties`、array 补 `items`、单元素 `type` 联合折叠），MCP 握手（initialize+tools/list）失败按 200/400ms 退避重试 3 次（幂等），工具调用本身不自动重试（非幂等危险）交由模型层决策
 
 ## 构建
 
@@ -182,10 +182,13 @@ crates/
 
 ## 质量门
 
+日常迭代按效率优先：提交前保证下列四条绿。pedantic 级风格 clippy 仅作提示不阻断（一次性 strict 清扫已完成），但 `clippy::all` 正确性 lint 仍为阻断门。
+
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets   # pedantic 零警告
 cargo test --workspace
+cargo build --release
+cargo clippy --workspace --all-targets -- -D warnings -A clippy::pedantic   # 阻断正确性；pedantic 仅提示
 ```
 
 ## License

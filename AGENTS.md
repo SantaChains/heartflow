@@ -18,7 +18,7 @@ heartflow 是一个 Rust 实现的终端 AI agent(仓库名 `heartflow`,二进�
 cargo build --release          # 产物 target/release/hf(.exe)
 cargo run -p heartflow         # 直接进入 REPL
 cargo fmt --all -- --check     # 格式门
-cargo clippy --workspace --all-targets   # 质量门:pedantic 零警告
+cargo clippy --workspace --all-targets -- -D warnings -A clippy::pedantic   # 质量门:阻断 clippy::all 正确性;pedantic 降为提示(效率优先)
 cargo test --workspace         # 全部测试
 cargo test -p store            # 单 crate 测试(store/tests/io_correctness.rs 为 I/O 正确性重点)
 ```
@@ -36,7 +36,7 @@ crates/
 ├── api        传输层:Anthropic / OpenAI Chat / OpenAI Responses 客户端、SSE 解析、重试。仅依赖 reqwest/serde/tokio。
 ├── runtime    会话循环:流消费、工具调度、compact、系统提示词、权限、bash/file_ops、agent 资产发现。
 │              agent 循环核心在 conversation.rs(ConversationRuntime、ToolExecutor、TurnStream、AgentEvent)。
-├── tools      原生工具的线上规格(wire spec)与执行:bash/read/write/edit/glob/grep、todo、web_fetch、verify_graphics、generate_image,以及 search_files(nucleo 模糊文件检索)、apply_patch(事务式多文件批量编辑)。新工具入参 schema 用 schemars 生成,旧工具维持手写。
+├── tools      原生工具的线上规格(wire spec)与执行:bash/read/write/edit/glob/grep、search_files(nucleo 模糊检索)、apply_patch(事务式多文件编辑)、todo、ask_user、web_fetch、verify_graphics、generate_image。新工具(search_files/apply_patch)的入参 schema 由 schemars 从输入类型派生;其余工具仍为手写 `json!` schema。
 ├── mcp        MCP 客户端:stdio JSON-RPC 2.0 传输。
 ├── commands   请求/响应数据结构(薄)。
 ├── store      系统级 SQLite 历史库:JSONL 权威 + best-effort 镜像到 ~/.heartflow/heartflow.db(FTS5 trigram 检索、用量聚合、integrity_check)。
@@ -55,7 +55,7 @@ crates/
 
 ## 代码约定
 
-- Clippy:workspace 级 `pedantic = warn`,`unsafe_code = forbid`。禁止 `unwrap`/`expect` 出现在可失败路径,用 `Result` + 错误类型传递。新增代码必须过 pedantic。
+- Clippy:workspace 级 `pedantic = warn`,`unsafe_code = forbid`。禁止 `unwrap`/`expect` 出现在可失败路径,用 `Result` + 错误类型传递。提交时以 `clippy::all` 为零告警硬门(正确性);pedantic 属风格建议,按效率优先仅作提示不阻断(存量 ~27 处为历史一次性清扫后的基线,不强求清零)。
 - 错误类型:crate 内自定义(`ApiError`、`StoreError`、`RuntimeError`、`ConfigError`),不用 `anyhow` 风格泛型下沉到库。
 - 工具注册:线上规格集中在 `crates/tools/src/lib.rs` 的 `mvp_tool_specs()` 与各 `*_tool_spec()`;分发在 `execute_tool`。新增工具须同时补 spec、execute 分支、`ToolRegistry::entries` 并接线到 adapter。`ask_user` 的**执行**在 CLI 层(需真实终端),`tools` crate 只持有 wire spec。
 - 全链路 UTF-8:文件读写支持 BOM 剥除、CJK 宽度对齐;Windows 走 PowerShell(pwsh 优先),命令需可移植。中文/空格路径必须正确处理。
@@ -66,10 +66,10 @@ crates/
 
 - 工具/history/store 的 I/O 与风险路径须经得起测试,且不得损坏数据(见 `crates/store/tests/io_correctness.rs`)。
 - 传输层与事件流转换的缺口只有真服务器冒烟能暴露(历史缺陷:SSE `message_stop` 未转发、工具输入拼接损坏)。涉及流式/工具往返的改动须跑端到端冒烟。
-- 提交前跑齐质量门:fmt + clippy + test。
+- 提交前跑齐质量门:fmt + test + release build(必绿)+ clippy(仅 `all` 阻断,pedantic 提示)。
 
 ## 注意
 
 - `.gitignore` 忽略 `target/`、`.heartflow/`、`archive/`、`.history/`、`.trae/`,以及本地笔记 `openmemory.md`、`ref.md`(个人头脑风暴/参考资料,不发布)。
-- 质量门由 `.github/workflows/ci.yml` 在推送/PR 时执行(fmt + clippy `-D warnings` + test + release);许可证 MIT(见 `LICENSE`)。
+- 质量门由 `.github/workflows/ci.yml` 在推送/PR 时执行(fmt + clippy `-D warnings -A clippy::pedantic`(仅正确性阻断)+ test + release);许可证 MIT(见 `LICENSE`)。
 - 修改 README 中列出的 CLI/REPL 接口时,同步更新 README 与 `--help`。

@@ -1205,10 +1205,14 @@ mod tests {
             !ran.load(std::sync::atomic::Ordering::SeqCst),
             "must not execute"
         );
-        assert!(matches!(
-            &summary.tool_results[0].blocks[0],
-            ContentBlock::ToolResult { is_error: true, output, .. } if output.contains("required field 'path'")
-        ));
+        assert!(
+            matches!(
+                &summary.tool_results[0].blocks[0],
+                ContentBlock::ToolResult { is_error: true, output, .. } if output.contains("invalid tool input")
+            ),
+            "actual: {:?}",
+            summary.tool_results[0].blocks[0]
+        );
     }
 
     #[tokio::test]

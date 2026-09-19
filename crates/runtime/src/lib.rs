@@ -14,7 +14,8 @@ pub use agent_assets::{discover_rules, discover_skills, RuleFile, SkillSummary};
 pub use bash::{execute_bash, is_dangerous_command, BashCommandInput, BashCommandOutput};
 pub use compact::{
     compact_session, estimate_session_tokens, format_compact_summary,
-    get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
+    get_compact_continuation_message, should_compact, truncate_chars, CompactionConfig,
+    CompactionResult,
 };
 pub use config::{
     ConfigEntry, ConfigError, ConfigLoader, ConfigSource, RuntimeConfig,
