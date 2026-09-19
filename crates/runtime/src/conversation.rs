@@ -7,7 +7,8 @@ use tokio::task::{AbortHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::compact::{
-    compact_session, estimate_session_tokens, should_compact, CompactionConfig, CompactionResult,
+    compact_session, estimate_session_tokens, should_compact, truncate_chars, CompactionConfig,
+    CompactionResult,
 };
 use crate::permissions::{PermissionOutcome, PermissionPolicy, PermissionPrompter};
 use crate::schema::validate_tool_input;
@@ -199,6 +200,74 @@ fn truncate_tool_output(output: &str) -> String {
     )
 }
 
+/// Trailing messages whose tool-result bodies are replayed verbatim. Older
+/// dumps (file reads, command logs, MCP payloads) are collapsed to a stub when
+/// building the request, so a long or resumed session never re-feeds stale bulk
+/// output. Roughly the last few turns stay intact.
+const REPLAY_VERBATIM_TAIL: usize = 12;
+/// Older error results carry signal, so a short head of the body survives.
+const REPLAY_ERROR_HEAD_CHARS: usize = 400;
+
+/// Project the durable transcript into the message list actually sent to the
+/// provider. Structure and ordering are preserved (each `tool_use` stays paired
+/// with its `tool_result`); only the *body* of a tool result older than the
+/// verbatim tail is replaced with a compact marker. The session keeps full
+/// output on disk; pinned messages are never rewritten.
+#[must_use]
+fn build_replay_messages(messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
+    let verbatim_from = messages.len().saturating_sub(REPLAY_VERBATIM_TAIL);
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            if index >= verbatim_from
+                || message.pinned
+                || !message
+                    .blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+            {
+                return message.clone();
+            }
+            let blocks = message
+                .blocks
+                .iter()
+                .map(|block| match block {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        tool_name,
+                        output,
+                        is_error,
+                    } => {
+                        let stubbed = if *is_error {
+                            let head = truncate_chars(output, REPLAY_ERROR_HEAD_CHARS);
+                            format!("[earlier error result: {head}]")
+                        } else {
+                            let total = output.chars().count();
+                            format!(
+                                "[{tool_name} result omitted from replay: {total} chars; re-run the tool or read the file if it is still needed]"
+                            )
+                        };
+                        ContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            tool_name: tool_name.clone(),
+                            output: stubbed,
+                            is_error: *is_error,
+                        }
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+            ConversationMessage {
+                role: message.role,
+                blocks,
+                usage: message.usage,
+                pinned: message.pinned,
+            }
+        })
+        .collect()
+}
+
 pub struct ConversationRuntime<C, T> {
     session: Session,
     api_client: C,
@@ -301,7 +370,7 @@ where
 
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
-                messages: self.session.messages.clone(),
+                messages: build_replay_messages(&self.session.messages),
                 tools: self.tool_executor.specs(),
             };
             let mut stream = self.api_client.stream(request)?;
@@ -1513,5 +1582,55 @@ mod tests {
 
         let short = String::from("tiny");
         assert_eq!(super::truncate_tool_output(&short), "tiny");
+    }
+
+    #[test]
+    fn replay_stubs_old_tool_results_but_keeps_recent_and_pinned() {
+        let bulk = "z".repeat(5_000);
+        let mut messages = vec![
+            // Old successful dump: should collapse to a size marker.
+            ConversationMessage::tool_result("t-old", "bash", bulk.clone(), false),
+            // Old pinned dump: survives verbatim even though it is old.
+            ConversationMessage::tool_result("t-pin", "read_file", bulk.clone(), false)
+                .with_pinned(true),
+        ];
+        // Pad past the verbatim tail so the first two entries fall out of it.
+        for i in 0..12 {
+            messages.push(ConversationMessage::user_text(format!("filler {i}")));
+        }
+        // A recent tool result (inside the tail) must stay verbatim.
+        messages.push(ConversationMessage::tool_result(
+            "t-new",
+            "bash",
+            bulk.clone(),
+            false,
+        ));
+
+        let replay = super::build_replay_messages(&messages);
+
+        let old = match &replay[0].blocks[0] {
+            ContentBlock::ToolResult { output, .. } => output.clone(),
+            _ => panic!("expected tool result"),
+        };
+        assert!(old.contains("omitted from replay"));
+        assert!(old.chars().count() < 200);
+
+        let pinned = match &replay[1].blocks[0] {
+            ContentBlock::ToolResult { output, .. } => output.clone(),
+            _ => panic!("expected tool result"),
+        };
+        assert_eq!(pinned, bulk, "pinned result must survive verbatim");
+
+        let recent = match &replay[replay.len() - 1].blocks[0] {
+            ContentBlock::ToolResult { output, .. } => output.clone(),
+            _ => panic!("expected tool result"),
+        };
+        assert_eq!(recent, bulk, "recent result must stay verbatim");
+
+        // The durable transcript is never mutated by the projection.
+        assert!(matches!(
+            &messages[0].blocks[0],
+            ContentBlock::ToolResult { output, .. } if output == &bulk
+        ));
     }
 }

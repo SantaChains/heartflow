@@ -415,14 +415,19 @@ pub fn load_system_prompt(
     Ok(builder.build())
 }
 
-/// Cap on injected `MEMORY.md` text so these durable notes stay token-cheap.
-const MAX_MEMORY_BYTES: usize = 4_096;
+/// Per-file budget for one `MEMORY.md`. Each layer (user, then project) gets
+/// its own slice so a large user-level file can never starve the project layer,
+/// which is where repo-specific pitfalls live.
+const MAX_MEMORY_PER_FILE_BYTES: usize = 3_072;
+/// Backstop across all layers so injected memory stays token-cheap.
+const MAX_MEMORY_BYTES: usize = 6_144;
 
 /// Read durable memory notes from `.heartflow/MEMORY.md` at each root (user then
-/// project), concatenated in that order and clamped to `MAX_MEMORY_BYTES` on a
-/// char boundary. Memory here is curated freeform text (pitfalls, decisions,
-/// preferences), not embeddings. A missing or unreadable file yields nothing so
-/// the prompt always builds.
+/// project). Every layer is clamped on its own budget (line-granular) before
+/// merging, so no single layer is dropped by another's size, then the merged
+/// blob is clamped overall. Memory here is curated freeform text (pitfalls,
+/// decisions, preferences), not embeddings. A missing or unreadable file yields
+/// nothing so the prompt always builds.
 fn load_memory(roots: &[&Path]) -> String {
     let mut merged = String::new();
     for root in roots {
@@ -434,12 +439,37 @@ fn load_memory(roots: &[&Path]) -> String {
         if content.is_empty() {
             continue;
         }
+        let content = clamp_lines(content, MAX_MEMORY_PER_FILE_BYTES);
+        if content.is_empty() {
+            continue;
+        }
         if !merged.is_empty() {
             merged.push_str("\n\n");
         }
         merged.push_str(content);
     }
-    clamp_bytes(&merged, MAX_MEMORY_BYTES).to_string()
+    clamp_lines(&merged, MAX_MEMORY_BYTES).to_string()
+}
+
+/// Truncate to at most `max_bytes` while dropping the trailing lines that would
+/// cross the budget, so a memory note is never cut mid-sentence. Falls back to a
+/// byte clamp only when a single oversized first line would otherwise vanish.
+fn clamp_lines(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = 0_usize;
+    for line in text.lines() {
+        let next = end + line.len() + usize::from(end != 0);
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    if end == 0 {
+        return clamp_bytes(text, max_bytes);
+    }
+    &text[..end]
 }
 
 fn render_memory_section(memory: &str) -> String {
@@ -790,6 +820,37 @@ mod tests {
         let clamped = super::clamp_bytes(text, 7);
         assert_eq!(clamped, "你好");
         assert_eq!(super::clamp_bytes("hello", 32), "hello");
+    }
+
+    #[test]
+    fn project_memory_survives_a_large_user_file_and_clamps_on_lines() {
+        let user = temp_dir();
+        let project = temp_dir();
+        fs::create_dir_all(user.join(".heartflow")).expect("user dir");
+        fs::create_dir_all(project.join(".heartflow")).expect("project dir");
+        // User layer blown far past its budget with filler lines.
+        let filler = "user note line\n".repeat(600);
+        fs::write(user.join(".heartflow").join("MEMORY.md"), filler).expect("write user");
+        // The repo-specific pitfall we must never drop.
+        fs::write(
+            project.join(".heartflow").join("MEMORY.md"),
+            "- PITFALL: never push, only commit.",
+        )
+        .expect("write project");
+
+        let memory = super::load_memory(&[user.as_path(), project.as_path()]);
+        assert!(
+            memory.contains("PITFALL: never push"),
+            "project pitfall must survive a huge user file"
+        );
+        // Merged output respects the overall budget and never cuts a line.
+        assert!(memory.len() <= super::MAX_MEMORY_BYTES);
+        assert!(
+            !memory.ends_with('\\') && memory.lines().all(|l| !l.ends_with("note li")),
+            "clamp must not split a line mid-word"
+        );
+        fs::remove_dir_all(user).expect("cleanup");
+        fs::remove_dir_all(project).expect("cleanup");
     }
 
     #[test]
