@@ -20,10 +20,11 @@ use crossterm::style::Stylize;
 use inquire::{Confirm, MultiSelect, Select, Text};
 use mcp::{HttpTransport, McpClient, McpTool, StdioTransport, Transport};
 use runtime::{
-    load_system_prompt, normalize_tool_schema, should_compact, truncate_chars, AgentEvent,
-    CompactionConfig, ContentBlock, ConversationMessage, ConversationRuntime, MessageRole,
-    PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
-    PermissionRequest, Session, TokenUsage, ToolError, ToolExecutor, ToolSpec,
+    execute_bash, is_dangerous_command, load_system_prompt, normalize_tool_schema, should_compact,
+    truncate_chars, AgentEvent, BashCommandInput, CompactionConfig, ContentBlock,
+    ConversationMessage, ConversationRuntime, MessageRole, PermissionMode, PermissionPolicy,
+    PermissionPromptDecision, PermissionPrompter, PermissionRequest, Session, TokenUsage,
+    ToolError, ToolExecutor, ToolSpec,
 };
 use store::{role_str, Integrity, SearchHit, SearchMethod, SessionMeta, Store};
 use tokio_util::sync::CancellationToken;
@@ -1386,6 +1387,9 @@ async fn run_repl(
                 )
                 .await?;
             }
+            _ if trimmed.starts_with('!') => {
+                handle_bang_command(trimmed).await;
+            }
             _ if trimmed.starts_with('/') => report_unknown_command(trimmed),
             _ => {
                 // Running turns cannot be submitted through the blocking line
@@ -1480,6 +1484,68 @@ fn handle_guide_command(input: &str, runtime: &AgentRuntime) {
     });
     println!("guide draft (edit and resend, or paste into the next message):\n");
     println!("{draft}\n");
+}
+
+/// `!<cmd>` — run a shell command directly through the same bash tool path the
+/// model uses (pwsh on Windows, UTF-8 wrapped), with no model round-trip.
+/// Dangerous commands are confirmed first; output is folded like tool output
+/// and stays reachable via `/expand`.
+async fn handle_bang_command(input: &str) {
+    let command = input.trim().strip_prefix('!').unwrap_or("").trim();
+    if command.is_empty() {
+        println!("usage: !<shell command>   e.g. !git status");
+        return;
+    }
+    if is_dangerous_command(command)
+        && !Confirm::new(&format!(
+            "Run potentially destructive command?\n  {command}"
+        ))
+        .with_default(false)
+        .prompt()
+        .unwrap_or(false)
+    {
+        println!("cancelled.");
+        return;
+    }
+    let bash_input = BashCommandInput {
+        command: command.to_string(),
+        timeout: None,
+        description: None,
+        run_in_background: Some(false),
+        dangerously_disable_sandbox: None,
+    };
+    // `execute_bash` drives its own current-thread runtime; run it off the
+    // async reactor so the nested `block_on` never panics.
+    let joined = tokio::task::spawn_blocking(move || execute_bash(bash_input)).await;
+    let output = match joined {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            println!("{}", format!("shell error: {error}").red());
+            return;
+        }
+        Err(task) => {
+            println!("{}", format!("shell task failed: {task}").red());
+            return;
+        }
+    };
+    let mut body = output.stdout;
+    if !output.stderr.is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&output.stderr);
+    }
+    if body.trim().is_empty() {
+        println!("{}", "(no output)".dark_grey());
+    } else {
+        let markdown = fold_tool_output("shell", &body, FOLD_TOOL_OUTPUT_LINES);
+        println!("{}", TerminalRenderer::new().render_markdown(&markdown));
+    }
+    if output.interrupted {
+        println!("{}", "! interrupted (timeout)".yellow());
+    } else if let Some(interpretation) = &output.return_code_interpretation {
+        println!("{}", format!("! {interpretation}").dark_grey());
+    }
 }
 
 /// Print the saved-session list for the `/sessions` command.
@@ -2024,6 +2090,9 @@ fn print_repl_help() {
     println!("  /expand [ID]   Re-show a folded tool output (default: latest)");
     println!("  /queue [pop|clear]  Inspect/withdraw follow-ups queued during a turn");
     println!("  /guide <TASK>  Assemble a prior-work/current-state/task draft to send");
+    println!(
+        "  !<CMD>         Run a shell command directly (no model); output folds like a tool result"
+    );
     println!("  /init          Scaffold a starting AGENTS.md in the current directory");
     println!("  /restart       Re-launch the program with a fresh config/MCP load");
     println!("  /exit          Quit the REPL");
