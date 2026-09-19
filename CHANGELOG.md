@@ -1,4 +1,11 @@
 
+# heartflow 1.0.1 - 2026-09-19
+
+## 缺陷修复
+
+- **scoop**: Hash extraction field is find, not regex (`bb45a6b`)
+
+
 # heartflow 1.0.0 - 2026-09-19
 
 ## 其他
