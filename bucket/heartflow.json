@@ -1,31 +1,31 @@
 {
-    "version": "1.0.0",
-    "description": "Terminal-native coding agent in Rust (binary: hf).",
-    "homepage": "https://github.com/SantaChains/heartflow",
-    "license": "MIT",
-    "notes": "首次运行先配置模型提供方,详见 https://github.com/SantaChains/heartflow",
-    "architecture": {
-        "64bit": {
-            "url": "https://github.com/SantaChains/heartflow/releases/download/v1.0.0/heartflow-1.0.0-win-amd64.zip",
-            "hash": {
-                "url": "https://github.com/SantaChains/heartflow/releases/download/v1.0.0/heartflow-1.0.0-win-amd64.zip.sha256",
-                "regex": "([a-fA-F0-9]{64})"
-            }
-        }
-    },
-    "bin": "hf.exe",
-    "checkver": {
-        "github": "https://github.com/SantaChains/heartflow"
-    },
-    "autoupdate": {
-        "architecture": {
-            "64bit": {
-                "url": "https://github.com/SantaChains/heartflow/releases/download/v$version/heartflow-$version-win-amd64.zip",
-                "hash": {
-                    "url": "https://github.com/SantaChains/heartflow/releases/download/v$version/heartflow-$version-win-amd64.zip.sha256",
-                    "regex": "([a-fA-F0-9]{64})"
-                }
-            }
-        }
+  "version": "1.0.0",
+  "description": "Terminal-native coding agent in Rust (binary: hf).",
+  "homepage": "https://github.com/SantaChains/heartflow",
+  "license": "MIT",
+  "notes": "首次运行先配置模型提供方,详见 https://github.com/SantaChains/heartflow",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/SantaChains/heartflow/releases/download/v1.0.0/heartflow-1.0.0-win-amd64.zip",
+      "hash": {
+        "url": "https://github.com/SantaChains/heartflow/releases/download/v1.0.0/heartflow-1.0.0-win-amd64.zip.sha256",
+        "regex": "([a-fA-F0-9]{64})"
+      }
     }
+  },
+  "bin": "hf.exe",
+  "checkver": {
+    "github": "SantaChains/heartflow"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/SantaChains/heartflow/releases/download/v$version/heartflow-$version-win-amd64.zip",
+        "hash": {
+          "url": "https://github.com/SantaChains/heartflow/releases/download/v$version/heartflow-$version-win-amd64.zip.sha256",
+          "regex": "([a-fA-F0-9]{64})"
+        }
+      }
+    }
+  }
 }
