@@ -1,0 +1,37 @@
+[package]
+name = "heartflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "hf"
+path = "src/main.rs"
+
+[dependencies]
+api = { path = "../api" }
+clap = { version = "4.6", features = ["derive"] }
+commands = { path = "../commands" }
+crossterm = "0.29"
+dirs = "7.0"
+inquire = "0.9"
+mcp = { path = "../mcp" }
+os_info = "3"
+pulldown-cmark = "0.13"
+reedline = "0.51"
+runtime = { path = "../runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+store = { path = "../store" }
+strsim = "0.11"
+syntect = "5"
+tokio = { version = "1", features = ["rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", default-features = false }
+toml = "0.9"
+tools = { path = "../tools" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true

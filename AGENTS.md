@@ -1,0 +1,75 @@
+# AGENTS.md
+
+本文件为在此仓库中工作的 agent 提供指引。heartflow 加载仓库指令时以 `AGENTS.md` 为主(中性跨工具标准),并为兼容旧仓库继续读取 `CLAUDE.md`。
+
+## 项目概览
+
+heartflow 是一个 Rust 实现的终端 AI agent(仓库名 `heartflow`,二进制 `hf`)。REPL 中通过 SSE 真流式与模型协作,执行 shell、读写文件、检索代码、挂载 MCP 工具,并以任务循环自迭代完成多步工作。
+
+- 语言/工具链:Rust 1.85+(本机为 nightly),edition 2021
+- 形态:Cargo workspace,`members = ["crates/*"]`,每个 crate 都是独立库,`cli` 产出二进制 `hf`
+- 身份约束:`FRONTIER_MODEL_NAME = "heartflow"`(`crates/runtime/src/prompt.rs:39`)。系统提示词强制“永远是 heartflow,不得冒充其他厂商/身份”。改动提示词时保留此约束。
+
+## 常用命令
+
+所有命令在仓库根(含 `Cargo.toml`)执行。
+
+```bash
+cargo build --release          # 产物 target/release/hf(.exe)
+cargo run -p heartflow         # 直接进入 REPL
+cargo fmt --all -- --check     # 格式门
+cargo clippy --workspace --all-targets   # 质量门:pedantic 零警告
+cargo test --workspace         # 全部测试
+cargo test -p store            # 单 crate 测试(store/tests/io_correctness.rs 为 I/O 正确性重点)
+```
+
+单测粒度:`cargo test -p <crate> <test_name>`。
+
+CLI 冒烟:`cargo run -p heartflow -- --help`、`... -- doctor`、`... -- system-prompt`。
+
+## Workspace 结构
+
+依赖方向单向:`cli → {runtime, api, tools, mcp, store, commands}`;`runtime` 不感知传输细节,`api/runtime/cli` 三层边界不得破。
+
+```text
+crates/
+├── api        传输层:Anthropic / OpenAI Chat / OpenAI Responses 客户端、SSE 解析、重试。仅依赖 reqwest/serde/tokio。
+├── runtime    会话循环:流消费、工具调度、compact、系统提示词、权限、bash/file_ops、agent 资产发现。
+│              agent 循环核心在 conversation.rs(ConversationRuntime、ToolExecutor、TurnStream、AgentEvent)。
+├── tools      原生工具的线上规格(wire spec)与执行:bash/read/write/edit/glob/grep、todo、web_fetch、verify_graphics、generate_image,以及 search_files(nucleo 模糊文件检索)、apply_patch(事务式多文件批量编辑)。新工具入参 schema 用 schemars 生成,旧工具维持手写。
+├── mcp        MCP 客户端:stdio JSON-RPC 2.0 传输。
+├── commands   请求/响应数据结构(薄)。
+├── store      系统级 SQLite 历史库:JSONL 权威 + best-effort 镜像到 ~/.heartflow/heartflow.db(FTS5 trigram 检索、用量聚合、integrity_check)。
+└── cli        hf 入口:REPL、clap CLI、配置解析、渲染、行编辑、权限交互。
+```
+
+## 运行时数据与配置
+
+- 会话:`~/.heartflow/sessions/*.jsonl`(JSONL 为权威存储,原子写入)
+- 历史库:`~/.heartflow/heartflow.db`(从 JSON 派生的缓存;损坏可删除重建,不阻断保存)
+- 配置优先级:`CLI 参数 > 项目 .heartflow/config.toml > 用户 ~/.heartflow/config.toml > 内置 provider 表 > 环境变量`。同名字段逐项覆盖,坏字段跳过告警,单条不阻断启动。REPL 每回合按 mtime 热重载。
+- Agent 资产:规则 `~/.agent/rules/*.md`(全量注入,上限 32 个/单个 32KB)与 `.agent/rules/`(项目层覆盖用户层);技能 `~/.agent/skills/*/SKILL.md` 仅注入 name/description 元数据。
+- 权限模式:`read-only / workspace-write(默认, 由 HEARTFLOW_PERMISSION_MODE 控制) / full`,REPL 内 `/mode` 热切换,工具级可覆盖。
+
+关键环境变量:`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY`、`DEEPSEEK_API_KEY`、`HEARTFLOW_LOG`(默认 warn,输出 stderr)、`HEARTFLOW_PERMISSION_MODE`、`HEARTFLOW_SHELL`、`HEARTFLOW_IMAGE_API_KEY`(生图工具,可选)。
+
+## 代码约定
+
+- Clippy:workspace 级 `pedantic = warn`,`unsafe_code = forbid`。禁止 `unwrap`/`expect` 出现在可失败路径,用 `Result` + 错误类型传递。新增代码必须过 pedantic。
+- 错误类型:crate 内自定义(`ApiError`、`StoreError`、`RuntimeError`、`ConfigError`),不用 `anyhow` 风格泛型下沉到库。
+- 工具注册:线上规格集中在 `crates/tools/src/lib.rs` 的 `mvp_tool_specs()` 与各 `*_tool_spec()`;分发在 `execute_tool`。新增工具须同时补 spec、execute 分支、`ToolRegistry::entries` 并接线到 adapter。`ask_user` 的**执行**在 CLI 层(需真实终端),`tools` crate 只持有 wire spec。
+- 全链路 UTF-8:文件读写支持 BOM 剥除、CJK 宽度对齐;Windows 走 PowerShell(pwsh 优先),命令需可移植。中文/空格路径必须正确处理。
+- 输出风格:纯文本精简,不使用 emoji、分隔线、无谓注释;只注释关键逻辑。
+- 日志:`tracing` + `HEARTFLOW_LOG` 门控,一律 stderr,不污染渲染 stdout。
+
+## 测试要求
+
+- 工具/history/store 的 I/O 与风险路径须经得起测试,且不得损坏数据(见 `crates/store/tests/io_correctness.rs`)。
+- 传输层与事件流转换的缺口只有真服务器冒烟能暴露(历史缺陷:SSE `message_stop` 未转发、工具输入拼接损坏)。涉及流式/工具往返的改动须跑端到端冒烟。
+- 提交前跑齐质量门:fmt + clippy + test。
+
+## 注意
+
+- `.gitignore` 忽略 `target/`、`.heartflow/`、`archive/`、`.history/`、`.trae/`,以及本地笔记 `openmemory.md`、`ref.md`(个人头脑风暴/参考资料,不发布)。
+- 质量门由 `.github/workflows/ci.yml` 在推送/PR 时执行(fmt + clippy `-D warnings` + test + release);许可证 MIT(见 `LICENSE`)。
+- 修改 README 中列出的 CLI/REPL 接口时,同步更新 README 与 `--help`。

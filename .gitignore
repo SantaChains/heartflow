@@ -1,0 +1,11 @@
+__pycache__/
+archive/
+.history/
+.trae/
+
+target/
+.heartflow/
+
+# 本地个人笔记/参考资料,不随仓库发布
+openmemory.md
+ref.md
