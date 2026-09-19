@@ -178,26 +178,35 @@ impl Store {
             params![session_row],
         )?;
 
-        for (index, message) in messages.iter().enumerate() {
-            let seq = i64::try_from(index).map_err(|e| StoreError::Format(e.to_string()))?;
-            let blocks_json = serde_json::to_string(&message.blocks)?;
-            let search_text = flatten_search_text(&message.blocks);
-            let (has_usage, input, output, cache_create, cache_read) = match message.usage {
-                Some(u) => (
-                    1,
-                    i64::from(u.input_tokens),
-                    i64::from(u.output_tokens),
-                    i64::from(u.cache_creation_input_tokens),
-                    i64::from(u.cache_read_input_tokens),
-                ),
-                None => (0, 0, 0, 0, 0),
-            };
-            tx.execute(
+        // Prepare the two per-row INSERTs once and reuse them across the loop.
+        // The old form called `tx.execute(sql, ..)` per message, which re-runs
+        // `sqlite3_prepare` on identical SQL 2*N times per save. `Statement::insert`
+        // binds/steps/resets and returns the new rowid in one call (no separate
+        // `last_insert_rowid` round-trip); the FTS rows are written in a second
+        // pass so the two prepared statements don't contend for the `tx` borrow.
+        // Persisted bytes are identical to the previous implementation.
+        let mut inserted: Vec<(i64, String)> = Vec::with_capacity(messages.len());
+        {
+            let mut stmt = tx.prepare(
                 "INSERT INTO messages (session_row, seq, role, blocks_json, search_text, has_usage, \
                  input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, \
-                 pinned) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);",
-                params![
+                 pinned) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);",
+            )?;
+            for (index, message) in messages.iter().enumerate() {
+                let seq = i64::try_from(index).map_err(|e| StoreError::Format(e.to_string()))?;
+                let blocks_json = serde_json::to_string(&message.blocks)?;
+                let search_text = flatten_search_text(&message.blocks);
+                let (has_usage, input, output, cache_create, cache_read) = match message.usage {
+                    Some(u) => (
+                        1,
+                        i64::from(u.input_tokens),
+                        i64::from(u.output_tokens),
+                        i64::from(u.cache_creation_input_tokens),
+                        i64::from(u.cache_read_input_tokens),
+                    ),
+                    None => (0, 0, 0, 0, 0),
+                };
+                let rowid = stmt.insert(params![
                     session_row,
                     seq,
                     role_str(message.role),
@@ -209,13 +218,16 @@ impl Store {
                     cache_create,
                     cache_read,
                     i64::from(u8::from(message.pinned))
-                ],
-            )?;
-            let message_row = tx.last_insert_rowid();
-            tx.execute(
-                "INSERT INTO messages_fts (rowid, search_text) VALUES (?1, ?2);",
-                params![message_row, search_text],
-            )?;
+                ])?;
+                inserted.push((rowid, search_text));
+            }
+        }
+        {
+            let mut stmt =
+                tx.prepare("INSERT INTO messages_fts (rowid, search_text) VALUES (?1, ?2);")?;
+            for (rowid, search_text) in &inserted {
+                stmt.execute(params![rowid, search_text])?;
+            }
         }
 
         tx.commit()?;
