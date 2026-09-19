@@ -2,7 +2,6 @@
 
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
-[![CI](https://github.com/SantaChains/heartflow/actions/workflows/ci.yml/badge.svg)](https://github.com/SantaChains/heartflow/actions)
 
 Rust 实现的终端 AI agent。二进制命令 `hf`，在 REPL 中通过流式输出与模型协作，可执行 shell、读写文件、检索代码、挂载 MCP 工具，并以任务循环自迭代完成多步工作。
 
@@ -26,6 +25,31 @@ Rust 实现的终端 AI agent。二进制命令 `hf`，在 REPL 中通过流式�
 - 自检自愈：`hf doctor [--fix]` 校验配置解析、目录可写、provider 与密钥，并对历史库跑 `PRAGMA integrity_check`（库体过大时自动降级 `quick_check`）；`--fix` 建缺失目录、坏配置备份移开
 - 权限模型：read-only / workspace-write / full 三档，工具级覆盖，REPL 内 /mode 热切换；/plan 规划模式（硬门禁：仅可写 `.heartflow/plans/*.md`，其余写/bash 一律拒绝），审批后进入 Hermes 任务环逐任务新鲜上下文执行，收尾把复盘写入 `.heartflow/reflections/`（可选沉淀为 `.agent/skills`）；read-only 与 plan 两档自动放行标注为只读的 MCP 工具（`readOnlyHint`/`read_only`），让远程只读 MCP 在受限模式下亦可用
 - 健壮性：connect/read 双超时、子进程 kill_on_drop、UTF-8 全链路（BOM 剥除、PowerShell 编码前缀，非 UTF-8 字节经 `chardetng` 嗅探 + `encoding_rs` 解码 GBK 等遗留码页、不再 lossy 碎字、CJK 宽度对齐）、工具输出 32K 截断、缓存目录剪枝；工具入参执行前用 `jsonschema` crate 做完整 JSON-Schema 校验（draft 全能力；空/布尔/无法编译的 schema 一律放行，绝不误拦合法调用），转发给 provider 前对（MCP）schema 做规整（object 补 `properties`、array 补 `items`、单元素 `type` 联合折叠），MCP 握手（initialize+tools/list）失败按 200/400ms 退避重试 3 次（幂等），工具调用本身不自动重试（非幂等危险）交由模型层决策
+
+## 安装
+
+Windows amd64 便携包与 crates.io 包随每次发布自动产出,四条安装通道:
+
+**scoop(Windows,推荐,带自动更新)**
+
+```powershell
+scoop bucket add heartflow https://github.com/SantaChains/heartflow
+scoop install heartflow
+```
+
+**cargo(crates.io)**
+
+```bash
+cargo install heartflow
+```
+
+**cargo(直接从 Git,不经过 crates.io)**
+
+```bash
+cargo install --git https://github.com/SantaChains/heartflow --locked heartflow
+```
+
+**便携 zip 直下**:到 [Releases](https://github.com/SantaChains/heartflow/releases) 下载 `heartflow-<版本>-win-amd64.zip`(内含 `hf.exe`),解压后把目录加入 PATH。
 
 ## 构建
 
@@ -150,13 +174,13 @@ AGENTS.md / CLAUDE.md    仓库指令（项目上下文，逐级向上聚合）
 
 ## 环境变量
 
-| 变量                                     | 作用                                 |
-|------------------------------------------|--------------------------------------|
-| ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY | 默认 anthropic 模式密钥              |
-| DEEPSEEK_API_KEY                         | 内置 deepseek provider 密钥          |
-| HEARTFLOW_LOG                            | 日志级别门，默认 warn，输出至 stderr |
-| HEARTFLOW_PERMISSION_MODE                | read-only / workspace-write（默认）/ full，REPL 内 /mode 可切换 |
-| HEARTFLOW_SHELL                          | 覆盖 bash 工具的 shell 程序          |
+| 变量                                     | 作用                                                                                                                                                                                                       |
+|------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY | 默认 anthropic 模式密钥                                                                                                                                                                                    |
+| DEEPSEEK_API_KEY                         | 内置 deepseek provider 密钥                                                                                                                                                                                |
+| HEARTFLOW_LOG                            | 日志级别门，默认 warn，输出至 stderr                                                                                                                                                                       |
+| HEARTFLOW_PERMISSION_MODE                | read-only / workspace-write（默认）/ full，REPL 内 /mode 可切换                                                                                                                                            |
+| HEARTFLOW_SHELL                          | 覆盖 bash 工具的 shell 程序                                                                                                                                                                                |
 | HEARTFLOW_AUTO_COMPACT_TOKENS            | 模型上下文窗口 tokens；设后即启用回合内 `>50%` 预压缩（越过半窗 summarize-then-compact），未设则回退到 `config.toml` 的 `[provider] context_window`，两者皆无则关闭。用 `hf --provider NAME models` 查窗口 |
 
 ## Workspace 结构

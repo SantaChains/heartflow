@@ -70,18 +70,20 @@ crates/
 
 ## 发布流程(自动化)
 
-`.github/workflows/release.yml` 在 push main 时以 Conventional Commits 自动驱动版本与 GitHub Release,三段式 `plan(dry) → publish → windows-installer(仅 major)`,零 Node(不引入 semantic-release/cargo 插件链):发布逻辑集中在 `scripts/release.sh`,CI 与本地共用同一事实源。
+`.github/workflows/release.yml` 在 push main 时以 Conventional Commits 自动驱动版本、GitHub Release、crates.io 与 Windows 便携包,三段式 `plan(dry) → publish → windows-zip`,零 Node(不引入 semantic-release/cargo 插件链):发布逻辑集中在 `scripts/release.sh`,CI 与本地共用同一事实源。
 
-- 本地预检(必须先于 push,不得用 Actions 试错):`bash scripts/release.sh plan`;`RELEASE_DRY_RUN=1 bash scripts/release.sh publish`(只读预演);质量门 fmt/clippy/test 本地全绿后才 push,Actions 只跑真实发布。
+- 本地预检(必须先于 push,不得用 Actions 试错):`bash scripts/release.sh plan`;`RELEASE_DRY_RUN=1 bash scripts/release.sh publish`(只读预演,需本地装 git-cliff);质量门 fmt/clippy/test 本地全绿后才 push,Actions 只跑真实发布。
 - 版本语义:`feat:` → minor,`fix:` → patch,`!` 或 `BREAKING CHANGE:` → major;`chore/docs/test/ci/style/build` 不触发发版,在 plan job 秒级短路(文案与过滤规则见根目录 `cliff.toml`)。
 - 提交 scope 用 crate 名,如 `feat(tools): ...`;Release Notes 按中文分栏并加粗 scope。
 - 版本号唯一维护点在根 `Cargo.toml` 的 `[workspace.package]`;各 crate 一律 `version.workspace = true`,禁止写死版本号。
+- crates.io:api/runtime/mcp/tools/store/commands 裸名已被占用,内部 crate 统一挂 `heartflow-` 前缀发布,`[lib] name` 保持旧 extern 名,依赖经 `[workspace.dependencies]` 的 `package =` 重命名(源码 `use` 不变);publish job 按依赖拓扑逐个发,单 crate 失败自动重试 3 次(sparse index 传播延迟),认证走仓库 secret `CRATES_IO_TOKEN`;版本一次性,同版本不可重发。
 - 机器人提交 `chore(release): vX.Y.Z [skip ci]` 自动同步 Cargo.toml/Cargo.lock/CHANGELOG、打 tag、建 GitHub Release;勿手工仿写此类提交。
-- Windows amd64 安装包仅在 major 触发 windows job(Inno Setup 脚本 `packaging/heartflow.iss`,产物 `heartflow-<ver>-win-amd64-setup.exe` + SHA256 附件);当前构建与上传整条链路含 upload 均为注释占位,启用时整体解开(避免引用不存在产物的必红步骤)。
-- 若 main 启用分支保护,需允许 GitHub Actions 直接推送;`ci.yml` 质量门独立运行,发布流水线不做代码检查。
+- Windows amd64 便携 zip(hf.exe 置于压缩包根 + .sha256)随每次发布上传到 Release;本仓库 `bucket/` 目录兼作 scoop bucket,清单 `bucket/heartflow.json` 带 checkver/autoupdate,新 Release 即被 scoop 发现(用户先 `scoop bucket add heartflow <仓库url>` 再 `scoop install heartflow`)。
+- git-cliff 版本钉在 `.github/actions/install-git-cliff/action.yml`(模板引擎行为随版本变动,升级需显式改并先过本地 dry-run)。
+- 若 main 启用分支保护,需允许 GitHub Actions 直接推送;发布流水线不做代码检查。
 
 ## 注意
 
-- `.gitignore` 忽略 `target/`、`.heartflow/`、`archive/`、`.history/`、`.trae/`,以及本地笔记 `openmemory.md`、`ref.md`(个人头脑风暴/参考资料,不发布)。
-- 质量门由 `.github/workflows/ci.yml` 在推送/PR 时执行(fmt + clippy `-D warnings -A clippy::pedantic`(仅正确性阻断)+ test + release);许可证 MIT(见 `LICENSE`)。
+- `.gitignore` 忽略 `target/`、`.heartflow/`、`archive/`、`.history/`、`.trae/`,以及本地笔记 `openmemory.md`、`ref.md`、`error.md`(个人头脑风暴/参考资料,不发布)。
+- 质量门当前以本地为准(fmt + clippy `-D warnings -A clippy::pedantic`(仅正确性阻断)+ test + release);`ci.yml.bak` 为暂存的 CI 工作流,启用时改回 `ci.yml`;许可证 MIT(见 `LICENSE`)。
 - 修改 README 中列出的 CLI/REPL 接口时,同步更新 README 与 `--help`。
