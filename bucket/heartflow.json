@@ -7,10 +7,7 @@
   "architecture": {
     "64bit": {
       "url": "https://github.com/SantaChains/heartflow/releases/download/v1.0.0/heartflow-1.0.0-win-amd64.zip",
-      "hash": {
-                "url": "https://github.com/SantaChains/heartflow/releases/download/v1.0.0/heartflow-1.0.0-win-amd64.zip.sha256",
-                "find": "([a-fA-F0-9]{64})"
-            }
+      "hash": "b7f03fc1dc581c09e4bcfc98548e4f04203432df96789a29f124cda7521b8078"
     }
   },
   "bin": "hf.exe",
