@@ -124,11 +124,15 @@ do_publish() {
     note "dry-run done: version calc + notes OK; Cargo.toml/Cargo.lock restored, no commit/push"
     note "----- release-notes.md preview -----"
     sed -n '1,20p' release-notes.md >&2
+    # 预演同样覆盖 CHANGELOG 生成路径的参数形态(历史缺陷:-o 与 --prepend 同文件被 git-cliff 拒绝)
+    changelog_dry="$(mktemp)"
+    git-cliff --unreleased --tag "$tag" --prepend "$changelog_dry"
+    rm -f "$changelog_dry"
     return 0
   fi
 
   need_cmd gh
-  git-cliff --unreleased --tag "$tag" --prepend -o CHANGELOG.md
+  git-cliff --unreleased --tag "$tag" --prepend CHANGELOG.md
   git config user.name "${GIT_AUTHOR_NAME:-github-actions[bot]}"
   git config user.email "${GIT_AUTHOR_EMAIL:-418982825+github-actions[bot]@users.noreply.github.com}"
   git add Cargo.toml Cargo.lock CHANGELOG.md
