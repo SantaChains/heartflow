@@ -65,9 +65,9 @@ do_plan() {
   fi
   l="${base#v}"; lm="${l%%.*}"; lmi="$(cut -d. -f2 <<<"$l")"
   n="${next#v}"; nm="${n%%.*}"; nmi="$(cut -d. -f2 <<<"$n")"
-  if [ "$lm" != "$nm" ]; then bump=major
-  elif [ "$lmi" != "$nmi" ]; then bump=minor
-  else bump=patch; fi
+  bump="patch"
+  if [ "$lm" != "$nm" ]; then bump="major"
+  elif [ "$lmi" != "$nmi" ]; then bump="minor"; fi
   emit_output released true
   emit_output bump "$bump"
   emit_output tag "$next"
