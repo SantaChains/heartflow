@@ -209,9 +209,10 @@ impl SystemPromptBuilder {
 
 /// Optional external CLI tools worth reaching for, each with a one-line role.
 /// The prompt advertises only the ones actually installed, so the agent is
-/// never pointed at a missing binary. Interactive or color-only pagers (fzf,
-/// git-delta, `less`) are deliberately absent: they need a human TTY, not the
-/// captured bash pipe.
+/// never pointed at a missing binary. Interactive or shell-integrated tools
+/// (fzf, yazi, zoxide, git-delta, `less`) are deliberately absent: they need a
+/// human TTY or shell session, not the captured bash pipe. Color-first tools
+/// (bat, eza) are included because they fall back to plain text when piped.
 const EXTERNAL_TOOL_HINTS: &[(&str, &str)] = &[
     ("jq", "slice and reshape JSON"),
     ("yq", "query and reshape YAML/TOML"),
@@ -219,11 +220,18 @@ const EXTERNAL_TOOL_HINTS: &[(&str, &str)] = &[
     ("jc", "convert ls/ps/ifconfig/etc. output to JSON"),
     ("rg", "fast regex search across files"),
     ("fd", "fast, gitignore-aware file finder"),
+    ("ast-grep", "structural (AST) code search and rewrite"),
+    (
+        "bat",
+        "cat with syntax highlighting; pass --paging=never for plain output",
+    ),
+    ("eza", "modern ls with git status and tree"),
     ("tree", "render a directory tree"),
     ("tokei", "count lines of code by language"),
     ("hyperfine", "statistical command benchmarking"),
     ("difft", "structural (syntax-aware) diff"),
     ("xsv", "query and reshape CSV"),
+    ("tldr", "concise vetted examples for a command"),
     ("gh", "GitHub issues, PRs, and checks from the CLI"),
 ];
 
@@ -240,7 +248,7 @@ fn render_external_tools(present: impl Fn(&str) -> bool) -> Option<String> {
     }
     let mut lines = vec![
         "External CLI tools.".to_string(),
-        "Prefer these over hand-rolled awk/sed/Python parsing when installed; call them through the bash tool. Before using one for the first time in this session, run `<tool> --help` to learn its current flags instead of guessing. These are non-interactive text filters; anything needing a human terminal (fzf, git-delta, pagers) is for the user, not for you.".to_string(),
+        "Prefer these over hand-rolled awk/sed/Python parsing when installed; call them through the bash tool. Before using one for the first time, check its current flags with `tldr <tool>` or `<tool> --help` instead of guessing. Use their non-interactive form (e.g. `bat --paging=never`); anything that needs a human terminal (fzf, yazi, zoxide, git-delta, pagers) is for the user, not for you.".to_string(),
     ];
     lines.extend(advertised);
     Some(lines.join("\n"))
@@ -364,7 +372,7 @@ fn render_rules_section(rules: &[RuleFile]) -> String {
 fn render_skills_section(skills: &[SkillSummary]) -> String {
     let mut sections = vec![
         "Skills.".to_string(),
-        "Reusable playbooks live in the files below. When a task matches one, read its full text with the read tool before acting; apply it exactly.".to_string(),
+        "Reusable playbooks live in the files below. When a task matches one, read its full text with the read_file tool before acting; apply it exactly.".to_string(),
     ];
     for skill in skills {
         let mut line = skill.name.clone();
@@ -539,7 +547,7 @@ fn get_response_style_section() -> String {
 fn get_task_loop_section() -> String {
     [
         "Task loop.",
-        "For multi-step work, set the task list with the todo tool before starting: one concise entry per task, exactly one in progress at a time. Phrase each task so its completion is verifiable, mark it done as soon as it is, and finish every task before giving the final answer. The system may nudge you to continue while the list still has unfinished items.",
+        "For multi-step work, set the task list with the todo_write tool before starting: one concise entry per task, exactly one in progress at a time. Phrase each task so its completion is verifiable, mark it done as soon as it is, and finish every task before giving the final answer. The system may nudge you to continue while the list still has unfinished items.",
     ]
     .join("\n")
 }
