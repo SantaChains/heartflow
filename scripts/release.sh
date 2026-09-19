@@ -15,14 +15,14 @@ set -euo pipefail
 
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
-log() {
-  # 日志一律 ASCII:Windows Git-Bash 本地预检时中文会被 GBK 写坏,CI 日志同理
+note() {
+  # 日志一律 ASCII:Windows Git-Bash 本地预检时中文会被 GBK 写坏,CI 日志同理(函数名避开外部命令 log)
   LC_ALL=C printf '%s\n' "$*" >&2
 }
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
-    log "missing dep: $1 (local install: cargo install git-cliff --locked; gh only needed by publish)"
+    note "missing dep: $1 (local install: cargo install git-cliff --locked; gh only needed by publish)"
     exit 2
   }
 }
@@ -51,7 +51,7 @@ do_plan() {
   last="$(git describe --tags --abbrev=0 2>/dev/null || true)"
   if ! range_has_release_commit "${last:-}"; then
     emit_output released false
-    log "no release-related commits since ${last:-initial}, skip release"
+    note "no release-related commits since ${last:-initial}, skip release"
     return 0
   fi
   need_cmd git-cliff
@@ -60,7 +60,7 @@ do_plan() {
   next="v${raw#v}"
   if [ "$next" = "$base" ]; then
     emit_output released false
-    log "git-cliff produced no version increment, skip release"
+    note "git-cliff produced no version increment, skip release"
     return 0
   fi
   l="${base#v}"; lm="${l%%.*}"; lmi="$(cut -d. -f2 <<<"$l")"
@@ -71,7 +71,7 @@ do_plan() {
   emit_output released true
   emit_output bump "$bump"
   emit_output tag "$next"
-  log "next version: ${last:+${last} -> }${next} (${bump})"
+  note "next version: ${last:+${last} -> }${next} (${bump})"
 }
 
 do_publish() {
@@ -84,14 +84,14 @@ do_publish() {
 
   # 单一版本点:根 [workspace.package];各 crate 经 version.workspace = true 继承,禁止逐 crate 写死
   sed -i "0,/^version = \"/s/^version = \"[^\"]*\"/version = \"${ver}\"/" Cargo.toml
-  # 只同步 workspace 内部 crate 在 Cargo.lock 中的版本,离线不触碰外部依赖
-  cargo update --workspace --offline
+  # 只同步 workspace 内部 crate 在 Cargo.lock 中的版本(-w 不升级外部依赖;不加 --offline,CI 全新 runner 无 registry 索引缓存)
+  cargo update --workspace
   git-cliff --unreleased --bump -o release-notes.md
 
   if [ "$dry" = "1" ]; then
     git restore Cargo.toml Cargo.lock
-    log "dry-run done: version calc + notes OK; Cargo.toml/Cargo.lock restored, no commit/push"
-    log "----- release-notes.md preview -----"
+    note "dry-run done: version calc + notes OK; Cargo.toml/Cargo.lock restored, no commit/push"
+    note "----- release-notes.md preview -----"
     sed -n '1,20p' release-notes.md >&2
     return 0
   fi
@@ -113,14 +113,14 @@ do_publish() {
     --target main \
     --title "heartflow ${tag} (${bump_label})" \
     --notes-file release-notes.md
-  log "released ${tag}"
+  note "released ${tag}"
 }
 
 case "${1:-}" in
   plan) do_plan ;;
   publish) do_publish ;;
   *)
-    log "usage: bash scripts/release.sh plan|publish"
+    note "usage: bash scripts/release.sh plan|publish"
     exit 1
     ;;
 esac
