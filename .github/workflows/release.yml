@@ -1,9 +1,9 @@
 name: Release
 
-# heartflow 自动发布,三段式:plan(dry) → publish → windows-installer(仅 major)
+# heartflow 自动发布,三段式:plan(dry) → publish → windows-zip(便携包,随每次发布)
 #   - 零 Node:版本计算/CHANGELOG/Release 全部走 scripts/release.sh + git-cliff,本地可先行验证省 Actions
 #   - 语义:feat→minor、fix→patch、!/BREAKING CHANGE→major;chore 等 push 在 plan 秒级短路
-#   - Windows amd64 安装包仅在 major 触发;整条构建链路(含 upload)注释占位,启用即整体解开
+#   - Windows amd64 便携 zip(hf.exe 置于压缩包根 + sha256)上传到 Release,供 scoop bucket 自动更新
 #   - 代码质量门由 ci.yml 独立负责,本流水线不做 fmt/clippy/test
 #   - 本地预检:bash scripts/release.sh plan;RELEASE_DRY_RUN=1 bash scripts/release.sh publish
 
@@ -60,58 +60,41 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash scripts/release.sh publish
 
-  windows-installer:
-    name: win-amd64 安装包(仅 major)
+  windows-zip:
+    name: win-amd64 便携 zip(scoop 供包)
     needs: [plan, publish]
-    if: needs.plan.outputs.bump == 'major'
+    if: needs.plan.outputs.released == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
     permissions:
       contents: write
     steps:
-      - name: placeholder(启用打包时解开下方全部步骤,含 upload)
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.tag }}
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build (hf.exe)
+        run: cargo build --release -p heartflow --target x86_64-pc-windows-msvc
+      - name: pack zip + sha256
         shell: pwsh
-        run: Write-Output "构建链路暂未启用;解开本 job 其余注释即生效。"
-
-      # - uses: actions/checkout@v4
-      #   with:
-      #     ref: ${{ needs.plan.outputs.tag }}
-      #     fetch-depth: 1
-      # - uses: dtolnay/rust-toolchain@stable
-      #   with:
-      #     targets: x86_64-pc-windows-msvc
-      # - uses: Swatinem/rust-cache@v2
-      # - name: cargo build (hf.exe)
-      #   run: cargo build --release -p heartflow --target x86_64-pc-windows-msvc
-      # - name: upx compress hf.exe (可选,默认不启用)
-      #   # 注意:UPX 壳对 Rust 二进制压缩率有限,却极易触发 Windows Defender/SmartScreen
-      #   # 对"打包器+shell 执行器"类程序的误报,污染安装包信誉;优先用 Cargo.toml
-      #   # [profile.release] 的 lto/strip/codegen-units 减体积;确认接受误报风险再解开。
-      #   run: |
-      #     choco install upx -y --no-progress
-      #     upx --best --lzma target\x86_64-pc-windows-msvc\release\hf.exe
-      # - name: install Inno Setup
-      #   run: choco install innosetup -y --no-progress
-      # - name: compile installer (heartflow-<ver>-win-amd64-setup.exe)
-      #   shell: pwsh
-      #   run: |
-      #     $ErrorActionPreference = "Stop"
-      #     $v = ("${{ needs.plan.outputs.tag }}" -replace "^v", "")
-      #     $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-      #     if (-not (Test-Path $iscc)) { $iscc = "$env:ProgramFiles\Inno Setup 6\ISCC.exe" }
-      #     & $iscc "/DVersion=$v" "packaging\heartflow.iss"
-      #     if ($LASTEXITCODE -ne 0) { throw "ISCC failed: $LASTEXITCODE" }
-      # - name: upload installer + sha256 to release
-      #   shell: pwsh
-      #   env:
-      #     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      #   run: |
-      #     $ErrorActionPreference = "Stop"
-      #     $tag = "${{ needs.plan.outputs.tag }}"
-      #     $v = ($tag -replace "^v", "")
-      #     $name = "heartflow-$v-win-amd64-setup.exe"
-      #     $exe = Join-Path "packaging\dist" $name
-      #     if (-not (Test-Path $exe)) { throw "installer not found: $exe" }
-      #     $sha = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
-      #     "$sha  $name" | Set-Content "$exe.sha256" -Encoding ascii
-      #     gh release upload $tag $exe "$exe.sha256" --clobber
+        run: |
+          $ErrorActionPreference = "Stop"
+          $v = ("${{ needs.plan.outputs.tag }}" -replace "^v", "")
+          $name = "heartflow-$v-win-amd64.zip"
+          # hf.exe 置于压缩包根目录,scoop 解包后直接挂 bin;sha256 文件供 manifest 校验
+          Compress-Archive -Path "target\x86_64-pc-windows-msvc\release\hf.exe" -DestinationPath $name -Force
+          $sha = (Get-FileHash $name -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$sha  $name" | Set-Content "$name.sha256" -Encoding ascii
+      - name: upload zip + sha256 to release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $v = ("${{ needs.plan.outputs.tag }}" -replace "^v", "")
+          $name = "heartflow-$v-win-amd64.zip"
+          gh release upload "${{ needs.plan.outputs.tag }}" $name "$name.sha256" --clobber

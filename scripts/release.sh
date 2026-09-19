@@ -59,10 +59,10 @@ do_plan() {
     # First-ever release: git-cliff infers the version prefix only from an
     # existing release tag, so with zero tags `--bumped-version` emits a bare
     # "0.1.0" and then rejects it against tag_pattern ("v[0-9]*") with a hard
-    # error. Its documented bootstrap default is exactly 0.1.0, so use it here
-    # without invoking git-cliff; every later release has a `v` tag and goes
+    # error. Bootstrap here without invoking git-cliff; the project ships
+    # directly at 1.0.0 by design, every later release has a `v` tag and goes
     # through git-cliff normally (prefix preserved, so it still matches).
-    raw="0.1.0"
+    raw="1.0.0"
   else
     need_cmd git-cliff
     raw="$(git-cliff --unreleased --bumped-version)"
