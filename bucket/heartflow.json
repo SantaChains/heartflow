@@ -1,13 +1,13 @@
 {
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Terminal-native coding agent in Rust (binary: hf).",
   "homepage": "https://github.com/SantaChains/heartflow",
   "license": "MIT",
   "notes": "首次运行先配置模型提供方,详见 https://github.com/SantaChains/heartflow",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/SantaChains/heartflow/releases/download/v1.0.0/heartflow-1.0.0-win-amd64.zip",
-      "hash": "b7f03fc1dc581c09e4bcfc98548e4f04203432df96789a29f124cda7521b8078"
+      "url": "https://github.com/SantaChains/heartflow/releases/download/v1.0.1/heartflow-1.0.1-win-amd64.zip",
+      "hash": "ad860d201d08635531cd698f40c7bff698af24706e3dfe134caca6687a63d608"
     }
   },
   "bin": "hf.exe",
@@ -19,9 +19,9 @@
       "64bit": {
         "url": "https://github.com/SantaChains/heartflow/releases/download/v$version/heartflow-$version-win-amd64.zip",
         "hash": {
-                    "url": "https://github.com/SantaChains/heartflow/releases/download/v$version/heartflow-$version-win-amd64.zip.sha256",
-                    "find": "([a-fA-F0-9]{64})"
-                }
+          "url": "https://github.com/SantaChains/heartflow/releases/download/v$version/heartflow-$version-win-amd64.zip.sha256",
+          "find": "([a-fA-F0-9]{64})"
+        }
       }
     }
   }
