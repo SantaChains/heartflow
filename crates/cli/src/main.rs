@@ -1578,6 +1578,9 @@ fn compaction_config(context_window_tokens: usize) -> CompactionConfig {
     let replay_verbatim_tail = env::var("HEARTFLOW_REPLAY_VERBATIM_TAIL")
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
+        // 0 would stub even the tool result the model just produced; treat it as
+        // unset and keep the default.
+        .filter(|n| *n > 0)
         .unwrap_or(12);
     CompactionConfig {
         preserve_recent_messages: 6,

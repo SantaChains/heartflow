@@ -454,13 +454,16 @@ fn load_memory(roots: &[&Path]) -> String {
 /// Truncate to at most `max_bytes` while dropping the trailing lines that would
 /// cross the budget, so a memory note is never cut mid-sentence. Falls back to a
 /// byte clamp only when a single oversized first line would otherwise vanish.
+/// Uses `split_inclusive` so each piece keeps its own line terminator: offsets
+/// stay correct for both `\n` and `\r\n` files and every cut lands on a char
+/// boundary (a Windows-authored `MEMORY.md` must not panic the prompt builder).
 fn clamp_lines(text: &str, max_bytes: usize) -> &str {
     if text.len() <= max_bytes {
         return text;
     }
     let mut end = 0_usize;
-    for line in text.lines() {
-        let next = end + line.len() + usize::from(end != 0);
+    for line in text.split_inclusive('\n') {
+        let next = end + line.len();
         if next > max_bytes {
             break;
         }
@@ -895,6 +898,30 @@ mod tests {
         );
         fs::remove_dir_all(user).expect("cleanup");
         fs::remove_dir_all(project).expect("cleanup");
+    }
+
+    #[test]
+    fn clamp_lines_is_crlf_and_multibyte_safe() {
+        // CRLF file with a multibyte line straddling the budget: the old
+        // `text.lines()` offset math under-counted the `\r` and could slice a
+        // char boundary (panic) or truncate mid-word. Must not panic and must
+        // keep whole lines only.
+        let text = "第一行避坑\r\nsecond line here\r\nthird line here\r\n";
+        // From the first whole line up: below it the function byte-clamps the
+        // oversized line (no whole-line guarantee), which is intentional.
+        let first_line = text.split_inclusive('\n').next().map_or(0, str::len);
+        for budget in first_line..text.len() {
+            let clamped = super::clamp_lines(text, budget);
+            assert!(
+                clamped.len() <= budget,
+                "budget {budget} overflowed: {clamped:?}"
+            );
+            assert!(text.starts_with(clamped), "not a prefix of the source");
+            assert!(
+                clamped.is_empty() || clamped.ends_with('\n'),
+                "cut mid-line at budget {budget}: {clamped:?}"
+            );
+        }
     }
 
     #[test]

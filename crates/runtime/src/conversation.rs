@@ -206,6 +206,9 @@ fn truncate_tool_output(output: &str) -> String {
 /// re-feeds stale bulk output; the durable on-disk transcript keeps everything.
 /// Older error results carry signal, so a short head of the body survives.
 const REPLAY_ERROR_HEAD_CHARS: usize = 400;
+/// A result shorter than this is cheaper to keep verbatim than to replace with
+/// the stub sentence, so only genuinely bulky dumps are collapsed.
+const REPLAY_MIN_STUB_CHARS: usize = 500;
 
 /// Project the durable transcript into the message list actually sent to the
 /// provider. Structure and ordering are preserved (each `tool_use` stays paired
@@ -241,11 +244,19 @@ fn build_replay_messages(
                         output,
                         is_error,
                     } => {
+                        let total = output.chars().count();
+                        let worth_stubbing = if *is_error {
+                            total > REPLAY_ERROR_HEAD_CHARS
+                        } else {
+                            total > REPLAY_MIN_STUB_CHARS
+                        };
+                        if !worth_stubbing {
+                            return block.clone();
+                        }
                         let stubbed = if *is_error {
                             let head = truncate_chars(output, REPLAY_ERROR_HEAD_CHARS);
                             format!("[earlier error result: {head}]")
                         } else {
-                            let total = output.chars().count();
                             format!(
                                 "[{tool_name} result omitted from replay: {total} chars; re-run the tool or read the file if it is still needed]"
                             )
@@ -1603,8 +1614,10 @@ mod tests {
             // Old pinned dump: survives verbatim even though it is old.
             ConversationMessage::tool_result("t-pin", "read_file", bulk.clone(), false)
                 .with_pinned(true),
+            // Old but tiny result: cheaper to keep than to stub, stays verbatim.
+            ConversationMessage::tool_result("t-short", "bash", "ok", false),
         ];
-        // Pad past the verbatim tail so the first two entries fall out of it.
+        // Pad past the verbatim tail so the first three entries fall out of it.
         for i in 0..12 {
             messages.push(ConversationMessage::user_text(format!("filler {i}")));
         }
@@ -1630,6 +1643,15 @@ mod tests {
             _ => panic!("expected tool result"),
         };
         assert_eq!(pinned, bulk, "pinned result must survive verbatim");
+
+        let short = match &replay[2].blocks[0] {
+            ContentBlock::ToolResult { output, .. } => output.clone(),
+            _ => panic!("expected tool result"),
+        };
+        assert_eq!(
+            short, "ok",
+            "tiny old result must not be inflated into a stub"
+        );
 
         let recent = match &replay[replay.len() - 1].blocks[0] {
             ContentBlock::ToolResult { output, .. } => output.clone(),
