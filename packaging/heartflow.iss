@@ -37,10 +37,10 @@ Source: "..\target\x86_64-pc-windows-msvc\release\hf.exe"; DestDir: "{app}"; Fla
 ; per-machine 安装写系统 PATH,per-user 安装写用户 PATH;仅当未包含时追加
 Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"; \
   ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; \
-  Check: IsAdminInstallMode and NeedsAddPath(HKLM, "SYSTEM\CurrentControlSet\Control\Session Manager\Environment")
+  Check: IsAdminInstallMode() and NeedsAddPath(HKLM, "SYSTEM\CurrentControlSet\Control\Session Manager\Environment")
 Root: HKCU; Subkey: "Environment"; \
   ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; \
-  Check: (not IsAdminInstallMode) and NeedsAddPath(HKCU, "Environment")
+  Check: (not IsAdminInstallMode()) and NeedsAddPath(HKCU, "Environment")
 
 [Code]
 function NeedsAddPath(Root: Integer; Subkey: string): Boolean;

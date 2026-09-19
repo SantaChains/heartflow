@@ -5,6 +5,7 @@ archive/
 
 target/
 .heartflow/
+.tmp-validator
 
 # 发布脚本本地预演产物(scripts/release.sh),不入库
 release-notes.md
