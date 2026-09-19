@@ -68,6 +68,17 @@ crates/
 - 传输层与事件流转换的缺口只有真服务器冒烟能暴露(历史缺陷:SSE `message_stop` 未转发、工具输入拼接损坏)。涉及流式/工具往返的改动须跑端到端冒烟。
 - 提交前跑齐质量门:fmt + test + release build(必绿)+ clippy(仅 `all` 阻断,pedantic 提示)。
 
+## 发布流程(自动化)
+
+`.github/workflows/release.yml` 在 push main 时以 Conventional Commits 自动驱动版本与 GitHub Release(纯 ubuntu 轻量 job,不引 Node/semantic-release):
+
+- 版本语义:`feat:` → minor,`fix:` → patch,`!` 或 `BREAKING CHANGE:` → major;`chore/docs/test/ci/style/build` 不触发发版(文案与过滤规则见根目录 `cliff.toml`)。
+- 提交 scope 用 crate 名,如 `feat(tools): ...`;Release Notes 按中文分栏并加粗 scope。
+- 版本号唯一维护点在根 `Cargo.toml` 的 `[workspace.package]`;各 crate 一律 `version.workspace = true`,禁止写死版本号。
+- 机器人提交 `chore(release): vX.Y.Z [skip ci]` 自动同步 Cargo.toml/Cargo.lock/CHANGELOG、打 tag、建 GitHub Release;勿手工仿写此类提交。
+- Windows amd64 安装包仅在 major 触发 windows job(Inno Setup 脚本 `packaging/heartflow.iss`,产物 `heartflow-<ver>-win-amd64-setup.exe` + SHA256 附件);当前构建步骤整段注释占位,启用时解开即可。
+- 若 main 启用分支保护,需允许 GitHub Actions 直接推送;`ci.yml` 质量门独立运行,发布不重复跑测试。
+
 ## 注意
 
 - `.gitignore` 忽略 `target/`、`.heartflow/`、`archive/`、`.history/`、`.trae/`,以及本地笔记 `openmemory.md`、`ref.md`(个人头脑风暴/参考资料,不发布)。
