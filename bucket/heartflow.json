@@ -8,9 +8,9 @@
     "64bit": {
       "url": "https://github.com/SantaChains/heartflow/releases/download/v1.0.0/heartflow-1.0.0-win-amd64.zip",
       "hash": {
-        "url": "https://github.com/SantaChains/heartflow/releases/download/v1.0.0/heartflow-1.0.0-win-amd64.zip.sha256",
-        "regex": "([a-fA-F0-9]{64})"
-      }
+                "url": "https://github.com/SantaChains/heartflow/releases/download/v1.0.0/heartflow-1.0.0-win-amd64.zip.sha256",
+                "find": "([a-fA-F0-9]{64})"
+            }
     }
   },
   "bin": "hf.exe",
@@ -22,9 +22,9 @@
       "64bit": {
         "url": "https://github.com/SantaChains/heartflow/releases/download/v$version/heartflow-$version-win-amd64.zip",
         "hash": {
-          "url": "https://github.com/SantaChains/heartflow/releases/download/v$version/heartflow-$version-win-amd64.zip.sha256",
-          "regex": "([a-fA-F0-9]{64})"
-        }
+                    "url": "https://github.com/SantaChains/heartflow/releases/download/v$version/heartflow-$version-win-amd64.zip.sha256",
+                    "find": "([a-fA-F0-9]{64})"
+                }
       }
     }
   }
