@@ -58,6 +58,7 @@ jobs:
           RELEASE_TAG: ${{ needs.plan.outputs.tag }}
           RELEASE_BUMP: ${{ needs.plan.outputs.bump }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: bash scripts/release.sh publish
 
   windows-zip:

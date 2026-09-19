@@ -10,7 +10,8 @@
 #   feat: → minor   fix: → patch   `!` 或 BREAKING CHANGE: → major
 #   chore/docs/test/ci/style/build 等不触发发版
 #
-# 本地依赖:git-cliff(cargo install git-cliff --locked)、gh(仅 publish 真实模式需要)
+# 本地依赖:git-cliff(cargo install git-cliff --locked)、gh、crates.io 凭据(publish 需要:
+# CI 传 CARGO_REGISTRY_TOKEN secret,本地 cargo login 一次即可)
 set -euo pipefail
 
 cd "$(cd "$(dirname "$0")/.." && pwd)"
@@ -85,7 +86,7 @@ do_plan() {
 }
 
 do_publish() {
-  local tag ver bump_label dry
+  local tag ver bump_label dry crate
   need_cmd git-cliff
   tag="${RELEASE_TAG:?缺少 RELEASE_TAG(来自 plan 输出)}"
   bump="${RELEASE_BUMP:?缺少 RELEASE_BUMP(来自 plan 输出)}"
@@ -93,7 +94,12 @@ do_publish() {
   ver="${tag#v}"
 
   # 单一版本点:根 [workspace.package];各 crate 经 version.workspace = true 继承,禁止逐 crate 写死
-  sed -i "0,/^version = \"/s/^version = \"[^\"]*\"/version = \"${ver}\"/" Cargo.toml
+  # 地址用 1,/re/ 而非 0,/re/:Git-Bash 自带 sed 非 GNU 实现,0, 地址会静默失效;
+  # 根 Cargo.toml 首行恒为 [workspace],1, 与 0, 语义等价(GNU sed 下两者皆可)
+  sed -i "1,/^version = \"/s/^version = \"[^\"]*\"/version = \"${ver}\"/" Cargo.toml
+  # [workspace.dependencies] 内部依赖(heartflow-* 前缀)的 version req 同步为发布版本
+  # (cargo publish 要求 path 依赖带 req;caret 语义下与自身版本精确一致最稳)
+  sed -i "s/version = \"[^\"]*\", path = \"crates\//version = \"${ver}\", path = \"crates\//g" Cargo.toml
   # 只同步 workspace 内部 crate 在 Cargo.lock 中的版本(-w 不升级外部依赖;不加 --offline,CI 全新 runner 无 registry 索引缓存)
   cargo update --workspace
   # Explicit --tag (not --bump): plan already decided the version, so pin the
@@ -127,6 +133,11 @@ do_publish() {
     --target main \
     --title "heartflow ${tag} (${bump_label})" \
     --notes-file release-notes.md
+  # crates.io registry 发布:内部 crate 挂 heartflow- 前缀,按依赖拓扑逐个发(先依赖后使用者)
+  for crate in heartflow-runtime heartflow-api heartflow-mcp heartflow-tools heartflow-store heartflow-commands heartflow; do
+    note "publishing ${crate} to crates.io"
+    cargo publish -p "$crate"
+  done
   note "released ${tag}"
 }
 
