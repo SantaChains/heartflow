@@ -11,7 +11,7 @@ body = """
 {% else %}\
 # 未发布
 {% endif %}\
-{% for group, commits in commits | groupby(attribute="group") %}
+{% for group, commits in commits | group_by(attribute="group") %}
 ## {{ group }}
 {% for commit in commits %}
 - {% if commit.breaking %}**[不兼容]** {% endif %}{% if commit.scope %}**{{ commit.scope }}**: {% endif %}{{ commit.message | upper_first }} (`{{ commit.id | truncate(length=7, end="") }}`)
