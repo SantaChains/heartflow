@@ -18,13 +18,19 @@ winresource = "0.1"
 api = { workspace = true }
 clap = { version = "4.6", features = ["derive"] }
 commands = { workspace = true }
-crossterm = "0.29"
+# crossterm is pinned to 0.28 to match ratatui 0.29 (tui-textarea 0.7 requires
+# ratatui 0.29, which pins crossterm 0.28). inquire 0.9 still pulls crossterm
+# 0.29 as a *transitional* second copy: the ratatui input editor owns idle
+# input, inquire owns during-turn prompts, so the two never drive the terminal
+# at once. P4-c.3 replaces inquire with ratatui overlays, after which the whole
+# binary converges on the single crossterm 0.28 backend.
+crossterm = "0.28"
 dirs = "7.0"
 inquire = "0.9"
 mcp = { workspace = true }
 os_info = "3"
 pulldown-cmark = "0.13"
-reedline = "0.51"
+ratatui = "0.29"
 runtime = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -37,6 +43,7 @@ toml = "0.9"
 tools = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tui-textarea = "0.7"
 
 [lints]
 workspace = true

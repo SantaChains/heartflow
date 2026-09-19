@@ -1277,7 +1277,9 @@ async fn run_repl(
     // already the final one.
     let mut model = HeartModel::new();
     println!("heartflow interactive mode");
-    println!("Type / to open the command menu (Up/Down to browse, Tab to insert, Enter to run).");
+    println!(
+        "Input: Enter sends, Alt/Shift+Enter newline, Up/Down history, Tab completes / commands."
+    );
     println!("Quit with /exit or Ctrl+D. Ctrl+C interrupts a running turn; on an idle line it just clears it.");
 
     loop {
@@ -2097,6 +2099,8 @@ fn print_repl_help() {
     println!("  /restart       Re-launch the program with a fresh config/MCP load");
     println!("  /exit          Quit the REPL");
     println!();
+    println!("Input: Enter sends, Alt/Shift+Enter inserts a newline, Up/Down walks history,");
+    println!("  Tab completes a slash command, Ctrl+C clears the idle line, Ctrl+D quits.");
     println!("Ctrl+C while a turn is running interrupts that turn; on an empty prompt");
     println!("it just clears the line. Quit with /exit or Ctrl+D.");
 }
