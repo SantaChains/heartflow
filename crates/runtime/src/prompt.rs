@@ -504,8 +504,52 @@ fn render_config_section(config: &RuntimeConfig) -> String {
         ));
     }
     lines.push(String::new());
-    lines.push(serde_json::to_string(&config.as_json()).unwrap_or_else(|_| "{}".to_string()));
+    let redacted = redact_secrets(config.as_json());
+    lines.push(serde_json::to_string(&redacted).unwrap_or_else(|_| "{}".to_string()));
     lines.join("\n")
+}
+
+/// Keys whose *values* must never leave the machine in a prompt, matched on the
+/// lowercased key name as a substring. Settings normally carry secrets via env,
+/// but nothing stops a user writing `apiKey`/`token` into `config.toml`; the
+/// merged config is serialized into the system prompt every turn, so redact by
+/// name before it reaches the provider.
+const SECRET_KEY_MARKERS: [&str; 7] = [
+    "key",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+    "authorization",
+];
+
+fn is_secret_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    SECRET_KEY_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Recursively replace values under secret-named object keys with `"[redacted]"`.
+fn redact_secrets(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    match value {
+        Value::Object(object) => {
+            let mut out = Map::with_capacity(object.len());
+            for (key, child) in object {
+                let kept = if is_secret_key(&key) {
+                    Value::String("[redacted]".to_string())
+                } else {
+                    redact_secrets(child)
+                };
+                out.insert(key, kept);
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(redact_secrets).collect()),
+        other => other,
+    }
 }
 
 fn get_simple_intro_section(has_output_style: bool) -> String {
@@ -851,6 +895,26 @@ mod tests {
         );
         fs::remove_dir_all(user).expect("cleanup");
         fs::remove_dir_all(project).expect("cleanup");
+    }
+
+    #[test]
+    fn config_redaction_drops_secret_values_but_keeps_normal_keys() {
+        let raw = serde_json::json!({
+            "model": "heartflow",
+            "apiKey": "sk-live-supersecret",
+            "providers": { "openai": { "token": "tok-abc", "baseUrl": "https://x" } },
+            "permissionMode": "workspace-write",
+        });
+        let text = serde_json::to_string(&super::redact_secrets(raw)).expect("serialize");
+        assert!(text.contains("heartflow"));
+        assert!(text.contains("workspace-write"));
+        assert!(text.contains("https://x"), "non-secret nested value kept");
+        assert!(
+            !text.contains("sk-live-supersecret"),
+            "top-level secret leaked"
+        );
+        assert!(!text.contains("tok-abc"), "nested secret leaked");
+        assert!(text.contains("[redacted]"));
     }
 
     #[test]
