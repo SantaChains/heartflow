@@ -9,6 +9,11 @@ pub struct CompactionConfig {
     /// (Hermes-style >50% pre-compaction). When zero, the absolute
     /// `max_estimated_tokens` threshold governs, preserving old behavior.
     pub context_window_tokens: usize,
+    /// Trailing messages whose tool-result bodies are replayed verbatim to the
+    /// provider; older dumps collapse to a stub (see `build_replay_messages`).
+    /// A tunable proxy for "how many recent turns stay lossless" (~4 messages
+    /// per turn, so 12 keeps roughly the last three turns intact).
+    pub replay_verbatim_tail: usize,
 }
 
 impl Default for CompactionConfig {
@@ -17,6 +22,7 @@ impl Default for CompactionConfig {
             preserve_recent_messages: 4,
             max_estimated_tokens: 10_000,
             context_window_tokens: 0,
+            replay_verbatim_tail: 12,
         }
     }
 }
@@ -473,6 +479,7 @@ mod tests {
                 preserve_recent_messages: 2,
                 max_estimated_tokens: 100,
                 context_window_tokens: 0,
+                ..CompactionConfig::default()
             }
         ));
         assert!(!should_compact(
@@ -481,6 +488,7 @@ mod tests {
                 preserve_recent_messages: 2,
                 max_estimated_tokens: 100_000,
                 context_window_tokens: 0,
+                ..CompactionConfig::default()
             }
         ));
     }

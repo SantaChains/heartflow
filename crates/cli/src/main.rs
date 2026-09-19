@@ -1272,7 +1272,14 @@ async fn run_repl(
     println!("Type / to open the command menu (Up/Down to browse, Tab to insert, Enter to run).");
     println!("Quit with /exit or Ctrl+D; Ctrl+C on an empty line only clears it.");
 
-    while let Some(line) = editor.read_line()? {
+    loop {
+        // Ctrl+D / EOF is a documented quit path (see the banner): save the
+        // session and print the resume command just like `/exit`, so the
+        // conversation is never silently dropped on the EOF path.
+        let Some(line) = editor.read_line()? else {
+            exit_with_resume_hint(&runtime);
+            break;
+        };
         // Config edited on disk since the last turn: re-resolve the provider and
         // rebuild the runtime, keeping the conversation and current mode.
         if watcher.changed() {
@@ -1568,9 +1575,14 @@ fn resolve_context_window(selection: &ProviderSelection) -> usize {
 /// kept verbatim, and the trigger is half of `context_window_tokens` (a zero
 /// window falls back to the absolute threshold).
 fn compaction_config(context_window_tokens: usize) -> CompactionConfig {
+    let replay_verbatim_tail = env::var("HEARTFLOW_REPLAY_VERBATIM_TAIL")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(12);
     CompactionConfig {
         preserve_recent_messages: 6,
         context_window_tokens,
+        replay_verbatim_tail,
         ..CompactionConfig::default()
     }
 }
@@ -1603,6 +1615,7 @@ fn force_compact(runtime: &mut AgentRuntime) {
         preserve_recent_messages: runtime.compaction().preserve_recent_messages,
         max_estimated_tokens: 0,
         context_window_tokens: 0,
+        ..CompactionConfig::default()
     };
     let result = runtime.compact(config);
     if result.removed_message_count == 0 {

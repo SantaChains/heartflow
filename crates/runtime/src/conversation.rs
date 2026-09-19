@@ -200,11 +200,10 @@ fn truncate_tool_output(output: &str) -> String {
     )
 }
 
-/// Trailing messages whose tool-result bodies are replayed verbatim. Older
-/// dumps (file reads, command logs, MCP payloads) are collapsed to a stub when
-/// building the request, so a long or resumed session never re-feeds stale bulk
-/// output. Roughly the last few turns stay intact.
-const REPLAY_VERBATIM_TAIL: usize = 12;
+/// Trailing messages whose tool-result bodies are replayed verbatim (from
+/// `CompactionConfig::replay_verbatim_tail`). Older dumps (file reads, command
+/// logs, MCP payloads) collapse to a stub so a long or resumed session never
+/// re-feeds stale bulk output; the durable on-disk transcript keeps everything.
 /// Older error results carry signal, so a short head of the body survives.
 const REPLAY_ERROR_HEAD_CHARS: usize = 400;
 
@@ -214,8 +213,11 @@ const REPLAY_ERROR_HEAD_CHARS: usize = 400;
 /// verbatim tail is replaced with a compact marker. The session keeps full
 /// output on disk; pinned messages are never rewritten.
 #[must_use]
-fn build_replay_messages(messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
-    let verbatim_from = messages.len().saturating_sub(REPLAY_VERBATIM_TAIL);
+fn build_replay_messages(
+    messages: &[ConversationMessage],
+    verbatim_tail: usize,
+) -> Vec<ConversationMessage> {
+    let verbatim_from = messages.len().saturating_sub(verbatim_tail);
     messages
         .iter()
         .enumerate()
@@ -370,7 +372,10 @@ where
 
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
-                messages: build_replay_messages(&self.session.messages),
+                messages: build_replay_messages(
+                    &self.session.messages,
+                    self.compaction.replay_verbatim_tail,
+                ),
                 tools: self.tool_executor.specs(),
             };
             let mut stream = self.api_client.stream(request)?;
@@ -1606,7 +1611,7 @@ mod tests {
             false,
         ));
 
-        let replay = super::build_replay_messages(&messages);
+        let replay = super::build_replay_messages(&messages, 12);
 
         let old = match &replay[0].blocks[0] {
             ContentBlock::ToolResult { output, .. } => output.clone(),
