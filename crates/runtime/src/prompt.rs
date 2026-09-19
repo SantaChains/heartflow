@@ -210,9 +210,9 @@ impl SystemPromptBuilder {
 /// Optional external CLI tools worth reaching for, each with a one-line role.
 /// The prompt advertises only the ones actually installed, so the agent is
 /// never pointed at a missing binary. Interactive or shell-integrated tools
-/// (fzf, yazi, zoxide, git-delta, `less`) are deliberately absent: they need a
-/// human TTY or shell session, not the captured bash pipe. Color-first tools
-/// (bat, eza) are included because they fall back to plain text when piped.
+/// (fzf, yazi, zoxide, git-delta, lazygit, `less`) are deliberately absent: they
+/// need a human TTY or shell session, not the captured bash pipe. Color-first
+/// tools (bat, eza) are included because they fall back to plain text when piped.
 const EXTERNAL_TOOL_HINTS: &[(&str, &str)] = &[
     ("jq", "slice and reshape JSON"),
     ("yq", "query and reshape YAML/TOML"),
@@ -248,7 +248,7 @@ fn render_external_tools(present: impl Fn(&str) -> bool) -> Option<String> {
     }
     let mut lines = vec![
         "External CLI tools.".to_string(),
-        "Prefer these over hand-rolled awk/sed/Python parsing when installed; call them through the bash tool. Before using one for the first time, check its current flags with `tldr <tool>` or `<tool> --help` instead of guessing. Use their non-interactive form (e.g. `bat --paging=never`); anything that needs a human terminal (fzf, yazi, zoxide, git-delta, pagers) is for the user, not for you.".to_string(),
+        "Prefer these over hand-rolled awk/sed/Python parsing when installed; call them through the bash tool. Before using one for the first time, check its current flags with `tldr <tool>` or `<tool> --help` instead of guessing. Use their non-interactive form (e.g. `bat --paging=never`); anything that needs a human terminal (fzf, yazi, zoxide, git-delta, lazygit, pagers) is for the user, not for you.".to_string(),
     ];
     lines.extend(advertised);
     Some(lines.join("\n"))
@@ -510,7 +510,7 @@ fn get_simple_doing_tasks_section() -> String {
         "3. When a request is still ambiguous, ask one focused clarifying question before acting.",
         "4. Before editing, be sure the current state can be rolled back, so a failed change can be reverted.",
         "5. Change only what the task needs. Do not cause regressions, add speculative abstractions or compatibility shims, do unrelated cleanup, or create files the task does not require.",
-        "6. Prefer established solutions over reinvention: reach for the official, mature approach first, then proven open source; add a mechanism only when a concrete gap calls for one.",
+        "6. Prefer established solutions over reinvention: reach for the official, mature approach first, then proven open source; when an installed tool already does the job, drive it instead of hand-writing a script; add a mechanism only when a concrete gap calls for one.",
         "7. If an approach fails, diagnose the failure before switching tactics.",
         "8. Do not introduce security vulnerabilities such as command injection, XSS, or SQL injection.",
         "9. You cannot see images. After writing any graphic file (png/jpg/gif/webp/svg/html), run the verify_graphics tool and fix it if the check fails.",

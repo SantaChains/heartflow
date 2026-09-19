@@ -108,7 +108,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "bash",
-            description: "Execute a shell command in the current workspace. Uses PowerShell on Windows (pwsh preferred) and sh elsewhere; write portable commands.",
+            description: "Execute a shell command in the current workspace. Uses PowerShell on Windows (pwsh preferred) and sh elsewhere; write portable commands. Match the real platform before assuming a binary exists: on Windows the interpreter is `python` (not `python3`) and the shell is PowerShell, elsewhere `python3`/sh; prefer `uv` for Python environments when present.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

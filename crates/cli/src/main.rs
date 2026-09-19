@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use api::OpenAiClient;
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
 use crossterm::style::Stylize;
 use inquire::{Confirm, MultiSelect, Select, Text};
 use mcp::{HttpTransport, McpClient, McpTool, StdioTransport, Transport};
@@ -189,12 +189,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Action::ResumeSession {
             session_path,
             command,
+            provider,
+            model,
         } => {
             let session_path = match session_path {
                 Some(path) => path,
                 None => pick_session()?,
             };
-            resume_session(&session_path, command);
+            match command {
+                // One-shot slash command run against the saved session, then exit.
+                Some(command) => resume_session(&session_path, &command),
+                // No --run: reopen the interactive REPL with the conversation restored.
+                None => {
+                    let session = Session::load_from_path(&session_path)
+                        .map_err(|error| format!("failed to restore session: {error}"))?;
+                    let selection = resolve_selection(provider.as_deref(), model.as_deref())?;
+                    println!(
+                        "Restored session from {} ({} messages).",
+                        session_path.display(),
+                        session.messages.len()
+                    );
+                    run_repl(selection, session).await?;
+                }
+            }
         }
         Action::Prompt {
             instruction,
@@ -236,7 +253,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     process::exit(1);
                 }
             };
-            run_repl(selection).await?;
+            run_repl(selection, Session::new()).await?;
         }
         Action::Config { action } => match action {
             ConfigAction::Export { output } => export_config(output)?,
@@ -607,6 +624,8 @@ enum Action {
     ResumeSession {
         session_path: Option<PathBuf>,
         command: Option<String>,
+        provider: Option<String>,
+        model: Option<String>,
     },
     Prompt {
         instruction: String,
@@ -645,6 +664,7 @@ enum Action {
 #[command(
     name = "hf",
     version,
+    disable_version_flag = true,
     about = "heartflow terminal AI agent\n\nWith no subcommand (or `hf chat`) hf starts the interactive REPL; every subcommand is non-interactive and pipe-friendly."
 )]
 #[command(subcommand_precedence_over_arg = true)]
@@ -658,6 +678,11 @@ struct Cli {
     /// Model override for the selected provider.
     #[arg(long, global = true)]
     model: Option<String>,
+    /// Print version information. Accepts the conventional `-V` and the
+    /// shorthand `-v` (as in node/npm); the built-in flag is disabled so this
+    /// one owns both spellings.
+    #[arg(short = 'v', visible_short_alias = 'V', long = "version", action = ArgAction::Version)]
+    version: (),
     /// Resume a saved session; `--resume` alone picks interactively, `--resume=PATH`
     /// opens a specific file. The value must use `=` so a bare `--resume` never
     /// swallows a following subcommand token.
@@ -776,6 +801,7 @@ impl Cli {
             resume,
             run,
             command,
+            version: _,
         } = self;
         if let Some(session_path) = resume {
             if command.is_some() {
@@ -785,6 +811,8 @@ impl Cli {
                 // `Some(None)` == bare `--resume` -> interactive picker.
                 session_path,
                 command: run,
+                provider,
+                model,
             });
         }
         match command {
@@ -1045,7 +1073,7 @@ async fn run_models(
     Ok(())
 }
 
-fn resume_session(session_path: &Path, command: Option<String>) {
+fn resume_session(session_path: &Path, command: &str) {
     let session = match Session::load_from_path(session_path) {
         Ok(session) => session,
         Err(error) => {
@@ -1053,42 +1081,30 @@ fn resume_session(session_path: &Path, command: Option<String>) {
             process::exit(1);
         }
     };
-
-    match command {
-        Some(command) if command.starts_with('/') => {
-            let Some(result) = commands::handle_slash_command(
-                &command,
-                &session,
-                CompactionConfig {
-                    max_estimated_tokens: 0,
-                    ..CompactionConfig::default()
-                },
-            ) else {
-                let hint = match editor::suggest_command(&command) {
-                    Some(good) => format!(" (did you mean {good}?)"),
-                    None => String::new(),
-                };
-                eprintln!("unknown slash command: {command}{hint}");
-                process::exit(2);
-            };
-            if let Err(error) = result.session.save_to_path(session_path) {
-                eprintln!("failed to persist resumed session: {error}");
-                process::exit(1);
-            }
-            println!("{}", result.message);
-        }
-        Some(other) => {
-            eprintln!("unsupported resumed command: {other}");
-            process::exit(2);
-        }
-        None => {
-            println!(
-                "Restored session from {} ({} messages).",
-                session_path.display(),
-                session.messages.len()
-            );
-        }
+    if !command.starts_with('/') {
+        eprintln!("unsupported resumed command: {command}");
+        process::exit(2);
     }
+    let Some(result) = commands::handle_slash_command(
+        command,
+        &session,
+        CompactionConfig {
+            max_estimated_tokens: 0,
+            ..CompactionConfig::default()
+        },
+    ) else {
+        let hint = match editor::suggest_command(command) {
+            Some(good) => format!(" (did you mean {good}?)"),
+            None => String::new(),
+        };
+        eprintln!("unknown slash command: {command}{hint}");
+        process::exit(2);
+    };
+    if let Err(error) = result.session.save_to_path(session_path) {
+        eprintln!("failed to persist resumed session: {error}");
+        process::exit(1);
+    }
+    println!("{}", result.message);
 }
 
 fn stdin_is_terminal() -> bool {
@@ -1235,12 +1251,15 @@ fn list_sessions() -> Vec<PathBuf> {
     entries
 }
 
-async fn run_repl(selection: ProviderSelection) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_repl(
+    selection: ProviderSelection,
+    session: Session,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut selection = selection;
     let mut mode = default_permission_mode(true);
     let cwd = env::current_dir()?;
     let mut watcher = ConfigWatcher::new(&cwd, &home_dir());
-    let mut runtime = build_runtime(Session::new(), selection.clone(), true, &mode)?;
+    let mut runtime = build_runtime(session, selection.clone(), true, &mode)?;
     let mut prompter = CliPermissionPrompter::new();
     // Planning runs on the *same* runtime (policy swapped in place) so the todo
     // ledger and conversation survive the plan -> execute handoff. `plan_path`
@@ -4093,6 +4112,8 @@ mod tests {
             Action::ResumeSession {
                 session_path: None,
                 command: None,
+                provider: None,
+                model: None,
             }
         );
         // `--resume=PATH --run CMD` is the single-flag carried form.
@@ -4101,6 +4122,8 @@ mod tests {
             Action::ResumeSession {
                 session_path: Some(PathBuf::from("s.json")),
                 command: Some("/compact".to_string()),
+                provider: None,
+                model: None,
             }
         );
         // A bare flag must not swallow a following subcommand token.
@@ -4214,6 +4237,8 @@ mod tests {
             Action::ResumeSession {
                 session_path: Some(PathBuf::from("session.json")),
                 command: Some("/compact".to_string()),
+                provider: None,
+                model: None,
             }
         );
         assert_eq!(
@@ -4221,6 +4246,8 @@ mod tests {
             Action::ResumeSession {
                 session_path: Some(PathBuf::from("session.json")),
                 command: None,
+                provider: None,
+                model: None,
             }
         );
     }
@@ -4232,6 +4259,8 @@ mod tests {
             Action::ResumeSession {
                 session_path: None,
                 command: None,
+                provider: None,
+                model: None,
             }
         );
     }
