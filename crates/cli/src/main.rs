@@ -642,8 +642,15 @@ enum Action {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "hf", version, about = "heartflow terminal AI agent")]
+#[command(
+    name = "hf",
+    version,
+    about = "heartflow terminal AI agent\n\nWith no subcommand (or `hf chat`) hf starts the interactive REPL; every subcommand is non-interactive and pipe-friendly."
+)]
 #[command(subcommand_precedence_over_arg = true)]
+#[command(
+    after_help = "INTERACTION CONTRACT\n  Interactive:  no args or `hf chat` opens the REPL (this is the only mode that can prompt for confirmation).\n  Non-interactive: subcommands (prompt/search/...) never block on a human. Because there is no tty to answer a confirmation, `prompt` runs tools under the permission mode from HEARTFLOW_PERMISSION_MODE, defaulting to `full` (auto-allow). Set HEARTFLOW_PERMISSION_MODE=read-only for an unattended, read-only pipe.\n\nEXIT CODES\n  0  success\n  1  runtime/provider error (stream, config resolution, failed turn)\n  2  usage error (bad arguments; emitted by the argument parser)"
+)]
 struct Cli {
     /// Provider name (deepseek, anthropic, or a [provider] table entry).
     #[arg(long, global = true)]
@@ -666,6 +673,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Start the interactive REPL (same as running `hf` with no subcommand).
+    Chat,
     /// Send one prompt and stream the response. When stdin is piped it is read
     /// as extra context, so `git diff | hf prompt "review this"` composes.
     Prompt {
@@ -781,6 +790,7 @@ impl Cli {
         }
         match command {
             None => Ok(Action::Repl { provider, model }),
+            Some(Command::Chat) => Ok(Action::Repl { provider, model }),
             Some(Command::Prompt { text, quiet, json }) => Ok(Action::Prompt {
                 instruction: text.join(" "),
                 provider,
