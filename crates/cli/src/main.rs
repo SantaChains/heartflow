@@ -1,5 +1,6 @@
 mod adapter;
 mod config;
+mod core;
 mod editor;
 mod render;
 
@@ -34,6 +35,7 @@ use config::{
     ConfigWatcher, McpServerConfig, ProviderProtocol, ProviderSelection, ProviderSettings,
     CONFIG_VERSION,
 };
+use core::{build_guide, guide_log_line, GuideSections, HeartModel};
 use render::{ColorTheme, Spinner, TerminalRenderer};
 
 /// Fallback date only when the system clock reads before the Unix epoch; the
@@ -1268,11 +1270,36 @@ async fn run_repl(
     let mut plan_path: Option<PathBuf> = None;
     let history_path = home_dir().join(".heartflow").join("history.txt");
     let mut editor = editor::ReplEditor::new(&history_path);
+    // Single live-turn state (queue/guide core). Under the blocking line
+    // editor the model is running only inside a turn, so the queue stays
+    // empty until P4-c wires keyboard polling; the injection point below is
+    // already the final one.
+    let mut model = HeartModel::new();
     println!("heartflow interactive mode");
     println!("Type / to open the command menu (Up/Down to browse, Tab to insert, Enter to run).");
     println!("Quit with /exit or Ctrl+D. Ctrl+C interrupts a running turn; on an idle line it just clears it.");
 
     loop {
+        // Turn boundary: a finished turn's queued follow-ups are merged into
+        // one injection message here (locked semantics: never interrupt, always
+        // deliver after the turn). A refused/failed injection is re-queued by
+        // the submit path below, so nothing is lost.
+        if let Some(injection) = model.queue_mut().drain_injection() {
+            model.begin_turn();
+            let delivery = if planning {
+                run_turn_interactive(&mut runtime, &injection, Some(&mut BlockPrompter)).await
+            } else {
+                run_turn_interactive(&mut runtime, &injection, Some(&mut prompter)).await
+            };
+            model.end_turn();
+            match delivery {
+                Ok(_) => maybe_auto_compact(&mut runtime),
+                Err(error) => {
+                    println!("queued delivery failed: {error}");
+                    let _ = model.enqueue(&injection);
+                }
+            }
+        }
         // Ctrl+D / EOF is a documented quit path (see the banner): save the
         // session and print the resume command just like `/exit`, so the
         // conversation is never silently dropped on the EOF path.
@@ -1329,6 +1356,12 @@ async fn run_repl(
             _ if trimmed == "/expand" || trimmed.starts_with("/expand ") => {
                 handle_expand_command(trimmed);
             }
+            _ if trimmed == "/queue" || trimmed.starts_with("/queue ") => {
+                handle_queue_command(trimmed, &mut model);
+            }
+            _ if trimmed == "/guide" || trimmed.starts_with("/guide ") => {
+                handle_guide_command(trimmed, &runtime);
+            }
             "/init" => match write_agents_skeleton(&cwd, false) {
                 Ok(message) => println!("{message}"),
                 Err(error) => println!("failed to write AGENTS.md: {error}"),
@@ -1355,7 +1388,14 @@ async fn run_repl(
             }
             _ if trimmed.starts_with('/') => report_unknown_command(trimmed),
             _ => {
-                if planning {
+                // Running turns cannot be submitted through the blocking line
+                // editor yet (P4-c); keep the queue routing explicit so the
+                // ratatui event loop only has to flip `begin_turn`.
+                if model.is_running() {
+                    if !model.enqueue(trimmed) {
+                        println!("follow-up queue is full; /queue to inspect");
+                    }
+                } else if planning {
                     run_turn_interactive(&mut runtime, trimmed, Some(&mut BlockPrompter)).await?;
                 } else {
                     run_turn_interactive(&mut runtime, trimmed, Some(&mut prompter)).await?;
@@ -1365,6 +1405,81 @@ async fn run_repl(
         }
     }
     Ok(())
+}
+
+/// `/queue` — inspect and edit the pending follow-up messages.
+fn handle_queue_command(input: &str, model: &mut HeartModel) {
+    let arg = input.trim().strip_prefix("/queue").unwrap_or("").trim();
+    match arg {
+        "" => {
+            if model.queue().is_empty() {
+                println!("queue is empty (messages sent during a running turn wait here)");
+                return;
+            }
+            println!("{} queued:", model.queue().len());
+            for (index, text) in model.queue().items().iter().enumerate() {
+                println!("  {}. {}", index + 1, truncate_chars(text, 120));
+            }
+        }
+        "pop" => match model.queue_mut().cancel_last() {
+            Some(text) => println!("withdrawd last queued message:\n{text}"),
+            None => println!("queue is empty"),
+        },
+        "clear" => {
+            let drained = model.queue_mut().drain_injection();
+            match drained {
+                Some(_) => println!("queue cleared."),
+                None => println!("queue is empty"),
+            }
+        }
+        other => println!("usage: /queue [pop|clear] (`{other}` is not a subcommand)"),
+    }
+}
+
+/// `/guide <TASK>` — assemble the three-part guide draft (prior work, current
+/// state, next task) locally with zero token spend, mirroring Qoder's
+/// guidance flow; the operator edits the printed draft and resends it.
+fn handle_guide_command(input: &str, runtime: &AgentRuntime) {
+    let task = input.trim().strip_prefix("/guide").unwrap_or("").trim();
+    if task.is_empty() {
+        println!("usage: /guide <下一步任务描述>");
+        return;
+    }
+    let messages = &runtime.session().messages;
+    let mut work_log = String::new();
+    for message in messages.iter().rev().take(6).rev() {
+        let role = match message.role {
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            // System prompt and raw tool turns are noise for re-entry context;
+            // the guide summarizes the human/assistant thread only.
+            MessageRole::System | MessageRole::Tool => continue,
+        };
+        let text = message
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !text.trim().is_empty() {
+            work_log.push_str(&guide_log_line(role, &text, 160));
+            work_log.push('\n');
+        }
+    }
+    let state = format!(
+        "{} pending tasks in the ledger",
+        runtime.executor().todo_ledger().pending_tasks()
+    );
+    let draft = build_guide(GuideSections {
+        work_log: &work_log,
+        state: &state,
+        task,
+    });
+    println!("guide draft (edit and resend, or paste into the next message):\n");
+    println!("{draft}\n");
 }
 
 /// Print the saved-session list for the `/sessions` command.
@@ -1907,6 +2022,8 @@ fn print_repl_help() {
     println!("  /search <Q>    Full-text search saved conversation history");
     println!("  /mcp           List connected MCP servers and tools");
     println!("  /expand [ID]   Re-show a folded tool output (default: latest)");
+    println!("  /queue [pop|clear]  Inspect/withdraw follow-ups queued during a turn");
+    println!("  /guide <TASK>  Assemble a prior-work/current-state/task draft to send");
     println!("  /init          Scaffold a starting AGENTS.md in the current directory");
     println!("  /restart       Re-launch the program with a fresh config/MCP load");
     println!("  /exit          Quit the REPL");

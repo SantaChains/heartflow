@@ -109,6 +109,8 @@ hf system-prompt [--cwd PATH] [--date YYYY-MM-DD] 打印系统提示词
 /mcp      列出 MCP 服务器与工具
 /search Q 全文检索历史      /exit         退出（自动保存并打印 resume 命令）
 /init     生成 AGENTS.md 骨架  /expand [ID]  展开上次折叠的工具输出
+/guide T  本地零 token 组装“前情/现状/下一步”三段引导草稿，供编辑后发送
+/queue [pop|clear]  查看/撤回回合运行期间排队的后续消息（入队注入随 TUI 事件循环上线）
 /plan GOAL 规划先行（写仅门禁到 plans/）  /plan approve 逐任务新鲜上下文执行+收尾复盘  /plan end 退出规划
 ```
 

@@ -30,6 +30,14 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/mcp", "List MCP servers and tools"),
     ("/expand [ID]", "Re-show a folded tool output"),
     (
+        "/queue [pop|clear]",
+        "Inspect/withdraw follow-ups queued during a turn",
+    ),
+    (
+        "/guide <TASK>",
+        "Assemble a prior-work/state/task draft to send",
+    ),
+    (
         "/init",
         "Scaffold a starting AGENTS.md in the current directory",
     ),
