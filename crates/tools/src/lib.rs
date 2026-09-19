@@ -124,7 +124,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_file",
-            description: "Read a text file from the workspace.",
+            description: "Read a text file from the workspace. When you already know the region you need, pass offset and limit to read only those lines instead of the whole file; locate code with grep_search or search_files first.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

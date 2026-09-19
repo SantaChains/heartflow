@@ -19,7 +19,7 @@ Rust 实现的终端 AI agent。二进制命令 `hf`，在 REPL 中通过流式�
 - 上下文工程：`>50%` 窗口预压缩——设 `config.toml` 的 `[provider] context_window` 或环境变量 `HEARTFLOW_AUTO_COMPACT_TOKENS`（= 模型上下文窗口 tokens，env 优先）后，回合内每次请求前若会话估算越过半窗即 summarize-then-compact（旧消息折成可续摘要、近若干条原样保留）；`/compact` 为手动强制压缩（忽略阈值立即压缩）。摘要按近期加权：越靠近存活窗口的轮次保留越多细节（每块 80→240 字预算）；`/pin` 把关键消息标记为永不压缩，逐字存活于每次压缩之后
 - 会话持久化：JSONL 转录原子写入 `~/.heartflow/sessions`，支持 resume 与 compact；`/exit` 打印本段 resume 命令，`/open N` 在 REPL 内直接跳回历史会话
 - 全文历史检索：每回合自动镜像进系统级 SQLite 库 `~/.heartflow/heartflow.db`（FTS5 trigram，中英文通吃，JSON 仍为权威存储），`hf search` 与 REPL `/search` 跨会话检索
-- 自迭代记忆：`~/.heartflow/MEMORY.md`（或项目 `.heartflow/MEMORY.md`）作为跨会话的坑/决策/偏好记录，以极小 token（截断 4KB）注入系统提示词的 `# Memory` 段；`/remember` 手动追加（去重），任务环遇硬坑（多次尝试失败被跳过）自动记录（非向量嵌入）
+- 自迭代记忆：`~/.heartflow/MEMORY.md`（或项目 `.heartflow/MEMORY.md`）作为跨会话的坑/决策/偏好记录，以极小 token（截断 4KB）注入系统提示词的 Memory 段；`/remember` 手动追加（去重），任务环遇硬坑（多次尝试失败被跳过）自动记录（非向量嵌入）
 - Unix 管道组合：stdin 被管道时读入为上下文，`git diff | hf prompt "评审这次改动"`；`--quiet` 只输出答案、`--json` 输出结构化结果，方便脚本串联
 - 外部 CLI 工具按需感知：系统提示词只广播主机上确已安装的非交互文本过滤器（jq/yq/gron/jc/rg/fd/tree/tokei/hyperfine/difft/xsv/gh），并约定首次使用前先 `<tool> --help` 学当前 flag 而非臆测；交互式/装饰性 TTY 工具（fzf、git-delta、less）归人类终端，不进 agent 提示（其能力已由原生 search_files 模糊检索与 apply_patch/真实 diff 覆盖）
 - 配置热重载：REPL 每回合边界按 mtime 探测配置变更，自动重建 provider 并保留会话（零依赖轮询）
