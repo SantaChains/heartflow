@@ -36,12 +36,21 @@ emit_output() { # key value —— CI 写 $GITHUB_OUTPUT,本地直接打印
   fi
 }
 
-publish_retry() { # crate —— 刚发布的版本在 sparse index 有秒级传播延迟,后续 crate 解析会扑空,退避重试
-  local crate=$1 attempt
-  for attempt in 1 2 3; do
-    if cargo publish -p "$crate"; then return 0; fi
-    note "publish ${crate} failed (attempt ${attempt}/3), retry in 20s"
-    sleep 20
+publish_retry() { # crate —— 退避重试:sparse index 传播延迟(秒级)与 crates.io 新crate限流(429,分钟级窗口)
+  local crate=$1 attempt out
+  for attempt in 1 2 3 4 5; do
+    if out="$(cargo publish -p "$crate" 2>&1)"; then return 0; fi
+    if grep -qiE "already (uploaded|published|exists)" <<<"$out"; then
+      note "publish ${crate}: already on crates.io, skip"
+      return 0
+    fi
+    if grep -q "429 Too Many Requests" <<<"$out"; then
+      note "publish ${crate}: rate limited (attempt ${attempt}/5), backoff 120s"
+      sleep 120
+    else
+      note "publish ${crate} failed (attempt ${attempt}/5), retry in 20s"
+      sleep 20
+    fi
   done
   note "publish ${crate}: all attempts failed"
   return 1

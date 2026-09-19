@@ -47,7 +47,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.released == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30 # 七连发 verify 构建 + 最坏 ~10 分钟的 crates.io 429 退避
     steps:
       - uses: actions/checkout@v4
         with:
