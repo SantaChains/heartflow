@@ -36,6 +36,17 @@ emit_output() { # key value —— CI 写 $GITHUB_OUTPUT,本地直接打印
   fi
 }
 
+publish_retry() { # crate —— 刚发布的版本在 sparse index 有秒级传播延迟,后续 crate 解析会扑空,退避重试
+  local crate=$1 attempt
+  for attempt in 1 2 3; do
+    if cargo publish -p "$crate"; then return 0; fi
+    note "publish ${crate} failed (attempt ${attempt}/3), retry in 20s"
+    sleep 20
+  done
+  note "publish ${crate}: all attempts failed"
+  return 1
+}
+
 # 区间内是否存在版本相关提交(先看门控再要 git-cliff,本地无 cliff 也能验证 chore 短路)
 range_has_release_commit() {
   local last="$1" log_src
@@ -136,7 +147,7 @@ do_publish() {
   # crates.io registry 发布:内部 crate 挂 heartflow- 前缀,按依赖拓扑逐个发(先依赖后使用者)
   for crate in heartflow-runtime heartflow-api heartflow-mcp heartflow-tools heartflow-store heartflow-commands heartflow; do
     note "publishing ${crate} to crates.io"
-    cargo publish -p "$crate"
+    publish_retry "$crate"
   done
   note "released ${tag}"
 }

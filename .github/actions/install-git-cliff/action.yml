@@ -7,7 +7,9 @@ runs:
       run: |
         set -euo pipefail
         if command -v git-cliff >/dev/null 2>&1; then git-cliff --version; exit 0; fi
-        V="$(curl -fsSL -o /dev/null -w '%{url_effective}' -I -L https://github.com/orhun/git-cliff/releases/latest | sed 's#.*/tag/v##')"
+        # 钉住版本:git-cliff 模板引擎行为随版本变动(groupby/group_by 事故教训),
+        # 升级需显式改这里,并先过本地 RELEASE_DRY_RUN=1 预检
+        V="2.14.2"
         curl -fsSL "https://github.com/orhun/git-cliff/releases/download/v${V}/git-cliff-${V}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz
         sudo mv "git-cliff-${V}/git-cliff" /usr/local/bin/git-cliff
         git-cliff --version

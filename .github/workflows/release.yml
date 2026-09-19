@@ -43,11 +43,11 @@ jobs:
         run: bash scripts/release.sh plan
 
   publish:
-    name: 版本落地 / tag / GitHub Release
+    name: 版本落地 / tag / GitHub Release / crates.io
     needs: plan
     if: needs.plan.outputs.released == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
