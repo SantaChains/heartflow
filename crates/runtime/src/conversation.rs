@@ -361,6 +361,11 @@ where
                     "conversation loop exceeded the maximum number of iterations",
                 ));
             }
+            // Honor a Ctrl+C that landed between iterations (e.g. right after a
+            // tool batch) instead of spending another request before noticing it.
+            if cancel.is_cancelled() {
+                return Err(RuntimeError::new("turn cancelled"));
+            }
 
             // Hermes-style >50% pre-compaction: shrink the context before
             // spending a request on it, but only when a window is configured.

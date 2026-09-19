@@ -1270,7 +1270,7 @@ async fn run_repl(
     let mut editor = editor::ReplEditor::new(&history_path);
     println!("heartflow interactive mode");
     println!("Type / to open the command menu (Up/Down to browse, Tab to insert, Enter to run).");
-    println!("Quit with /exit or Ctrl+D; Ctrl+C on an empty line only clears it.");
+    println!("Quit with /exit or Ctrl+D. Ctrl+C interrupts a running turn; on an idle line it just clears it.");
 
     loop {
         // Ctrl+D / EOF is a documented quit path (see the banner): save the
@@ -2335,12 +2335,26 @@ async fn run_turn_interactive(
             }
         }
         Err(error) => {
+            let interrupted = error.to_string().contains("cancelled");
             if turn.spinner_active {
-                turn.spinner.fail("Turn failed", &turn.theme, &mut stdout)?;
+                if interrupted {
+                    turn.spinner
+                        .cancel("Interrupted", &turn.theme, &mut stdout)?;
+                } else {
+                    turn.spinner.fail("Turn failed", &turn.theme, &mut stdout)?;
+                }
             } else {
                 writeln!(stdout)?;
             }
-            println!("{}", format!("✘ {error}").red());
+            if interrupted {
+                println!(
+                    "{}",
+                    "turn interrupted; the transcript stays consistent - give the next instruction or /exit to quit"
+                        .dark_grey()
+                );
+            } else {
+                println!("{}", format!("✘ {error}").red());
+            }
             if let Ok(path) = save_session(runtime.session()) {
                 println!(
                     "{}",

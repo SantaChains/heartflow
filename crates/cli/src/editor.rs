@@ -146,11 +146,11 @@ impl ReplEditor {
                     println!("\nquit.");
                     return Ok(None);
                 }
-                // Ctrl+C on an empty line clears it rather than exiting; without
-                // this hint users believe the program is stuck and cannot close.
+                // Ctrl+C on an idle line clears it rather than exiting; during a
+                // running turn the same key interrupts the turn (see the REPL).
                 Signal::CtrlC => {
                     println!(
-                        "^C newline (Ctrl+C does not exit) - type /exit or press Ctrl+D to quit."
+                        "^C line cleared. Ctrl+C interrupts a running turn; /exit or Ctrl+D quits."
                     );
                 }
                 _ => {}

@@ -109,6 +109,26 @@ impl Spinner {
         )?;
         out.flush()
     }
+
+    /// Clear the spinner line and print a neutral, non-alarming marker for a
+    /// user-initiated interruption, so a Ctrl+C never looks like a failure.
+    pub fn cancel(
+        &mut self,
+        label: &str,
+        theme: &ColorTheme,
+        out: &mut impl Write,
+    ) -> io::Result<()> {
+        self.frame_index = 0;
+        execute!(
+            out,
+            MoveToColumn(0),
+            Clear(ClearType::CurrentLine),
+            SetForegroundColor(theme.quote),
+            Print(format!("⏸ {label}\n")),
+            ResetColor
+        )?;
+        out.flush()
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
