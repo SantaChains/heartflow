@@ -54,9 +54,19 @@ do_plan() {
     note "no release-related commits since ${last:-initial}, skip release"
     return 0
   fi
-  need_cmd git-cliff
   base="${last:-v0.0.0}"
-  raw="$(git-cliff --unreleased --bumped-version)"
+  if [ -z "$last" ]; then
+    # First-ever release: git-cliff infers the version prefix only from an
+    # existing release tag, so with zero tags `--bumped-version` emits a bare
+    # "0.1.0" and then rejects it against tag_pattern ("v[0-9]*") with a hard
+    # error. Its documented bootstrap default is exactly 0.1.0, so use it here
+    # without invoking git-cliff; every later release has a `v` tag and goes
+    # through git-cliff normally (prefix preserved, so it still matches).
+    raw="0.1.0"
+  else
+    need_cmd git-cliff
+    raw="$(git-cliff --unreleased --bumped-version)"
+  fi
   next="v${raw#v}"
   if [ "$next" = "$base" ]; then
     emit_output released false
@@ -86,7 +96,11 @@ do_publish() {
   sed -i "0,/^version = \"/s/^version = \"[^\"]*\"/version = \"${ver}\"/" Cargo.toml
   # 只同步 workspace 内部 crate 在 Cargo.lock 中的版本(-w 不升级外部依赖;不加 --offline,CI 全新 runner 无 registry 索引缓存)
   cargo update --workspace
-  git-cliff --unreleased --bump -o release-notes.md
+  # Explicit --tag (not --bump): plan already decided the version, so pin the
+  # notes/CHANGELOG to that exact tag. Avoids git-cliff's auto-bump path (which
+  # re-derives the prefix and, pre-first-release, aborts on the tag_pattern
+  # check) and guarantees CHANGELOG version == tag == Cargo.toml version.
+  git-cliff --unreleased --tag "$tag" -o release-notes.md
 
   if [ "$dry" = "1" ]; then
     git restore Cargo.toml Cargo.lock
@@ -97,7 +111,7 @@ do_publish() {
   fi
 
   need_cmd gh
-  git-cliff --unreleased --bump --prepend -o CHANGELOG.md
+  git-cliff --unreleased --tag "$tag" --prepend -o CHANGELOG.md
   git config user.name "${GIT_AUTHOR_NAME:-github-actions[bot]}"
   git config user.email "${GIT_AUTHOR_EMAIL:-418982825+github-actions[bot]@users.noreply.github.com}"
   git add Cargo.toml Cargo.lock CHANGELOG.md
