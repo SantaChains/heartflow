@@ -29,6 +29,8 @@ use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use tui_textarea::{CursorMove, TextArea};
 
+use crate::theme::{glyphs, Theme};
+
 /// REPL slash commands surfaced by completion and the "did you mean" hint.
 /// Kept in sync with `print_repl_help` in main.rs; add new commands to both.
 const COMMANDS: &[(&str, &str)] = &[
@@ -65,8 +67,9 @@ const COMMANDS: &[(&str, &str)] = &[
 ];
 
 /// Width of the prompt gutter (`› `). The input cell starts just past it so the
-/// real cursor sits between the gutter and the first typed glyph.
-const PROMPT_WIDTH: u16 = 2;
+/// real cursor sits between the gutter and the first typed glyph. Sourced from
+/// the shared theme so the echoed prompt and the live gutter never disagree.
+const PROMPT_WIDTH: u16 = glyphs::PROMPT_WIDTH;
 /// Fixed inline viewport: one input row + one hint/completion row.
 const VIEWPORT_ROWS: u16 = 2;
 /// Cap on retained history entries; the oldest are dropped first.
@@ -119,7 +122,7 @@ pub fn echo_lines(text: &str) -> Vec<String> {
     let mut lines = text.split('\n');
     let mut out = Vec::new();
     if let Some(first) = lines.next() {
-        out.push(format!("› {first}"));
+        out.push(format!("{}{first}", glyphs::PROMPT));
     }
     for rest in lines {
         out.push(format!("  {rest}"));
@@ -499,6 +502,7 @@ impl ReplEditor {
 /// cells, and the hint row beneath. Rect math is done by hand to avoid coupling
 /// to the layout-algorithm API across ratatui releases.
 fn draw_frame(frame: &mut Frame<'_>, textarea: &TextArea<'static>, hint: &str) {
+    let theme = Theme::default();
     let size = frame.area();
     let gutter = Rect::new(size.x, size.y, PROMPT_WIDTH.min(size.width), 1);
     let editor = Rect::new(
@@ -508,12 +512,18 @@ fn draw_frame(frame: &mut Frame<'_>, textarea: &TextArea<'static>, hint: &str) {
         1,
     );
     let hint_area = Rect::new(size.x, size.y + 1, size.width, 1);
-    frame.render_widget(Paragraph::new(Line::from(Span::raw("› "))), gutter);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            glyphs::PROMPT,
+            Style::default().fg(theme.accent().ratatui()),
+        ))),
+        gutter,
+    );
     frame.render_widget(textarea, editor);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             hint.to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.muted().ratatui()),
         ))),
         hint_area,
     );
@@ -633,7 +643,7 @@ fn configure_textarea(mut textarea: TextArea<'static>) -> TextArea<'static> {
 /// reads, matching the historical behavior exactly.
 fn read_line_fallback() -> io::Result<Option<String>> {
     let mut stdout = io::stdout();
-    write!(stdout, "› ")?;
+    write!(stdout, "{}", glyphs::PROMPT)?;
     stdout.flush()?;
     let mut buffer = String::new();
     if io::stdin().read_line(&mut buffer)? == 0 {

@@ -11,6 +11,12 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
 
+use crate::theme::{glyphs, Theme as AppTheme};
+
+/// Crossterm projection of the shared [`AppTheme`] palette, consumed by the line
+/// renderer and [`Spinner`]. Colors are *derived*, never chosen here, so the
+/// idle input editor (which reads [`AppTheme`] directly through ratatui) and
+/// this streaming renderer stay in one color family. See [`crate::theme`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColorTheme {
     heading: Color,
@@ -19,24 +25,40 @@ pub struct ColorTheme {
     inline_code: Color,
     link: Color,
     quote: Color,
+    muted: Color,
     spinner_active: Color,
     spinner_done: Color,
     spinner_failed: Color,
 }
 
+impl ColorTheme {
+    /// Project the canonical [`AppTheme`] palette into crossterm colors.
+    #[must_use]
+    pub fn from(theme: &AppTheme) -> Self {
+        Self {
+            heading: theme.heading().crossterm(),
+            emphasis: theme.emphasis().crossterm(),
+            strong: theme.strong().crossterm(),
+            inline_code: theme.inline_code().crossterm(),
+            link: theme.link().crossterm(),
+            quote: theme.quote().crossterm(),
+            muted: theme.muted().crossterm(),
+            spinner_active: theme.accent().crossterm(),
+            spinner_done: theme.success().crossterm(),
+            spinner_failed: theme.error().crossterm(),
+        }
+    }
+
+    /// Dimmed foreground for secondary/live text (deltas, running markers).
+    #[must_use]
+    pub fn muted(&self) -> Color {
+        self.muted
+    }
+}
+
 impl Default for ColorTheme {
     fn default() -> Self {
-        Self {
-            heading: Color::Cyan,
-            emphasis: Color::Magenta,
-            strong: Color::Yellow,
-            inline_code: Color::Green,
-            link: Color::Blue,
-            quote: Color::DarkGrey,
-            spinner_active: Color::Blue,
-            spinner_done: Color::Green,
-            spinner_failed: Color::Red,
-        }
+        Self::from(&AppTheme::default())
     }
 }
 
@@ -46,9 +68,6 @@ pub struct Spinner {
 }
 
 impl Spinner {
-    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -59,7 +78,8 @@ impl Spinner {
         theme: &ColorTheme,
         out: &mut impl Write,
     ) -> io::Result<()> {
-        let frame = Self::FRAMES[self.frame_index % Self::FRAMES.len()];
+        let frames = glyphs::SPINNER_FRAMES;
+        let frame = frames[self.frame_index % frames.len()];
         self.frame_index += 1;
         queue!(
             out,
@@ -86,7 +106,7 @@ impl Spinner {
             MoveToColumn(0),
             Clear(ClearType::CurrentLine),
             SetForegroundColor(theme.spinner_done),
-            Print(format!("✔ {label}\n")),
+            Print(format!("{} {label}\n", glyphs::DONE)),
             ResetColor
         )?;
         out.flush()
@@ -104,7 +124,7 @@ impl Spinner {
             MoveToColumn(0),
             Clear(ClearType::CurrentLine),
             SetForegroundColor(theme.spinner_failed),
-            Print(format!("✘ {label}\n")),
+            Print(format!("{} {label}\n", glyphs::FAILED)),
             ResetColor
         )?;
         out.flush()
@@ -123,8 +143,8 @@ impl Spinner {
             out,
             MoveToColumn(0),
             Clear(ClearType::CurrentLine),
-            SetForegroundColor(theme.quote),
-            Print(format!("⏸ {label}\n")),
+            SetForegroundColor(theme.muted),
+            Print(format!("{} {label}\n", glyphs::CANCELLED)),
             ResetColor
         )?;
         out.flush()
@@ -256,7 +276,7 @@ impl TerminalRenderer {
                     format!("`{code}`").with(self.color_theme.inline_code)
                 );
             }
-            Event::Rule => output.push_str("---\n"),
+            Event::Rule => output.push_str(glyphs::RULE),
             Event::Text(text) => {
                 self.push_text(text.as_ref(), state, output, code_buffer, *in_code_block);
             }
@@ -317,12 +337,12 @@ impl TerminalRenderer {
 
     fn start_quote(&self, state: &mut RenderState, output: &mut String) {
         state.quote += 1;
-        let _ = write!(output, "{}", "│ ".with(self.color_theme.quote));
+        let _ = write!(output, "{}", glyphs::QUOTE_BAR.with(self.color_theme.quote));
     }
 
     fn start_item(state: &RenderState, output: &mut String) {
         output.push_str(&"  ".repeat(state.list.saturating_sub(1)));
-        output.push_str("• ");
+        output.push_str(glyphs::BULLET);
     }
 
     fn start_code_block(&self, code_language: &str, output: &mut String) {
@@ -330,7 +350,7 @@ impl TerminalRenderer {
             let _ = writeln!(
                 output,
                 "{}",
-                format!("╭─ {code_language}").with(self.color_theme.heading)
+                format!("{}{code_language}", glyphs::CODE_OPEN).with(self.color_theme.heading)
             );
         }
     }
@@ -338,7 +358,11 @@ impl TerminalRenderer {
     fn finish_code_block(&self, code_buffer: &str, code_language: &str, output: &mut String) {
         output.push_str(&self.highlight_code(code_buffer, code_language));
         if !code_language.is_empty() {
-            let _ = write!(output, "{}", "╰─".with(self.color_theme.heading));
+            let _ = write!(
+                output,
+                "{}",
+                glyphs::CODE_CLOSE.with(self.color_theme.heading)
+            );
         }
         output.push_str("\n\n");
     }

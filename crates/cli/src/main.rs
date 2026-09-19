@@ -3,6 +3,7 @@ mod config;
 mod core;
 mod editor;
 mod render;
+mod theme;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -2386,11 +2387,11 @@ impl TurnRenderer {
                 }
                 self.saw_text = true;
                 self.assistant_text.push_str(delta.as_ref());
-                print!("{}", delta.as_str().dark_grey());
+                print!("{}", delta.as_str().with(self.theme.muted()));
                 out.flush().ok();
             }
             AgentEvent::ThinkingDelta(delta) => {
-                print!("{}", delta.as_str().dark_grey().italic());
+                print!("{}", delta.as_str().with(self.theme.muted()).italic());
                 io::stdout().flush().ok();
             }
             AgentEvent::ToolUse { name, .. } => {
@@ -2399,7 +2400,7 @@ impl TurnRenderer {
                         .tick(&format!("Running `{name}`"), &self.theme, &mut out)
                         .ok();
                 } else {
-                    println!("{}", format!("· running `{name}`").dark_grey());
+                    println!("{}", format!("· running `{name}`").with(self.theme.muted()));
                 }
             }
             AgentEvent::ToolResult {
@@ -2417,7 +2418,7 @@ impl TurnRenderer {
                     self.spinner.finish(&label, &self.theme, &mut out).ok();
                     self.spinner_active = false;
                 } else {
-                    println!("{}", format!("· {label}").dark_grey());
+                    println!("{}", format!("· {label}").with(self.theme.muted()));
                 }
                 let markdown = fold_tool_output(name, output, FOLD_TOOL_OUTPUT_LINES);
                 writeln!(out, "{}", self.renderer.render_markdown(&markdown)).ok();
