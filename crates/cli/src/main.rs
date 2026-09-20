@@ -211,7 +211,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Some(command) => resume_session(&session_path, &command),
                 // No --run: reopen the interactive REPL with the conversation restored.
                 None => {
-                    let session = Session::load_from_path(&session_path)
+                    let session = load_saved_session(&session_path)
                         .map_err(|error| format!("failed to restore session: {error}"))?;
                     // Continue this transcript in place: adopt its id so later
                     // turns overwrite the same file and update the same row.
@@ -1090,7 +1090,7 @@ async fn run_models(
 }
 
 fn resume_session(session_path: &Path, command: &str) {
-    let session = match Session::load_from_path(session_path) {
+    let session = match load_saved_session(session_path) {
         Ok(session) => session,
         Err(error) => {
             eprintln!("failed to restore session: {error}");
@@ -1194,6 +1194,18 @@ fn unix_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_millis())
         .unwrap_or_default()
+}
+
+/// Restore a saved session: the snapshot file plus any append-only segment
+/// beside it. A segment that cannot be placed on the snapshot never fails the
+/// restore — the snapshot is complete on its own — so it is dropped with a note
+/// on stderr. See `Session::load_with_segment`.
+fn load_saved_session(path: &Path) -> Result<Session, String> {
+    let (session, segment) = Session::load_with_segment(path).map_err(|error| error.to_string())?;
+    if let Some(warning) = segment.warning() {
+        eprintln!("{}: {warning}", path.display());
+    }
+    Ok(session)
 }
 
 fn save_session(session: &Session) -> io::Result<PathBuf> {
@@ -1801,7 +1813,7 @@ fn handle_open_command(
         return;
     }
     let path = &sessions[index - 1];
-    match Session::load_from_path(path) {
+    match load_saved_session(path) {
         Ok(session) => match build_runtime(session, selection.clone(), true, mode) {
             Ok(fresh) => {
                 *runtime = fresh;
@@ -3253,14 +3265,11 @@ impl ToolExecutor for NativeToolExecutor {
             // tool only when it exists so the model never sees a dead entry.
         ]
         .into_iter()
-        .chain(
-            if runtime::rga_available() {
-                vec![tools::search_documents_tool_spec()]
-            } else {
-                Vec::new()
-            },
-        )
-        {
+        .chain(if runtime::rga_available() {
+            vec![tools::search_documents_tool_spec()]
+        } else {
+            Vec::new()
+        }) {
             specs.push(ToolSpec {
                 name: spec.name.to_string(),
                 description: spec.description.to_string(),
