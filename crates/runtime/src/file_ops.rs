@@ -3,11 +3,14 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use glob::Pattern;
+use ignore::WalkState;
 use nucleo_matcher::{Config, Matcher, Utf32Str};
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 
@@ -163,6 +166,12 @@ const SKIP_DIRS: &[&str] = &[
 ];
 /// Files larger than this are treated as data blobs, not searchable text.
 const MAX_GREP_FILE_BYTES: u64 = 1024 * 1024;
+/// Bytes sniffed from a file's head for binary detection (ripgrep's NUL
+/// heuristic): one NUL byte in the first 8 KiB disqualifies the file.
+const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+/// Hard ceiling on content-mode lines collected across one grep call,
+/// bounding worst-case memory no matter how many workers hit matches.
+const MAX_GREP_CONTENT_LINES: usize = 50_000;
 /// Hard ceiling on files examined per search to bound worst-case latency.
 const MAX_SEARCH_FILES: usize = 20_000;
 /// Default number of fuzzy file hits `search_files` returns.
@@ -215,7 +224,7 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&absolute_path, content)?;
+    write_text_atomic(&absolute_path, content)?;
 
     Ok(WriteFileOutput {
         kind: if original_file.is_some() {
@@ -257,7 +266,7 @@ pub fn edit_file(
     } else {
         original_file.replacen(old_string, new_string, 1)
     };
-    fs::write(&absolute_path, &updated)?;
+    write_text_atomic(&absolute_path, &updated)?;
 
     Ok(EditFileOutput {
         file_path: absolute_path.to_string_lossy().into_owned(),
@@ -379,7 +388,7 @@ pub fn apply_patch(changes: &[PatchChange]) -> io::Result<ApplyPatchOutput> {
         if let Some(parent) = prepared.absolute_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&prepared.absolute_path, &prepared.content)?;
+        write_text_atomic(&prepared.absolute_path, &prepared.content)?;
         let (kind, structured_patch) = match &prepared.original {
             Some(original) => (
                 String::from("update"),
@@ -407,6 +416,38 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 
 fn not_found(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, message.into())
+}
+
+/// Atomic text write: stage the content in a sibling temp file, fsync, then
+/// rename over the target. A crash mid-write leaves the previous content
+/// intact instead of a truncated file. (`std::fs::rename` replaces existing
+/// files on both Unix and Windows.)
+fn write_text_atomic(path: &Path, content: &str) -> io::Result<()> {
+    use std::io::Write as _;
+
+    static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let name = path.file_name().map_or_else(
+        || std::ffi::OsString::from("hf-file"),
+        std::ffi::OsStr::to_os_string,
+    );
+    let tmp_path = path.with_file_name(format!(
+        ".{}.hf-tmp-{}-{}",
+        name.to_string_lossy(),
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+
+    let result = (|| {
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp_path, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
@@ -482,7 +523,7 @@ pub fn search_files(
     let needle = Utf32Str::new(query, &mut needle_buf);
 
     let mut scored: Vec<(u32, String)> = Vec::new();
-    for candidate in collect_search_files(&base)? {
+    for candidate in collect_search_files(&base) {
         // Score against the path relative to the search root (matches folder and
         // file names, like `fzf`), but hand back the absolute path for reuse.
         let display = candidate
@@ -534,64 +575,69 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let file_type = input.file_type.as_deref();
     let output_mode = input
         .output_mode
-        .clone()
-        .unwrap_or_else(|| String::from("files_with_matches"));
+        .as_deref()
+        .unwrap_or("files_with_matches")
+        .trim()
+        .to_owned();
     let context = input.context.or(input.context_short).unwrap_or(0);
 
-    let mut filenames = Vec::new();
+    // ripgrep's shape: the whole per-file pipeline (filter -> read -> sniff ->
+    // regex) runs on the walker's worker threads, so cold-page IO and matching
+    // overlap across cores. Each visitor accumulates thread-local hits; the
+    // single shared sink is touched once per file.
+    let results = Mutex::new(Vec::<FileScan>::new());
+    let seen_files = AtomicUsize::new(0);
+    let content_budget = AtomicUsize::new(MAX_GREP_CONTENT_LINES);
+
+    build_search_walker(&base_path).run(|| {
+        // Shared state is captured by reference (`Mutex`/`AtomicUsize` are
+        // `Sync`), so every per-thread visitor sees the same sink.
+        Box::new(|entry: Result<ignore::DirEntry, ignore::Error>| {
+            let Ok(entry) = entry else {
+                return WalkState::Continue; // one unreadable entry never kills the walk
+            };
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                return WalkState::Continue;
+            }
+            // Bound the walk like the sequential crawler did.
+            if seen_files.fetch_add(1, Ordering::Relaxed) >= MAX_SEARCH_FILES {
+                return WalkState::Quit;
+            }
+            let path = entry.path();
+            if !matches_optional_filters(path, glob_filter.as_ref(), file_type) {
+                return WalkState::Continue;
+            }
+            if let Some(scan) =
+                scan_file(path, &regex, input, &output_mode, context, &content_budget)
+            {
+                if let Ok(mut sink) = results.lock() {
+                    sink.push(scan);
+                }
+            }
+            WalkState::Continue
+        })
+    });
+
+    let mut scans = results.into_inner().unwrap_or_default();
+    // Deterministic output regardless of worker scheduling: group by path.
+    scans.sort_unstable_by(|a, b| {
+        a.path
+            .as_os_str()
+            .as_encoded_bytes()
+            .cmp(b.path.as_os_str().as_encoded_bytes())
+    });
+
+    let mut filenames = Vec::with_capacity(scans.len());
     let mut content_lines = Vec::new();
     let mut total_matches = 0usize;
-
-    for file_path in collect_search_files(&base_path)? {
-        if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
-            continue;
-        }
-
-        // Skip binary-looking or oversized files instead of pulling them into RAM.
-        let Ok(metadata) = fs::metadata(&file_path) else {
-            continue;
-        };
-        if metadata.len() > MAX_GREP_FILE_BYTES {
-            continue;
-        }
-
-        let Ok(file_content) = fs::read_to_string(&file_path) else {
-            continue;
-        };
-        let file_content = strip_bom(&file_content);
-
+    for scan in &scans {
+        filenames.push(scan.path.to_string_lossy().into_owned());
         if output_mode == "count" {
-            let count = regex.find_iter(file_content).count();
-            if count > 0 {
-                filenames.push(file_path.to_string_lossy().into_owned());
-                total_matches += count;
-            }
-            continue;
-        }
-
-        let matched_lines: Vec<usize> = file_content
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| regex.is_match(line))
-            .map(|(index, _)| index)
-            .collect();
-
-        if matched_lines.is_empty() {
-            continue;
-        }
-
-        filenames.push(file_path.to_string_lossy().into_owned());
-        if output_mode == "content" {
-            push_content_matches(
-                &mut content_lines,
-                &file_path,
-                file_content,
-                &matched_lines,
-                input,
-                context,
-            );
+            total_matches += scan.count;
+        } else if output_mode == "content" {
+            content_lines.extend(scan.content_lines.iter().cloned());
         } else {
-            total_matches += matched_lines.len();
+            total_matches += scan.line_matches;
         }
     }
 
@@ -625,42 +671,108 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     })
 }
 
-/// Append rendered content-mode matches (with optional context lines) for one
-/// already-matched file.
-fn push_content_matches(
-    content_lines: &mut Vec<String>,
-    file_path: &Path,
-    file_content: &str,
-    matched_lines: &[usize],
-    input: &GrepSearchInput,
-    context: usize,
-) {
-    let lines: Vec<&str> = file_content.lines().collect();
-    for index in matched_lines {
-        let start = index.saturating_sub(input.before.unwrap_or(context));
-        let end = (index + input.after.unwrap_or(context) + 1).min(lines.len());
-        for (i, line) in lines.iter().enumerate().take(end).skip(start) {
-            let prefix = if input.line_numbers.unwrap_or(true) {
-                format!("{}:{}:", file_path.to_string_lossy(), i + 1)
-            } else {
-                format!("{}:", file_path.to_string_lossy())
-            };
-            content_lines.push(format!("{prefix}{line}"));
-        }
-    }
+/// One file's grep result, produced entirely on a walker thread and only then
+/// handed to the shared sink.
+struct FileScan {
+    path: PathBuf,
+    /// `count`-mode regex match count.
+    count: usize,
+    /// Number of matching lines (all modes except `count`).
+    line_matches: usize,
+    /// Rendered content-mode lines (path:line: prefix + text, context included).
+    content_lines: Vec<String>,
 }
 
-fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
-    if base_path.is_file() {
-        return Ok(vec![base_path.to_path_buf()]);
+/// Read + scan one file for the grep pipeline. Returns `None` for filtered-out,
+/// oversized, binary, or non-UTF-8 files. The regex is shared (`Regex` is
+/// `Sync`); the content budget bounds worst-case memory across all workers.
+fn scan_file(
+    path: &Path,
+    regex: &Regex,
+    input: &GrepSearchInput,
+    output_mode: &str,
+    context: usize,
+    content_budget: &AtomicUsize,
+) -> Option<FileScan> {
+    // Skip oversized files before pulling them into RAM.
+    let metadata = fs::metadata(path).ok()?;
+    if metadata.len() > MAX_GREP_FILE_BYTES {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    // Binary sniff: a NUL byte in the first 8 KiB (ripgrep's heuristic) means
+    // the file is not worth regexing or feeding to a model.
+    let sniff_len = bytes.len().min(BINARY_SNIFF_BYTES);
+    if memchr::memchr(0, &bytes[..sniff_len]).is_some() {
+        return None;
+    }
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+
+    if output_mode == "count" {
+        let count = regex.find_iter(text).count();
+        return (count > 0).then(|| FileScan {
+            path: path.to_path_buf(),
+            count,
+            line_matches: 0,
+            content_lines: Vec::new(),
+        });
     }
 
-    let mut files = Vec::new();
-    // `ignore` is ripgrep's proven crawler: it honours `.gitignore`/`.ignore`
-    // even outside a git checkout (`require_git(false)`) and always skips `.git`.
-    // Hidden files stay searchable to preserve prior behaviour; SKIP_DIRS still
-    // prunes build caches a project may have forgotten to ignore.
-    let walker = ignore::WalkBuilder::new(base_path)
+    let matched_lines: Vec<usize> = text
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| regex.is_match(line))
+        .map(|(index, _)| index)
+        .collect();
+    if matched_lines.is_empty() {
+        return None;
+    }
+
+    let mut content_lines = Vec::new();
+    if output_mode == "content" {
+        let lines: Vec<&str> = text.lines().collect();
+        for index in &matched_lines {
+            let start = index.saturating_sub(input.before.unwrap_or(context));
+            let end = (index + input.after.unwrap_or(context) + 1).min(lines.len());
+            for (i, line) in lines.iter().enumerate().take(end).skip(start) {
+                // Budget guard: 0 means exhausted (never decrement through it).
+                if content_budget
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .is_err()
+                {
+                    return Some(FileScan {
+                        path: path.to_path_buf(),
+                        count: 0,
+                        line_matches: matched_lines.len(),
+                        content_lines,
+                    });
+                }
+                let prefix = if input.line_numbers.unwrap_or(true) {
+                    format!("{}:{}:", path.to_string_lossy(), i + 1)
+                } else {
+                    format!("{}:", path.to_string_lossy())
+                };
+                content_lines.push(format!("{prefix}{line}"));
+            }
+        }
+    }
+
+    Some(FileScan {
+        path: path.to_path_buf(),
+        count: 0,
+        line_matches: matched_lines.len(),
+        content_lines,
+    })
+}
+
+/// Shared crawler for grep/fuzzy-search: ripgrep's `ignore` walker, parallel
+/// build. Honours `.gitignore`/`.ignore` even outside a git checkout
+/// (`require_git(false)`), always skips `.git`; hidden files stay searchable to
+/// preserve prior behaviour, and `SKIP_DIRS` prunes forgotten build caches.
+fn build_search_walker(base_path: &Path) -> ignore::WalkParallel {
+    let mut builder = ignore::WalkBuilder::new(base_path);
+    builder
         .hidden(false)
         .require_git(false)
         .filter_entry(|entry| {
@@ -671,21 +783,37 @@ fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
                     .file_name()
                     .to_str()
                     .is_some_and(|name| SKIP_DIRS.contains(&name))
-        })
-        .build();
-    for entry in walker {
-        let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
-        if entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_file())
-        {
-            files.push(entry.path().to_path_buf());
-            if files.len() >= MAX_SEARCH_FILES {
-                break;
-            }
-        }
+        });
+    builder.build_parallel()
+}
+
+fn collect_search_files(base_path: &Path) -> Vec<PathBuf> {
+    if base_path.is_file() {
+        return vec![base_path.to_path_buf()];
     }
-    Ok(files)
+
+    // Parallel crawl (the same WalkParallel ripgrep uses): directory IO is the
+    // bottleneck for the fuzzy finder, so spread it across cores. Errors on
+    // single entries are skipped rather than aborting the whole enumeration.
+    let files = Mutex::new(Vec::<PathBuf>::new());
+    let seen = AtomicUsize::new(0);
+    build_search_walker(base_path).run(|| {
+        Box::new(|entry: Result<ignore::DirEntry, ignore::Error>| {
+            if let Ok(entry) = entry {
+                if entry.file_type().is_some_and(|t| t.is_file())
+                    && seen.fetch_add(1, Ordering::Relaxed) < MAX_SEARCH_FILES
+                {
+                    if let Ok(mut sink) = files.lock() {
+                        sink.push(entry.path().to_path_buf());
+                    }
+                } else if entry.file_type().is_some_and(|t| t.is_file()) {
+                    return WalkState::Quit;
+                }
+            }
+            WalkState::Continue
+        })
+    });
+    files.into_inner().unwrap_or_default()
 }
 
 fn matches_optional_filters(
