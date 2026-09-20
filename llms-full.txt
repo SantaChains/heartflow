@@ -216,7 +216,7 @@ read_only = true                       # 声明该 server 工具均只读：read
 
 ## 内置 provider
 
-- `deepseek`：OpenAI 协议，`api_key_env = "DEEPSEEK_API_KEY"`，默认模型 `deepseek-flash`。
+- `deepseek`：OpenAI 协议，`api_key_env = "DEEPSEEK_API_KEY"`，默认模型 `deepseek-v4-flash`。
 - `anthropic`：Anthropic 协议，`api_key_env = "ANTHROPIC_API_KEY"`。
 - 任意 `[provider.NAME]` 表项即自定义 provider。
 

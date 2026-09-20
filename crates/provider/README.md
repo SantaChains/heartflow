@@ -20,7 +20,7 @@ provider 配置解析与 API 流式桥接层:把 `[provider]` 配置归并成传
 # ~/.heartflow/config.toml
 [provider]
 name = "deepseek"             # 内置项:deepseek / anthropic;自定义需配 base_url
-model = "deepseek-flash"      # 省略时用内置默认
+model = "deepseek-v4-flash"   # 省略时用内置默认
 # protocol = "openai-responses" # 自定义端点可改写协议(内置项不可改)
 # base_url = "https://api.deepseek.com/v1"
 # api_key_env = "DEEPSEEK_API_KEY"

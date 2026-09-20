@@ -102,7 +102,7 @@ fn builtin_provider(name: &str) -> Option<BuiltinProvider> {
             protocol: ProviderProtocol::OpenAi,
             base_url: DEEPSEEK_BASE_URL,
             api_key_env: "DEEPSEEK_API_KEY",
-            model: Some("deepseek-flash"),
+            model: Some("deepseek-v4-flash"),
         }),
         "anthropic" => Some(BuiltinProvider {
             protocol: ProviderProtocol::Anthropic,
@@ -274,6 +274,7 @@ impl ProviderSettings {
     }
 }
 
+#[must_use]
 pub fn quote_toml_string(text: &str) -> String {
     format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -554,7 +555,7 @@ mod tests {
                 assert_eq!(protocol, ProviderProtocol::OpenAi);
                 assert_eq!(base_url, "https://api.deepseek.com/v1");
                 assert_eq!(api_key_env, "DEEPSEEK_API_KEY");
-                assert_eq!(model, "deepseek-flash");
+                assert_eq!(model, "deepseek-v4-flash");
                 assert_eq!(max_tokens, DEFAULT_MAX_TOKENS);
             }
             other @ ProviderSpec::Env { .. } => panic!("expected resolved profile, got {other:?}"),
