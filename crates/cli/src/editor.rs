@@ -16,6 +16,7 @@
 use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crossterm::cursor::Show;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -29,6 +30,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use tui_textarea::{CursorMove, TextArea};
 
+use crate::mascot::Mascot;
 use crate::theme::{glyphs, Theme};
 
 /// REPL slash commands surfaced by completion and the "did you mean" hint.
@@ -76,6 +78,13 @@ const VIEWPORT_ROWS: u16 = 2;
 const HISTORY_MAX: usize = 500;
 /// Max command suggestions the hint tracks (Tab cycles through them).
 const MAX_COMPLETIONS: usize = 8;
+/// Idle animation cadence for the mascot badge. A slow tick keeps the blink
+/// natural while waking the loop rarely; ratatui's diff makes an unchanged
+/// redraw near-free, so idle CPU stays negligible.
+const MASCOT_TICK: Duration = Duration::from_millis(120);
+/// Minimum terminal width before the mascot reserves room on the input row; if
+/// the window is narrower the badge is hidden rather than crowd the prompt.
+const MASCOT_MIN_WIDTH: u16 = 40;
 
 /// Closest known slash command to `input`, judged on its leading token, when one
 /// is similar enough to be worth suggesting. Backs the "did you mean" hint so a
@@ -357,6 +366,7 @@ impl ReplEditor {
         completion_idx: &mut Option<usize>,
         exit: &mut Exit,
     ) -> io::Result<()> {
+        let mut mascot = Mascot::new();
         loop {
             let text = textarea.lines().join("\n");
             let prefix = current_token_prefix(&text);
@@ -367,7 +377,7 @@ impl ReplEditor {
                 status.take().as_deref(),
             );
 
-            let frame = terminal.draw(|frame| draw_frame(frame, textarea, &hint))?;
+            let frame = terminal.draw(|frame| draw_frame(frame, textarea, &hint, &mascot))?;
             // Park the real terminal cursor on the input cell (the IME anchor).
             let (cursor_row, cursor_col) = textarea.cursor();
             let column = if cursor_row == 0 {
@@ -380,6 +390,13 @@ impl ReplEditor {
             terminal.set_cursor_position(Position::new(x, area.y))?;
             terminal.show_cursor()?;
 
+            // Poll instead of a blocking read so the mascot can tick while the
+            // user is idle; on timeout we advance the animation and redraw
+            // (ratatui diffs, so an unchanged frame emits nothing).
+            if !event::poll(MASCOT_TICK)? {
+                mascot.advance(MASCOT_TICK.as_secs_f64());
+                continue;
+            }
             let key = match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => key,
                 _ => continue,
@@ -499,16 +516,28 @@ impl ReplEditor {
 }
 
 /// Render one frame: the `› ` gutter, the textarea in the remaining input
-/// cells, and the hint row beneath. Rect math is done by hand to avoid coupling
-/// to the layout-algorithm API across ratatui releases.
-fn draw_frame(frame: &mut Frame<'_>, textarea: &TextArea<'static>, hint: &str) {
+/// cells, the idle mascot badge parked at the far right of the input row, and
+/// the hint row beneath. Rect math is done by hand to avoid coupling to the
+/// layout-algorithm API across ratatui releases.
+fn draw_frame(frame: &mut Frame<'_>, textarea: &TextArea<'static>, hint: &str, mascot: &Mascot) {
     let theme = Theme::current();
     let size = frame.area();
     let gutter = Rect::new(size.x, size.y, PROMPT_WIDTH.min(size.width), 1);
+    // The mascot owns a few columns at the right of the input row; hide it on
+    // narrow terminals rather than crowd the prompt, and never let it eat the
+    // whole line (cap the reserve against the available input width).
+    let badge = mascot.badge();
+    let badge_width = u16::try_from(badge.chars().count()).unwrap_or(0);
+    let show_mascot = size.width >= MASCOT_MIN_WIDTH;
+    let reserve = if show_mascot {
+        (badge_width + 2).min(size.width.saturating_sub(PROMPT_WIDTH + 4))
+    } else {
+        0
+    };
     let editor = Rect::new(
         size.x + PROMPT_WIDTH,
         size.y,
-        size.width.saturating_sub(PROMPT_WIDTH),
+        size.width.saturating_sub(PROMPT_WIDTH + reserve),
         1,
     );
     let hint_area = Rect::new(size.x, size.y + 1, size.width, 1);
@@ -520,6 +549,21 @@ fn draw_frame(frame: &mut Frame<'_>, textarea: &TextArea<'static>, hint: &str) {
         gutter,
     );
     frame.render_widget(textarea, editor);
+    if show_mascot {
+        let badge_area = Rect::new(
+            size.x + size.width.saturating_sub(badge_width),
+            size.y,
+            badge_width,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                badge,
+                Style::default().fg(theme.muted().ratatui()),
+            ))),
+            badge_area,
+        );
+    }
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             hint.to_string(),

@@ -2,6 +2,7 @@ mod adapter;
 mod config;
 mod core;
 mod editor;
+mod mascot;
 mod render;
 mod theme;
 
@@ -1368,6 +1369,9 @@ async fn run_repl(
     // empty until P4-c wires keyboard polling; the injection point below is
     // already the final one.
     let mut model = HeartModel::new();
+    for line in mascot::Mascot::new().render() {
+        println!("{line}");
+    }
     println!("heartflow interactive mode");
     println!(
         "Input: Enter sends, Alt/Shift+Enter newline, Up/Down history, Tab completes / commands."

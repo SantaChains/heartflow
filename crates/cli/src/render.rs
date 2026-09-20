@@ -11,6 +11,7 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
 
+use crate::mascot::Mascot;
 use crate::theme::{glyphs, Theme as AppTheme};
 
 /// Crossterm projection of the shared [`AppTheme`] palette, consumed by the line
@@ -78,8 +79,10 @@ impl Spinner {
         theme: &ColorTheme,
         out: &mut impl Write,
     ) -> io::Result<()> {
-        let frames = glyphs::SPINNER_FRAMES;
-        let frame = frames[self.frame_index % frames.len()];
+        // The mascot's busy "scanning" face replaces the plain braille dot: it
+        // alternates each event, so a run of tool calls reads as the figure
+        // working rather than a generic spinner. Advances per event (no timer).
+        let frame = Mascot::busy_face(self.frame_index);
         self.frame_index += 1;
         queue!(
             out,

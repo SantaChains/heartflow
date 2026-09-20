@@ -345,8 +345,6 @@ pub mod glyphs {
     pub const CODE_OPEN: &str = "╭─ ";
     /// Close corner for a fenced code block.
     pub const CODE_CLOSE: &str = "╰─";
-    /// Active (in-progress) spinner state.
-    pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     /// Completed/ok state.
     pub const DONE: &str = "✔";
     /// Failed state.

@@ -180,6 +180,10 @@ error = "#f7768e"        # 失败
 # 其余可选：emphasis / strong / inline_code / link / quote
 ```
 
+### 终端伴侣（mascot）
+
+REPL 内置一个纯几何、零素材、零第三方动画库的小机器形象（`crates/cli/src/mascot.rs`），呼应 agent 状态：启动横幅展示会呼吸/眨眼的圆脸 blob；空闲输入框右端有一枚随呼吸节律眨眼的单行眼睛伴侣（终端过窄时自动隐藏，从不挤占输入）；工具运行的状态行用扫描表情替代通用 spinner。动画由一个临界阻尼弹簧积分器驱动（与所参考的 JS 实现同一类数学），仅在时钟或状态变化时重算，配合 ratatui diff 使静帧开销近零。造型全为自绘几何字形，不含任何外部素材/商标，配色沿用上面的主题。完整的 `idle/thinking/busy/done/error` 状态机与多行彩色投影是就绪的公共 API，随 ratatui 状态栏（P4-c.3）接入后全量点亮。
+
 ## Agent 资产
 
 仓库指令文件以 `AGENTS.md`（含 `AGENTS.local.md`、逐级向上到仓库根）为主注入系统提示词；仅当同目录没有 `AGENTS.md` 时才回退读取旧名 `CLAUDE.md`（排他回退，避免双注入）；`hf init` / REPL `/init` 生成中性的 `AGENTS.md` 骨架。规则与技能分用户层与项目层，项目同名覆盖用户。
