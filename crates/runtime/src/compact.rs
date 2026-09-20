@@ -270,6 +270,11 @@ pub fn truncate_chars(content: &str, max_chars: usize) -> String {
 /// a 3-byte UTF-8 glyph by 4 and badly underestimate mixed Chinese text.
 #[must_use]
 fn estimate_text_tokens(text: &str) -> usize {
+    // Vectorized all-ASCII check first: megabyte tool results skip the
+    // per-char classification entirely and take the byte-division path.
+    if text.is_ascii() {
+        return text.len() / 4;
+    }
     let mut ascii = 0_usize;
     let mut non_ascii = 0_usize;
     for ch in text.chars() {
