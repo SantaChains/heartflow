@@ -80,10 +80,10 @@ const VIEWPORT_ROWS: u16 = 2;
 const HISTORY_MAX: usize = 500;
 /// Max command suggestions the hint tracks (Tab cycles through them).
 const MAX_COMPLETIONS: usize = 8;
-/// Idle animation cadence for the mascot badge. A slow tick keeps the blink
+/// Idle animation cadence for the mascot badge. A slow tick keeps the beat
 /// natural while waking the loop rarely; ratatui's diff makes an unchanged
 /// redraw near-free, so idle CPU stays negligible. 80ms (~12fps) tracks the
-/// spring smoothly for blinks and the Done pop without spinning the loop hot.
+/// spring smoothly for beats and the Done pop without spinning the loop hot.
 const MASCOT_TICK: Duration = Duration::from_millis(80);
 /// Minimum terminal width before the mascot reserves room on the input row; if
 /// the window is narrower the badge is hidden rather than crowd the prompt.

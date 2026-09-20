@@ -28,8 +28,8 @@ use crossterm::style::Stylize;
 use inquire::{Confirm, MultiSelect, Select, Text};
 use mcp::{HttpTransport, McpClient, McpTool, StdioTransport, Transport};
 use runtime::{
-    execute_bash, is_dangerous_command, load_system_prompt, normalize_tool_schema, redact_session,
-    truncate_chars, AgentEvent, BashCommandInput, CompactionConfig, ContentBlock,
+    execute_bash, is_dangerous_command, load_system_prompt, normalize_tool_schema, redact_messages,
+    redact_session, truncate_chars, AgentEvent, BashCommandInput, CompactionConfig, ContentBlock,
     ConversationMessage, ConversationRuntime, MessageRole, PermissionMode, PermissionPolicy,
     PermissionPromptDecision, PermissionPrompter, PermissionRequest, Session, TokenUsage,
     ToolError, ToolExecutor, ToolSpec,
@@ -1215,7 +1215,7 @@ fn save_session(session: &Session) -> io::Result<PathBuf> {
     // (both the authoritative JSON and the SQLite mirror) on a clone, so the
     // in-memory session that talks to the provider is left verbatim.
     let secrets = registered_secrets();
-    let redacted = redact_session(session, &secrets);
+    let redacted = redact_for_save(session, &secrets);
     // One file per conversation, keyed by the stable id (see current_session_id):
     // each turn overwrites it via the atomic temp+rename in `save_to_path`, so a
     // crash keeps the last complete snapshot rather than a truncated tail.
@@ -1227,6 +1227,67 @@ fn save_session(session: &Session) -> io::Result<PathBuf> {
     // authoritative, so a store failure must never fail the save.
     mirror_to_store(&path, &redacted);
     Ok(path)
+}
+
+/// Per-process redaction cache: the redacted prefix of the current transcript,
+/// so each save scrubs only the newly added messages instead of re-running the
+/// four structural regexes over the whole (multi-MB) transcript every turn.
+///
+/// A single hf run is one conversation, so the tracker needs no id: it is
+/// invalidated whenever the cached prefix stops being a trustworthy base —
+/// a compaction shortened the transcript, or a pin toggle / task-context reset
+/// mutated rows in place (`note_mirror_rewrite` forces both caches, whose
+/// invalidation sources are identical). Credentials registered at runtime build
+/// time always predate the messages that follow, so extending the prefix with
+/// the current literal set stays sound.
+struct SaveTracker {
+    last_len: usize,
+    force_full: bool,
+    redacted: Session,
+}
+
+impl SaveTracker {
+    /// Whether this save may extend the cached redacted prefix. Sound only when
+    /// the transcript strictly grows past an already-scrubbed base and no
+    /// in-place rewrite was forced.
+    #[must_use]
+    fn can_extend(&self, len: usize) -> bool {
+        !self.force_full && self.last_len > 0 && len > self.last_len
+    }
+}
+
+static SAVE_CACHE: Mutex<Option<SaveTracker>> = Mutex::new(None);
+
+/// Scrub the transcript for persistence, extending the cached redacted prefix
+/// when possible. The clone handed back is what reaches disk and the mirror;
+/// the tracker keeps its own authoritative copy so a failed save simply leaves
+/// the cache intact and the next save redoes the same extension.
+fn redact_for_save(session: &Session, secrets: &[String]) -> Session {
+    let len = session.messages.len();
+    if let Ok(mut guard) = SAVE_CACHE.lock() {
+        if let Some(tracker) = guard.as_mut() {
+            if tracker.can_extend(len) {
+                // Scrub only the new tail: the cached prefix was already
+                // scrubbed, and credentials registered at runtime build time
+                // always predate the messages that follow.
+                tracker.redacted.messages.extend(redact_messages(
+                    &session.messages[tracker.last_len..],
+                    secrets,
+                ));
+                tracker.last_len = len;
+                return tracker.redacted.clone();
+            }
+        }
+        let redacted = redact_session(session, secrets);
+        *guard = Some(SaveTracker {
+            last_len: len,
+            force_full: false,
+            redacted: redacted.clone(),
+        });
+        return redacted;
+    }
+    // Poisoned lock: the always-correct full scrub.
+    redact_session(session, secrets)
 }
 
 /// Credential literals learned this run (the resolved API key / auth token).
@@ -1371,6 +1432,14 @@ static MIRROR: Mutex<Option<MirrorTracker>> = Mutex::new(None);
 /// mutates already-mirrored rows without necessarily growing the transcript.
 fn note_mirror_rewrite() {
     if let Ok(mut guard) = MIRROR.lock() {
+        if let Some(tracker) = guard.as_mut() {
+            tracker.force_full = true;
+        }
+    }
+    // The JSON snapshot's redaction cache shares every invalidation source
+    // (pin toggle / compaction / task reset change rows in place), so it is
+    // forced here rather than threading a second note call through each site.
+    if let Ok(mut guard) = SAVE_CACHE.lock() {
         if let Some(tracker) = guard.as_mut() {
             tracker.force_full = true;
         }

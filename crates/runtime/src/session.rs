@@ -156,7 +156,10 @@ impl Session {
     /// target so a crash never leaves a truncated session transcript.
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), SessionError> {
         let path = path.as_ref();
-        let payload = serde_json::to_string_pretty(self)?;
+        // simd-json's SIMD string classification dominates serde_json on the
+        // MB-scale transcripts this writes every turn.
+        let payload = simd_json::serde::to_string_pretty(self)
+            .map_err(|error| SessionError::Format(error.to_string()))?;
         let temp = match path.file_name() {
             Some(name) => path.with_file_name(format!(
                 ".{}.tmp-{}",

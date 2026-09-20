@@ -1,26 +1,29 @@
-//! The REPL companion: a lively terminal "robot head" drawn from pure geometry,
-//! with no image assets and no third-party animation framework.
+//! The REPL companion: a lively terminal heart drawn from pure geometry, with
+//! no image assets and no third-party animation framework.
+//!
+//! The figure is a filled heart carrying a heartbeat trace. Four flat tones only
+//! — a bright contour, a darker body, the trace, and a highlight on the trace's
+//! spike. Nothing is shaded: a vertical gradient across a filled shape quantises
+//! into visible horizontal stripes at this size, which is what made the earlier
+//! gradient-filled egg read as a bee.
 //!
 //! Two renderers share one [`Mascot`] state machine, both driven by the same
 //! spring physics, and each uses the dot-matrix packing that suits its size:
-//!   * [`Mascot::render_head_cells`] rasterises a **half-block truecolor** head
-//!     (`▀`/`▄`/`█`, two full-colour pixels per cell — foreground = top pixel,
-//!     background = bottom). The design language is the grok-bot school: a
-//!     floating porcelain egg in a calm vertical gradient, two large ink eyes,
-//!     no mouth at rest, and an orbiting spark of theme emphasis. This is the
-//!     startup banner, drawn in colour via [`draw_banner`].
-//!   * [`Mascot::badge`] draws a tiny **braille** face (2×4 sub-pixels per cell,
-//!     the same sub-cell technique ratatui's `Canvas` uses) that fits the fixed
-//!     inline input viewport, where the extra vertical resolution makes the
-//!     eyes read clearly at a few cells wide.
+//!   * [`Mascot::render_head_cells`] rasterises the banner as **half-block
+//!     truecolor** cells (`▀`/`▄`/`█`, two full-colour pixels per cell —
+//!     foreground = top pixel, background = bottom), coloured via [`draw_banner`].
+//!   * [`Mascot::badge`] draws the same heart as a tiny **braille** figure (2×4
+//!     sub-pixels per cell, the same sub-cell technique ratatui's `Canvas` uses)
+//!     for the fixed inline input viewport, where ten dots across is the
+//!     smallest size at which a heart still reads as one.
 //!
 //! The figure is *interactive*: the spring integrator ([`Spring`]) gives the
-//! breathing squash, the bob, the eye-lid blink, and the little pop when a mood
-//! flips, all computed only when the clock advances — so idle CPU stays near
-//! zero. Motion is a standard critically-damped spring; every "pixel" is an
-//! original geometric glyph chosen to read on any UTF-8 truecolor terminal, and
-//! the base hues come from [`Theme`] so the companion stays in the project's one
-//! coordinated colour family.
+//! breathing squash, the bob, the wake-up, the heartbeat that dims and lights the
+//! whole figure, and the little pop when a mood flips — all computed only when
+//! the clock advances, so idle CPU stays near zero. Motion is a standard
+//! critically-damped spring; every "pixel" is an original geometric glyph chosen
+//! to read on any UTF-8 truecolor terminal, and the base hues come from [`Theme`]
+//! so the companion stays in the project's one coordinated colour family.
 
 use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
@@ -98,39 +101,100 @@ impl Spring {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mood {
-    /// Waiting at the prompt: slow breathing + occasional blink.
+    /// Waiting at the prompt: one beat, in place, on the breathing period.
     Idle,
-    /// Streaming a response / reasoning: wide, focused eyes, small "o" mouth.
+    /// Streaming a response / reasoning: a single faint beat wanders slowly.
     Thinking,
-    /// Running a tool: pupils scan side to side.
+    /// Running a tool: a fast beat sweeps back and forth.
     Busy,
-    /// Turn finished cleanly: happy up-arched eyes, big smile.
+    /// Turn finished cleanly: a full beat, held, in the success hue.
     Done,
-    /// Turn failed: distressed X eyes.
+    /// Turn failed: the trace drops and stalls, in the error hue.
     Error,
 }
 
 impl Mood {
-    /// Whether this calm mood blinks (busy/thinking hold their eyes open).
-    const fn blinks(self) -> bool {
+    /// Whether this mood keeps the resting heartbeat rhythm (busy and thinking
+    /// hold a steady pulse instead, so the figure reads as *working*).
+    const fn beats(self) -> bool {
         matches!(self, Self::Idle)
     }
 }
 
-/// Half-block canvas size for the banner head, in sub-pixels. Each cell is
-/// 1 column x 2 rows of pixels, so the head is `HEAD_W` cells wide and
-/// `HEAD_H / 2` cells tall. Because a half-block pixel is ~1.3x taller than
-/// wide, the head radii below are tuned so the silhouette reads as a round
-/// robot head, not a horizontally-stretched oval.
+/// Half-block canvas size for the banner, in sub-pixels. Each cell is 1 column x
+/// 2 rows of pixels, so the banner is `HEAD_W` cells wide and `HEAD_H / 2` cells
+/// tall.
 const HEAD_W: usize = 24;
-const HEAD_H: usize = 20;
+const HEAD_H: usize = 18;
 /// Braille canvas size for the inline badge, in sub-pixels (2 wide x 4 tall per
-/// cell), so the face is `BADGE_W / 2` cells wide and `BADGE_H / 4` cells tall.
+/// cell), so the badge is `BADGE_W / 2` cells wide and `BADGE_H / 4` cells tall.
 const BADGE_W: usize = 10;
 const BADGE_H: usize = 8;
 /// Braille sub-pixels per cell, horizontally and vertically.
 const CELL_COLS: usize = 2;
 const CELL_ROWS: usize = 4;
+
+/// The inline badge's heart, one dot row per string, `#` a lit dot. Ten dots
+/// across is the narrowest a heart still reads at, and at that size a hand-drawn
+/// mask beats sampling the banner's geometry: every lobe and the tip gets its
+/// own dot row instead of whatever the curve happens to round to. [`BADGE_SQUEEZE`]
+/// is the same heart with the systole cut off the tip.
+const BADGE_HEART: [&str; BADGE_H] = [
+    "..##..##..",
+    ".########.",
+    ".########.",
+    ".########.",
+    "..######..",
+    "...####...",
+    "....##....",
+    "..........",
+];
+const BADGE_SQUEEZE: [&str; BADGE_H] = [
+    "..##..##..",
+    ".########.",
+    ".########.",
+    "..######..",
+    "...####...",
+    "....##....",
+    "..........",
+    "..........",
+];
+
+/// Heart geometry on the banner canvas, in half-block pixels: half-width, full
+/// height, and how finely the outline is sampled ([`heart_outline`]).
+///
+/// The proportions are fixed by the screen, not the canvas. A half-block pixel is
+/// 16 x 12 px on a normal terminal, so it is *wider* than it is tall and the
+/// figure needs more rows than columns to match a heart glyph's ~1.11:1. These
+/// numbers give 14 columns by 16 rows, i.e. 1.17:1 on screen.
+const HEART_HW: f64 = 7.2;
+const HEART_H: f64 = 17.6;
+/// Outline samples per heart. At 14 px across, 180 points already land a sample
+/// in every boundary pixel; more only costs time on the startup frames.
+const HEART_SAMPLES: usize = 180;
+/// Horizontal and vertical centre of the heart on the canvas. The bob and the
+/// breathing scale pivot on the vertical one.
+const HEART_CX: f64 = (HEAD_W - 1) as f64 / 2.0;
+const HEART_CY: f64 = (HEAD_H - 1) as f64 / 2.0;
+/// The trace's rest line: the heart's own centre line, where the silhouette is
+/// still twelve pixels wide, so the trace clears the contour on both sides
+/// instead of running into it.
+const TRACE_DY: f64 = 0.0;
+/// Half-width of the beat's segment, in columns, and how many of its outermost
+/// columns fade out. Bounding it is what keeps the trace a pulse *inside* the
+/// figure: run edge to edge with a lead either side, the same line reads as a
+/// sash strapped across the heart.
+const TRACE_SPAN: f64 = 4.0;
+const TRACE_FADE: f64 = 1.5;
+/// Below this fraction of the glow the fade is not painted at all. The tail of a
+/// smooth ramp is a lone almost-black pixel, which reads as dirt on the figure
+/// rather than as the end of a line.
+const TRACE_MIN: f64 = 0.3;
+/// How far the working moods' beat wanders off centre, in columns, and how fast.
+const THINK_SWAY: f64 = 3.0;
+const BUSY_SWAY: f64 = 3.5;
+/// Seconds between beats at rest, matched to the breathing period.
+const BEAT_PERIOD: f64 = 2.6;
 
 /// DEC private mode 2026 (begin/end synchronized output). Terminals that
 /// support it (Windows Terminal, kitty, WezTerm, foot) buffer everything
@@ -157,11 +221,6 @@ impl Col {
         r: 240,
         g: 245,
         b: 255,
-    };
-    const SOCKET: Col = Col {
-        r: 14,
-        g: 16,
-        b: 24,
     };
 
     const fn new(r: u8, g: u8, b: u8) -> Self {
@@ -207,18 +266,16 @@ fn col_from(rgb: Rgb) -> Col {
     }
 }
 
-/// The mood-resolved palette the renderers share, so the head, spark, eyes,
-/// and mouth all stay harmonised. The design language is deliberately
-/// minimal (the grok-bot school): a porcelain shell carrying only two ink
-/// eyes, with mood signalled by shell tint and the orbiting spark.
+/// The mood-resolved palette the renderers share, so the banner heart, its
+/// badge, and the trace all stay harmonised. The design language is deliberately
+/// flat: one contour, one body, one signal.
 struct Palette {
-    /// Porcelain body hue (mood-tinted toward white).
+    /// Outer contour: the mood hue washed toward white.
     shell: Col,
-    /// Bottom-gradient / soft-rim shade of the shell.
+    /// Heart body: the mood hue darkened. A flat fill, not a gradient — a
+    /// gradient would quantise into horizontal stripes across these 16 rows.
     shade: Col,
-    /// Near-black ink for the eyes.
-    ink: Col,
-    /// Orbiting spark, from the theme's emphasis hue.
+    /// The heartbeat trace and its spike highlight, from the theme's emphasis hue.
     glow: Col,
 }
 
@@ -265,14 +322,6 @@ impl HalfBuf {
         }
     }
 
-    /// Paint a pixel by float coordinate (rounds to the nearest pixel).
-    fn set_f(&mut self, fx: f64, fy: f64, c: Col) {
-        if fx < 0.0 || fy < 0.0 || !fx.is_finite() || !fy.is_finite() {
-            return;
-        }
-        self.set_i(fx.round() as i64, fy.round() as i64, c);
-    }
-
     /// Encode to per-row half-block cells: two stacked pixels collapse into one
     /// cell, foreground carrying the top pixel and background the bottom.
     fn encode(&self) -> Vec<Vec<Cell>> {
@@ -311,31 +360,190 @@ impl HalfBuf {
     }
 }
 
-/// Fill an axis-aligned ellipse of solid colour.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss
-)]
-fn fill_ellipse(buf: &mut HalfBuf, cx: f64, cy: f64, rx: f64, ry: f64, c: Col) {
-    let x0 = (cx - rx).floor() as i64;
-    let x1 = (cx + rx).ceil() as i64;
-    let y0 = (cy - ry).floor() as i64;
-    let y1 = (cy + ry).ceil() as i64;
-    for y in y0..=y1 {
-        for x in x0..=x1 {
-            let nx = (x as f64 - cx) / rx;
-            let ny = (y as f64 - cy) / ry;
-            if nx * nx + ny * ny <= 1.0 {
-                buf.set_i(x, y, c);
+/// The heart's outline, sampled once into a closed polygon in unit space: `u`
+/// runs -1..=1 across the lobes, `v` runs 0 at the clefts down to 1 at the tip.
+///
+/// This is the classic parametric heart, and it is the third construction tried
+/// against this canvas. The implicit cubic `(u²+v²−1)³ − u²v³ = 0` rasterised as
+/// a rounded box with a dent: over 18 x 16 pixels its sides vary 8% in half-width
+/// and its cleft is under a pixel deep. Two overlapping discs with a power-tapered
+/// cone needed a hand-cut V and still left six equal-width rows through the middle
+/// and a blunt two-pixel stem, so the figure read as a crenellated box. Sampling
+/// the curve instead gives a deep three-row cleft, a continuous taper to a
+/// two-pixel tip, and no flat run longer than a third of the height.
+#[allow(clippy::cast_precision_loss)] // sample index -> angle
+fn heart_outline() -> Vec<[f64; 2]> {
+    let samples: Vec<[f64; 2]> = (0..HEART_SAMPLES)
+        .map(|i| {
+            let t = std::f64::consts::TAU * i as f64 / HEART_SAMPLES as f64;
+            let (sin, cos) = t.sin_cos();
+            let v = 13.0 * cos - 5.0 * (2.0 * t).cos() - 2.0 * (3.0 * t).cos() - (4.0 * t).cos();
+            [16.0 * sin * sin * sin, v]
+        })
+        .collect();
+    // Normalise to the curve's own bounding box, so the canvas constants are the
+    // only place the figure's size is stated.
+    let top = samples
+        .iter()
+        .map(|p| p[1])
+        .fold(f64::NEG_INFINITY, f64::max);
+    let tip = samples.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min);
+    samples
+        .iter()
+        .map(|[u, v]| [u / 16.0, (top - v) / (top - tip)])
+        .collect()
+}
+
+/// Whether `(x, y)` falls inside the heart centred on `(cx, cy)`. `k` scales every
+/// length at once, so the renderer animates the whole figure through one knob.
+///
+/// The test is an even-odd crossing count along the row: the outline is closed, so
+/// a point is inside exactly when a ray from it crosses the boundary an odd number
+/// of times. That resolves the cleft and the tip exactly, which sampling the curve
+/// per pixel would not.
+fn heart_inside(outline: &[[f64; 2]], x: f64, y: f64, cx: f64, cy: f64, k: f64) -> bool {
+    let u = (x - cx) / (HEART_HW * k);
+    let v = (y - (cy - 0.5 * HEART_H * k)) / (HEART_H * k);
+    // The curve reaches |u| = 1 exactly once, at the widest row.
+    if !(0.0..=1.0).contains(&v) || u.abs() > 1.0 {
+        return false;
+    }
+    let mut inside = false;
+    let mut previous = outline[outline.len() - 1];
+    for &[px, py] in outline {
+        if (py > v) != (previous[1] > v) {
+            let cut = (previous[0] - px) * (v - py) / (previous[1] - py) + px;
+            if u < cut {
+                inside = !inside;
             }
         }
+        previous = [px, py];
+    }
+    inside
+}
+
+/// One column of the QRS complex, as a vertical offset from the trace's rest
+/// line with `+` pointing down the screen: a small dip, the R spike, the S dip,
+/// then recovery. `d` is the distance from the beat's centre, in columns.
+///
+/// The windows are delimited at half-integers so that every integer column falls
+/// in exactly one of them. That matters: the beat's centre is usually fractional
+/// (the idle beat sits on the canvas centre, `HEART_CX` = 11.5), and on
+/// quarter-integer windows no sampled column lands in the spike at all — the
+/// R spike vanishes and leaves a lone floating pixel behind.
+fn qrs(d: f64) -> f64 {
+    if d < -1.5 || d >= 2.5 {
+        0.0
+    } else if d < -0.5 {
+        0.9
+    } else if d < 0.5 {
+        -3.4
+    } else if d < 1.5 {
+        1.6
+    } else {
+        0.5
     }
 }
 
-/// A pixel buffer that paints sub-pixels at float coordinates and encodes them
-/// as braille cells. Backs the compact inline [`Mascot::badge`] face, where the
-/// 2x4 sub-cell resolution keeps small eyes legible.
+/// Where the mood puts its beat, and how tall. `Idle` beats in place, `Thinking`
+/// wanders a faint beat slowly, `Busy` sweeps a fast one, `Done` holds a full
+/// beat, and `Error` has no complex at all — its trace drops and stalls instead.
+/// Only the brightness of the beat moves with the clock; the waveform's shape is
+/// fixed per mood, so the figure never wriggles.
+///
+/// The working moods oscillate rather than travel: a beat crossing the whole
+/// canvas would spend most of its cycle off the silhouette, leaving the figure
+/// blank, so `THINK_SWAY` and `BUSY_SWAY` keep it over the heart.
+fn beat_at(mood: Mood, t: f64) -> (f64, f64) {
+    match mood {
+        Mood::Idle => (HEART_CX, 0.9),
+        Mood::Thinking => (HEART_CX + THINK_SWAY * (t * 0.9).sin(), 0.8),
+        Mood::Busy => (HEART_CX + BUSY_SWAY * (t * 2.6).sin(), 1.0),
+        Mood::Done => (HEART_CX, 1.0),
+        Mood::Error => (HEART_CX, 0.0),
+    }
+}
+
+/// The trace height at column `x`: a function graph, so the line is connected by
+/// construction and never needs a path-walking rasteriser.
+fn pulse_dy(mood: Mood, x: f64, centre: f64, amp: f64) -> f64 {
+    let mut dy = qrs(x - centre) * amp;
+    // The failed trace steps down at the beat and stays down: a signal that
+    // stopped, rather than one that merely lost its spike.
+    if mood == Mood::Error && x >= centre {
+        dy += 2.6;
+    }
+    dy
+}
+
+/// Which banner-canvas pixels fall inside the heart silhouette, row-major.
+#[allow(clippy::cast_precision_loss)]
+fn heart_mask(outline: &[[f64; 2]], cx: f64, cy: f64, k: f64) -> Vec<bool> {
+    (0..HEAD_H)
+        .flat_map(|y| {
+            (0..HEAD_W).map(move |x| heart_inside(outline, x as f64, y as f64, cx, cy, k))
+        })
+        .collect()
+}
+
+/// The heartbeat: one sample per column, joined to the previous column by a
+/// vertical run, so the QRS spike is a connected riser rather than a pixel
+/// floating above the line. Only columns within [`TRACE_SPAN`] of the beat are
+/// drawn, faded out at the ends and clipped to the silhouette, so what shows is a
+/// pulse in the figure rather than a line across it.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn paint_trace(
+    buf: &mut HalfBuf,
+    pal: &Palette,
+    mood: Mood,
+    t: f64,
+    cy: f64,
+    alive: f64,
+    is_in: &impl Fn(i64, i64) -> bool,
+) {
+    let (centre, amp) = beat_at(mood, t);
+    let mood_gain = match mood {
+        Mood::Error => 0.6,
+        Mood::Thinking => 0.8,
+        _ => 1.0,
+    };
+    let gain = mood_gain * (0.3 + 0.7 * alive);
+    let rest = cy + TRACE_DY;
+    let sample = |x: f64| -> i64 { (rest + pulse_dy(mood, x, centre, amp)).round() as i64 };
+    let first = (centre - TRACE_SPAN).ceil() as i64;
+    let last = (centre + TRACE_SPAN).floor() as i64;
+    let mut previous = sample(first as f64);
+    // The topmost sample of the trace, which is the top of the R wave.
+    let mut peak = (previous, first);
+    for x in first..=last {
+        let y = sample(x as f64);
+        // Fade the outermost columns, so the segment has no cut ends.
+        let strength =
+            gain * ((TRACE_SPAN - (x as f64 - centre).abs()) / TRACE_FADE).clamp(0.0, 1.0);
+        if strength > TRACE_MIN {
+            for row in y.min(previous)..=y.max(previous) {
+                if is_in(x, row) {
+                    buf.set_i(x, row, pal.glow.scale(strength));
+                }
+            }
+        }
+        if amp > 0.0 && y < peak.0 {
+            peak = (y, x);
+        }
+        previous = y;
+    }
+    // The spike's highlight rides the top of the R wave, the one pixel that
+    // carries the beat. The old design floated a spark in the negative space
+    // above the figure, which read as a detached plus sign; an accent on the
+    // trace belongs to the character instead of sitting beside it.
+    if amp > 0.0 && gain > 0.2 && is_in(peak.1, peak.0) {
+        buf.set_i(peak.1, peak.0, pal.glow.mix(Col::WHITE, 0.55).scale(gain));
+    }
+}
+
+/// A dot buffer that paints sub-pixels by dot coordinate and encodes them as
+/// braille cells. Backs the compact inline [`Mascot::badge`], where the 2x4
+/// sub-cell resolution packs a legible heart into five cells wide.
 struct Braille {
     w: usize,
     h: usize,
@@ -404,22 +612,22 @@ const fn dot_bit(dx: usize, dy: usize) -> u16 {
     }
 }
 
-/// Time-based state for the companion. Owns the blink cadence, the eye-lid
-/// spring, and a slow breathing phase; the REPL drives it by calling
-/// [`Mascot::advance`] on each idle tick and [`Mascot::set_mood`] at phase
-/// changes.
+/// Time-based state for the companion. Owns the pulse spring the renderers draw
+/// every pixel from, the beat cadence that drives it, and the current mood; the
+/// REPL drives it by calling [`Mascot::advance`] on each idle tick and
+/// [`Mascot::set_mood`] at phase changes.
 #[derive(Debug, Clone)]
 pub struct Mascot {
     mood: Mood,
     elapsed: f64,
-    lid: Spring,
-    /// Wall-clock seconds when the current blink began, or `None` when awake.
-    blink_at: Option<f64>,
-    /// Next time a blink should start (jittered so it never looks metronomic).
-    next_blink: f64,
-    /// Deterministic LCG for blink jitter (fixed seed => reproducible frames).
-    /// `u32` so the float conversion below is exact (no precision loss).
-    rng: u32,
+    /// Aliveness, 0..=1: `1` at rest, springing up while the companion wakes and
+    /// dropping for one systole on each beat. Every tone in the figure and the
+    /// trace's gain scale from it, so one spring animates the whole character.
+    pulse: Spring,
+    /// Wall-clock seconds when the current beat began, or `None` between beats.
+    beat_at: Option<f64>,
+    /// When the next beat is due.
+    next_beat: f64,
 }
 
 impl Default for Mascot {
@@ -429,26 +637,25 @@ impl Default for Mascot {
 }
 
 impl Mascot {
-    /// A freshly-born idle mascot at time zero, eyes open.
+    /// A freshly-born idle mascot at time zero, at rest.
     #[must_use]
     pub fn new() -> Self {
         Self {
             mood: Mood::Idle,
             elapsed: 0.0,
-            lid: Spring::new(1.0),
-            blink_at: None,
-            next_blink: 3.0,
-            rng: 0x9E37_79B9,
+            pulse: Spring::new(1.0),
+            beat_at: None,
+            next_beat: BEAT_PERIOD,
         }
     }
 
-    /// A mascot whose eyes start shut and spring open — used by [`draw_banner`]
-    /// so the startup animation reads as the companion waking up.
+    /// A mascot whose pulse starts dark and springs up — used by [`draw_banner`]
+    /// so the startup animation reads as the companion coming to life.
     #[must_use]
     pub fn booting() -> Self {
         let mut mascot = Self::new();
-        mascot.lid = Spring::new(0.0);
-        mascot.lid.target = 1.0; // spring the eyes open over the first frames
+        mascot.pulse = Spring::new(0.0);
+        mascot.pulse.target = 1.0; // spring alight over the first frames
         mascot
     }
 
@@ -459,46 +666,48 @@ impl Mascot {
         self.mood
     }
 
-    /// Transition to a new mood. A flip to [`Mood::Done`] gives the lid a small
-    /// springy pop so the change reads as motion, not a teleport.
+    /// Transition to a new mood. A flip to [`Mood::Done`] kicks the pulse off
+    /// rest so the under-damped spring rings it back up — a visible surge on the
+    /// frame the turn lands, instead of a silent recolour.
     pub fn set_mood(&mut self, mood: Mood) {
         if mood == self.mood {
             return;
         }
         self.mood = mood;
         if mood == Mood::Done {
-            self.lid = Spring::bouncy(1.0);
-            self.lid.target = 1.0;
+            self.pulse = Spring::bouncy(0.45);
+            self.pulse.target = 1.0;
         } else if mood != Mood::Idle {
-            // Non-idle moods hold eyes open.
-            self.blink_at = None;
-            self.lid.target = 1.0;
+            // Working moods hold a steady pulse rather than the resting rhythm.
+            self.beat_at = None;
+            self.pulse.target = 1.0;
         }
     }
 
-    /// Advance elapsed time by `dt` seconds, driving breathing, blink, and the
-    /// lid spring. Cheap; call once per idle tick.
+    /// Advance elapsed time by `dt` seconds, driving the breathing, the beat
+    /// cadence, and the pulse spring. Cheap; call once per idle tick.
     pub fn advance(&mut self, dt: f64) {
         self.elapsed += dt;
-        // Blink scheduling (idle only).
-        if self.mood.blinks() {
-            if self.blink_at.is_none() && self.elapsed >= self.next_blink {
-                self.blink_at = Some(self.elapsed);
-                self.lid.target = 0.0;
+        // Beat scheduling (idle only: a working mascot holds a steady pulse).
+        if self.mood.beats() {
+            if self.beat_at.is_none() && self.elapsed >= self.next_beat {
+                self.beat_at = Some(self.elapsed);
+                self.pulse.target = 0.0;
             }
-            if let Some(started) = self.blink_at {
-                // Lid closes via spring; hold briefly, then reopen and reschedule.
+            if let Some(started) = self.beat_at {
+                // The spring drops the pulse, holds the systole, then releases
+                // it; the beat is over once it is back up.
                 let since = self.elapsed - started;
-                if self.lid.value() < 0.15 && since > 0.08 {
-                    self.lid.target = 1.0;
+                if self.pulse.value() < 0.15 && since > 0.08 {
+                    self.pulse.target = 1.0;
                 }
-                if self.lid.value() > 0.9 && since > 0.12 {
-                    self.blink_at = None;
-                    self.next_blink = self.elapsed + self.jitter();
+                if self.pulse.value() > 0.9 && since > 0.12 {
+                    self.beat_at = None;
+                    self.next_beat = self.elapsed + BEAT_PERIOD;
                 }
             }
         }
-        self.lid.step(dt);
+        self.pulse.step(dt);
     }
 
     /// Record how the last turn ended so the badge reflects it until the user
@@ -511,40 +720,32 @@ impl Mascot {
     }
 
     /// The user pressed a key: drop any lingering post-turn mood back to the
-    /// blinking [`Mood::Idle`] baseline. Idempotent (a no-op once already idle).
+    /// idle [`Mood::Idle`] baseline. Idempotent (a no-op once already idle).
     pub fn resume_idle(&mut self) {
         self.set_mood(Mood::Idle);
     }
 
-    /// Jittered gap to the next blink: 2.2..4.0s, deterministic per instance.
-    fn jitter(&mut self) -> f64 {
-        // Numerical-Recipes LCG on `u32`; the u32 -> f64 map is exact, so the
-        // fraction carries no precision loss.
-        self.rng = self.rng.wrapping_mul(1_664_525).wrapping_add(1);
-        let unit = f64::from(self.rng) / f64::from(u32::MAX);
-        2.2 + unit * 1.8
-    }
-
-    /// Whether the eyes are currently shut (blink in progress).
+    /// Whether the figure is mid-systole: the resting rhythm squeezing the pulse
+    /// spring down. A beat is the only thing that changes the badge, so this is
+    /// the badge's single animation gate.
     #[must_use]
-    fn eyes_closed(&self) -> bool {
-        self.mood.blinks() && self.lid.value() < 0.5
+    fn contracted(&self) -> bool {
+        self.mood.beats() && self.pulse.value() < 0.5
     }
 
-    /// The mood-resolved palette: a porcelain shell washed toward white with
-    /// the mood hue, its darker shade, ink eyes, and the theme's spark hue.
+    /// The mood-resolved palette: the mood hue washed toward white for the
+    /// contour, darkened for the body, and the theme's emphasis hue carrying the
+    /// signal.
     fn palette(&self, theme: &Theme) -> Palette {
         let base = col_from(match self.mood {
             Mood::Done => theme.success(),
             Mood::Error => theme.error(),
             _ => theme.accent(),
         });
-        let shell = base.mix(Col::WHITE, 0.62);
         Palette {
-            shade: shell.scale(0.82),
-            ink: Col::SOCKET,
-            glow: col_from(theme.emphasis()),
-            shell,
+            shell: base.mix(Col::WHITE, 0.42),
+            shade: base.scale(0.62).mix(Col::WHITE, 0.12),
+            glow: col_from(theme.emphasis()).mix(Col::WHITE, 0.28),
         }
     }
 
@@ -558,10 +759,15 @@ impl Mascot {
         }
     }
 
-    /// Render the banner head as half-block truecolor cells: a floating
-    /// porcelain egg with two ink eyes and an orbiting spark. Flat vertical
-    /// gradient only — radial shading read as banding at this size, which is
-    /// what made the old lit dome look like a striped bee.
+    /// Render the banner head as half-block truecolor cells: a filled heart with
+    /// a heartbeat trace across it.
+    ///
+    /// The painting order is body, then trace, then contour. The contour is the
+    /// mask's boundary layer, so drawing it last keeps the outline unbroken
+    /// wherever the trace crosses it, and the whole figure stays readable as one
+    /// silhouette. Every tone is a single flat colour scaled by the pulse; a
+    /// vertical gradient across the fill would quantise into horizontal stripes
+    /// over these ten cell rows, which is what made the old egg read as a bee.
     #[must_use]
     #[allow(
         clippy::cast_possible_truncation,
@@ -572,172 +778,64 @@ impl Mascot {
         let pal = self.palette(theme);
         let breath = (self.elapsed / 2.6 * std::f64::consts::PI).sin();
         let bob = (self.elapsed / 3.3 * std::f64::consts::PI).sin();
+        let alive = self.pulse.value().clamp(0.0, 1.0);
+        let cx = HEART_CX;
+        let cy = HEART_CY + bob * 0.5;
+        // Waking up grows the heart into place; breathing swells it. The swell is
+        // vertical-only, since a horizontal wobble reads as jitter.
+        let scale = (0.9 + 0.1 * alive) / (1.0 + 0.02 * breath);
+        let inside = heart_mask(&heart_outline(), cx, cy, scale);
+        let is_in = |x: i64, y: i64| -> bool {
+            x >= 0
+                && y >= 0
+                && (x as usize) < HEAD_W
+                && (y as usize) < HEAD_H
+                && inside[y as usize * HEAD_W + x as usize]
+        };
+        // The contour is the boundary layer of the mask: inside, with at least
+        // one four-neighbour outside. Deriving it from the mask keeps the stroke
+        // closed everywhere, which sampling the curve would not guarantee.
+        let rim = |x: i64, y: i64| -> bool {
+            is_in(x, y)
+                && !(is_in(x - 1, y) && is_in(x + 1, y) && is_in(x, y - 1) && is_in(x, y + 1))
+        };
         let mut buf = HalfBuf::new(HEAD_W, HEAD_H);
-        let cx = f64::from((HEAD_W - 1) as u32) / 2.0;
-        let cy = HEAD_H as f64 * 0.58 + bob * 0.7;
-        // Egg ratio (rx < 1.3 * ry) and a low centre leave generous negative
-        // space above the head for the orbiting spark.
-        let rx = 7.6;
-        let ry = 6.5 * (1.0 + 0.02 * breath);
-
-        // Porcelain shell: a calm top-to-bottom gradient plus a barely-there
-        // soft rim at the silhouette edge. Nothing else — no dome shading, no
-        // specular term, no stripes.
-        for y in 0..HEAD_H {
-            for x in 0..HEAD_W {
-                let nx = (x as f64 - cx) / rx;
-                let ny = (y as f64 - cy) / ry;
-                let e = nx * nx + ny * ny;
-                if e > 1.0 {
-                    continue;
+        let lit = 0.3 + 0.7 * alive;
+        for y in 0..HEAD_H as i64 {
+            for x in 0..HEAD_W as i64 {
+                if is_in(x, y) && !rim(x, y) {
+                    buf.set_i(x, y, pal.shade.scale(lit));
                 }
-                let t = ((y as f64 - (cy - ry)) / (2.0 * ry)).clamp(0.0, 1.0);
-                let mut c = pal.shell.mix(pal.shade, t * 0.8);
-                if e > 0.88 {
-                    c = c.mix(pal.shade, ((e - 0.88) / 0.12).clamp(0.0, 1.0) * 0.5);
-                }
-                buf.set(x, y, c);
             }
         }
-
-        self.paint_spark(&mut buf, &pal, cx, cy, ry);
-        self.paint_eyes(&mut buf, &pal, cx, cy);
-        self.paint_mouth(&mut buf, &pal, cx, cy);
+        paint_trace(&mut buf, &pal, self.mood, self.elapsed, cy, alive, &is_in);
+        for y in 0..HEAD_H as i64 {
+            for x in 0..HEAD_W as i64 {
+                if rim(x, y) {
+                    buf.set_i(x, y, pal.shell.scale(lit));
+                }
+            }
+        }
         buf.encode()
     }
 
-    /// A spark of theme emphasis orbiting above the head: one bright core in a
-    /// four-point halo, drifting on slow sines. This is the character's "alive"
-    /// accent — it replaced the antenna, which read as clutter.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-    fn paint_spark(&self, buf: &mut HalfBuf, pal: &Palette, cx: f64, cy: f64, ry: f64) {
-        let t = self.elapsed;
-        let sx = cx + (t / 1.9).sin() * 6.2;
-        let sy = cy - ry - 2.4 + (t / 2.9).sin() * 0.9;
-        buf.set_f(sx, sy, pal.glow);
-        buf.set_f(sx - 1.0, sy, pal.glow.scale(0.55));
-        buf.set_f(sx + 1.0, sy, pal.glow.scale(0.55));
-        buf.set_f(sx, sy - 1.0, pal.glow.scale(0.55));
-        buf.set_f(sx, sy + 1.0, pal.glow.scale(0.55));
-    }
-
-    /// Both eyes with the mood's shape: large ink ovals with a single glint,
-    /// scaled by blink openness and nudged by look-around (idle), an up-left
-    /// gaze (thinking), or a fast scan (busy).
-    #[allow(clippy::cast_precision_loss)]
-    fn paint_eyes(&self, buf: &mut HalfBuf, pal: &Palette, cx: f64, cy: f64) {
-        let openness = if self.mood.blinks() {
-            self.lid.value().clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
-        let (mut dx, mut dy) = match self.mood {
-            Mood::Busy => ((self.elapsed * 1.6).sin() * 1.5, 0.0),
-            Mood::Thinking => (-0.7, -0.6),
-            _ => ((self.elapsed * 0.5).sin() * 0.5, 0.0),
-        };
-        if openness < 0.3 {
-            // Lids: shut eyes become short horizontal lines pressed onto the
-            // shell, so a blink reads as a calm close, not a vanish.
-            dx = 0.0;
-            dy = 0.0;
-        }
-        let ecy = cy - 0.6 + dy;
-        for sign in [-1.0, 1.0] {
-            let ecx = cx + sign * 3.1 + dx;
-            match self.mood {
-                Mood::Error => {
-                    for i in -2..=2 {
-                        let d = f64::from(i);
-                        buf.set_f(ecx + d, ecy + d, pal.ink);
-                        buf.set_f(ecx + d, ecy - d, pal.ink);
-                    }
-                }
-                Mood::Done => {
-                    for i in -2..=2 {
-                        let d = f64::from(i);
-                        buf.set_f(
-                            ecx + d,
-                            ecy + 0.9 - (1.0 - (d / 2.0).powi(2)) * 1.7,
-                            pal.ink,
-                        );
-                    }
-                }
-                _ if openness < 0.3 => {
-                    for i in -2..=2 {
-                        buf.set_f(ecx + f64::from(i), ecy, pal.shade.mix(pal.ink, 0.55));
-                    }
-                }
-                _ => {
-                    let ery = 2.6 * (0.25 + 0.75 * openness);
-                    fill_ellipse(buf, ecx, ecy, 1.6, ery, pal.ink);
-                    buf.set_f(ecx - 0.6, ecy - ery * 0.45, Col::WHITE);
-                }
-            }
-        }
-    }
-
-    /// The mouth, only when a mood truly needs one. Idle and thinking are
-    /// mouthless (the grok-bot minimalism — the eyes carry the expression);
-    /// done/error earn a small arc.
-    #[allow(clippy::cast_precision_loss)]
-    fn paint_mouth(&self, buf: &mut HalfBuf, pal: &Palette, cx: f64, cy: f64) {
-        let my = cy + 3.4;
-        let ink = pal.shade.mix(pal.ink, 0.7);
-        match self.mood {
-            Mood::Error => {
-                for i in -1..=1 {
-                    let d = f64::from(i);
-                    buf.set_f(cx + d, my + 1.0 - d * d * 0.9, ink);
-                }
-            }
-            Mood::Done => {
-                for i in -1..=1 {
-                    let d = f64::from(i);
-                    buf.set_f(cx + d, my - 0.4 + d * d * 0.9, ink);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Render the inline badge as two braille rows: a tiny rounded face whose
-    /// eyes blink and follow the mood. Braille (not half-block) is used here
-    /// because the 2x4 sub-cell keeps the eyes legible at only a few cells wide.
+    /// Render the inline badge as two braille rows: the same heart as the banner,
+    /// filled, squeezed for the length of each systole. Braille (not half-block)
+    /// is used here because the 2x4 sub-cell is the only packing that keeps a
+    /// silhouette legible at five cells wide.
     #[must_use]
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss
-    )] // float art -> braille dot grid
     pub fn badge(&self) -> Vec<String> {
-        let mut cv = Braille::new(BADGE_W, BADGE_H);
-        let cx = (BADGE_W - 1) as f64 / 2.0;
-        let cy = (BADGE_H - 1) as f64 / 2.0;
-        let rx = f64::from(BADGE_W as u32) / 2.0 - 0.6;
-        let ry = f64::from(BADGE_H as u32) / 2.0 - 0.4;
-        for y in 0..BADGE_H {
-            for x in 0..BADGE_W {
-                let nx = (x as f64 - cx) / rx;
-                let ny = (y as f64 - cy) / ry;
-                let e = nx * nx + ny * ny;
-                cv.set(x, y, (0.55..=1.05).contains(&e)); // head ring
-            }
-        }
-        // Eyes: two verticals, or a shut line during a blink.
-        if self.eyes_closed() {
-            for x in [2usize, 3, 6, 7] {
-                cv.set(x, 4, true);
-            }
+        let art = if self.contracted() {
+            BADGE_SQUEEZE
         } else {
-            for x in [3usize, 6] {
-                cv.set(x, 3, true);
-                cv.set(x, 4, true);
+            BADGE_HEART
+        };
+        let mut cv = Braille::new(BADGE_W, BADGE_H);
+        for (y, row) in art.iter().enumerate() {
+            for (x, dot) in row.chars().enumerate() {
+                cv.set(x, y, dot == '#');
             }
         }
-        // A small smile.
-        cv.set(4, 6, true);
-        cv.set(5, 6, true);
         cv.render()
     }
 
@@ -778,7 +876,7 @@ fn write_cells<W: Write>(out: &mut W, cells: &[Vec<Cell>], color: bool) -> io::R
 }
 
 /// Draw the startup banner head. On an interactive terminal it plays a short
-/// "waking up" animation (eyes spring open over ~1s of breathing/bobbing) by
+/// "waking up" animation (the pulse springs up over ~1s of breathing/bobbing) by
 /// redrawing the head in place; otherwise it emits one static frame. Leaves the
 /// cursor on the line just below the head.
 #[allow(clippy::cast_possible_truncation)]
@@ -972,13 +1070,13 @@ mod tests {
     }
 
     #[test]
-    fn booting_eyes_spring_open() {
+    fn booting_starts_contracted_and_springs_open() {
         let mut m = Mascot::booting();
-        assert!(m.eyes_closed(), "boots with eyes shut");
+        assert!(m.contracted(), "boots with the pulse down");
         for _ in 0..40 {
             m.advance(0.06);
         }
-        assert!(!m.eyes_closed(), "eyes open after the spring settles");
+        assert!(!m.contracted(), "pulse up after the spring settles");
     }
 
     #[test]
@@ -996,34 +1094,34 @@ mod tests {
     }
 
     #[test]
-    fn idle_blinks_over_time_and_recovers() {
+    fn idle_beats_over_time_and_recovers() {
         let mut m = Mascot::new(); // Idle
-        let mut saw_closed = false;
-        let mut saw_open_again = false;
-        for _ in 0..600 {
-            m.advance(0.1);
-            if m.eyes_closed() {
-                saw_closed = true;
-            } else if saw_closed {
-                saw_open_again = true;
+        let mut saw_contracted = false;
+        let mut saw_recovered = false;
+        for _ in 0..750 {
+            m.advance(0.08);
+            if m.contracted() {
+                saw_contracted = true;
+            } else if saw_contracted {
+                saw_recovered = true;
             }
         }
-        assert!(saw_closed, "idle mascot should blink at least once in 60s");
-        assert!(saw_open_again, "eyes should reopen after a blink");
+        assert!(saw_contracted, "idle mascot should beat within 60s");
+        assert!(saw_recovered, "pulse should come back up after a beat");
     }
 
     #[test]
-    fn busy_mood_holds_eyes_open_no_blink() {
+    fn busy_mood_holds_a_steady_pulse() {
         let mut m = Mascot::new();
         m.set_mood(Mood::Busy);
-        for _ in 0..600 {
-            m.advance(0.1);
-            assert!(!m.eyes_closed(), "busy eyes must not blink");
+        for _ in 0..750 {
+            m.advance(0.08);
+            assert!(!m.contracted(), "busy pulse must not contract");
         }
     }
 
     #[test]
-    fn badge_is_two_braille_rows_and_blinks() {
+    fn badge_is_two_braille_rows_and_beats() {
         let mut m = Mascot::new();
         let open = m.badge();
         assert_eq!(open.len(), BADGE_H / CELL_ROWS, "badge row count");
@@ -1031,25 +1129,21 @@ mod tests {
             assert_eq!(row.chars().count(), BADGE_W / CELL_COLS, "badge width");
             for ch in row.chars() {
                 assert!(
-                    ch == ' ' || ('\u{2800}'..'\u{28FF}').contains(&ch),
+                    ch == ' ' || ('\u{2800}'..='\u{28FF}').contains(&ch),
                     "non-braille glyph {ch:?}"
                 );
             }
         }
-        // Force a blink frame and confirm the face actually changes.
-        let mut closed_seen = None;
-        for _ in 0..600 {
-            m.advance(0.1);
-            if m.eyes_closed() {
-                closed_seen = Some(m.badge());
+        // Force a systole frame and confirm the figure actually changes.
+        let mut squeezed = None;
+        for _ in 0..750 {
+            m.advance(0.08);
+            if m.contracted() {
+                squeezed = Some(m.badge());
                 break;
             }
         }
-        assert_ne!(
-            open,
-            closed_seen.expect("idle badge should blink"),
-            "blink changes badge"
-        );
+        assert_ne!(open, squeezed.expect("idle badge should beat"), "beat");
     }
 
     #[test]

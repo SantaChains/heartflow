@@ -166,17 +166,27 @@ fn redact_message(message: &ConversationMessage, literals: &[String]) -> Convers
 pub fn redact_session(session: &Session, literals: &[String]) -> Session {
     Session {
         version: session.version,
-        messages: session
-            .messages
-            .iter()
-            .map(|message| redact_message(message, literals))
-            .collect(),
+        messages: redact_messages(&session.messages, literals),
     }
+}
+
+/// Incremental half of [`redact_session`]: scrub an arbitrary slice of messages,
+/// so a save path that already redacted a prefix can extend it without
+/// re-scanning the whole transcript every turn.
+#[must_use]
+pub fn redact_messages(
+    messages: &[ConversationMessage],
+    literals: &[String],
+) -> Vec<ConversationMessage> {
+    messages
+        .iter()
+        .map(|message| redact_message(message, literals))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{redact_session, redact_text, REDACTED};
+    use super::{redact_messages, redact_session, redact_text, REDACTED};
     use crate::session::{ContentBlock, ConversationMessage, Session};
 
     #[test]
@@ -277,6 +287,26 @@ mod tests {
                 assert!(!output.contains("hunter2") && !output.contains(":p@"));
             }
             other => panic!("expected tool_result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redacts_a_slice_incrementally() {
+        let session = Session {
+            version: 1,
+            messages: vec![
+                ConversationMessage::user_text("plain first turn"),
+                ConversationMessage::user_text("key sk-abcdefghijklmnopqrstuv"),
+            ],
+        };
+        let tail = redact_messages(&session.messages[1..], &[]);
+        assert_eq!(tail.len(), 1);
+        match &tail[0].blocks[0] {
+            ContentBlock::Text { text } => {
+                assert!(text.contains(REDACTED));
+                assert!(!text.contains("abcdefghijklmnop"));
+            }
+            other => panic!("expected text block, got {other:?}"),
         }
     }
 
