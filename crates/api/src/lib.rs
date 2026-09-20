@@ -12,7 +12,8 @@ pub use openai::{
     Balance, BalanceInfo, ChatChoice, ChatChunk, ChatChunkChoice, ChatContent, ChatContentPart,
     ChatDelta, ChatDeltaFunction, ChatDeltaToolCall, ChatFunctionCall, ChatImageUrl, ChatMessage,
     ChatRequest, ChatResponse, ChatRole, ChatStream, ChatTool, ChatToolCall, ChatToolCallType,
-    ChatToolChoice, ChatToolSpec, ChatUsage, ModelInfo, OpenAiClient, StreamOptions, ThinkingControl,
+    ChatToolChoice, ChatToolSpec, ChatUsage, ModelInfo, OpenAiClient, StreamOptions,
+    ThinkingControl,
 };
 pub use responses::{
     IncompleteDetails, InputTokenDetails, ResponsesClient, ResponsesContent, ResponsesError,

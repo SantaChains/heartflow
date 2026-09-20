@@ -794,7 +794,8 @@ fn responses_input_items(messages: &[ConversationMessage]) -> Vec<serde_json::Va
     for message in messages {
         match message.role {
             MessageRole::System | MessageRole::User => {
-                let content = responses_content_parts(&message.blocks, message.role == MessageRole::User);
+                let content =
+                    responses_content_parts(&message.blocks, message.role == MessageRole::User);
                 if !content.is_empty() {
                     items.push(serde_json::json!({
                         "role": "user",
@@ -904,16 +905,14 @@ async fn drive_responses_stream(
             }
             terminal = Some(match kind.as_str() {
                 "response.completed" => ResponsesTerminal::Completed,
-                "response.failed" => ResponsesTerminal::Failed(
-                    response
-                        .as_ref()
-                        .map_or_else(|| "no error detail".to_string(), ResponsesPayload::failure_reason),
-                ),
-                _ => ResponsesTerminal::Incomplete(
-                    response
-                        .as_ref()
-                        .map_or_else(|| "unknown reason".to_string(), ResponsesPayload::failure_reason),
-                ),
+                "response.failed" => ResponsesTerminal::Failed(response.as_ref().map_or_else(
+                    || "no error detail".to_string(),
+                    ResponsesPayload::failure_reason,
+                )),
+                _ => ResponsesTerminal::Incomplete(response.as_ref().map_or_else(
+                    || "unknown reason".to_string(),
+                    ResponsesPayload::failure_reason,
+                )),
             });
         }
     }
@@ -921,7 +920,9 @@ async fn drive_responses_stream(
     match terminal {
         Some(ResponsesTerminal::Failed(reason)) => {
             let _ = tx
-                .send(AgentEvent::Error(format!("responses request failed: {reason}")))
+                .send(AgentEvent::Error(format!(
+                    "responses request failed: {reason}"
+                )))
                 .await;
             return Ok(());
         }
@@ -1109,7 +1110,10 @@ mod tests {
         let wire = build_chat_request(&request, "deepseek-flash", 8192, true, None);
         assert_eq!(wire.messages.len(), 2);
         assert_eq!(wire.messages[0].role, ChatRole::System);
-        assert_eq!(wire.messages[0].content.as_ref().map(ChatContent::text), Some("be brief".to_string()));
+        assert_eq!(
+            wire.messages[0].content.as_ref().map(ChatContent::text),
+            Some("be brief".to_string())
+        );
         assert_eq!(wire.messages[1].role, ChatRole::User);
         assert_eq!(wire.max_tokens, Some(8192));
         assert_eq!(wire.tools.as_ref().expect("tools").len(), 1);
@@ -1160,7 +1164,10 @@ mod tests {
         assert_eq!(calls[0].function.name, "bash");
         assert_eq!(converted[1].role, ChatRole::Tool);
         assert_eq!(converted[1].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(converted[1].content.as_ref().map(ChatContent::text), Some("ok".to_string()));
+        assert_eq!(
+            converted[1].content.as_ref().map(ChatContent::text),
+            Some("ok".to_string())
+        );
         assert_eq!(
             converted[2].content.as_ref().map(ChatContent::text),
             Some("tool error: boom".to_string())

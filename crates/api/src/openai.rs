@@ -306,12 +306,8 @@ impl ChatContent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChatContentPart {
-    Text {
-        text: String,
-    },
-    ImageUrl {
-        image_url: ChatImageUrl,
-    },
+    Text { text: String },
+    ImageUrl { image_url: ChatImageUrl },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
