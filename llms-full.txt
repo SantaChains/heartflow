@@ -378,7 +378,7 @@ MCP 握手（initialize + tools/list）失败按 200/400ms 退避重试 3 次（
 ## 文档站（web / wiki）
 
 - **引擎**：mdBook（纯 Rust，零 Node，与发布流水线取向一致）。源在 `docs/src/`，目录见 `docs/src/SUMMARY.md`，输出到 `docs/book/`（已 gitignore）。
-- **本地预览**：`cargo install mdbook && mdbook serve -p 3000 --open -d docs`。
+- **本地预览**：`cargo install mdbook && mdbook serve docs -p 3000 --open`（mdBook 0.5+；book 根为 `docs`，输出默认 `docs/book`）。
 - **部署（当前暂未启用）**：Pages 工作流以 `.github/workflows/docs.yml.bak` 形式暂存（与仓库 `ci.yml.bak` 约定一致，GitHub 不识别 `.bak` 故不触发）。启用三步：① 改回 `docs.yml`；② 仓库 Settings → Pages → Source 选 "GitHub Actions"；③ 如需自定义域名，把 `docs/book.toml` 的 `site-url` 改 `/` 并填 `cname`。项目页默认子路径为 `/heartflow/`。
 
 ## API 文档（rustdoc）

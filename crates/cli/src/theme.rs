@@ -63,10 +63,11 @@ impl Rgb {
 
 /// The coordinated semantic palette plus the fixed glyph/layout tokens.
 ///
-/// Hues follow the "Tokyo Night" family: a cohesive cool set (soft blue accent,
-/// teal headings, muted lavender/amber emphasis) chosen for low eye strain on a
-/// dark terminal while keeping every role visually distinct. Body text is left
-/// uncolored so it inherits the user's own terminal foreground.
+/// Hues follow a "Kurosawa" family drawn from Akira Kurosawa's films (Ran,
+/// Kagemusha, Dreams): lacquer-warm neutrals carrying vermilion, crest gold,
+/// jade, indigo-teal and twilight lavender — a cohesive, high-contrast set tuned
+/// for legibility on a dark terminal while keeping every role distinct. Body text
+/// is left uncolored so it inherits the user's own terminal foreground.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     heading: Rgb,
@@ -83,19 +84,19 @@ pub struct Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        // Tokyo Night derived (RGB). Kept as literals so both backends receive
+        // Kurosawa-derived (RGB). Kept as literals so both backends receive
         // byte-identical hues; see the module note on why one palette matters.
         Self {
-            heading: Rgb::new(42, 195, 222),      // cyan
-            emphasis: Rgb::new(187, 154, 247),    // lavender
-            strong: Rgb::new(224, 175, 104),      // amber
-            inline_code: Rgb::new(158, 206, 106), // green
-            link: Rgb::new(122, 162, 247),        // blue
-            quote: Rgb::new(86, 95, 137),         // slate
-            accent: Rgb::new(122, 162, 247),      // blue (prompt, spinner, focus)
-            muted: Rgb::new(120, 130, 160),       // dimmed slate (deltas, secondary)
-            success: Rgb::new(158, 206, 106),     // green
-            error: Rgb::new(247, 118, 142),       // rose
+            heading: Rgb::new(201, 91, 63),       // terracotta-vermilion (Ran)
+            emphasis: Rgb::new(176, 150, 196),    // twilight lavender (Dreams)
+            strong: Rgb::new(227, 179, 65),       // crest gold (Kagemusha)
+            inline_code: Rgb::new(143, 181, 122), // jade (Rashomon forest)
+            link: Rgb::new(111, 168, 199),        // indigo-teal (Taketora dusk)
+            quote: Rgb::new(154, 139, 114),       // faded parchment
+            accent: Rgb::new(227, 179, 65),       // crest gold (prompt, spinner, focus)
+            muted: Rgb::new(122, 108, 88),        // warm dim (deltas, secondary)
+            success: Rgb::new(143, 181, 122),     // jade
+            error: Rgb::new(214, 90, 90),         // alarm red
         }
     }
 }

@@ -407,6 +407,13 @@ fn resolve_spec(
 }
 
 fn materialize(spec: ProviderSpec) -> Result<ProviderSelection, String> {
+    // Credential-sourcing policy (guardrail): a key may originate from exactly
+    // two places and nowhere else -- (1) the environment variable *named* by
+    // `api_key_env` (the name, never the value, is what config files store and
+    // export), or (2) an inline `[provider] api_key` in a local config file.
+    // hf never scans keychains, browser stores, other tools' dotfiles, or shell
+    // history, and `to_toml_string` emits neither source's value. Env wins when
+    // it holds a non-empty value; the inline key is only the on-disk fallback.
     match spec {
         ProviderSpec::Env { model } => Ok(ProviderSelection::Env { model }),
         ProviderSpec::Resolved {
@@ -1032,6 +1039,23 @@ mod tests {
             }
             other @ ProviderSelection::Env { .. } => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn blank_inline_key_is_never_treated_as_a_credential() {
+        // A whitespace-only inline key must not masquerade as a source: it is
+        // filtered out, leaving no env name and no value, so resolution fails
+        // rather than silently shipping an empty credential to the provider.
+        let error = resolve_spec(
+            Some("custom"),
+            Some("m"),
+            &settings("[provider]\nbase_url = \"http://localhost:8000\"\napi_key = \"   \"\n"),
+        )
+        .expect_err("blank inline key is not a usable credential source");
+        assert!(
+            error.contains("api_key_env missing"),
+            "expected the missing-key guard to fire: {error}"
+        );
     }
 
     #[test]

@@ -23,8 +23,8 @@ use crossterm::style::Stylize;
 use inquire::{Confirm, MultiSelect, Select, Text};
 use mcp::{HttpTransport, McpClient, McpTool, StdioTransport, Transport};
 use runtime::{
-    execute_bash, is_dangerous_command, load_system_prompt, normalize_tool_schema, should_compact,
-    truncate_chars, AgentEvent, BashCommandInput, CompactionConfig, ContentBlock,
+    execute_bash, is_dangerous_command, load_system_prompt, normalize_tool_schema, redact_session,
+    should_compact, truncate_chars, AgentEvent, BashCommandInput, CompactionConfig, ContentBlock,
     ConversationMessage, ConversationRuntime, MessageRole, PermissionMode, PermissionPolicy,
     PermissionPromptDecision, PermissionPrompter, PermissionRequest, Session, TokenUsage,
     ToolError, ToolExecutor, ToolSpec,
@@ -1195,17 +1195,49 @@ fn unix_millis() -> u128 {
 fn save_session(session: &Session) -> io::Result<PathBuf> {
     let dir = sessions_dir();
     fs::create_dir_all(&dir)?;
+    // Never persist a live credential: scrub the transcript that reaches disk
+    // (both the authoritative JSON and the SQLite mirror) on a clone, so the
+    // in-memory session that talks to the provider is left verbatim.
+    let secrets = registered_secrets();
+    let redacted = redact_session(session, &secrets);
     // One file per conversation, keyed by the stable id (see current_session_id):
     // each turn overwrites it via the atomic temp+rename in `save_to_path`, so a
     // crash keeps the last complete snapshot rather than a truncated tail.
     let path = dir.join(format!("{}.json", current_session_id()));
-    session
+    redacted
         .save_to_path(&path)
         .map_err(|error| io::Error::other(error.to_string()))?;
     // Best-effort mirror into the searchable store; the JSON file stays
     // authoritative, so a store failure must never fail the save.
-    mirror_to_store(&path, session);
+    mirror_to_store(&path, &redacted);
     Ok(path)
+}
+
+/// Credential literals learned this run (the resolved API key / auth token).
+/// Registered when a runtime is built and replayed against every saved
+/// transcript so a key that matches no structural redaction pattern is still
+/// scrubbed before it reaches disk. De-duplicated; a redeployed provider just
+/// re-registers its (identical) value.
+static SECRETS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn register_secret(value: &str) {
+    let value = value.trim();
+    // Mirrors redact_text's floor: a shorter string is ordinary text.
+    if value.len() < 4 {
+        return;
+    }
+    if let Ok(mut guard) = SECRETS.lock() {
+        if !guard.iter().any(|existing| existing == value) {
+            guard.push(value.to_string());
+        }
+    }
+}
+
+fn registered_secrets() -> Vec<String> {
+    SECRETS
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default()
 }
 
 /// Process-lifetime read-write handle to the history store, opened on the first
@@ -1427,9 +1459,7 @@ async fn run_repl(
     // empty until P4-c wires keyboard polling; the injection point below is
     // already the final one.
     let mut model = HeartModel::new();
-    for line in mascot::Mascot::new().render() {
-        println!("{line}");
-    }
+    mascot::draw_banner(theme::Theme::current(), &mut io::stdout())?;
     println!("heartflow interactive mode");
     println!(
         "Input: Enter sends, Alt/Shift+Enter newline, Up/Down history, Tab completes / commands."
@@ -1450,9 +1480,13 @@ async fn run_repl(
             };
             model.end_turn();
             match delivery {
-                Ok(_) => maybe_auto_compact(&mut runtime),
+                Ok(outcome) => {
+                    maybe_auto_compact(&mut runtime);
+                    editor.note_turn(outcome.ok);
+                }
                 Err(error) => {
                     println!("queued delivery failed: {error}");
+                    editor.note_turn(false);
                     let _ = model.enqueue(&injection);
                 }
             }
@@ -1555,10 +1589,14 @@ async fn run_repl(
                     if !model.enqueue(trimmed) {
                         println!("follow-up queue is full; /queue to inspect");
                     }
-                } else if planning {
-                    run_turn_interactive(&mut runtime, trimmed, Some(&mut BlockPrompter)).await?;
                 } else {
-                    run_turn_interactive(&mut runtime, trimmed, Some(&mut prompter)).await?;
+                    let outcome = if planning {
+                        run_turn_interactive(&mut runtime, trimmed, Some(&mut BlockPrompter))
+                            .await?
+                    } else {
+                        run_turn_interactive(&mut runtime, trimmed, Some(&mut prompter)).await?
+                    };
+                    editor.note_turn(outcome.ok);
                 }
                 maybe_auto_compact(&mut runtime);
             }
@@ -1911,20 +1949,42 @@ fn resolve_context_window(selection: &ProviderSelection) -> usize {
     env_context_window().or_else(from_profile).unwrap_or(0)
 }
 
-/// The shared compaction policy: `preserve_recent_messages` recent turns are
-/// kept verbatim, and the trigger is half of `context_window_tokens` (a zero
-/// window falls back to the absolute threshold).
-fn compaction_config(context_window_tokens: usize) -> CompactionConfig {
+/// Provider-keyed compaction tuning: how many recent messages stay verbatim
+/// and how deep the verbatim tool-result replay tail reaches. Anthropic keeps
+/// a longer verbatim prefix because its prompt cache is billed on an exact
+/// message prefix — collapsing fewer recent turns maximises cache hits — while
+/// the stateless OpenAI/DeepSeek dialects keep a shorter window at no cache cost
+/// (mirrors the per-provider compaction handlers in mature agent runtimes).
+#[must_use]
+fn compaction_profile(protocol: Option<ProviderProtocol>) -> (usize, usize) {
+    match protocol {
+        Some(ProviderProtocol::Anthropic) => (8, 16),
+        Some(ProviderProtocol::OpenAi | ProviderProtocol::OpenAiResponses) | None => (6, 12),
+    }
+}
+
+/// The shared compaction policy for one provider: `preserve_recent_messages`
+/// recent turns are kept verbatim, and the trigger is half of
+/// `context_window_tokens` (a zero window falls back to the absolute
+/// threshold). The window comes from the resolved profile (env override wins);
+/// the preserve/replay counts come from the provider's compaction profile.
+fn compaction_config(selection: &ProviderSelection) -> CompactionConfig {
+    let context_window = resolve_context_window(selection);
+    let protocol = match selection {
+        ProviderSelection::Env { .. } => None,
+        ProviderSelection::Profile(profile) => Some(profile.protocol),
+    };
+    let (preserve_recent_messages, default_replay_tail) = compaction_profile(protocol);
     let replay_verbatim_tail = env::var("HEARTFLOW_REPLAY_VERBATIM_TAIL")
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         // 0 would stub even the tool result the model just produced; treat it as
-        // unset and keep the default.
+        // unset and keep the provider default.
         .filter(|n| *n > 0)
-        .unwrap_or(12);
+        .unwrap_or(default_replay_tail);
     CompactionConfig {
-        preserve_recent_messages: 6,
-        context_window_tokens,
+        preserve_recent_messages,
+        context_window_tokens: context_window,
         replay_verbatim_tail,
         ..CompactionConfig::default()
     }
@@ -2755,7 +2815,22 @@ fn build_runtime(
     let (os_name, os_version) = os_platform();
     let system_prompt =
         load_system_prompt(cwd.clone(), home_dir(), current_date(), os_name, os_version)?;
-    let context_window = resolve_context_window(&selection);
+    let compaction = compaction_config(&selection);
+    // Remember the concrete credential values so redaction can scrub them from
+    // disk even when they match no structural secret pattern.
+    match &selection {
+        ProviderSelection::Env { .. } => {
+            if let Ok(key) = env::var("ANTHROPIC_API_KEY") {
+                register_secret(&key);
+            }
+        }
+        ProviderSelection::Profile(profile) => {
+            register_secret(&profile.api_key);
+            if let Some(token) = &profile.auth_token {
+                register_secret(token);
+            }
+        }
+    }
     let client = match selection {
         ProviderSelection::Env { model } => {
             TransportClient::Anthropic(AnthropicStreamClient::from_env(model, true)?)
@@ -2773,7 +2848,7 @@ fn build_runtime(
         permission_policy_for_mode(mode, &mcp_read_only),
         system_prompt,
     )
-    .with_compaction(compaction_config(context_window)))
+    .with_compaction(compaction))
 }
 
 /// Terminal-backed permission prompt. `allow_all` latches for the rest of
@@ -3985,6 +4060,43 @@ mod tests {
         assert!(
             !tracker(5, true).can_append(8),
             "forced rewrite wins over growth"
+        );
+    }
+
+    #[test]
+    fn anthropic_keeps_a_longer_verbatim_compaction_window() {
+        use super::{compaction_profile, ProviderProtocol};
+        let anthropic = compaction_profile(Some(ProviderProtocol::Anthropic));
+        let openai = compaction_profile(Some(ProviderProtocol::OpenAi));
+        let responses = compaction_profile(Some(ProviderProtocol::OpenAiResponses));
+        let env = compaction_profile(None);
+        assert!(
+            anthropic.0 > openai.0 && anthropic.1 > openai.1,
+            "anthropic preserves more recent + deeper replay tail"
+        );
+        // Stateless dialects and env mode share the shorter default profile.
+        assert_eq!(openai, responses);
+        assert_eq!(openai, env);
+    }
+
+    #[test]
+    fn secret_registry_dedups_and_ignores_short_values() {
+        use super::{register_secret, registered_secrets};
+        let before = registered_secrets();
+        // A <4-char value is ordinary text and must never be registered.
+        register_secret("ab");
+        assert_eq!(registered_secrets().len(), before.len());
+        // Repeated registration of the same credential collapses to one entry.
+        register_secret("sk-supersecret-value-xyz");
+        register_secret("sk-supersecret-value-xyz");
+        let after = registered_secrets();
+        assert_eq!(
+            after
+                .iter()
+                .filter(|value| *value == "sk-supersecret-value-xyz")
+                .count(),
+            1,
+            "credential literals are de-duplicated"
         );
     }
 

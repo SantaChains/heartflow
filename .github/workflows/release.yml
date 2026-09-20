@@ -3,8 +3,9 @@ name: Release
 # heartflow 自动发布,三段式:plan(dry) → publish → windows-zip(便携包,随每次发布)
 #   - 零 Node:版本计算/CHANGELOG/Release 全部走 scripts/release.sh + git-cliff,本地可先行验证省 Actions
 #   - 语义:feat→minor、fix→patch、!/BREAKING CHANGE→major;chore 等 push 在 plan 秒级短路
-#   - Windows amd64 便携 zip(hf.exe 置于压缩包根 + sha256)上传到 Release;bucket manifest
-#     由 windows-zip job 直接写真实 version/url/hash(CI 单一写入者,无外部 autoupdate 机器人)
+#   - Windows amd64 便携 zip(hf.exe 置于压缩包根 + sha256)上传到 Release;附 SHA256SUMS 清单,
+#     并用 actions/attest-build-provenance 签发 SLSA/in-toto 构建溯源(id-token: write)
+#   - bucket manifest 由 windows-zip job 直接写真实 version/url/hash(CI 单一写入者,无外部 autoupdate 机器人)
 #   - 代码质量门由 ci.yml 独立负责,本流水线不做 fmt/clippy/test
 #   - 本地预检:bash scripts/release.sh plan;RELEASE_DRY_RUN=1 bash scripts/release.sh publish
 
@@ -70,6 +71,9 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: write
+      # attest-build-provenance mints an in-toto/SLSA provenance statement and
+      # needs to sign it with the workflow's OIDC token.
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -102,6 +106,26 @@ jobs:
           $v = ("${{ needs.plan.outputs.tag }}" -replace "^v", "")
           $name = "heartflow-$v-win-amd64.zip"
           gh release upload "${{ needs.plan.outputs.tag }}" $name "$name.sha256" --clobber
+      - name: publish SHA256SUMS manifest + SLSA build provenance
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $v = ("${{ needs.plan.outputs.tag }}" -replace "^v", "")
+          $name = "heartflow-$v-win-amd64.zip"
+          # Tooling-consumable checksum manifest (`sha256sum` format), attached to
+          # the release so verifiers get one canonical file for every asset.
+          (Get-FileHash $name -Algorithm SHA256).Hash.ToLowerInvariant() + "  $name" |
+            Set-Content SHA256SUMS.txt -Encoding ascii
+          gh release upload "${{ needs.plan.outputs.tag }}" SHA256SUMS.txt --clobber
+      - name: attest build provenance (SLSA/in-toto)
+        # Binds hf.exe to this repo + commit + runner via an OIDC-signed
+        # provenance statement, so consumers can verify the binary was built by
+        # this pipeline rather than merely that its hash matches the manifest.
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: heartflow-*-win-amd64.zip
       - name: update bucket manifest (version + url + hash)
         shell: pwsh
         run: |

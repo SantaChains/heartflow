@@ -290,6 +290,10 @@ enum Exit {
 pub struct ReplEditor {
     history_path: PathBuf,
     history: History,
+    /// The companion. Owned here (not per-line) so it survives across turns and
+    /// remembers the last outcome; the REPL reports each turn via
+    /// [`ReplEditor::note_turn`] and the badge reverts to idle on the next key.
+    mascot: Mascot,
 }
 
 impl ReplEditor {
@@ -300,7 +304,16 @@ impl ReplEditor {
         Self {
             history_path: history_path.to_path_buf(),
             history: History::load(history_path),
+            mascot: Mascot::new(),
         }
+    }
+
+    /// Report the just-finished turn's outcome to the companion: `ok` picks the
+    /// Done (success) vs Error badge, shown until the user types again. This is
+    /// the only event->mood seam the REPL loop touches; how each mood *looks*
+    /// is entirely [`crate::mascot`]'s concern.
+    pub fn note_turn(&mut self, ok: bool) {
+        self.mascot.note_turn(ok);
     }
 
     /// Read one REPL line. `Ok(None)` means quit (Ctrl+D on an empty line);
@@ -375,7 +388,6 @@ impl ReplEditor {
         completion_idx: &mut Option<usize>,
         exit: &mut Exit,
     ) -> io::Result<()> {
-        let mut mascot = Mascot::new();
         loop {
             let text = textarea.lines().join("\n");
             let prefix = current_token_prefix(&text);
@@ -401,7 +413,7 @@ impl ReplEditor {
                     area,
                     textarea,
                     &hint,
-                    &mascot,
+                    &self.mascot,
                     completions,
                     *completion_idx,
                 )
@@ -411,13 +423,16 @@ impl ReplEditor {
             // user is idle; on timeout we advance the animation and redraw
             // (ratatui diffs, so an unchanged frame emits nothing).
             if !event::poll(MASCOT_TICK)? {
-                mascot.advance(MASCOT_TICK.as_secs_f64());
+                self.mascot.advance(MASCOT_TICK.as_secs_f64());
                 continue;
             }
             let key = match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => key,
                 _ => continue,
             };
+            // Any key means the user is engaging again: clear the lingering
+            // Done/Error badge so the companion returns to its idle baseline.
+            self.mascot.resume_idle();
             if self.handle_key(key, textarea, completions, completion_idx, status, exit) {
                 return Ok(());
             }
@@ -567,9 +582,11 @@ fn draw_frame(
     // The mascot owns a few columns at the right of the input row; hide it on
     // narrow terminals rather than crowd the prompt, and never let it eat the
     // whole line (cap the reserve against the available input width).
-    let badge = mascot.badge();
-    let badge_width = u16::try_from(badge.chars().count()).unwrap_or(0);
-    let show_mascot = size.width >= MASCOT_MIN_WIDTH;
+    let badge_rows = mascot.badge();
+    let badge_width = badge_rows
+        .first()
+        .map_or(0, |r| u16::try_from(r.chars().count()).unwrap_or(0));
+    let show_mascot = size.width >= MASCOT_MIN_WIDTH && badge_width > 0;
     let reserve = if show_mascot {
         (badge_width + 2).min(size.width.saturating_sub(PROMPT_WIDTH + 4))
     } else {
@@ -581,7 +598,9 @@ fn draw_frame(
         size.width.saturating_sub(PROMPT_WIDTH + reserve),
         1,
     );
-    let hint_area = Rect::new(size.x, size.y + 1, size.width, 1);
+    // The badge owns the right edge of both viewport rows; keep the hint narrow
+    // enough that left-aligned hint text never runs under it.
+    let hint_area = Rect::new(size.x, size.y + 1, size.width.saturating_sub(reserve), 1);
     Paragraph::new(Line::from(Span::styled(
         glyphs::PROMPT,
         Style::default().fg(theme.accent().ratatui()),
@@ -589,17 +608,24 @@ fn draw_frame(
     .render(gutter, buf);
     textarea.render(editor, buf);
     if show_mascot {
-        let badge_area = Rect::new(
-            size.x + size.width.saturating_sub(badge_width),
-            size.y,
-            badge_width,
-            1,
-        );
-        Paragraph::new(Line::from(Span::styled(
-            badge,
-            Style::default().fg(theme.muted().ratatui()),
-        )))
-        .render(badge_area, buf);
+        let fg = mascot.badge_color(theme).ratatui();
+        let badge_x = size.x + size.width.saturating_sub(badge_width);
+        for (row, line) in badge_rows.iter().enumerate() {
+            if row >= usize::from(VIEWPORT_ROWS) {
+                break; // never paint past the viewport into the menu rows
+            }
+            let y = size.y + u16::try_from(row).unwrap_or(0);
+            for (col, ch) in line.chars().enumerate() {
+                let x = badge_x + u16::try_from(col).unwrap_or(0);
+                if x < size.x + size.width {
+                    let mut glyph = [0u8; 4];
+                    if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+                        cell.set_symbol(ch.encode_utf8(&mut glyph));
+                        cell.set_fg(fg);
+                    }
+                }
+            }
+        }
     }
     Paragraph::new(Line::from(Span::styled(
         hint.to_string(),

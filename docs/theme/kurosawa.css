@@ -1,0 +1,71 @@
+/* heartflow · "黑泽明" 配色(经 additional-css 覆盖内置 ayu 主题变量;mdBook 0.5 无 additional-themes)
+   取自黑泽明电影的物象与色彩(《乱》《影武者》《梦》):
+   漆器墨底 + 和纸米白正文 + 朱红(乱/伊贺) + 金(影武者六瓣 crest) + 翡绿(罗生门林间)
+   + 靛蓝灰(暮色/竹虎) + 暮紫(梦之黄昏)。暗色为主,与终端 theme.rs 同一色家族。 */
+
+.ayu {
+    --bg: #1a1611;            /* 漆器暖黑 */
+    --fg: #e4d9c3;            /* 和纸米白 */
+
+    --sidebar-bg: #14100c;
+    --sidebar-fg: #cabfa8;
+    --sidebar-non-existant: #5a5148;
+    --sidebar-active: #e3b341;  /* 金 crest:当前章节 */
+    --sidebar-spacer: #241d18;
+
+    --scrollbar: var(--sidebar-fg);
+
+    --icons: #8a7f6f;
+    --icons-hover: #e3b341;
+
+    --links: #d6714b;           /* 朱红:链接 */
+
+    --inline-code-color: #8fb57a; /* 翡翠:行内码 */
+
+    --theme-popup-bg: #14100c;
+    --theme-popup-border: #5a5148;
+    --theme-hover: #241d18;
+
+    --quote-bg: #221d17;
+    --quote-border: #2f281f;
+
+    --warning-border: #e3b341;
+
+    --table-border-color: #2a231c;
+    --table-header-bg: #2f281f;
+    --table-alternate-bg: #1d1813;
+
+    --searchbar-border-color: #5a5148;
+    --searchbar-bg: #241d18;
+    --searchbar-fg: #e4d9c3;
+    --searchbar-shadow-color: #241d18;
+    --searchresults-header-fg: #8a7f6f;
+    --searchresults-border-color: #5a5148;
+    --searchresults-li-bg: #1d1813;
+    --search-mark-bg: #e3b341;
+
+    --color-scheme: dark;
+
+    --copy-button-filter: invert(52%) sepia(8%) saturate(400%) hue-rotate(2deg) brightness(90%) contrast(85%);
+    --copy-button-filter-hover: invert(72%) sepia(40%) saturate(600%) hue-rotate(2deg) brightness(102%) contrast(95%);
+
+    --footnote-highlight: #3a4a6b;   /* 靛蓝:脚注定位 */
+
+    --overlay-bg: rgba(20, 16, 12, 0.55);
+
+    --blockquote-note-color: #6fa8c7;      /* 靛蓝灰 */
+    --blockquote-tip-color: #8fb57a;       /* 翡翠 */
+    --blockquote-important-color: #b096c4; /* 暮紫 */
+    --blockquote-warning-color: #e3b341;   /* 金 */
+    --blockquote-caution-color: #cf6b4a;   /* 朱红 */
+
+    --sidebar-header-border-color: #c1863a;
+}
+
+/* 代码块面板落在同色系暖黑上,而非默认 tomorrow-night 冷灰,保持画面统一 */
+.ayu .content pre {
+    background: #14100c;
+}
+.ayu :not(pre) > code {
+    background: #241d18;
+}

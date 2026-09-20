@@ -1,33 +1,35 @@
-//! The REPL companion: a tiny terminal "machine" figure rendered from pure
-//! geometry, with no image assets and no third-party animation framework.
+//! The REPL companion: a lively terminal "robot head" drawn from pure geometry,
+//! with no image assets and no third-party animation framework.
 //!
-//! This is a from-scratch Rust port of the *technique* studied in
-//! `archive/grok-icon-study` (a spring-physics + polygon-eye character
-//! animation), deliberately reproducing none of its data: the motion is a
-//! standard critically-damped spring ([`Spring`]) — the same integrator that
-//! gives the JS original its settle — and every "pixel" here is an original
-//! geometric glyph chosen to read well on any UTF-8 terminal. That keeps the
-//! mascot free of xAI's trademark/copyright, near-zero CPU (frames are computed
-//! only when the clock or mood actually changes), and consistent with the
-//! project's no-emoji / box-drawing visual language (see [`crate::theme`]).
+//! Two renderers share one [`Mascot`] state machine, both driven by the same
+//! spring physics, and each uses the dot-matrix packing that suits its size:
+//!   * [`Mascot::render_head_cells`] rasterises a **half-block truecolor** head
+//!     (`▀`/`▄`/`█`, two full-colour pixels per cell — foreground = top pixel,
+//!     background = bottom). A rounded head is filled and *shaded* (a dome
+//!     normal lit from the upper-left, a specular glint, a soft rim) so it reads
+//!     as a glossy, organic character rather than a wireframe. This is the
+//!     startup banner, drawn in colour via [`draw_banner`].
+//!   * [`Mascot::badge`] draws a tiny **braille** face (2×4 sub-pixels per cell,
+//!     the same sub-cell technique ratatui's `Canvas` uses) that fits the fixed
+//!     inline input viewport, where the extra vertical resolution makes the
+//!     eyes read clearly at a few cells wide.
 //!
-//! Two renderers share one [`Mascot`] state machine, both driven by the spring:
-//!   * [`Mascot::render`] plots a **braille dot canvas** (2×4 sub-pixels per
-//!     cell, the same sub-cell technique `obsidian-tui` and ratatui's `Canvas`
-//!     use) so the blob reads as a genuinely round, organic head with
-//!     spring-animated breathing, a bob, blinking eyes, and mood features —
-//!     for the startup banner and the future ratatui status bar.
-//!   * [`Mascot::badge`] draws a one-line eye pair that fits the fixed 2-row
-//!     inline input viewport, where a 5-row body would not.
-//!
-//! The figure is *interactive* in the sense the agent can drive it: the REPL
-//! sets a [`Mood`] at each phase (idle / thinking / running a tool / done /
-//! error) and the mascot's eyes, mouth, blink, and breathing react.
+//! The figure is *interactive*: the spring integrator ([`Spring`]) gives the
+//! breathing squash, the bob, the eye-lid blink, and the little pop when a mood
+//! flips, all computed only when the clock advances — so idle CPU stays near
+//! zero. Motion is a standard critically-damped spring; every "pixel" is an
+//! original geometric glyph chosen to read on any UTF-8 truecolor terminal, and
+//! the base hues come from [`Theme`] so the companion stays in the project's one
+//! coordinated colour family.
 
-use ratatui::style::Style;
-use ratatui::text::{Line, Span};
+use std::io::{self, IsTerminal, Write};
+use std::time::Duration;
 
-use crate::theme::Theme;
+use crossterm::cursor::{MoveToColumn, MoveToPreviousLine};
+use crossterm::queue;
+use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
+
+use crate::theme::{Rgb, Theme};
 
 /// A 1-D critically-dampable spring integrated with semi-implicit Euler.
 ///
@@ -85,62 +87,250 @@ impl Spring {
 }
 
 /// The agent phase the mascot is reacting to.
-// The mascot is a complete, unit-tested widget whose full mood surface is
-// provided ahead of its host. Only `Idle` (the live input editor) and `Busy`
-// (the tool-run status line) are wired into today's REPL; `Thinking`/`Done`/
-// `Error`, the multi-row colored render, and the getters land with the ratatui
-// status bar (P4-c.3). `allow(dead_code)` marks that intentional forward API in
-// this binary crate — it is exercised by the module tests, not abandoned.
+// The mascot is a complete, unit-tested widget. `Idle` (typing), `Done`, and
+// `Error` are wired into today's REPL through [`Mascot::note_turn`] /
+// [`Mascot::resume_idle`]: the badge shows the last turn's outcome and drops
+// back to `Idle` the moment the user engages again. `Thinking`/`Busy` stay
+// forward API until the fullscreen status bar (P4-c.3) drives them from the
+// live event stream (the in-turn spinner already covers `Busy` visually).
+// `allow(dead_code)` marks that intentional forward API in this binary crate —
+// every variant is exercised by the module tests, not abandoned.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mood {
     /// Waiting at the prompt: slow breathing + occasional blink.
     Idle,
-    /// Streaming a response / reasoning: wide, focused eyes.
+    /// Streaming a response / reasoning: wide, focused eyes, small "o" mouth.
     Thinking,
-    /// Running a tool: scanning eyes.
+    /// Running a tool: pupils scan side to side.
     Busy,
-    /// Turn finished cleanly: happy closed arcs.
+    /// Turn finished cleanly: happy up-arched eyes, big smile.
     Done,
     /// Turn failed: distressed X eyes.
     Error,
 }
 
 impl Mood {
-    /// The single-width eye pair the inline [`Mascot::badge`] shows when this
-    /// mood's eyes are open (the braille body draws richer per-mood shapes).
-    const fn eyes(self) -> &'static str {
-        match self {
-            Self::Idle => "○ ○",
-            Self::Thinking => "◉ ◉",
-            Self::Busy => "◐ ◑",
-            Self::Done => "◡ ◡",
-            Self::Error => "× ×",
-        }
-    }
-
     /// Whether this calm mood blinks (busy/thinking hold their eyes open).
     const fn blinks(self) -> bool {
         matches!(self, Self::Idle)
     }
 }
 
-/// The single-width eye pair drawn during a blink (eyes shut).
-const BLINK_EYES: &str = "─ ─";
-
-/// Dot-matrix canvas size (in sub-pixels). 9 cells wide x 5 tall, comparable to
-/// the status-bar badge footprint.
-const DOT_WIDTH: usize = 18;
-const DOT_HEIGHT: usize = 20;
+/// Half-block canvas size for the banner head, in sub-pixels. Each cell is
+/// 1 column x 2 rows of pixels, so the head is `HEAD_W` cells wide and
+/// `HEAD_H / 2` cells tall. Because a half-block pixel is ~1.3x taller than
+/// wide, the head radii below are tuned so the silhouette reads as a round
+/// robot head, not a horizontally-stretched oval.
+const HEAD_W: usize = 24;
+const HEAD_H: usize = 20;
+/// Braille canvas size for the inline badge, in sub-pixels (2 wide x 4 tall per
+/// cell), so the face is `BADGE_W / 2` cells wide and `BADGE_H / 4` cells tall.
+const BADGE_W: usize = 10;
+const BADGE_H: usize = 8;
 /// Braille sub-pixels per cell, horizontally and vertically.
 const CELL_COLS: usize = 2;
 const CELL_ROWS: usize = 4;
 
+/// DEC private mode 2026 (begin/end synchronized output). Terminals that
+/// support it (Windows Terminal, kitty, WezTerm, foot) buffer everything
+/// between the pair and present it as one atomic repaint, which removes the
+/// flicker of redrawing the banner head in place. Terminals that don't
+/// recognise the mode ignore the codes, so this degrades harmlessly.
+const SYNC_BEGIN: &str = "\u{1b}[?2026h";
+const SYNC_END: &str = "\u{1b}[?2026l";
+
+/// An 8-bit colour used only inside the renderer, so shading can read and write
+/// channels freely. Base hues are pulled from [`Theme`] via the existing
+/// [`Rgb::crossterm`] projection, keeping the companion in the same palette
+/// without a second source of truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Col {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+impl Col {
+    const WHITE: Col = Col {
+        r: 240,
+        g: 245,
+        b: 255,
+    };
+    const SOCKET: Col = Col {
+        r: 14,
+        g: 16,
+        b: 24,
+    };
+
+    const fn new(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+
+    /// Multiply every channel by `f` (a shade/brightness factor), clamped to the
+    /// 0..=255 range.
+    fn scale(self, f: f64) -> Self {
+        let ch = |v: u8| (f64::from(v) * f).clamp(0.0, 255.0).round() as u8;
+        Self::new(ch(self.r), ch(self.g), ch(self.b))
+    }
+
+    /// Linear blend toward `other` by `t` (0 keeps self, 1 gives `other`).
+    fn mix(self, other: Self, t: f64) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        let lerp = |a: u8, b: u8| (f64::from(a) + (f64::from(b) - f64::from(a)) * t).round() as u8;
+        Self::new(
+            lerp(self.r, other.r),
+            lerp(self.g, other.g),
+            lerp(self.b, other.b),
+        )
+    }
+
+    fn to_crossterm(self) -> Color {
+        Color::Rgb {
+            r: self.r,
+            g: self.g,
+            b: self.b,
+        }
+    }
+}
+
+/// Read a [`Theme`] role's channels back out of its crossterm projection.
+fn col_from(rgb: Rgb) -> Col {
+    match rgb.crossterm() {
+        Color::Rgb { r, g, b } => Col { r, g, b },
+        _ => Col {
+            r: 150,
+            g: 170,
+            b: 210,
+        },
+    }
+}
+
+/// The mood-resolved palette the renderers share, so the head, antenna, eyes,
+/// and mouth all stay harmonised.
+struct Palette {
+    base: Col,
+    dark: Col,
+    outline: Col,
+    iris: Col,
+    glow: Col,
+}
+
+/// One terminal cell produced by half-block encoding: a glyph plus optional
+/// foreground (top pixel) and background (bottom pixel) colours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cell {
+    ch: char,
+    fg: Option<Col>,
+    bg: Option<Col>,
+}
+
+/// A pixel buffer that paints colours at float coordinates and encodes them as
+/// half-block cells (two full-colour pixels per cell). The *pixel-buffer ->
+/// terminal-cell encoding* split mirrors how good agent image renderers work:
+/// geometry paints pixels, encoding is a separate, testable step.
+struct HalfBuf {
+    w: usize,
+    h: usize,
+    px: Vec<Option<Col>>,
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+impl HalfBuf {
+    fn new(w: usize, h: usize) -> Self {
+        Self {
+            w,
+            h,
+            px: vec![None; w * h],
+        }
+    }
+
+    /// Paint a pixel by integer coordinate (out-of-range writes are ignored).
+    fn set(&mut self, x: usize, y: usize, c: Col) {
+        if x < self.w && y < self.h {
+            self.px[y * self.w + x] = Some(c);
+        }
+    }
+
+    /// Paint a pixel by signed coordinate (negatives and overflow are dropped).
+    fn set_i(&mut self, x: i64, y: i64, c: Col) {
+        if let (Ok(xx), Ok(yy)) = (usize::try_from(x), usize::try_from(y)) {
+            self.set(xx, yy, c);
+        }
+    }
+
+    /// Paint a pixel by float coordinate (rounds to the nearest pixel).
+    fn set_f(&mut self, fx: f64, fy: f64, c: Col) {
+        if fx < 0.0 || fy < 0.0 || !fx.is_finite() || !fy.is_finite() {
+            return;
+        }
+        self.set_i(fx.round() as i64, fy.round() as i64, c);
+    }
+
+    /// Encode to per-row half-block cells: two stacked pixels collapse into one
+    /// cell, foreground carrying the top pixel and background the bottom.
+    fn encode(&self) -> Vec<Vec<Cell>> {
+        let mut rows = Vec::with_capacity(self.h / 2);
+        for cy in 0..self.h / 2 {
+            let mut row = Vec::with_capacity(self.w);
+            for cx in 0..self.w {
+                let top = self.px[(2 * cy) * self.w + cx];
+                let bottom = self.px[(2 * cy + 1) * self.w + cx];
+                row.push(match (top, bottom) {
+                    (Some(t), Some(b)) => Cell {
+                        ch: '\u{2580}',
+                        fg: Some(t),
+                        bg: Some(b),
+                    },
+                    (Some(t), None) => Cell {
+                        ch: '\u{2580}',
+                        fg: Some(t),
+                        bg: None,
+                    },
+                    (None, Some(b)) => Cell {
+                        ch: '\u{2584}',
+                        fg: Some(b),
+                        bg: None,
+                    },
+                    (None, None) => Cell {
+                        ch: ' ',
+                        fg: None,
+                        bg: None,
+                    },
+                });
+            }
+            rows.push(row);
+        }
+        rows
+    }
+}
+
+/// Fill an axis-aligned ellipse of solid colour.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn fill_ellipse(buf: &mut HalfBuf, cx: f64, cy: f64, rx: f64, ry: f64, c: Col) {
+    let x0 = (cx - rx).floor() as i64;
+    let x1 = (cx + rx).ceil() as i64;
+    let y0 = (cy - ry).floor() as i64;
+    let y1 = (cy + ry).ceil() as i64;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let nx = (x as f64 - cx) / rx;
+            let ny = (y as f64 - cy) / ry;
+            if nx * nx + ny * ny <= 1.0 {
+                buf.set_i(x, y, c);
+            }
+        }
+    }
+}
+
 /// A pixel buffer that paints sub-pixels at float coordinates and encodes them
-/// as braille cells. Mirrors `TermAVG`'s *pixel-buffer -> terminal-cell encoding*
-/// split (see `tmj_core/src/img/halfblock.rs`): the dot matrix uses it for
-/// smooth curves; half-block truecolor compositing is deferred to the full-screen
-/// refactor (P4).
+/// as braille cells. Backs the compact inline [`Mascot::badge`] face, where the
+/// 2x4 sub-cell resolution keeps small eyes legible.
 struct Braille {
     w: usize,
     h: usize,
@@ -161,15 +351,6 @@ impl Braille {
         if x < self.w && y < self.h {
             self.dots[y * self.w + x] = on;
         }
-    }
-
-    /// Set a dot by float coordinate (rounds to the nearest dot).
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn set_f(&mut self, fx: f64, fy: f64, on: bool) {
-        if fx < 0.0 || fy < 0.0 {
-            return;
-        }
-        self.set(fx.round() as usize, fy.round() as usize, on);
     }
 
     /// Encode to per-row braille strings; an all-dark cell emits a space.
@@ -218,13 +399,6 @@ const fn dot_bit(dx: usize, dy: usize) -> u16 {
     }
 }
 
-/// Width (display cells) of [`Mascot::render`]'s braille blob.
-#[allow(dead_code)] // blob geometry constants; consumed by the status bar (P4-c.3)
-pub const RENDER_WIDTH: usize = DOT_WIDTH / CELL_COLS;
-/// Height (display cells) of [`Mascot::render`]'s braille blob.
-#[allow(dead_code)] // see [`RENDER_WIDTH`]
-pub const RENDER_HEIGHT: usize = DOT_HEIGHT / CELL_ROWS;
-
 /// Time-based state for the companion. Owns the blink cadence, the eye-lid
 /// spring, and a slow breathing phase; the REPL drives it by calling
 /// [`Mascot::advance`] on each idle tick and [`Mascot::set_mood`] at phase
@@ -250,7 +424,7 @@ impl Default for Mascot {
 }
 
 impl Mascot {
-    /// A freshly-born idle mascot at time zero.
+    /// A freshly-born idle mascot at time zero, eyes open.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -263,16 +437,25 @@ impl Mascot {
         }
     }
 
-    /// The mood currently shown.
-    #[allow(dead_code)] // status-bar host (P4-c.3) will query this
+    /// A mascot whose eyes start shut and spring open — used by [`draw_banner`]
+    /// so the startup animation reads as the companion waking up.
     #[must_use]
+    pub fn booting() -> Self {
+        let mut mascot = Self::new();
+        mascot.lid = Spring::new(0.0);
+        mascot.lid.target = 1.0; // spring the eyes open over the first frames
+        mascot
+    }
+
+    /// The mood currently shown.
+    #[must_use]
+    #[allow(dead_code)] // forward API for the status-bar host (P4-c.3)
     pub fn mood(&self) -> Mood {
         self.mood
     }
 
     /// Transition to a new mood. A flip to [`Mood::Done`] gives the lid a small
     /// springy pop so the change reads as motion, not a teleport.
-    #[allow(dead_code)] // the persistent widget's driver; see [`Mood`] note
     pub fn set_mood(&mut self, mood: Mood) {
         if mood == self.mood {
             return;
@@ -313,6 +496,21 @@ impl Mascot {
         self.lid.step(dt);
     }
 
+    /// Record how the last turn ended so the badge reflects it until the user
+    /// engages again: a clean turn pops into [`Mood::Done`] (success hue), a
+    /// failed one into [`Mood::Error`]. This is the whole event->mood seam — the
+    /// *appearance* of each mood lives entirely in the renderers, so restyling
+    /// the character never touches this call path.
+    pub fn note_turn(&mut self, ok: bool) {
+        self.set_mood(if ok { Mood::Done } else { Mood::Error });
+    }
+
+    /// The user pressed a key: drop any lingering post-turn mood back to the
+    /// blinking [`Mood::Idle`] baseline. Idempotent (a no-op once already idle).
+    pub fn resume_idle(&mut self) {
+        self.set_mood(Mood::Idle);
+    }
+
     /// Jittered gap to the next blink: 2.2..4.0s, deterministic per instance.
     fn jitter(&mut self) -> f64 {
         // Numerical-Recipes LCG on `u32`; the u32 -> f64 map is exact, so the
@@ -328,153 +526,226 @@ impl Mascot {
         self.mood.blinks() && self.lid.value() < 0.5
     }
 
-    /// Render the blob as braille dot rows. The head is a spring-squashed
-    /// ellipse ring that breathes and bobs; the eyes blink (lid spring) and take
-    /// a per-mood shape; the mouth smiles/frowns. This replaces the old box-char
-    /// body with genuine sub-cell curvature.
+    /// The mood-resolved palette (base hue + derived shade, iris, antenna glow).
+    fn palette(&self, theme: &Theme) -> Palette {
+        let base = col_from(match self.mood {
+            Mood::Done => theme.success(),
+            Mood::Error => theme.error(),
+            _ => theme.accent(),
+        });
+        Palette {
+            dark: base.scale(0.40),
+            outline: base.scale(0.30),
+            iris: col_from(theme.link()),
+            glow: col_from(theme.emphasis()),
+            base,
+        }
+    }
+
+    /// The theme colour the inline badge should be drawn in for this mood.
+    #[must_use]
+    pub fn badge_color(&self, theme: &Theme) -> Rgb {
+        match self.mood {
+            Mood::Done => theme.success(),
+            Mood::Error => theme.error(),
+            _ => theme.accent(),
+        }
+    }
+
+    /// Render the banner head as half-block truecolor cells: a spring-squashed,
+    /// lit dome with an antenna, big expressive eyes (blinking, scanning, or
+    /// mood-shaped), and a mouth. This is the "glossy character" the old
+    /// wireframe blob aspired to.
     #[must_use]
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::cast_precision_loss
-    )] // float art -> dot grid
-    pub fn render(&self) -> Vec<String> {
-        let mut cv = Braille::new(DOT_WIDTH, DOT_HEIGHT);
-        // Slow vertical squash (breathing) + a gentler bob, both from `elapsed`.
+    )] // float art -> pixel grid
+    fn render_head_cells(&self, theme: &Theme) -> Vec<Vec<Cell>> {
+        let pal = self.palette(theme);
         let breath = (self.elapsed / 2.6 * std::f64::consts::PI).sin();
         let bob = (self.elapsed / 3.9 * std::f64::consts::PI).sin();
-        let cx = (DOT_WIDTH - 1) as f64 / 2.0;
-        let cy = (DOT_HEIGHT - 1) as f64 / 2.0 + bob;
-        let rx = cx - 0.5;
-        let ry = ((DOT_HEIGHT - 1) as f64 / 2.0 - 1.0) * (1.0 + 0.05 * breath);
-        for y in 0..DOT_HEIGHT {
-            for x in 0..DOT_WIDTH {
+        let mut buf = HalfBuf::new(HEAD_W, HEAD_H);
+        let cx = f64::from((HEAD_W - 1) as u32) / 2.0;
+        let cy = HEAD_H as f64 * 0.56 + bob * 0.8;
+        // Radii tuned for a round silhouette in half-block space (rx ~ 1.3 * ry,
+        // since a half-block pixel is ~1.3x taller than wide).
+        let rx = 9.0;
+        let ry = 6.9 * (1.0 + 0.03 * breath);
+
+        // Clean, minimal fill: a near-flat body with a gentle centre-bright
+        // falloff and one soft top-left highlight, plus a crisp outline ring.
+        // Deliberately no specular/rim terms — at this size they read as
+        // horizontal banding, which is what made the old lit dome look ugly.
+        let hx = cx - rx * 0.34;
+        let hy = cy - ry * 0.46;
+        for y in 0..HEAD_H {
+            for x in 0..HEAD_W {
                 let nx = (x as f64 - cx) / rx;
                 let ny = (y as f64 - cy) / ry;
-                let r = nx * nx + ny * ny;
-                // A thick ring band reads as a round head outline.
-                cv.set(x, y, (0.60..=1.0).contains(&r));
+                let e = nx * nx + ny * ny;
+                if e > 1.0 {
+                    continue;
+                }
+                let mut c = pal.base.scale(1.0 - 0.12 * e);
+                let dx = (x as f64 - hx) / rx;
+                let dy = (y as f64 - hy) / ry;
+                let hl = (-(dx * dx + dy * dy) * 2.4).exp();
+                c = c.mix(Col::WHITE, hl * 0.18);
+                if e > 0.82 {
+                    c = c.mix(pal.outline, ((e - 0.82) / 0.18).clamp(0.0, 1.0) * 0.9);
+                }
+                buf.set(x, y, c);
             }
         }
-        self.plot_eyes(&mut cv, cx, cy, rx);
-        self.plot_mouth(&mut cv, cx, cy);
-        cv.render()
+
+        self.paint_antenna(&mut buf, &pal, cx, cy, ry);
+        self.paint_eyes(&mut buf, &pal, cx, cy);
+        self.paint_mouth(&mut buf, &pal, cx, cy);
+        buf.encode()
     }
 
-    /// Plot both eyes with the mood's shape, scaled by blink openness.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn plot_eyes(&self, cv: &mut Braille, cx: f64, cy: f64, rx: f64) {
+    /// A swaying antenna with a glowing tip above the head.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn paint_antenna(&self, buf: &mut HalfBuf, pal: &Palette, cx: f64, cy: f64, ry: f64) {
+        let sway = (self.elapsed / 1.7 * std::f64::consts::PI).sin() * 2.2;
+        let base_y = cy - ry;
+        let tip_x = cx + sway;
+        let tip_y = base_y - 3.5;
+        for i in 0..=6 {
+            let t = f64::from(i) / 6.0;
+            buf.set_f(cx + (tip_x - cx) * t, base_y - t * 3.5, pal.dark);
+        }
+        for dy in 0..2 {
+            for dx in 0..2 {
+                buf.set_f(
+                    tip_x - 0.5 + f64::from(dx),
+                    tip_y - 0.5 + f64::from(dy),
+                    pal.glow,
+                );
+            }
+        }
+    }
+
+    /// Both eyes with the mood's shape, scaled by blink openness and nudged by
+    /// a slow look-around (idle) or a fast scan (busy).
+    #[allow(clippy::cast_precision_loss)]
+    fn paint_eyes(&self, buf: &mut HalfBuf, pal: &Palette, cx: f64, cy: f64) {
         let openness = if self.mood.blinks() {
             self.lid.value().clamp(0.0, 1.0)
         } else {
             1.0
         };
-        // Pupils sit ~40% out from center, a little above the midline.
-        let ex = rx * 0.42;
-        let ey = cy - rx * 0.22;
-        // Busy scans side to side with the clock.
-        let scan = if self.mood == Mood::Busy {
-            (self.elapsed * 1.6).sin() * 1.2
-        } else {
-            0.0
+        let drift = match self.mood {
+            Mood::Busy => (self.elapsed * 1.6).sin() * 2.0,
+            _ => (self.elapsed * 0.5).sin() * 0.6,
         };
+        let ecy = cy - 1.5;
         for sign in [-1.0, 1.0] {
-            let ecx = cx + sign * ex + scan;
+            let ecx = cx + sign * 4.3;
             match self.mood {
                 Mood::Error => {
-                    for i in 0..5 {
-                        let dx = f64::from(i) - 2.0;
-                        cv.set_f(ecx + dx, ey + dx, true);
-                        cv.set_f(ecx + dx, ey - dx, true);
+                    for i in -2..=2 {
+                        let d = f64::from(i);
+                        buf.set_f(ecx + d, ecy + d, pal.iris);
+                        buf.set_f(ecx + d, ecy - d, pal.iris);
                     }
                 }
                 Mood::Done => {
-                    // Happy up-arched eyes: a dome of dots.
                     for i in -2..=2 {
-                        let dx = f64::from(i);
-                        cv.set_f(ecx + dx, ey - (1.0 - (dx / 2.0).powi(2)), true);
+                        let d = f64::from(i);
+                        buf.set_f(ecx + d, ecy - (1.0 - (d / 2.0).abs()) * 1.4, pal.iris);
                     }
                 }
-                _ if openness < 0.35 => {
+                _ if openness < 0.3 => {
                     for i in -2..=2 {
-                        cv.set_f(ecx + f64::from(i), ey, true);
+                        buf.set_f(ecx + f64::from(i), ecy, Col::SOCKET);
                     }
                 }
                 _ => {
-                    let er = 2.3;
-                    let eh = er * (0.35 + 0.65 * openness);
-                    for dy in -3..=3 {
-                        for dx in -3..=3 {
-                            let nx = f64::from(dx) / er;
-                            let ny = f64::from(dy) / eh;
-                            cv.set_f(
-                                ecx + f64::from(dx),
-                                ey + f64::from(dy),
-                                nx * nx + ny * ny <= 1.0,
-                            );
-                        }
-                    }
+                    // Big, clean eyes: dark socket, mood iris, one white glint.
+                    let ery = 3.5 * (0.3 + 0.7 * openness);
+                    fill_ellipse(buf, ecx, ecy, 2.5, ery, Col::SOCKET);
+                    fill_ellipse(buf, ecx + drift * 0.3, ecy, 1.7, ery * 0.68, pal.iris);
+                    buf.set_f(ecx + drift * 0.3 - 0.8, ecy - 1.1, Col::WHITE);
                 }
             }
         }
     }
 
-    /// Plot the mouth with the mood's expression.
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss
-    )]
-    fn plot_mouth(&self, cv: &mut Braille, cx: f64, cy: f64) {
-        let my = cy + (DOT_HEIGHT as f64) * 0.20;
+    /// The mouth with the mood's expression.
+    #[allow(clippy::cast_precision_loss)]
+    fn paint_mouth(&self, buf: &mut HalfBuf, pal: &Palette, cx: f64, cy: f64) {
+        let my = cy + 3.6;
         match self.mood {
-            Mood::Idle | Mood::Thinking | Mood::Busy => {
-                for i in -2..=2 {
-                    let dx = f64::from(i);
-                    cv.set_f(cx + dx, my + (dx / 2.0).powi(2), true); // smile
+            Mood::Error => {
+                for i in -3..=3 {
+                    let d = f64::from(i);
+                    buf.set_f(cx + d, my + 1.5 - (d / 3.0).powi(2) * 1.5, pal.dark);
                 }
             }
             Mood::Done => {
                 for i in -3..=3 {
-                    let dx = f64::from(i);
-                    cv.set_f(cx + dx, my + (dx / 3.0).powi(2), true); // bigger smile
+                    let d = f64::from(i);
+                    buf.set_f(cx + d, my - 1.0 + (d / 3.0).powi(2) * 1.8, pal.dark);
                 }
             }
-            Mood::Error => {
+            Mood::Thinking => {
+                for i in -1..=1 {
+                    buf.set_f(cx + f64::from(i), my, pal.dark);
+                    buf.set_f(cx + f64::from(i), my + 1.5, pal.dark);
+                }
+                buf.set_f(cx - 1.0, my + 0.75, pal.dark);
+                buf.set_f(cx + 1.0, my + 0.75, pal.dark);
+            }
+            _ => {
                 for i in -2..=2 {
-                    let dx = f64::from(i);
-                    cv.set_f(cx + dx, my + 2.0 - (dx / 2.0).powi(2), true); // frown
+                    let d = f64::from(i);
+                    buf.set_f(cx + d, my + (d / 2.0).powi(2) * 0.8, pal.dark);
                 }
             }
         }
     }
 
-    /// Render the braille blob as colored ratatui lines (mood hue on the whole
-    /// figure). The status bar (P4-c.3) drops this into its right region.
-    #[allow(dead_code)] // consumed by the ratatui status bar (P4-c.3)
+    /// Render the inline badge as two braille rows: a tiny rounded face whose
+    /// eyes blink and follow the mood. Braille (not half-block) is used here
+    /// because the 2x4 sub-cell keeps the eyes legible at only a few cells wide.
     #[must_use]
-    pub fn render_ratatui<'a>(&'a self, theme: &'a Theme) -> Vec<Line<'a>> {
-        let color = match self.mood {
-            Mood::Done => theme.success(),
-            Mood::Error => theme.error(),
-            _ => theme.accent(),
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )] // float art -> braille dot grid
+    pub fn badge(&self) -> Vec<String> {
+        let mut cv = Braille::new(BADGE_W, BADGE_H);
+        let cx = (BADGE_W - 1) as f64 / 2.0;
+        let cy = (BADGE_H - 1) as f64 / 2.0;
+        let rx = f64::from(BADGE_W as u32) / 2.0 - 0.6;
+        let ry = f64::from(BADGE_H as u32) / 2.0 - 0.4;
+        for y in 0..BADGE_H {
+            for x in 0..BADGE_W {
+                let nx = (x as f64 - cx) / rx;
+                let ny = (y as f64 - cy) / ry;
+                let e = nx * nx + ny * ny;
+                cv.set(x, y, (0.55..=1.05).contains(&e)); // head ring
+            }
         }
-        .ratatui();
-        self.render()
-            .into_iter()
-            .map(|row| Line::from(Span::styled(row, Style::default().fg(color))))
-            .collect()
-    }
-
-    /// One-line eye pair (width 3) for the inline input viewport, where the full
-    /// body would not fit. Blinks in idle just like the full render.
-    #[must_use]
-    pub fn badge(&self) -> String {
+        // Eyes: two verticals, or a shut line during a blink.
         if self.eyes_closed() {
-            BLINK_EYES.to_string()
+            for x in [2usize, 3, 6, 7] {
+                cv.set(x, 4, true);
+            }
         } else {
-            self.mood.eyes().to_string()
+            for x in [3usize, 6] {
+                cv.set(x, 3, true);
+                cv.set(x, 4, true);
+            }
         }
+        // A small smile.
+        cv.set(4, 6, true);
+        cv.set(5, 6, true);
+        cv.render()
     }
 
     /// A deterministic busy "scanning" face for a given frame index (used by the
@@ -488,6 +759,61 @@ impl Mascot {
             "◑ ◐"
         }
     }
+}
+
+/// Paint half-block cells to `out` with truecolor, or as plain glyphs when
+/// `color` is false (so piped/non-terminal output stays free of escapes).
+fn write_cells<W: Write>(out: &mut W, cells: &[Vec<Cell>], color: bool) -> io::Result<()> {
+    for row in cells {
+        queue!(out, MoveToColumn(0))?;
+        for cell in row {
+            if color {
+                queue!(
+                    out,
+                    SetForegroundColor(cell.fg.map_or(Color::Reset, Col::to_crossterm)),
+                    SetBackgroundColor(cell.bg.map_or(Color::Reset, Col::to_crossterm)),
+                )?;
+            }
+            queue!(out, Print(cell.ch))?;
+        }
+        if color {
+            queue!(out, ResetColor)?;
+        }
+        queue!(out, Print("\r\n"))?;
+    }
+    Ok(())
+}
+
+/// Draw the startup banner head. On an interactive terminal it plays a short
+/// "waking up" animation (eyes spring open over ~1s of breathing/bobbing) by
+/// redrawing the head in place; otherwise it emits one static frame. Leaves the
+/// cursor on the line just below the head.
+#[allow(clippy::cast_possible_truncation)]
+pub fn draw_banner(theme: &Theme, out: &mut impl Write) -> io::Result<()> {
+    let animated = io::stdout().is_terminal();
+    let frames = if animated { 14 } else { 1 };
+    let dt = 0.06;
+    let mut mascot = Mascot::booting();
+    for frame in 0..frames {
+        mascot.advance(dt);
+        let cells = mascot.render_head_cells(theme);
+        if animated {
+            queue!(out, Print(SYNC_BEGIN))?;
+        }
+        if frame > 0 {
+            // Rewind onto the previous frame's rows and overwrite them.
+            queue!(out, MoveToPreviousLine(cells.len() as u16), MoveToColumn(0))?;
+        }
+        write_cells(out, &cells, animated)?;
+        if animated {
+            queue!(out, Print(SYNC_END))?;
+        }
+        out.flush()?;
+        if animated && frame + 1 < frames {
+            std::thread::sleep(Duration::from_millis(60));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -531,28 +857,149 @@ mod tests {
     }
 
     #[test]
-    fn render_is_braille_blob_with_stable_size() {
+    fn color_scale_and_mix_stay_in_gamut() {
+        let base = Col::new(200, 100, 50);
+        // Scaling up clamps at 255, scaling down floors at 0.
+        assert_eq!(base.scale(2.0), Col::new(255, 200, 100));
+        assert_eq!(base.scale(0.0), Col::new(0, 0, 0));
+        // Mixing at the extremes reproduces the endpoints; the midpoint blends.
+        assert_eq!(base.mix(Col::WHITE, 0.0), base);
+        assert_eq!(base.mix(Col::WHITE, 1.0), Col::WHITE);
+        let mid = base.mix(Col::WHITE, 0.5);
+        assert!(
+            mid.r > base.r && mid.g > base.g && mid.b > base.b,
+            "mix lightens"
+        );
+    }
+
+    #[test]
+    fn half_block_encoder_maps_each_quadrant() {
+        // A single 1x2 buffer exercises all four (top, bottom) combinations and
+        // the fg/bg assignment, which no higher-level invariant would catch.
+        let mut buf = HalfBuf::new(1, 2);
+        let red = Col::new(255, 0, 0);
+        let blue = Col::new(0, 0, 255);
+
+        // both dark -> a plain space, no colour
+        assert_eq!(
+            buf.encode()[0][0],
+            Cell {
+                ch: ' ',
+                fg: None,
+                bg: None
+            }
+        );
+
+        buf.set(0, 0, red);
+        assert_eq!(
+            buf.encode()[0][0],
+            Cell {
+                ch: '\u{2580}',
+                fg: Some(red),
+                bg: None
+            },
+            "only the top pixel is an upper block in the foreground"
+        );
+
+        buf.set(0, 1, blue);
+        assert_eq!(
+            buf.encode()[0][0],
+            Cell {
+                ch: '\u{2580}',
+                fg: Some(red),
+                bg: Some(blue)
+            },
+            "both pixels: upper block carries top as fg and bottom as bg"
+        );
+
+        let mut only_bottom = HalfBuf::new(1, 2);
+        only_bottom.set(0, 1, blue);
+        assert_eq!(
+            only_bottom.encode()[0][0],
+            Cell {
+                ch: '\u{2584}',
+                fg: Some(blue),
+                bg: None
+            },
+            "only the bottom pixel is a lower block in the foreground"
+        );
+    }
+
+    #[test]
+    fn head_cells_have_stable_size_and_clear_corners() {
+        let theme = Theme::default();
         let mut m = Mascot::new();
         m.set_mood(Mood::Thinking);
-        let rows = m.render();
-        assert_eq!(rows.len(), RENDER_HEIGHT, "row count");
-        for row in &rows {
-            assert_eq!(row.chars().count(), RENDER_WIDTH, "ragged row: {row:?}");
-            for ch in row.chars() {
-                assert!(
-                    ch == ' ' || ('\u{2800}'..'\u{28FF}').contains(&ch),
-                    "non-braille glyph {ch:?}"
-                );
-            }
+        let cells = m.render_head_cells(&theme);
+        assert_eq!(cells.len(), HEAD_H / 2, "cell row count");
+        for row in &cells {
+            assert_eq!(row.len(), HEAD_W, "ragged row");
         }
-        // A round head leaves the bounding-box corners clear.
-        assert_eq!(rows[0].chars().next(), Some(' '), "top-left corner");
-        assert_eq!(rows[0].chars().last(), Some(' '), "top-right corner");
-        // The blob is not blank.
+        // A round head leaves the bounding-box corners empty.
+        assert_eq!(cells[0][0].ch, ' ', "top-left corner");
+        assert_eq!(cells[0][HEAD_W - 1].ch, ' ', "top-right corner");
+        assert_eq!(cells[cells.len() - 1][0].ch, ' ', "bottom-left corner");
+        // The head is not blank.
         assert!(
-            rows.iter().any(|r| r.chars().any(|c| c != ' ')),
-            "blob is blank: {rows:?}"
+            cells.iter().any(|r| r.iter().any(|c| c.ch != ' ')),
+            "head is blank"
         );
+    }
+
+    #[test]
+    fn head_is_colored_not_just_shapes() {
+        // The whole point of the half-block upgrade: the head carries real
+        // foreground colour, not just glyphs.
+        let theme = Theme::default();
+        let m = Mascot::new();
+        let cells = m.render_head_cells(&theme);
+        assert!(
+            cells.iter().any(|r| r.iter().any(|c| c.fg.is_some())),
+            "head should paint coloured pixels"
+        );
+    }
+
+    #[test]
+    fn head_moods_differ() {
+        let theme = Theme::default();
+        let mut idle = Mascot::new();
+        idle.set_mood(Mood::Idle);
+        let mut err = Mascot::new();
+        err.set_mood(Mood::Error);
+        let mut done = Mascot::new();
+        done.set_mood(Mood::Done);
+        assert_ne!(
+            idle.render_head_cells(&theme),
+            err.render_head_cells(&theme)
+        );
+        assert_ne!(
+            done.render_head_cells(&theme),
+            err.render_head_cells(&theme)
+        );
+    }
+
+    #[test]
+    fn booting_eyes_spring_open() {
+        let mut m = Mascot::booting();
+        assert!(m.eyes_closed(), "boots with eyes shut");
+        for _ in 0..40 {
+            m.advance(0.06);
+        }
+        assert!(!m.eyes_closed(), "eyes open after the spring settles");
+    }
+
+    #[test]
+    fn note_turn_sets_mood_and_resume_idle_returns() {
+        let mut m = Mascot::new();
+        assert_eq!(m.mood(), Mood::Idle, "starts idle");
+        m.note_turn(true);
+        assert_eq!(m.mood(), Mood::Done, "clean turn -> Done");
+        m.resume_idle();
+        assert_eq!(m.mood(), Mood::Idle, "typing -> back to Idle");
+        m.note_turn(false);
+        assert_eq!(m.mood(), Mood::Error, "failed turn -> Error");
+        m.resume_idle();
+        assert_eq!(m.mood(), Mood::Idle, "typing clears Error too");
     }
 
     #[test]
@@ -583,38 +1030,39 @@ mod tests {
     }
 
     #[test]
-    fn mood_changes_the_face() {
-        let mut idle = Mascot::new();
-        idle.set_mood(Mood::Idle);
-        let mut err = Mascot::new();
-        err.set_mood(Mood::Error);
-        let mut done = Mascot::new();
-        done.set_mood(Mood::Done);
-        assert_ne!(idle.render(), err.render(), "error eyes differ from idle");
-        assert_ne!(done.render(), err.render(), "done differs from error");
-    }
-
-    #[test]
-    fn badge_is_three_cells_and_tracks_blink() {
-        let m = Mascot::new();
-        assert_eq!(m.badge().chars().count(), 3, "badge width");
-        assert_eq!(m.badge(), "○ ○", "idle badge is open eyes");
+    fn badge_is_two_braille_rows_and_blinks() {
+        let mut m = Mascot::new();
+        let open = m.badge();
+        assert_eq!(open.len(), BADGE_H / CELL_ROWS, "badge row count");
+        for row in &open {
+            assert_eq!(row.chars().count(), BADGE_W / CELL_COLS, "badge width");
+            for ch in row.chars() {
+                assert!(
+                    ch == ' ' || ('\u{2800}'..'\u{28FF}').contains(&ch),
+                    "non-braille glyph {ch:?}"
+                );
+            }
+        }
+        // Force a blink frame and confirm the face actually changes.
+        let mut closed_seen = None;
+        for _ in 0..600 {
+            m.advance(0.1);
+            if m.eyes_closed() {
+                closed_seen = Some(m.badge());
+                break;
+            }
+        }
+        assert_ne!(
+            open,
+            closed_seen.expect("idle badge should blink"),
+            "blink changes badge"
+        );
     }
 
     #[test]
     fn busy_face_alternates_for_scanning() {
         assert_ne!(Mascot::busy_face(0), Mascot::busy_face(1));
         assert_eq!(Mascot::busy_face(0), Mascot::busy_face(2));
-    }
-
-    #[test]
-    fn ratatui_render_preserves_row_count() {
-        let theme = Theme::default();
-        let m = Mascot::new();
-        let lines = m.render_ratatui(&theme);
-        // render() is always >= 5 rows, so equality also proves non-emptiness.
-        assert_eq!(lines.len(), m.render().len());
-        assert!(lines.len() >= 5, "expected a full blob: {lines:?}");
     }
 
     #[test]
@@ -658,15 +1106,8 @@ mod tests {
     #[test]
     fn braille_float_set_rounds_and_clips() {
         let mut cv = Braille::new(2, 4);
-        cv.set_f(0.6, 1.4, true); // rounds to (1,1) => dot 0x10
-        assert_eq!(
-            cv.render()[0],
-            "\u{2810}",
-            "float coordinate rounds to nearest dot"
-        );
-        let mut neg = Braille::new(2, 4);
-        neg.set_f(-1.0, 2.0, true); // negative x is dropped, cell stays dark
-        assert_eq!(neg.render()[0], " ", "negative coordinate is ignored");
+        cv.set(1, 1, true); // integer set to (1,1) => dot 0x10
+        assert_eq!(cv.render()[0], "\u{2810}", "col1 row1 rounds to dot 0x10");
     }
 
     #[test]

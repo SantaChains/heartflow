@@ -6,6 +6,7 @@ mod conversation;
 mod file_ops;
 mod permissions;
 mod prompt;
+mod redact;
 mod schema;
 mod session;
 mod usage;
@@ -39,6 +40,7 @@ pub use prompt::{
     load_system_prompt, ContextFile, ProjectContext, PromptBuildError, SystemPromptBuilder,
     FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
+pub use redact::{redact_session, redact_text, REDACTED};
 pub use schema::{normalize_tool_schema, validate_tool_input};
 pub use session::{ContentBlock, ConversationMessage, MessageRole, Session, SessionError};
 pub use usage::{TokenUsage, UsageTracker};
