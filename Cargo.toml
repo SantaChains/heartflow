@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "1.0.1"
+version = "1.1.0"
 edition = "2021"
 # 真实下限来自依赖(image/time/simd-json/globset/ignore 均要求 1.88),声明后可让旧
 # 工具链得到明确报错而不是晦涩的依赖解析失败;开发用工具链见 rust-toolchain.toml
@@ -17,13 +17,13 @@ publish = true
 # 靠依赖重命名(package =)保住各 crate 内 use 语句不变;下方 version req 由
 # release.sh publish 时随根版本同步改写(cargo publish 要求 path 依赖带 req)
 [workspace.dependencies]
-api = { package = "heartflow-api", version = "1.0.1", path = "crates/api" }
-commands = { package = "heartflow-commands", version = "1.0.1", path = "crates/commands" }
-mcp = { package = "heartflow-mcp", version = "1.0.1", path = "crates/mcp" }
-provider = { package = "heartflow-provider", version = "1.0.1", path = "crates/provider" }
-runtime = { package = "heartflow-runtime", version = "1.0.1", path = "crates/runtime" }
-store = { package = "heartflow-store", version = "1.0.1", path = "crates/store" }
-tools = { package = "heartflow-tools", version = "1.0.1", path = "crates/tools" }
+api = { package = "heartflow-api", version = "1.1.0", path = "crates/api" }
+commands = { package = "heartflow-commands", version = "1.1.0", path = "crates/commands" }
+mcp = { package = "heartflow-mcp", version = "1.1.0", path = "crates/mcp" }
+provider = { package = "heartflow-provider", version = "1.1.0", path = "crates/provider" }
+runtime = { package = "heartflow-runtime", version = "1.1.0", path = "crates/runtime" }
+store = { package = "heartflow-store", version = "1.1.0", path = "crates/store" }
+tools = { package = "heartflow-tools", version = "1.1.0", path = "crates/tools" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
