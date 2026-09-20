@@ -6,6 +6,12 @@ mod render;
 mod theme;
 mod viewport_term;
 
+// mimalloc serves the hot allocation streams (serde_json parsing on every
+// SSE chunk, per-tool-call JSON round trips) measurably faster than the
+// system allocator on Windows, with no code change beyond this line.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;

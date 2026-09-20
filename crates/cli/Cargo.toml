@@ -29,6 +29,7 @@ crossterm = "0.28"
 dirs = "7.0"
 inquire = "0.9"
 mcp = { workspace = true }
+mimalloc = "0.1"
 os_info = "3"
 pulldown-cmark = "0.13"
 provider = { workspace = true }
