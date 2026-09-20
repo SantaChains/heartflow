@@ -25,8 +25,6 @@ const MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_HEAD_LIMIT: usize = 50;
 /// Most matching lines one search may return.
 const MAX_HEAD_LIMIT: usize = 500;
-/// Most matching lines one ripgrep run may produce before hf cuts it off.
-const MAX_TOTAL_MATCHES: usize = 2_000;
 /// Refuse absurd regexes up front instead of inside rga.
 const MAX_PATTERN_CHARS: usize = 4_096;
 /// Bytes of stderr kept for error reporting.
@@ -104,7 +102,7 @@ pub fn search_documents(input: &DocSearchInput) -> io::Result<DocSearchOutput> {
     args.push(input.pattern.clone());
     args.push(input.path.clone());
 
-    let (status, stdout, stderr) = run_rga(&args)?;
+    let (status, stdout, stdout_capped, stderr) = run_rga(&args)?;
     // ripgrep exit codes: 0 = matches, 1 = no matches, 2 = error.
     if !matches!(status.code(), Some(0 | 1)) {
         let detail = stderr_summary(&stderr);
@@ -114,7 +112,7 @@ pub fn search_documents(input: &DocSearchInput) -> io::Result<DocSearchOutput> {
     Ok(DocSearchOutput {
         duration_ms: started.elapsed().as_millis(),
         num_matches: hits.len(),
-        truncated: hits.len() >= head_limit || hits.len() >= MAX_TOTAL_MATCHES,
+        truncated: hits.len() >= head_limit || stdout_capped,
         hits,
     })
 }
@@ -138,7 +136,7 @@ pub fn rga_available() -> bool {
 /// Spawn rga, collect stdout/stderr on threads, and enforce a wall-clock
 /// timeout by killing the process tree root. Bounded output prevents a
 /// runaway `--json` stream from exhausting memory.
-fn run_rga(args: &[String]) -> io::Result<(std::process::ExitStatus, String, String)> {
+fn run_rga(args: &[String]) -> io::Result<(std::process::ExitStatus, String, bool, String)> {
     let mut child = Command::new("rga")
         .args(args)
         .stdout(Stdio::piped())
@@ -167,6 +165,10 @@ fn run_rga(args: &[String]) -> io::Result<(std::process::ExitStatus, String, Str
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
+                // Draining the readers keeps the thread lifecycle
+                // deterministic: kill closed the pipes, so join returns.
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("rga exceeded the {}s wall clock", RGA_TIMEOUT.as_secs()),
@@ -175,28 +177,37 @@ fn run_rga(args: &[String]) -> io::Result<(std::process::ExitStatus, String, Str
             None => std::thread::sleep(Duration::from_millis(10)),
         }
     };
-    let stdout = stdout_reader
+    let (stdout, stdout_capped) = stdout_reader
         .join()
         .map_err(|_| io::Error::other("rga stdout reader panicked"))??;
-    let stderr = stderr_reader
+    let (stderr, _) = stderr_reader
         .join()
         .map_err(|_| io::Error::other("rga stderr reader panicked"))??;
-    Ok((status, stdout, stderr))
+    Ok((status, stdout, stdout_capped, stderr))
 }
 
-/// Read a pipe fully but stop after `cap` bytes (the child is killed soon
-/// after by the caller, unblocking any pending write).
-fn read_bounded(pipe: &mut impl Read, cap: u64) -> io::Result<String> {
+/// Read a pipe fully but stop after `cap` bytes; the bool reports whether the
+/// cap was hit (output was dropped) rather than the stream ending naturally.
+fn read_bounded(pipe: &mut impl Read, cap: u64) -> io::Result<(String, bool)> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
+    let mut capped = false;
     loop {
         let read = pipe.read(&mut chunk)?;
-        if read == 0 || buf.len() as u64 + read as u64 > cap {
+        if read == 0 {
             break;
         }
-        buf.extend_from_slice(&chunk[..read]);
+        let remaining = usize::try_from(cap.saturating_sub(buf.len() as u64)).unwrap_or(0);
+        if read <= remaining {
+            buf.extend_from_slice(&chunk[..read]);
+        } else {
+            // Keep what still fits, mark the loss, stop reading.
+            buf.extend_from_slice(&chunk[..remaining]);
+            capped = true;
+            break;
+        }
     }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok((String::from_utf8_lossy(&buf).into_owned(), capped))
 }
 
 fn stderr_summary(stderr: &str) -> String {
@@ -269,7 +280,7 @@ fn parse_rg_json(stdout: &str, head_limit: usize) -> Vec<DocHit> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_rg_json, DocSearchInput, MAX_TOTAL_MATCHES};
+    use super::{parse_rg_json, DocSearchInput};
     use serde_json::json;
     use std::io;
 
@@ -303,7 +314,6 @@ mod tests {
         }
         let hits = parse_rg_json(&stdout, 3);
         assert_eq!(hits.len(), 3);
-        assert!(hits.len() < MAX_TOTAL_MATCHES);
     }
 
     #[test]
