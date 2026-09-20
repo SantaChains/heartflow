@@ -1094,6 +1094,36 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
             lines,
         });
     }
+    fold_oversized_hunks(hunks)
+}
+
+/// Cap the diff the model receives. A whole-file rewrite can legitimately
+/// produce thousands of diff lines; echoing them all back burns context
+/// without adding review value (the write already succeeded and the model
+/// knows its own content). Past the cap, keep head/tail of each hunk and a
+/// factual omission note; hunk line counts stay truthful.
+fn fold_oversized_hunks(mut hunks: Vec<StructuredPatchHunk>) -> Vec<StructuredPatchHunk> {
+    const MAX_DIFF_LINES: usize = 400;
+    const KEEP_HEAD: usize = 12;
+    const KEEP_TAIL: usize = 8;
+
+    let total: usize = hunks.iter().map(|hunk| hunk.lines.len()).sum();
+    if total <= MAX_DIFF_LINES {
+        return hunks;
+    }
+    for hunk in &mut hunks {
+        if hunk.lines.len() <= KEEP_HEAD + KEEP_TAIL {
+            continue;
+        }
+        let omitted = hunk.lines.len() - KEEP_HEAD - KEEP_TAIL;
+        let mut folded = Vec::with_capacity(KEEP_HEAD + KEEP_TAIL + 1);
+        folded.extend(hunk.lines[..KEEP_HEAD].iter().cloned());
+        folded.push(format!(
+            "... {omitted} diff lines omitted (the edit itself was applied in full) ..."
+        ));
+        folded.extend(hunk.lines[hunk.lines.len() - KEEP_TAIL..].iter().cloned());
+        hunk.lines = folded;
+    }
     hunks
 }
 
@@ -1356,6 +1386,31 @@ mod tests {
         assert_eq!(make_patch(original, updated).len(), 2, "two distant hunks");
         // Identical text produces no hunks at all.
         assert_eq!(make_patch(original, original).len(), 0);
+    }
+
+    #[test]
+    fn oversized_diffs_fold_with_an_omission_note() {
+        // 600 distinct changed lines exceed the 400-line cap: the hunk must
+        // fold to head + note + tail instead of echoing everything.
+        let original = String::new();
+        let mut updated = String::new();
+        for i in 0..600 {
+            use std::fmt::Write as _;
+            let _ = writeln!(updated, "line {i}");
+        }
+        let hunks = make_patch(&original, &updated);
+        assert_eq!(hunks.len(), 1);
+        let total: usize = hunks[0].lines.len();
+        assert!(total < 30, "hunk should fold, got {total} lines");
+        assert!(
+            hunks[0]
+                .lines
+                .iter()
+                .any(|line| line.contains("diff lines omitted")),
+            "missing omission note"
+        );
+        // The truthful counts are untouched by folding.
+        assert_eq!(hunks[0].new_lines, 600);
     }
 
     #[test]
