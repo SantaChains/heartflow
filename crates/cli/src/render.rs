@@ -58,7 +58,7 @@ impl ColorTheme {
 
 impl Default for ColorTheme {
     fn default() -> Self {
-        Self::from(&AppTheme::default())
+        Self::from(AppTheme::current())
     }
 }
 

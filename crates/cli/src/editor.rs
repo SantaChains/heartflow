@@ -502,7 +502,7 @@ impl ReplEditor {
 /// cells, and the hint row beneath. Rect math is done by hand to avoid coupling
 /// to the layout-algorithm API across ratatui releases.
 fn draw_frame(frame: &mut Frame<'_>, textarea: &TextArea<'static>, hint: &str) {
-    let theme = Theme::default();
+    let theme = Theme::current();
     let size = frame.area();
     let gutter = Rect::new(size.x, size.y, PROMPT_WIDTH.min(size.width), 1);
     let editor = Rect::new(

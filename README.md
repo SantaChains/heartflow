@@ -164,6 +164,20 @@ bearer_token_env = "SEARCH_MCP_TOKEN"  # 从此环境变量读 Bearer token（�
 read_only = true                       # 声明该 server 工具均只读：read-only/plan 模式下也放行
 ```
 
+### 终端配色（theme.toml）
+
+配色以单一主题源为基准（Tokyo Night 冷色系，流式渲染与输入框共用同一色族），可按语义角色覆盖。文件位于 `~/.heartflow/theme.toml`（用户）与 `.heartflow/theme.toml`（项目，逐项胜出），与 `config.toml` 同优先级链。每个值取 `#RRGGBB`，坏值跳过并告警、绝不阻断启动；缺省沿用内置色板。改后重启生效（首次渲染时解析并进程级缓存）。
+
+```toml
+[theme]
+heading = "#2ac3de"      # Markdown 标题
+accent = "#7aa2f7"       # 提示符 / 活动 spinner / 补全高亮
+muted = "#78829f"        # 次要文本（增量、空闲提示）
+success = "#9ece6a"      # 完成
+error = "#f7768e"        # 失败
+# 其余可选：emphasis / strong / inline_code / link / quote
+```
+
 ## Agent 资产
 
 仓库指令文件以 `AGENTS.md`（含 `AGENTS.local.md`、逐级向上到仓库根）为主注入系统提示词；仅当同目录没有 `AGENTS.md` 时才回退读取旧名 `CLAUDE.md`（排他回退，避免双注入）；`hf init` / REPL `/init` 生成中性的 `AGENTS.md` 骨架。规则与技能分用户层与项目层，项目同名覆盖用户。
