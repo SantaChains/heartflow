@@ -1,4 +1,4 @@
-use runtime::{compact_session, CompactionConfig, MessageRole, Session};
+use runtime::{compact_session_in_place, CompactionConfig, MessageRole, Session};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandManifestEntry {
@@ -49,19 +49,17 @@ pub fn handle_slash_command(
 
     match trimmed.split_whitespace().next() {
         Some("/compact") => {
-            let result = compact_session(session, compaction);
-            let message = if result.removed_message_count == 0 {
-                "Compaction skipped: session is below the compaction threshold.".to_string()
-            } else {
+            let mut session = session.clone();
+            let message = if runtime::should_compact(&session, compaction) {
+                let result = compact_session_in_place(&mut session, compaction);
                 format!(
                     "Compacted {} messages into a resumable system summary.",
                     result.removed_message_count
                 )
+            } else {
+                "Compaction skipped: session is below the compaction threshold.".to_string()
             };
-            Some(SlashCommandResult {
-                message,
-                session: result.compacted_session,
-            })
+            Some(SlashCommandResult { message, session })
         }
         Some("/pin") => {
             let mut session = session.clone();

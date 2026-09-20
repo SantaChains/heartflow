@@ -35,7 +35,6 @@ impl Default for CompactionConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionResult {
     pub summary: String,
-    pub compacted_session: Session,
     pub removed_message_count: usize,
 }
 
@@ -119,28 +118,45 @@ pub fn get_compact_continuation_message(
     base
 }
 
+/// Compact the session in place. Ownership over `session.messages` is taken
+/// with `mem::take`, so the preserved tail and pinned survivors are *moved*
+/// into the compacted transcript instead of cloned - on image-heavy sessions
+/// the old clone-everything approach dominated compaction cost entirely.
+///
+/// The caller gates on the token threshold (`should_compact` or the amortized
+/// `should_compact_with_estimate`): re-estimating here would redo the full
+/// O(n) scan the runtime's incremental token cache already avoids.
 #[must_use]
-pub fn compact_session(session: &Session, config: CompactionConfig) -> CompactionResult {
-    if !should_compact(session, config) {
+pub fn compact_session_in_place(
+    session: &mut Session,
+    config: CompactionConfig,
+) -> CompactionResult {
+    // Misuse guard: below the preserve window there is nothing to summarize,
+    // and "compacting" would still replace the transcript with a stub.
+    let message_count = session.messages.len();
+    if message_count <= config.preserve_recent_messages {
         return CompactionResult {
             summary: String::new(),
-            compacted_session: session.clone(),
             removed_message_count: 0,
         };
     }
 
-    let keep_from = session
-        .messages
-        .len()
-        .saturating_sub(config.preserve_recent_messages);
-    let removed = &session.messages[..keep_from];
-    let preserved = session.messages[keep_from..].to_vec();
+    let keep_from = message_count.saturating_sub(config.preserve_recent_messages);
+    let mut messages = std::mem::take(&mut session.messages);
+    let preserved = messages.split_off(keep_from);
 
     // A pinned message inside the would-be-summarized window is never folded
     // into the summary: it survives verbatim, placed after the continuation
     // header and before the recent tail. Only unpinned history is condensed.
-    let (pinned, to_summarize): (Vec<ConversationMessage>, Vec<ConversationMessage>) =
-        removed.iter().cloned().partition(|message| message.pinned);
+    let mut pinned = Vec::new();
+    let mut to_summarize = Vec::new();
+    for message in messages {
+        if message.pinned {
+            pinned.push(message);
+        } else {
+            to_summarize.push(message);
+        }
+    }
 
     let summary = summarize_messages(&to_summarize);
     let continuation = get_compact_continuation_message(
@@ -157,15 +173,12 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
     }];
     compacted_messages.extend(pinned);
     compacted_messages.extend(preserved);
+    session.messages = compacted_messages;
 
+    // Only messages actually folded into the summary count as removed;
+    // pinned survivors stay in the transcript.
     CompactionResult {
         summary,
-        compacted_session: Session {
-            version: session.version,
-            messages: compacted_messages,
-        },
-        // Only messages actually folded into the summary count as removed;
-        // pinned survivors stay in the transcript.
         removed_message_count: to_summarize.len(),
     }
 }
@@ -205,32 +218,50 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
 }
 
 fn summarize_block(block: &ContentBlock, max_chars: usize) -> String {
-    let raw = match block {
-        ContentBlock::Text { text } => text.clone(),
-        ContentBlock::ToolUse { name, input, .. } => format!("tool_use {name}({input})"),
+    match block {
+        ContentBlock::Text { text } => truncate_chars(text, max_chars),
+        ContentBlock::ToolUse { name, input, .. } => {
+            // Cap the input before joining: the tool's JSON can be megabytes,
+            // and a join-then-truncate would materialize all of it first.
+            truncate_chars(
+                &format!("tool_use {name}({})", truncate_chars(input, max_chars)),
+                max_chars,
+            )
+        }
         ContentBlock::ToolResult {
             tool_name,
             output,
             is_error,
             ..
-        } => format!(
-            "tool_result {tool_name}: {}{output}",
-            if *is_error { "error " } else { "" }
-        ),
+        } => {
+            let header = format!(
+                "tool_result {tool_name}: {}",
+                if *is_error { "error " } else { "" }
+            );
+            let output_budget = max_chars.saturating_sub(header.chars().count());
+            format!("{header}{}", truncate_chars(output, output_budget))
+        }
         ContentBlock::Image { media_type, .. } => format!("image {media_type}"),
-    };
-    truncate_chars(&raw, max_chars)
+    }
 }
 
 /// Clamp to `max_chars` code points (CJK-safe) with an ellipsis marker.
+///
+/// Single pass: iteration stops at `max_chars + 1` characters, so a
+/// multi-megabyte tool result costs only `max_chars` characters of scanning,
+/// never a full traversal.
 #[must_use]
 pub fn truncate_chars(content: &str, max_chars: usize) -> String {
-    if content.chars().count() <= max_chars {
-        return content.to_string();
+    let mut out = String::with_capacity(max_chars.saturating_mul(4));
+    for (count, ch) in content.chars().enumerate() {
+        if count == max_chars {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
     }
-    let mut truncated = content.chars().take(max_chars).collect::<String>();
-    truncated.push('…');
-    truncated
+    // Fewer than max_chars characters: the content fits as-is.
+    content.to_string()
 }
 
 /// Token estimate that stays honest for CJK. ASCII code points are counted at
@@ -311,8 +342,8 @@ fn collapse_blank_lines(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_session, estimate_session_tokens, estimate_text_tokens, format_compact_summary,
-        should_compact, CompactionConfig,
+        compact_session_in_place, estimate_session_tokens, estimate_text_tokens,
+        format_compact_summary, should_compact, CompactionConfig,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
@@ -324,20 +355,21 @@ mod tests {
 
     #[test]
     fn leaves_small_sessions_unchanged() {
-        let session = Session {
+        let mut session = Session {
             version: 1,
             messages: vec![ConversationMessage::user_text("hello")],
         };
+        let original = session.clone();
 
-        let result = compact_session(&session, CompactionConfig::default());
+        let result = compact_session_in_place(&mut session, CompactionConfig::default());
         assert_eq!(result.removed_message_count, 0);
-        assert_eq!(result.compacted_session, session);
+        assert_eq!(session, original);
         assert_eq!(result.summary, "");
     }
 
     #[test]
     fn compacts_older_messages_into_a_system_summary() {
-        let session = Session {
+        let mut session = Session {
             version: 1,
             messages: vec![
                 ConversationMessage::user_text("one ".repeat(200)),
@@ -355,23 +387,21 @@ mod tests {
                 },
             ],
         };
+        let estimated_before = estimate_session_tokens(&session);
 
-        let result = compact_session(
-            &session,
+        let result = compact_session_in_place(
+            &mut session,
             CompactionConfig {
                 preserve_recent_messages: 2,
                 max_estimated_tokens: 1,
                 ..CompactionConfig::default()
             },
         );
-
         assert_eq!(result.removed_message_count, 2);
-        assert_eq!(
-            result.compacted_session.messages[0].role,
-            MessageRole::System
-        );
+
+        assert_eq!(session.messages[0].role, MessageRole::System);
         assert!(matches!(
-            &result.compacted_session.messages[0].blocks[0],
+            &session.messages[0].blocks[0],
             ContentBlock::Text { text } if text.contains("Summary:")
         ));
         assert!(should_compact(
@@ -382,9 +412,7 @@ mod tests {
                 ..CompactionConfig::default()
             }
         ));
-        assert!(
-            estimate_session_tokens(&result.compacted_session) < estimate_session_tokens(&session)
-        );
+        assert!(estimate_session_tokens(&session) < estimated_before);
     }
 
     #[test]
@@ -403,7 +431,7 @@ mod tests {
     fn pinned_messages_survive_compaction_verbatim() {
         // A pinned early message must not be folded into the summary: it stays
         // in the transcript verbatim and is excluded from the removed count.
-        let session = Session {
+        let mut session = Session {
             version: 1,
             messages: vec![
                 ConversationMessage::user_text("important constraint ".repeat(40))
@@ -419,8 +447,8 @@ mod tests {
             ],
         };
 
-        let result = compact_session(
-            &session,
+        let result = compact_session_in_place(
+            &mut session,
             CompactionConfig {
                 preserve_recent_messages: 2,
                 max_estimated_tokens: 1,
@@ -431,7 +459,7 @@ mod tests {
         // keep_from = 3; of the 3 removed messages only the 2 unpinned ones are
         // summarized, so the pinned constraint is not counted as removed.
         assert_eq!(result.removed_message_count, 2);
-        let messages = &result.compacted_session.messages;
+        let messages = &session.messages;
         // [continuation, pinned constraint, filler(summarized away? no - it is
         // the preserved recent tail set)] -> the pinned text must be present.
         assert!(

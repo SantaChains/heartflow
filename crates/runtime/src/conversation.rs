@@ -8,7 +8,7 @@ use tokio::task::{AbortHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::compact::{
-    compact_session, estimate_tokens_from, should_compact_with_estimate, truncate_chars,
+    compact_session_in_place, estimate_tokens_from, should_compact_with_estimate, truncate_chars,
     CompactionConfig, CompactionResult,
 };
 use crate::permissions::{PermissionOutcome, PermissionPolicy, PermissionPrompter};
@@ -802,11 +802,19 @@ where
     }
 
     /// Compact the session in place, keeping a resumable system summary.
+    /// The gate uses the amortized token estimate; the in-place compaction
+    /// itself moves messages instead of cloning them.
     pub fn compact(&mut self, config: CompactionConfig) -> CompactionResult {
-        let result = compact_session(&self.session, config);
-        self.session = result.compacted_session.clone();
-        self.token_prefix.set((0, 0));
-        result
+        if self.should_compact(config) {
+            let result = compact_session_in_place(&mut self.session, config);
+            self.token_prefix.set((0, 0));
+            result
+        } else {
+            CompactionResult {
+                summary: String::new(),
+                removed_message_count: 0,
+            }
+        }
     }
 
     /// Toggle the pin flag on the most recent non-system message and return its
@@ -960,15 +968,16 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentEvent, ApiClient, ApiRequest, ConversationRuntime, RuntimeError, StaticToolExecutor,
-        ToolError, ToolExecutor, ToolSpec, TurnStream,
+        build_replay_messages, AgentEvent, ApiClient, ApiRequest, ConversationRuntime,
+        RuntimeError, StaticToolExecutor, ToolError, ToolExecutor, ToolSpec, TurnStream,
     };
-    use crate::compact::CompactionConfig;
+    use crate::compact::{compact_session_in_place, estimate_session_tokens, CompactionConfig};
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest,
     };
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
+    use crate::redact::redact_session;
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::usage::TokenUsage;
     use std::path::PathBuf;
@@ -1239,10 +1248,6 @@ mod tests {
             ..CompactionConfig::default()
         });
         assert!(result.summary.contains("Conversation summary"));
-        assert_eq!(
-            result.compacted_session.messages[0].role,
-            MessageRole::System
-        );
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
     }
 
@@ -1952,5 +1957,137 @@ mod tests {
             probe.max_reads.load(Ordering::SeqCst) >= 2,
             "consecutive independent reads should still run in parallel"
         );
+    }
+
+    /// Size of the synthetic tool result body, in bytes.
+    const TOOL_RESULT_BYTES: usize = 32 * 1024;
+
+    /// One synthetic turn worth of blocks: user text, an assistant text plus
+    /// tool call, and a tool result of `TOOL_RESULT_BYTES`. The first turn also
+    /// carries a base64 image, mirroring a screenshot that is attached once and
+    /// then stays in the transcript for the rest of the session.
+    fn synthetic_turn(round: usize, with_image: bool) -> Vec<ConversationMessage> {
+        let tool_id = format!("call-{round}");
+        let mut blocks = vec![ContentBlock::Text {
+            text: format!("turn {round}: explain what this command does and whether it is safe"),
+        }];
+        if with_image {
+            blocks.push(ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: "A".repeat(4 * 1024 * 1024),
+            });
+        }
+        vec![
+            ConversationMessage {
+                role: MessageRole::User,
+                blocks,
+                usage: None,
+                pinned: false,
+            },
+            ConversationMessage::assistant(vec![
+                ContentBlock::Text {
+                    text: "reading the file first".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: tool_id.clone(),
+                    name: "read_file".to_string(),
+                    input: "{\"path\":\"src/main.rs\"}".to_string(),
+                },
+            ]),
+            ConversationMessage::tool_result(
+                tool_id,
+                "read_file",
+                "x".repeat(TOOL_RESULT_BYTES),
+                false,
+            ),
+        ]
+    }
+
+    fn synthetic_transcript(rounds: usize) -> Session {
+        let mut session = Session::new();
+        for round in 0..rounds {
+            session.messages.extend(synthetic_turn(round, round == 0));
+        }
+        session
+    }
+
+    /// Fastest of `repeat` runs, in microseconds. The probe reports minima
+    /// because these stages are pure CPU: the low end is the signal, the tail is
+    /// scheduler noise.
+    fn timed(repeat: usize, mut step: impl FnMut()) -> u128 {
+        let mut best = u128::MAX;
+        for _ in 0..repeat {
+            let start = std::time::Instant::now();
+            step();
+            best = best.min(start.elapsed().as_micros());
+        }
+        best
+    }
+
+    /// Cost curve of the work every turn pays regardless of how much the model
+    /// says. Run explicitly:
+    ///
+    /// `cargo test -p heartflow-runtime --lib -- --ignored --nocapture turn_overhead`
+    ///
+    /// Numbers are synthetic but scale-faithful: the synthetic tool result is
+    /// `TOOL_RESULT_BYTES` and the image is 4 MiB of base64, the size a single
+    /// attached screenshot reaches.
+    #[test]
+    #[ignore = "perf probe: run with --ignored --nocapture"]
+    fn turn_overhead_grows_with_transcript() {
+        let config = CompactionConfig {
+            preserve_recent_messages: 4,
+            max_estimated_tokens: 10_000,
+            context_window_tokens: 128_000,
+            replay_verbatim_tail: 12,
+        };
+        let literals = vec!["sk-live-credential".to_string()];
+        println!("tool result = {TOOL_RESULT_BYTES} B, image = 4 MiB base64");
+        for rounds in [200usize, 1000, 3000] {
+            let session = synthetic_transcript(rounds);
+            let messages = session.messages.len();
+            println!("rounds={rounds} messages={messages}");
+            let estimate = timed(3, || {
+                std::hint::black_box(estimate_session_tokens(&session));
+            });
+            println!("  estimate_session_tokens  {estimate:>8} us");
+            let replay = timed(3, || {
+                std::hint::black_box(build_replay_messages(
+                    &session.messages,
+                    config.replay_verbatim_tail,
+                ));
+            });
+            println!("  build_replay_messages    {replay:>8} us");
+            let compact = {
+                let mut session = synthetic_transcript(rounds);
+                let start = std::time::Instant::now();
+                std::hint::black_box(compact_session_in_place(&mut session, config));
+                start.elapsed()
+            };
+            println!("  compact_session         {compact:>9?}");
+            let redact = timed(3, || {
+                std::hint::black_box(redact_session(&session, &literals));
+            });
+            println!("  redact_session           {redact:>8} us");
+            let serialize = timed(3, || {
+                std::hint::black_box(
+                    serde_json::to_string_pretty(&session).expect("session should serialize"),
+                );
+            });
+            println!("  to_string_pretty         {serialize:>8} us");
+            // The transcript is rewritten whole every turn, so its serialized
+            // size is also the per-turn disk write.
+            let payload = serde_json::to_string_pretty(&session).expect("session should serialize");
+            println!(
+                "  payload                  {:>8.1} MiB",
+                payload.len() as f64 / (1024.0 * 1024.0)
+            );
+            let path = std::env::temp_dir().join("hf-probe-session.json");
+            let write = timed(3, || {
+                std::fs::write(&path, &payload).expect("probe write");
+            });
+            println!("  fs::write                {write:>8} us");
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }

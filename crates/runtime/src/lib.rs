@@ -16,7 +16,7 @@ pub use agent_assets::{discover_rules, discover_skills, RuleFile, SkillSummary};
 pub use bash::{execute_bash, is_dangerous_command, BashCommandInput, BashCommandOutput};
 pub use compact::estimate_tokens_from;
 pub use compact::{
-    compact_session, estimate_session_tokens, format_compact_summary,
+    compact_session_in_place, estimate_session_tokens, format_compact_summary,
     get_compact_continuation_message, should_compact, truncate_chars, CompactionConfig,
     CompactionResult,
 };
@@ -45,5 +45,7 @@ pub use prompt::{
 };
 pub use redact::{redact_session, redact_text, REDACTED};
 pub use schema::{normalize_tool_schema, validate_tool_input};
-pub use session::{ContentBlock, ConversationMessage, MessageRole, Session, SessionError};
+pub use session::{
+    ContentBlock, ConversationMessage, MessageRole, SegmentRead, Session, SessionError,
+};
 pub use usage::{TokenUsage, UsageTracker};
