@@ -11,18 +11,20 @@
 //! only when the clock or mood actually changes), and consistent with the
 //! project's no-emoji / box-drawing visual language (see [`crate::theme`]).
 //!
-//! Two renderers share one [`Mascot`] state machine:
-//!   * [`Mascot::render`] draws the full 7-wide rounded blob (breathing body +
-//!     blinking eyes) as plain lines for the startup banner and the future
-//!     ratatui status bar.
+//! Two renderers share one [`Mascot`] state machine, both driven by the spring:
+//!   * [`Mascot::render`] plots a **braille dot canvas** (2×4 sub-pixels per
+//!     cell, the same sub-cell technique `obsidian-tui` and ratatui's `Canvas`
+//!     use) so the blob reads as a genuinely round, organic head with
+//!     spring-animated breathing, a bob, blinking eyes, and mood features —
+//!     for the startup banner and the future ratatui status bar.
 //!   * [`Mascot::badge`] draws a one-line eye pair that fits the fixed 2-row
-//!     inline input viewport, where a 5-6 row body would not.
+//!     inline input viewport, where a 5-row body would not.
 //!
 //! The figure is *interactive* in the sense the agent can drive it: the REPL
 //! sets a [`Mood`] at each phase (idle / thinking / running a tool / done /
 //! error) and the mascot's eyes, mouth, blink, and breathing react.
 
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::theme::Theme;
@@ -105,7 +107,8 @@ pub enum Mood {
 }
 
 impl Mood {
-    /// Open (unblinking) eye glyphs, left then right.
+    /// The single-width eye pair the inline [`Mascot::badge`] shows when this
+    /// mood's eyes are open (the braille body draws richer per-mood shapes).
     const fn eyes(self) -> &'static str {
         match self {
             Self::Idle => "○ ○",
@@ -113,16 +116,6 @@ impl Mood {
             Self::Busy => "◐ ◑",
             Self::Done => "◡ ◡",
             Self::Error => "× ×",
-        }
-    }
-
-    /// Mouth glyph.
-    const fn mouth(self) -> &'static str {
-        match self {
-            Self::Idle | Self::Done => "‿",
-            Self::Thinking => "·",
-            Self::Busy => "▫",
-            Self::Error => "﹍",
         }
     }
 
@@ -135,9 +128,102 @@ impl Mood {
 /// The single-width eye pair drawn during a blink (eyes shut).
 const BLINK_EYES: &str = "─ ─";
 
-/// Width (display cells) of [`Mascot::render`] body rows.
-#[allow(dead_code)] // asserted by tests; consumed by the future status bar
-pub const BODY_WIDTH: usize = 7;
+/// Dot-matrix canvas size (in sub-pixels). 9 cells wide x 5 tall, comparable to
+/// the status-bar badge footprint.
+const DOT_WIDTH: usize = 18;
+const DOT_HEIGHT: usize = 20;
+/// Braille sub-pixels per cell, horizontally and vertically.
+const CELL_COLS: usize = 2;
+const CELL_ROWS: usize = 4;
+
+/// A pixel buffer that paints sub-pixels at float coordinates and encodes them
+/// as braille cells. Mirrors `TermAVG`'s *pixel-buffer -> terminal-cell encoding*
+/// split (see `tmj_core/src/img/halfblock.rs`): the dot matrix uses it for
+/// smooth curves; half-block truecolor compositing is deferred to the full-screen
+/// refactor (P4).
+struct Braille {
+    w: usize,
+    h: usize,
+    dots: Vec<bool>,
+}
+
+impl Braille {
+    fn new(w: usize, h: usize) -> Self {
+        Self {
+            w,
+            h,
+            dots: vec![false; w * h],
+        }
+    }
+
+    /// Set a dot by integer coordinate (out-of-range writes are ignored).
+    fn set(&mut self, x: usize, y: usize, on: bool) {
+        if x < self.w && y < self.h {
+            self.dots[y * self.w + x] = on;
+        }
+    }
+
+    /// Set a dot by float coordinate (rounds to the nearest dot).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn set_f(&mut self, fx: f64, fy: f64, on: bool) {
+        if fx < 0.0 || fy < 0.0 {
+            return;
+        }
+        self.set(fx.round() as usize, fy.round() as usize, on);
+    }
+
+    /// Encode to per-row braille strings; an all-dark cell emits a space.
+    fn render(&self) -> Vec<String> {
+        let cols = self.w.div_ceil(CELL_COLS);
+        let rows = self.h.div_ceil(CELL_ROWS);
+        (0..rows)
+            .map(|cy| {
+                (0..cols)
+                    .map(|cx| {
+                        let mut bits = 0u16;
+                        for dy in 0..CELL_ROWS {
+                            for dx in 0..CELL_COLS {
+                                let x = cx * CELL_COLS + dx;
+                                let y = cy * CELL_ROWS + dy;
+                                if x < self.w && y < self.h && self.dots[y * self.w + x] {
+                                    bits |= dot_bit(dx, dy);
+                                }
+                            }
+                        }
+                        if bits == 0 {
+                            ' '
+                        } else {
+                            char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ')
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+}
+
+/// Braille bit map: column 0 is 0x01,0x02,0x04,0x40 (rows 0..3); column 1 is
+/// 0x08,0x10,0x20,0x80.
+const fn dot_bit(dx: usize, dy: usize) -> u16 {
+    match (dx, dy) {
+        (0, 0) => 0x01,
+        (0, 1) => 0x02,
+        (0, 2) => 0x04,
+        (0, 3) => 0x40,
+        (1, 0) => 0x08,
+        (1, 1) => 0x10,
+        (1, 2) => 0x20,
+        (1, 3) => 0x80,
+        _ => 0,
+    }
+}
+
+/// Width (display cells) of [`Mascot::render`]'s braille blob.
+#[allow(dead_code)] // blob geometry constants; consumed by the status bar (P4-c.3)
+pub const RENDER_WIDTH: usize = DOT_WIDTH / CELL_COLS;
+/// Height (display cells) of [`Mascot::render`]'s braille blob.
+#[allow(dead_code)] // see [`RENDER_WIDTH`]
+pub const RENDER_HEIGHT: usize = DOT_HEIGHT / CELL_ROWS;
 
 /// Time-based state for the companion. Owns the blink cadence, the eye-lid
 /// spring, and a slow breathing phase; the REPL drives it by calling
@@ -242,72 +328,137 @@ impl Mascot {
         self.mood.blinks() && self.lid.value() < 0.5
     }
 
-    /// Slow breathing toggle (0 or 1 extra body row) from a 4s sine phase.
+    /// Render the blob as braille dot rows. The head is a spring-squashed
+    /// ellipse ring that breathes and bobs; the eyes blink (lid spring) and take
+    /// a per-mood shape; the mouth smiles/frowns. This replaces the old box-char
+    /// body with genuine sub-cell curvature.
     #[must_use]
-    fn breath(&self) -> usize {
-        // One extra mid row half the time -> a gentle height pulse.
-        usize::from((self.elapsed / 4.0).sin() > 0.0)
-    }
-
-    /// Render the full blob as plain single-width lines. The outer box is fixed;
-    /// breathing adds/removes one interior row and a blink swaps the eye pair,
-    /// so the figure visibly idles.
-    #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )] // float art -> dot grid
     pub fn render(&self) -> Vec<String> {
-        let eyes = if self.eyes_closed() {
-            BLINK_EYES
-        } else {
-            self.mood.eyes()
-        };
-        let mut rows = vec![
-            "╭─────╮".to_string(),
-            format!("│ {eyes} │"),
-            "│     │".to_string(),
-        ];
-        // Breathing inserts an extra belly row at its peak.
-        for _ in 0..self.breath() {
-            rows.push("│     │".to_string());
+        let mut cv = Braille::new(DOT_WIDTH, DOT_HEIGHT);
+        // Slow vertical squash (breathing) + a gentler bob, both from `elapsed`.
+        let breath = (self.elapsed / 2.6 * std::f64::consts::PI).sin();
+        let bob = (self.elapsed / 3.9 * std::f64::consts::PI).sin();
+        let cx = (DOT_WIDTH - 1) as f64 / 2.0;
+        let cy = (DOT_HEIGHT - 1) as f64 / 2.0 + bob;
+        let rx = cx - 0.5;
+        let ry = ((DOT_HEIGHT - 1) as f64 / 2.0 - 1.0) * (1.0 + 0.05 * breath);
+        for y in 0..DOT_HEIGHT {
+            for x in 0..DOT_WIDTH {
+                let nx = (x as f64 - cx) / rx;
+                let ny = (y as f64 - cy) / ry;
+                let r = nx * nx + ny * ny;
+                // A thick ring band reads as a round head outline.
+                cv.set(x, y, (0.60..=1.0).contains(&r));
+            }
         }
-        rows.push(format!("│  {}  │", self.mood.mouth()));
-        rows.push("╰─────╯".to_string());
-        rows
+        self.plot_eyes(&mut cv, cx, cy, rx);
+        self.plot_mouth(&mut cv, cx, cy);
+        cv.render()
     }
 
-    /// Render the full blob as colored ratatui lines (body muted, eyes accent,
-    /// done/error eyes take the success/error hue). For the future status bar.
+    /// Plot both eyes with the mood's shape, scaled by blink openness.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn plot_eyes(&self, cv: &mut Braille, cx: f64, cy: f64, rx: f64) {
+        let openness = if self.mood.blinks() {
+            self.lid.value().clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        // Pupils sit ~40% out from center, a little above the midline.
+        let ex = rx * 0.42;
+        let ey = cy - rx * 0.22;
+        // Busy scans side to side with the clock.
+        let scan = if self.mood == Mood::Busy {
+            (self.elapsed * 1.6).sin() * 1.2
+        } else {
+            0.0
+        };
+        for sign in [-1.0, 1.0] {
+            let ecx = cx + sign * ex + scan;
+            match self.mood {
+                Mood::Error => {
+                    for i in 0..5 {
+                        let dx = f64::from(i) - 2.0;
+                        cv.set_f(ecx + dx, ey + dx, true);
+                        cv.set_f(ecx + dx, ey - dx, true);
+                    }
+                }
+                Mood::Done => {
+                    // Happy up-arched eyes: a dome of dots.
+                    for i in -2..=2 {
+                        let dx = f64::from(i);
+                        cv.set_f(ecx + dx, ey - (1.0 - (dx / 2.0).powi(2)), true);
+                    }
+                }
+                _ if openness < 0.35 => {
+                    for i in -2..=2 {
+                        cv.set_f(ecx + f64::from(i), ey, true);
+                    }
+                }
+                _ => {
+                    let er = 2.3;
+                    let eh = er * (0.35 + 0.65 * openness);
+                    for dy in -3..=3 {
+                        for dx in -3..=3 {
+                            let nx = f64::from(dx) / er;
+                            let ny = f64::from(dy) / eh;
+                            cv.set_f(
+                                ecx + f64::from(dx),
+                                ey + f64::from(dy),
+                                nx * nx + ny * ny <= 1.0,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Plot the mouth with the mood's expression.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+    fn plot_mouth(&self, cv: &mut Braille, cx: f64, cy: f64) {
+        let my = cy + (DOT_HEIGHT as f64) * 0.20;
+        match self.mood {
+            Mood::Idle | Mood::Thinking | Mood::Busy => {
+                for i in -2..=2 {
+                    let dx = f64::from(i);
+                    cv.set_f(cx + dx, my + (dx / 2.0).powi(2), true); // smile
+                }
+            }
+            Mood::Done => {
+                for i in -3..=3 {
+                    let dx = f64::from(i);
+                    cv.set_f(cx + dx, my + (dx / 3.0).powi(2), true); // bigger smile
+                }
+            }
+            Mood::Error => {
+                for i in -2..=2 {
+                    let dx = f64::from(i);
+                    cv.set_f(cx + dx, my + 2.0 - (dx / 2.0).powi(2), true); // frown
+                }
+            }
+        }
+    }
+
+    /// Render the braille blob as colored ratatui lines (mood hue on the whole
+    /// figure). The status bar (P4-c.3) drops this into its right region.
     #[allow(dead_code)] // consumed by the ratatui status bar (P4-c.3)
     #[must_use]
     pub fn render_ratatui<'a>(&'a self, theme: &'a Theme) -> Vec<Line<'a>> {
-        let eye_color = match self.mood {
+        let color = match self.mood {
             Mood::Done => theme.success(),
             Mood::Error => theme.error(),
             _ => theme.accent(),
-        };
-        let body = theme.muted().ratatui();
-        let eye_color = eye_color.ratatui();
+        }
+        .ratatui();
         self.render()
             .into_iter()
-            .map(|row| {
-                // Split the eye row so only the pupils are accent-colored.
-                let eyes = if self.eyes_closed() {
-                    BLINK_EYES
-                } else {
-                    self.mood.eyes()
-                };
-                if row.starts_with("│ ") && row.contains(eyes) {
-                    let (head, tail) = row.split_once(eyes).unwrap_or(("", ""));
-                    Line::from(vec![
-                        Span::styled(head.to_string(), Style::default().fg(body)),
-                        Span::styled(
-                            eyes.to_string(),
-                            Style::default().fg(eye_color).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(tail.to_string(), Style::default().fg(body)),
-                    ])
-                } else {
-                    Line::from(Span::styled(row, Style::default().fg(body)))
-                }
-            })
+            .map(|row| Line::from(Span::styled(row, Style::default().fg(color))))
             .collect()
     }
 
@@ -376,19 +527,28 @@ mod tests {
     }
 
     #[test]
-    fn render_is_box_lined_and_width_stable() {
+    fn render_is_braille_blob_with_stable_size() {
         let mut m = Mascot::new();
-        // Freeze breathing at both phases so width invariance is checked fully.
         m.set_mood(Mood::Thinking);
         let rows = m.render();
-        assert!(rows.first().is_some_and(|r| r == "╭─────╮"));
-        assert!(rows.last().is_some_and(|r| r == "╰─────╯"));
-        // Every row is the same display width (single-width glyphs only).
-        let width = rows[0].chars().count();
-        assert_eq!(width, BODY_WIDTH, "row width: {rows:?}");
+        assert_eq!(rows.len(), RENDER_HEIGHT, "row count");
         for row in &rows {
-            assert_eq!(row.chars().count(), width, "ragged row: {row}");
+            assert_eq!(row.chars().count(), RENDER_WIDTH, "ragged row: {row:?}");
+            for ch in row.chars() {
+                assert!(
+                    ch == ' ' || ('\u{2800}'..'\u{28FF}').contains(&ch),
+                    "non-braille glyph {ch:?}"
+                );
+            }
         }
+        // A round head leaves the bounding-box corners clear.
+        assert_eq!(rows[0].chars().next(), Some(' '), "top-left corner");
+        assert_eq!(rows[0].chars().last(), Some(' '), "top-right corner");
+        // The blob is not blank.
+        assert!(
+            rows.iter().any(|r| r.chars().any(|c| c != ' ')),
+            "blob is blank: {rows:?}"
+        );
     }
 
     #[test]
@@ -419,13 +579,15 @@ mod tests {
     }
 
     #[test]
-    fn mood_changes_eyes_and_mouth() {
-        let mut m = Mascot::new();
-        m.set_mood(Mood::Error);
-        let rendered = m.render().concat();
-        assert!(rendered.contains("× ×"), "error shows X eyes: {rendered}");
-        m.set_mood(Mood::Thinking);
-        assert!(m.render().concat().contains("◉ ◉"));
+    fn mood_changes_the_face() {
+        let mut idle = Mascot::new();
+        idle.set_mood(Mood::Idle);
+        let mut err = Mascot::new();
+        err.set_mood(Mood::Error);
+        let mut done = Mascot::new();
+        done.set_mood(Mood::Done);
+        assert_ne!(idle.render(), err.render(), "error eyes differ from idle");
+        assert_ne!(done.render(), err.render(), "done differs from error");
     }
 
     #[test]
