@@ -120,7 +120,10 @@ pub fn search_documents(input: &DocSearchInput) -> io::Result<DocSearchOutput> {
 }
 
 /// True when `rga --version` runs successfully. Cached for the process.
-fn rga_available() -> bool {
+/// Exposed so tool registration can advertise `search_documents` only when
+/// the backing binary exists.
+#[must_use]
+pub fn rga_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
         Command::new("rga")
