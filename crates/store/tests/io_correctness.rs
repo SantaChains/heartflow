@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use runtime::{ContentBlock, ConversationMessage, MessageRole, TokenUsage};
-use store::{Integrity, SearchMethod, SessionMeta, Store};
+use store::{Integrity, SearchMethod, SessionMeta, Store, StoreError};
 
 /// A temp dir that removes itself (and any `-wal`/`-shm` sidecars) on drop.
 struct Scratch(PathBuf);
@@ -591,4 +591,119 @@ fn wal_lets_two_open_handles_share_one_file() {
         "b's committed write is readable from a"
     );
     assert_eq!(a.integrity_check().expect("check"), Integrity::Ok);
+}
+
+/// A list of `n` distinguishable messages for append-vs-full comparisons.
+fn msgs(prefix: &str, n: usize) -> Vec<ConversationMessage> {
+    (0..n)
+        .map(|i| user(&format!("{prefix} message {i} 中文内容")))
+        .collect()
+}
+
+#[test]
+fn incremental_append_equals_full_replace() {
+    let all = msgs("grow", 10);
+    // Control: one full save of every message.
+    let control = Store::open_in_memory().expect("control");
+    control
+        .save_session("s", &meta(1), &all)
+        .expect("control save");
+
+    // Under test: save a base, then append the remaining turns incrementally.
+    let store = Store::open_in_memory().expect("store");
+    let split = 4;
+    store
+        .save_session("s", &meta(1), &all[..split])
+        .expect("base save");
+    store
+        .append_messages("s", &meta(2), split, &all[split..], split)
+        .expect("append tail");
+
+    // The reconstructed transcript (order + content) must equal both the
+    // source and a byte-for-byte full replace — proving seq continues correctly
+    // and the shared row-writer emits identical bytes.
+    assert_eq!(load(&store, "s"), all, "append reconstructs exactly");
+    assert_eq!(load(&store, "s"), load(&control, "s"));
+    assert_eq!(
+        store.integrity_check().expect("check"),
+        Integrity::Ok,
+        "FTS shadow stays consistent after append"
+    );
+    assert!(
+        !store
+            .search("grow message 9", None, 10)
+            .expect("search appended")
+            .is_empty(),
+        "appended tail must be searchable"
+    );
+}
+
+#[test]
+fn append_rejects_base_count_drift_without_writing() {
+    let store = Store::open_in_memory().expect("store");
+    store
+        .save_session("s", &meta(1), &msgs("keep", 3))
+        .expect("base");
+    // Caller believes 7 rows exist; only 3 do (e.g. a compaction shortened it).
+    let err = store
+        .append_messages("s", &meta(2), 7, &msgs("new", 2), 7)
+        .expect_err("must reject on drift");
+    assert!(
+        matches!(
+            err,
+            StoreError::Drift {
+                expected: 7,
+                found: 3
+            }
+        ),
+        "unexpected error: {err}"
+    );
+    assert_eq!(load(&store, "s").len(), 3, "original rows untouched");
+}
+
+#[test]
+fn append_rejects_inconsistent_first_seq_before_touching_db() {
+    let store = Store::open_in_memory().expect("store");
+    store
+        .save_session("s", &meta(1), &msgs("keep", 3))
+        .expect("base");
+    // first_seq (5) disagrees with expected_existing (3): a caller bug, rejected
+    // without a connection round-trip.
+    let err = store
+        .append_messages("s", &meta(2), 5, &msgs("new", 1), 3)
+        .expect_err("mismatched seq/base rejected");
+    assert!(matches!(err, StoreError::Drift { .. }));
+    assert_eq!(load(&store, "s").len(), 3);
+}
+
+#[test]
+fn append_rolls_back_header_when_base_missing() {
+    // A fresh DB has zero rows for the id; an append expecting a prior base must
+    // fail and leave no orphan session header (the transaction rolls back).
+    let store = Store::open_in_memory().expect("store");
+    let err = store
+        .append_messages("ghost", &meta(1), 5, &msgs("new", 1), 5)
+        .expect_err("missing base rejected");
+    assert!(matches!(
+        err,
+        StoreError::Drift {
+            expected: 5,
+            found: 0
+        }
+    ));
+    assert!(
+        store.load_session("ghost").expect("load").is_none(),
+        "rejected append leaves no orphan header row"
+    );
+}
+
+#[test]
+fn append_empty_tail_refreshes_header_only() {
+    let store = Store::open_in_memory().expect("store");
+    let base = msgs("same", 3);
+    store.save_session("s", &meta(1), &base).expect("base");
+    store
+        .append_messages("s", &meta(9), 3, &[], 3)
+        .expect("empty append ok");
+    assert_eq!(load(&store, "s"), base, "no rows added");
 }

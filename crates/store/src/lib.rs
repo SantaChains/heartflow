@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 use runtime::{ConversationMessage, Session};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, Transaction};
 
 pub use error::StoreError;
 pub use model::{
@@ -146,28 +146,7 @@ impl Store {
     ) -> Result<(), StoreError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
-        tx.execute(
-            "INSERT INTO sessions (session_id, created_at, updated_at, source_path, provider, model)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(session_id) DO UPDATE SET
-                 updated_at = excluded.updated_at,
-                 source_path = excluded.source_path,
-                 provider = excluded.provider,
-                 model = excluded.model;",
-            params![
-                session_id,
-                meta.created_at,
-                meta.updated_at,
-                meta.source_path,
-                meta.provider,
-                meta.model
-            ],
-        )?;
-        let session_row: i64 = tx.query_row(
-            "SELECT id FROM sessions WHERE session_id = ?1;",
-            params![session_id],
-            |row| row.get(0),
-        )?;
+        let session_row = upsert_session(&tx, session_id, meta)?;
 
         tx.execute(
             "DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE session_row = ?1);",
@@ -177,59 +156,60 @@ impl Store {
             "DELETE FROM messages WHERE session_row = ?1;",
             params![session_row],
         )?;
+        write_message_rows(&tx, session_row, 0, messages)?;
 
-        // Prepare the two per-row INSERTs once and reuse them across the loop.
-        // The old form called `tx.execute(sql, ..)` per message, which re-runs
-        // `sqlite3_prepare` on identical SQL 2*N times per save. `Statement::insert`
-        // binds/steps/resets and returns the new rowid in one call (no separate
-        // `last_insert_rowid` round-trip); the FTS rows are written in a second
-        // pass so the two prepared statements don't contend for the `tx` borrow.
-        // Persisted bytes are identical to the previous implementation.
-        let mut inserted: Vec<(i64, String)> = Vec::with_capacity(messages.len());
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO messages (session_row, seq, role, blocks_json, search_text, has_usage, \
-                 input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, \
-                 pinned) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);",
-            )?;
-            for (index, message) in messages.iter().enumerate() {
-                let seq = i64::try_from(index).map_err(|e| StoreError::Format(e.to_string()))?;
-                let blocks_json = serde_json::to_string(&message.blocks)?;
-                let search_text = flatten_search_text(&message.blocks);
-                let (has_usage, input, output, cache_create, cache_read) = match message.usage {
-                    Some(u) => (
-                        1,
-                        i64::from(u.input_tokens),
-                        i64::from(u.output_tokens),
-                        i64::from(u.cache_creation_input_tokens),
-                        i64::from(u.cache_read_input_tokens),
-                    ),
-                    None => (0, 0, 0, 0, 0),
-                };
-                let rowid = stmt.insert(params![
-                    session_row,
-                    seq,
-                    role_str(message.role),
-                    blocks_json,
-                    search_text,
-                    has_usage,
-                    input,
-                    output,
-                    cache_create,
-                    cache_read,
-                    i64::from(u8::from(message.pinned))
-                ])?;
-                inserted.push((rowid, search_text));
-            }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Append a new message *tail* onto an already-mirrored session without
+    /// rewriting its existing rows — the fast path that turns per-turn history
+    /// mirroring from O(session length) into O(new messages).
+    ///
+    /// `first_seq` is the sequence index the first element of `tail` must take
+    /// (the caller's belief about how many rows are already stored), and
+    /// `expected_existing` restates that base so the write can be validated.
+    /// The whole operation is one transaction guarded by a base check: if the
+    /// stored row count differs — a compaction shortened the session, the DB was
+    /// rebuilt, or another process rewrote it — this returns
+    /// [`StoreError::Drift`] *without* touching any row, and the caller falls
+    /// back to the proven full [`save_session`](Self::save_session). The JSON
+    /// transcript stays authoritative, so a rejected append never loses or
+    /// duplicates history; it only defers to the rewrite.
+    pub fn append_messages(
+        &self,
+        session_id: &str,
+        meta: &SessionMeta,
+        first_seq: usize,
+        tail: &[ConversationMessage],
+        expected_existing: usize,
+    ) -> Result<(), StoreError> {
+        if first_seq != expected_existing {
+            return Err(StoreError::Drift {
+                expected: expected_existing,
+                found: first_seq,
+            });
         }
-        {
-            let mut stmt =
-                tx.prepare("INSERT INTO messages_fts (rowid, search_text) VALUES (?1, ?2);")?;
-            for (rowid, search_text) in &inserted {
-                stmt.execute(params![rowid, search_text])?;
-            }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let session_row = upsert_session(&tx, session_id, meta)?;
+
+        let stored: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_row = ?1;",
+            params![session_row],
+            |row| row.get(0),
+        )?;
+        let stored = usize::try_from(stored).map_err(|e| StoreError::Format(e.to_string()))?;
+        if stored != expected_existing {
+            // Base moved under us: drop without commit (rolls back the header
+            // upsert too) and let the caller take the full-rewrite path.
+            return Err(StoreError::Drift {
+                expected: expected_existing,
+                found: stored,
+            });
         }
 
+        write_message_rows(&tx, session_row, first_seq, tail)?;
         tx.commit()?;
         Ok(())
     }
@@ -423,6 +403,104 @@ impl Store {
         let version: i64 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
         Ok(version)
     }
+}
+
+/// Insert-or-refresh the session header row and return its internal id. Shared
+/// by the full replace (`save_session`) and the incremental tail-append
+/// (`append_messages`) so header semantics (which fields update on conflict) can
+/// never drift between the two write paths.
+fn upsert_session(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    meta: &SessionMeta,
+) -> Result<i64, StoreError> {
+    tx.execute(
+        "INSERT INTO sessions (session_id, created_at, updated_at, source_path, provider, model)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(session_id) DO UPDATE SET
+             updated_at = excluded.updated_at,
+             source_path = excluded.source_path,
+             provider = excluded.provider,
+             model = excluded.model;",
+        params![
+            session_id,
+            meta.created_at,
+            meta.updated_at,
+            meta.source_path,
+            meta.provider,
+            meta.model
+        ],
+    )?;
+    let session_row: i64 = tx.query_row(
+        "SELECT id FROM sessions WHERE session_id = ?1;",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    Ok(session_row)
+}
+
+/// Write `messages` as ordered rows starting at sequence `start_seq`, plus their
+/// FTS shadows, reusing one prepared statement per table across the loop.
+///
+/// This is the single definition of "how a message becomes stored rows", shared
+/// byte-for-byte by both the full rewrite and the incremental append, so the two
+/// paths always agree on column order, usage flattening, and pin encoding. The
+/// old per-message `tx.execute(sql, ..)` re-ran `sqlite3_prepare` on identical
+/// SQL 2*N times; `Statement::insert` binds/steps/resets and returns the rowid
+/// in one call. FTS rows are written in a second pass so the two prepared
+/// statements don't contend for the `tx` borrow.
+fn write_message_rows(
+    tx: &Transaction<'_>,
+    session_row: i64,
+    start_seq: usize,
+    messages: &[ConversationMessage],
+) -> Result<(), StoreError> {
+    let mut inserted: Vec<(i64, String)> = Vec::with_capacity(messages.len());
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO messages (session_row, seq, role, blocks_json, search_text, has_usage, \
+             input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, \
+             pinned) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);",
+        )?;
+        for (index, message) in messages.iter().enumerate() {
+            let seq =
+                i64::try_from(start_seq + index).map_err(|e| StoreError::Format(e.to_string()))?;
+            let blocks_json = serde_json::to_string(&message.blocks)?;
+            let search_text = flatten_search_text(&message.blocks);
+            let (has_usage, input, output, cache_create, cache_read) = match message.usage {
+                Some(u) => (
+                    1,
+                    i64::from(u.input_tokens),
+                    i64::from(u.output_tokens),
+                    i64::from(u.cache_creation_input_tokens),
+                    i64::from(u.cache_read_input_tokens),
+                ),
+                None => (0, 0, 0, 0, 0),
+            };
+            let rowid = stmt.insert(params![
+                session_row,
+                seq,
+                role_str(message.role),
+                blocks_json,
+                search_text,
+                has_usage,
+                input,
+                output,
+                cache_create,
+                cache_read,
+                i64::from(u8::from(message.pinned))
+            ])?;
+            inserted.push((rowid, search_text));
+        }
+    }
+    {
+        let mut stmt =
+            tx.prepare("INSERT INTO messages_fts (rowid, search_text) VALUES (?1, ?2);")?;
+        for (rowid, search_text) in &inserted {
+            stmt.execute(params![rowid, search_text])?;
+        }
+    }
+    Ok(())
 }
 
 /// Create/upgrade the schema to `SCHEMA_VERSION`, idempotently.

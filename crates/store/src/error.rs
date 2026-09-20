@@ -10,6 +10,12 @@ pub enum StoreError {
     Json(serde_json::Error),
     /// The stored row could not be decoded into a domain type.
     Format(String),
+    /// An incremental append found a message count other than the caller's
+    /// base assumption (a compaction shortened the session, the DB was rebuilt,
+    /// or another process rewrote it). The append was rejected untouched; the
+    /// caller should fall back to a full `save_session`. `expected` is the base
+    /// the caller believed present, `found` the actual stored count.
+    Drift { expected: usize, found: usize },
 }
 
 impl Display for StoreError {
@@ -18,6 +24,12 @@ impl Display for StoreError {
             Self::Sqlite(error) => write!(f, "sqlite error: {error}"),
             Self::Json(error) => write!(f, "json error: {error}"),
             Self::Format(error) => write!(f, "store format error: {error}"),
+            Self::Drift { expected, found } => {
+                write!(
+                    f,
+                    "append base drift: expected {expected} stored rows, found {found}"
+                )
+            }
         }
     }
 }
