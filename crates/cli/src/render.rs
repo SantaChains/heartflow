@@ -1,5 +1,6 @@
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
+use std::sync::OnceLock;
 
 use crossterm::cursor::{MoveToColumn, RestorePosition, SavePosition};
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor, Stylize};
@@ -176,23 +177,33 @@ impl RenderState {
     }
 }
 
+/// Process-wide syntax definitions, loaded once (~10ms) instead of per turn.
+fn global_syntax_set() -> &'static SyntaxSet {
+    static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
+    SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
+}
+
+/// Process-wide highlight theme, loaded once instead of per turn.
+fn global_theme() -> &'static Theme {
+    static THEME: OnceLock<Theme> = OnceLock::new();
+    THEME.get_or_init(|| {
+        ThemeSet::load_defaults()
+            .themes
+            .remove("base16-ocean.dark")
+            .unwrap_or_default()
+    })
+}
+
 #[derive(Debug)]
 pub struct TerminalRenderer {
-    syntax_set: SyntaxSet,
-    syntax_theme: Theme,
+    syntax_theme: &'static Theme,
     color_theme: ColorTheme,
 }
 
 impl Default for TerminalRenderer {
     fn default() -> Self {
-        let syntax_set = SyntaxSet::load_defaults_newlines();
-        let syntax_theme = ThemeSet::load_defaults()
-            .themes
-            .remove("base16-ocean.dark")
-            .unwrap_or_default();
         Self {
-            syntax_set,
-            syntax_theme,
+            syntax_theme: global_theme(),
             color_theme: ColorTheme::default(),
         }
     }
@@ -387,15 +398,15 @@ impl TerminalRenderer {
 
     #[must_use]
     pub fn highlight_code(&self, code: &str, language: &str) -> String {
-        let syntax = self
-            .syntax_set
+        let syntax_set = global_syntax_set();
+        let syntax = syntax_set
             .find_syntax_by_token(language)
-            .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
-        let mut syntax_highlighter = HighlightLines::new(syntax, &self.syntax_theme);
+            .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
+        let mut syntax_highlighter = HighlightLines::new(syntax, self.syntax_theme);
         let mut colored_output = String::new();
 
         for line in LinesWithEndings::from(code) {
-            match syntax_highlighter.highlight_line(line, &self.syntax_set) {
+            match syntax_highlighter.highlight_line(line, syntax_set) {
                 Ok(ranges) => {
                     colored_output.push_str(&as_24_bit_terminal_escaped(&ranges[..], false));
                 }

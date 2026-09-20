@@ -27,10 +27,13 @@ struct Job {
 /// object or an SSE body whose `data:` frames carry the JSON-RPC messages. The
 /// `Mcp-Session-Id` returned by `initialize` is replayed on later requests.
 ///
-/// A dedicated worker thread owns an async `reqwest` client and its own tokio
-/// runtime, so `send_line`/`recv_line` stay synchronous for callers exactly like
+/// A dispatcher thread owns an async `reqwest` client and its own tokio
+/// runtime shared with per-request worker threads, so `send_line`/`recv_line`
+/// stay synchronous for callers exactly like
 /// [`StdioTransport`](crate::StdioTransport) — and never trip the
 /// `block_on` inside a runtime panic regardless of the calling context.
+/// Concurrent tool calls therefore POST in parallel instead of queueing on a
+/// single worker.
 ///
 /// Limitation (documented, not a defect): the optional server-initiated GET SSE
 /// channel is not opened. heartflow does not service server→client requests
@@ -51,7 +54,10 @@ impl HttpTransport {
         bearer: Option<String>,
     ) -> io::Result<Self> {
         let (tx, rx) = mpsc::channel::<Job>();
-        let worker = thread::spawn(move || run_worker(&url, &headers, bearer.as_deref(), rx));
+        let url: Arc<str> = Arc::from(url);
+        let headers: Arc<Vec<(String, String)>> = Arc::new(headers);
+        let bearer: Option<Arc<str>> = bearer.map(Into::into);
+        let worker = thread::spawn(move || run_worker(&url, &headers, bearer.as_ref(), rx));
         Ok(Self {
             tx,
             inbound: VecDeque::new(),
@@ -61,9 +67,9 @@ impl HttpTransport {
 }
 
 fn run_worker(
-    url: &str,
-    headers: &[(String, String)],
-    bearer: Option<&str>,
+    url: &Arc<str>,
+    headers: &Arc<Vec<(String, String)>>,
+    bearer: Option<&Arc<str>>,
     rx: mpsc::Receiver<Job>,
 ) {
     // A private runtime keeps this transport independent of the caller's.
@@ -75,15 +81,31 @@ fn run_worker(
         }
         return;
     };
+    let rt = Arc::new(rt);
     let client = build_client();
     let session: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     for job in rx {
-        let lines = rt.block_on(post_once(
-            &client, url, headers, bearer, &session, &job.body,
-        ));
-        if job.reply.send(lines).is_err() {
-            break;
-        }
+        // One thread per request: callers may issue several MCP tool calls in
+        // parallel, and each thread blocks on its own POST inside the shared
+        // runtime. Detached threads end naturally after their POST finishes
+        // (bounded by HTTP_TIMEOUT) even if the transport is dropped.
+        let rt = Arc::clone(&rt);
+        let client = client.clone();
+        let session = Arc::clone(&session);
+        let url = Arc::clone(url);
+        let headers = Arc::clone(headers);
+        let bearer = bearer.cloned();
+        thread::spawn(move || {
+            let lines = rt.block_on(post_once(
+                &client,
+                &url,
+                &headers,
+                bearer.as_deref(),
+                &session,
+                &job.body,
+            ));
+            let _ = job.reply.send(lines);
+        });
     }
 }
 
