@@ -5,6 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command as TokioCommand;
 use tokio::runtime::Builder;
 use tokio::time::timeout;
@@ -63,6 +64,45 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
 /// Foreground-command timeout ceiling; the model may override it per call.
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
+
+/// Per-stream capture ceiling. A build log or directory dump can emit many
+/// megabytes; echoing all of it back burns context tokens with no review
+/// value. Past the cap the tail is replaced by an omission note pointing the
+/// model at precise tools (`grep`/`read_file`) instead of raw replay.
+const MAX_STREAM_BYTES: usize = 512 * 1024;
+
+/// Read one child stream up to [`MAX_STREAM_BYTES`], then keep draining and
+/// counting the rest. Draining is required: a stalled pipe would block the
+/// child forever and turn the timeout into the only exit.
+async fn read_stream_bounded<S: tokio::io::AsyncRead + Unpin>(mut stream: S) -> (Vec<u8>, u64) {
+    let mut buf = Vec::with_capacity(64 * 1024);
+    let mut dropped: u64 = 0;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        if buf.len() < MAX_STREAM_BYTES {
+            let take = (MAX_STREAM_BYTES - buf.len()).min(n);
+            buf.extend_from_slice(&chunk[..take]);
+            dropped += (n - take) as u64;
+        } else {
+            dropped += n as u64;
+        }
+    }
+    (buf, dropped)
+}
+
+/// Append the omission note for a capped stream, keeping byte count honest.
+fn with_truncation_note(text: String, dropped: u64) -> String {
+    if dropped > 0 {
+        return format!(
+            "{text}\n[truncated: {dropped} bytes omitted; use grep_search or read_file for precise output]"
+        );
+    }
+    text
+}
 
 /// Background tasks tee stdout/stderr into a shared log file (returned as
 /// `raw_output_path`) instead of discarding them, so the agent can read
@@ -171,8 +211,38 @@ async fn execute_bash_async(
         .timeout
         .unwrap_or(DEFAULT_TIMEOUT_MS)
         .min(MAX_TIMEOUT_MS);
-    let output_result = match timeout(Duration::from_millis(timeout_ms), command.output()).await {
-        Ok(result) => (result?, false),
+
+    // Bounded streaming instead of `.output()`: each stream is captured up to
+    // MAX_STREAM_BYTES. On timeout the future is dropped and kill_on_drop
+    // reaps the child, exactly as before.
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Boxed once: the join! state machine plus Child exceed clippy's
+    // large-future threshold and poll() never inspects them anyway.
+    let collected = timeout(
+        Duration::from_millis(timeout_ms),
+        Box::pin(async {
+            let stdout = read_stream_bounded(child.stdout.take().expect("piped stdout"));
+            let stderr = read_stream_bounded(child.stderr.take().expect("piped stderr"));
+            let wait = child.wait();
+            let (status_res, (out_bytes, out_dropped), (err_bytes, err_dropped)) =
+                tokio::join!(wait, stdout, stderr);
+            // A wait() error means the child vanished under us; treat as unknown
+            // status rather than failing the whole capture.
+            let status = status_res.ok();
+            (
+                status,
+                with_truncation_note(decode_output(&out_bytes), out_dropped),
+                with_truncation_note(decode_output(&err_bytes), err_dropped),
+            )
+        }),
+    )
+    .await;
+    let (output, interrupted) = match collected {
+        Ok(triple) => (triple, false),
         Err(_) => {
             return Ok(BashCommandOutput {
                 stdout: String::new(),
@@ -193,11 +263,9 @@ async fn execute_bash_async(
         }
     };
 
-    let (output, interrupted) = output_result;
-    let stdout = decode_output(&output.stdout);
-    let stderr = decode_output(&output.stderr);
+    let (status, stdout, stderr) = output;
     let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
-    let return_code_interpretation = output.status.code().and_then(|code| {
+    let return_code_interpretation = status.and_then(|status| status.code()).and_then(|code| {
         if code == 0 {
             None
         } else {
@@ -386,6 +454,53 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{execute_bash, is_dangerous_command, resolve_shell, BashCommandInput};
+
+    #[test]
+    fn bounded_reads_capture_head_and_count_tail() {
+        // A small runtime exercises the exact drain semantics used in prod.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let payload = vec![b'x'; super::MAX_STREAM_BYTES + 10_000];
+        let (buf, dropped) =
+            runtime.block_on(super::read_stream_bounded(std::io::Cursor::new(payload)));
+        assert_eq!(buf.len(), super::MAX_STREAM_BYTES);
+        assert_eq!(dropped, 10_000);
+
+        let (buf, dropped) =
+            runtime.block_on(super::read_stream_bounded(std::io::Cursor::new(vec![
+                b'y';
+                100
+            ])));
+        assert_eq!(buf.len(), 100);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn truncation_note_reports_omitted_bytes() {
+        let plain = super::with_truncation_note(String::from("ok"), 0);
+        assert_eq!(plain, "ok");
+        let noted = super::with_truncation_note(String::from("head"), 4096);
+        assert!(noted.starts_with("head"));
+        assert!(noted.contains("4096 bytes omitted"));
+    }
+
+    #[test]
+    fn oversized_output_is_truncated_with_note() {
+        let output = execute_bash(BashCommandInput {
+            // ~2 MB of stdout: beyond the 512 KB capture cap.
+            command: String::from("1..200000 | ForEach-Object { 'A' * 12 }"),
+            timeout: Some(30_000),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(false),
+        })
+        .expect("shell command should execute");
+        assert!(output.stdout.len() < 600 * 1024, "stdout not truncated");
+        assert!(output.stdout.contains("bytes omitted"));
+        assert!(!output.interrupted);
+    }
 
     #[test]
     fn flags_destructive_commands() {
