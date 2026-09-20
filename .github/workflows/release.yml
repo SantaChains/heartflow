@@ -3,7 +3,8 @@ name: Release
 # heartflow 自动发布,三段式:plan(dry) → publish → windows-zip(便携包,随每次发布)
 #   - 零 Node:版本计算/CHANGELOG/Release 全部走 scripts/release.sh + git-cliff,本地可先行验证省 Actions
 #   - 语义:feat→minor、fix→patch、!/BREAKING CHANGE→major;chore 等 push 在 plan 秒级短路
-#   - Windows amd64 便携 zip(hf.exe 置于压缩包根 + sha256)上传到 Release,供 scoop bucket 自动更新
+#   - Windows amd64 便携 zip(hf.exe 置于压缩包根 + sha256)上传到 Release;bucket manifest
+#     由 windows-zip job 直接写真实 version/url/hash(CI 单一写入者,无外部 autoupdate 机器人)
 #   - 代码质量门由 ci.yml 独立负责,本流水线不做 fmt/clippy/test
 #   - 本地预检:bash scripts/release.sh plan;RELEASE_DRY_RUN=1 bash scripts/release.sh publish
 
@@ -101,19 +102,25 @@ jobs:
           $v = ("${{ needs.plan.outputs.tag }}" -replace "^v", "")
           $name = "heartflow-$v-win-amd64.zip"
           gh release upload "${{ needs.plan.outputs.tag }}" $name "$name.sha256" --clobber
-      - name: update bucket manifest (version + hash)
+      - name: update bucket manifest (version + url + hash)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          # scoop install 只认字符串 hash;url+find 形态仅 autoupdate 可解析。
-          # 自托管 bucket 无自动更新机器人,由本流水线在每次发布时写入实际值。
+          # 自托管 bucket,CI 是唯一写入者:version/url/hash 三者全由本次 tag 独立推导。
+          # url 恒等于 release 下载地址(以 homepage 为基,不硬编码 host/repo),不再解析
+          # 上一版 url 做子串替换——少一层假设,历史漂移也能自愈;scoop 下载与 hash 天然对应。
+          $tag = "${{ needs.plan.outputs.tag }}"
+          $v = ($tag -replace "^v", "")
+          $name = "heartflow-$v-win-amd64.zip"
           $m = Get-Content bucket/heartflow.json -Raw | ConvertFrom-Json
-          $m.version = ("${{ needs.plan.outputs.tag }}" -replace "^v", "")
+          $m.version = $v
+          $m.architecture."64bit".url = "$($m.homepage)/releases/download/$tag/$name"
           $m.architecture."64bit".hash = "${{ steps.pack.outputs.sha }}"
-          ($m | ConvertTo-Json -Depth 10) | Set-Content bucket/heartflow.json -Encoding utf8
+          # pwsh7 utf8 本就无 BOM;显式 utf8NoBOM 以免疫环境默认编码(带 BOM 会令部分 JSON 解析器报错)
+          ($m | ConvertTo-Json -Depth 10) | Set-Content bucket/heartflow.json -Encoding utf8NoBOM
           git config user.name "github-actions[bot]"
           git config user.email "418982825+github-actions[bot]@users.noreply.github.com"
           git add bucket/heartflow.json
-          git commit -m "chore(bucket): update manifest for ${{ needs.plan.outputs.tag }} [skip ci]"
+          git commit -m "chore(bucket): update manifest for $tag [skip ci]"
           if ($LASTEXITCODE -ne 0) { exit 0 } # 同版本重传时 manifest 无变化
           git push origin HEAD:main

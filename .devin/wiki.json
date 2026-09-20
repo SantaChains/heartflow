@@ -1,0 +1,34 @@
+{
+  "repo_notes": [
+    {
+      "content": "heartflow 是 Rust 实现的终端 AI agent,二进制/命令名是 hf(不是 heartflow)。Cargo workspace 成员在 crates/*,依赖单向:cli -> {runtime, api, tools, mcp, store, commands}。请以此命名与拓扑为准组织各页。",
+      "author": "maintainer"
+    },
+    {
+      "content": "运行时核心在 crates/runtime:conversation.rs 区分磁盘转录与喂给模型的注入视图(build_replay_messages);prompt.rs 组装系统提示词(Memory/Rules/Skills/Project,含 memory 分层夹紧与 redact_secrets);compact.rs 定义 CompactionConfig。crates/store 是派生自 JSON 的 SQLite FTS5 缓存,JSON 始终权威。",
+      "author": "maintainer"
+    },
+    {
+      "content": "发布流水线零 Node:scripts/release.sh + git-cliff 驱动版本/GitHub Release/crates.io,bucket/ 目录兼作 scoop bucket。面向用户的文档站在 docs/src(mdBook)。",
+      "author": "maintainer"
+    }
+  ],
+  "pages": [
+    { "title": "Overview", "purpose": "项目定位、核心能力(流式、双协议、原生工具、MCP、任务自迭代、上下文工程)与 README 特性矩阵的高层导览" },
+    { "title": "Installation & Distribution", "purpose": "四条安装通道(scoop/crates.io/git/便携 zip)、从源码构建、以及 scripts/release.sh + .github/workflows/release.yml 的发布/分发流水线" },
+    { "title": "CLI Reference", "purpose": "crates/cli 的子命令面(prompt/search/config/doctor/init/models/system-prompt)、全局参数、--resume 交互契约与退出码" },
+    { "title": "REPL & Slash Commands", "purpose": "REPL 内联视口交互与全部 slash 命令(/help /model /mode /status /compact /pin /sessions /remember /mcp /search /plan /guide /queue 等),权限三档与 /plan 门禁" },
+    { "title": "Configuration", "purpose": "config.toml 优先级链、[provider]/[mcp.servers]/[theme] 结构、内置 deepseek/anthropic provider、密钥解析(env 优先)、热重载" },
+    { "title": "Context Engineering", "purpose": ">50% 预压缩 summarize-then-compact、HEARTFLOW_AUTO_COMPACT_TOKENS 与 [provider] context_window、/pin 免疫、replay_verbatim_tail 注入折叠" },
+    { "title": "Sessions & History Store", "purpose": "crates/store:JSONL 权威转录、SQLite FTS5 trigram 镜像(append_messages 增量)、hf search、doctor 的 integrity_check" },
+    { "title": "Memory & Agent Assets", "purpose": "~/.heartflow/MEMORY.md 自迭代记忆与分层夹紧、AGENTS.md/CLAUDE.md 注入、rules/skills 用户层与项目层" },
+    { "title": "Architecture", "purpose": "workspace 模块划分与单向依赖、各 crate 职责、端到端一次回合的数据流(api 流消费 -> runtime 调度 -> tools/mcp 执行)" },
+    { "title": "API Crate (Transport)", "purpose": "crates/api:Anthropic/OpenAI 客户端、SSE 解析、错误与重试" },
+    { "title": "Runtime Crate (Conversation Loop)", "purpose": "crates/runtime:会话循环、工具调度、compact、prompt 组装、permissions、bash/file_ops/schema 校验" },
+    { "title": "Tools Crate", "purpose": "crates/tools:mvp_tool_specs 原生工具规格与 execute_tool 分发、todo、graphics" },
+    { "title": "MCP Client", "purpose": "crates/mcp:JSON-RPC 2.0 双传输(stdio 与 Streamable-HTTP/SSE)、protocol、transport、握手重试与只读放行" },
+    { "title": "CLI Rendering & TUI", "purpose": "crates/cli 的渲染层(render.rs)、编辑器/输入(editor.rs)、mascot 伴侣、动态行内视口终端(viewport_term.rs)" },
+    { "title": "MCP Servers Integration", "purpose": "文档说明如何给 hf 挂载 context7/deepwiki 等远程 MCP,以及本地 stdio server 配置" },
+    { "title": "Docs & AI Integration", "purpose": "docs/src mdBook 文档站、GitHub Pages 工作流(当前暂存为 .github/workflows/docs.yml.bak)、scripts/gen-llms.sh 按 llms.txt v2 生成仓库根 llms.txt/llms-full.txt、.devin/wiki.json(本页)、docs/context7.json 与 GitHub Wiki 种子" }
+  ]
+}

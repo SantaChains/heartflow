@@ -1,0 +1,465 @@
+# heartflow
+
+> Rust 终端 AI agent(命令名 hf)。本文件为文档站各章节全文拼接,供 AI 一次性读入。
+> 源码 https://github.com/SantaChains/heartflow · 站点 https://santachains.github.io/heartflow
+
+
+---
+
+<!-- file: index.md -->
+
+# heartflow
+
+Rust 实现的终端 AI agent。二进制命令 `hf`，在 REPL 中通过流式输出与模型协作，可执行 shell、读写文件、检索代码、挂载 MCP 工具，并以任务循环自迭代完成多步工作。
+
+仓库：[github.com/SantaChains/heartflow](https://github.com/SantaChains/heartflow)
+
+## 它能做什么
+
+- **真流式**：SSE 增量经 mpsc 通道推送，思考与正文实时渲染，markdown 与代码高亮输出。
+- **双协议**：Anthropic 消息协议与 OpenAI Chat Completions 方言；内置 DeepSeek，自定义 provider 可接任意兼容端点。
+- **原生工具**：bash、read/write/edit_file、glob/grep/search_files、apply_patch、todo_write、ask_user、web_fetch（SSRF 防护）等。
+- **MCP 支持**：JSON-RPC 2.0 双传输——本地 stdio 与远程 Streamable-HTTP/SSE。
+- **任务自迭代**：todo_write 登记计划，未完成任务自动续推；Hermes 任务环逐任务在新鲜上下文里执行。
+- **上下文工程**：`>50%` 窗口预压缩（summarize-then-compact）、`/compact` 手动压缩、`/pin` 免疫压缩。
+- **会话持久化**：JSONL 权威存储 + SQLite FTS5 全文检索，支持 resume 与跨会话检索。
+- **自迭代记忆**：`~/.heartflow/MEMORY.md` 以极小 token 注入系统提示词。
+
+完整能力矩阵与逐条实现细节以 [仓库 README 的「特性」节](https://github.com/SantaChains/heartflow#特性) 为准，本文档站聚焦"怎么用"。
+
+## 从这里开始
+
+- 想跑起来：见 [安装](installation.md) 与 [快速开始](quickstart.md)。
+- 想让 AI 工具读到最新文档：见 [AI 文档集成](ai-integration.md)。
+
+
+---
+
+<!-- file: installation.md -->
+
+# 安装
+
+Windows amd64 便携包与 crates.io 包随每次发布自动产出，四条安装通道：
+
+**scoop（Windows，推荐，带自动更新）**
+
+```powershell
+scoop bucket add heartflow https://github.com/SantaChains/heartflow
+scoop install heartflow
+```
+
+**cargo（crates.io）**
+
+```bash
+cargo install heartflow
+```
+
+**cargo（直接从 Git，不经过 crates.io）**
+
+```bash
+cargo install --git https://github.com/SantaChains/heartflow --locked heartflow
+```
+
+**便携 zip 直下**：到 [Releases](https://github.com/SantaChains/heartflow/releases) 下载 `heartflow-<版本>-win-amd64.zip`（内含 `hf.exe`），解压后把目录加入 PATH。
+
+> 命令名是 **`hf`**（不是 heartflow）。
+
+## 从源码构建
+
+需要 Rust 1.85+。
+
+```bash
+# 克隆后在仓库根目录（含 Cargo.toml）执行
+git clone https://github.com/SantaChains/heartflow.git
+cd heartflow
+cargo build --release
+target/release/hf.exe --help   # Linux/macOS 为 target/release/hf
+```
+
+
+---
+
+<!-- file: quickstart.md -->
+
+# 快速开始
+
+```bash
+# 方式一：环境变量（默认 anthropic 协议）
+export ANTHROPIC_AUTH_TOKEN=sk-...
+
+# 方式二：DeepSeek（OpenAI 方言，密钥走环境变量名）
+export DEEPSEEK_API_KEY=sk-...
+hf --provider deepseek
+```
+
+无参数启动即进入 REPL。输入基于 ratatui 内联视口（保留原生 scrollback、真实光标供 CJK/IME 候选）：Enter 发送，Shift/Alt+Enter 或 Ctrl+J 换行，输入 `/` 在下方弹出可选命令列表（↑/↓ 选择、高亮项按 Enter 或 Tab 补全、Esc 取消高亮；无高亮时 Enter 原样发送），空闲时 ↑/↓ 翻历史，Ctrl+C 取消当前回合（空闲行则仅清空），`/exit` 退出。
+
+> **进不去 REPL / 输出乱码？** 几乎都是终端环境问题而非程序故障。一是密钥只在别的 shell 会话里设过：在**当前**终端重新 `export`（Windows 用 `setx` 后要重启终端），再 `hf doctor` 复核 provider 与密钥是否解析成功。二是 Windows 控制台默认 GBK 代码页把 UTF-8 显示成乱码（库内字节始终正确）：执行 `chcp 65001` 或 `[Console]::OutputEncoding=[Text.Encoding]::UTF8`，并换用支持中文的等宽字体即可。
+
+
+---
+
+<!-- file: cli.md -->
+
+# CLI 用法
+
+```text
+hf [--provider NAME] [--model MODEL]              进入交互 REPL（等价 hf chat）
+hf [--provider NAME] [--model MODEL] prompt TEXT  单次提问，流式输出
+hf prompt -q|--quiet TEXT                         只打印答案（去掉进度/用量行，脚本友好）
+hf prompt --json TEXT                             输出 {text, usage, session_id} 结构化 JSON
+echo TEXT | hf prompt "指令"                       stdin 作为上下文与指令拼接（Unix 管道）
+hf search QUERY [--limit N] [--json]              跨会话全文检索历史（非交互，可管道）
+hf --resume[=SESSION.json] [--run /compact]       恢复会话（省略 PATH 进选择器），--run 恢复后立即执行 slash 命令
+hf config export [--output FILE]                  导出配置（不含密钥）
+hf config import FILE                             导入配置（自动备份 .bak）
+hf doctor [--fix]                                 诊断环境（含历史库完整性）；--fix 应用安全修复
+hf init [--force]                                 在当前目录生成 AGENTS.md 指令骨架（已存在不动，--force 覆盖）
+hf --provider NAME models [--balance]             provider 自举：列模型、报当前模型上下文窗口；--balance 才查余额（省额度）
+hf system-prompt [--cwd PATH] [--date YYYY-MM-DD] 打印系统提示词
+```
+
+版本：`hf -V` / `hf -v` / `hf --version` 均可。
+
+## 交互契约与退出码
+
+- **交互式**：无参数或 `hf chat` 打开 REPL（唯一能弹确认的模式）。
+- **恢复**：`hf --resume[=PATH] [--run "/cmd"]` 重开已存会话（省略 PATH 进选择器；值形式必须用 `=`）。
+- **非交互**：子命令（prompt/search/…）绝不阻塞等人。因无 tty 应答确认，`prompt` 在 `HEARTFLOW_PERMISSION_MODE` 的权限模式下跑工具，默认 `full`（自动放行）；无人值守只读管道设 `HEARTFLOW_PERMISSION_MODE=read-only`。
+
+| 退出码 | 含义 |
+|--------|------|
+| 0 | 成功 |
+| 1 | 运行时/提供方错误（流、配置解析、失败的回合） |
+| 2 | 用法错误（参数非法，由解析器发出） |
+
+
+---
+
+<!-- file: repl.md -->
+
+# REPL 命令
+
+```text
+/help     帮助              /model [NAME] 显示或切换模型
+/mode     [NAME] 显示或切换权限模式（read-only/workspace-write/full）
+/status   会话状态          /compact      手动强制压缩会话历史（忽略阈值）
+/pin      切换末条消息的永不压缩标记（跨 /compact 逐字存活）
+/save     立即持久化        /clear        开启新会话
+/sessions 列出已存会话      /open N       跳回第 N 个已存会话（同 /sessions 编号）
+/remember T 追加一条长期记忆到 ~/.heartflow/MEMORY.md（自动去重）
+/mcp      列出 MCP 服务器与工具
+/search Q 全文检索历史      /exit         退出（自动保存并打印 resume 命令）
+/init     生成 AGENTS.md 骨架  /expand [ID]  展开上次折叠的工具输出
+/guide T  本地零 token 组装“前情/现状/下一步”三段引导草稿，供编辑后发送
+/queue [pop|clear]  查看/撤回回合运行期间排队的后续消息（入队注入随 TUI 事件循环上线）
+!CMD  不经模型直接跑一条 shell 命令取输出（Windows 走 pwsh，危险命令先确认，输出同工具一样可折叠/展开）
+/plan GOAL 规划先行（写仅门禁到 plans/）  /plan approve 逐任务新鲜上下文执行+收尾复盘  /plan end 退出规划
+```
+
+## 权限模式
+
+`read-only` / `workspace-write` / `full` 三档，工具级覆盖，REPL 内 `/mode` 热切换。`/plan` 规划模式是硬门禁：仅可写 `.heartflow/plans/*.md`，其余写/bash 一律拒绝；审批后进入 Hermes 任务环逐任务在新鲜上下文执行，收尾把复盘写入 `.heartflow/reflections/`。`read-only` 与 `plan` 两档自动放行标注为只读的 MCP 工具。
+
+
+---
+
+<!-- file: piping.md -->
+
+# 管道与脚本
+
+hf 遵循 Unix 过滤工具约定：当 stdin 被管道或重定向（非交互终端）时自动读入全文，与命令行指令拼接为一个提示词（`指令\n\n<stdin>`）；`--quiet` 只输出回答正文，`--json` 输出 `{text, usage, session_id}`，便于与 `jq`、`Select-String`、`git` 等串联。每回合自动镜像进 SQLite 历史库，`hf search` 因此可在管道里非交互地检索历史。
+
+```bash
+git diff HEAD | hf prompt --quiet "评审这次改动，只列风险点"
+hf prompt --json "用三句话总结上面这段日志" | jq -r .text
+hf search 中文笔记 --json | jq -r '.[].snippet'   # ≥ 3 码点走 FTS5 trigram，短词/中文回退转义 LIKE
+```
+
+
+---
+
+<!-- file: configuration.md -->
+
+# 配置
+
+优先级从高到低：CLI 参数 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量。同名字段逐项覆盖，坏字段跳过并告警，单条配置不阻断启动。
+
+REPL 运行期间编辑并保存任一 `config.toml`，下一回合会自动热重载（保留当前会话与权限模式）。环境异常可用 `hf doctor` 诊断，`hf doctor --fix` 应用安全修复。
+
+```toml
+version = 1
+
+[provider.deepseek]
+protocol = "openai"          # "openai" 或 "anthropic"
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+model = "deepseek-chat"
+reasoning_effort = "high"      # 思考等级：openai 协议直传，anthropic 协议映射为 extended thinking 预算
+context_window = 65536         # 模型上下文窗口 tokens，驱动回合内 >50% 预压缩（等价于 HEARTFLOW_AUTO_COMPACT_TOKENS，后者优先）
+
+[provider.my-proxy]
+protocol = "anthropic"
+base_url = "https://my-proxy.example.com"
+api_key_env = "MY_PROXY_TOKEN"
+
+[mcp.servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+[mcp.servers.remote-search]            # 远程/网络型 MCP：给 url 即走 Streamable-HTTP/SSE（无需 command）
+url = "https://mcp.example.com/stream" # 与 command 二选一；两者都缺则跳过并告警
+headers = { "X-Tenant" = "acme" }      # 额外请求头；值支持 ${ENV_VAR} 展开
+bearer_token_env = "SEARCH_MCP_TOKEN"  # 从此环境变量读 Bearer token（为空则不发）
+read_only = true                       # 声明该 server 工具均只读：read-only/plan 模式下也放行
+```
+
+## 内置 provider
+
+- `deepseek`：OpenAI 协议，`api_key_env = "DEEPSEEK_API_KEY"`，默认模型 `deepseek-flash`。
+- `anthropic`：Anthropic 协议，`api_key_env = "ANTHROPIC_API_KEY"`。
+- 任意 `[provider.NAME]` 表项即自定义 provider。
+
+## 终端配色（theme.toml）
+
+配色以单一主题源为基准（Tokyo Night 冷色系），可按语义角色覆盖。文件位于 `~/.heartflow/theme.toml`（用户）与 `.heartflow/theme.toml`（项目，逐项胜出）。每个值取 `#RRGGBB`，坏值跳过并告警、绝不阻断启动；改后重启生效。
+
+```toml
+[theme]
+heading = "#2ac3de"      # Markdown 标题
+accent = "#7aa2f7"       # 提示符 / 活动 spinner / 补全高亮
+muted = "#78829f"        # 次要文本（增量、空闲提示）
+success = "#9ece6a"      # 完成
+error = "#f7768e"        # 失败
+# 其余可选：emphasis / strong / inline_code / link / quote
+```
+
+
+---
+
+<!-- file: sessions.md -->
+
+# 会话与历史库
+
+对话以 JSONL 为权威存储写入 `~/.heartflow/sessions`；同时 best-effort 镜像进系统级 SQLite 库 `~/.heartflow/heartflow.db`（镜像失败绝不阻断保存）。库采用 WAL、外键级联与 `user_version` 迁移，历史消息存于 `messages`、`messages_fts`（FTS5 trigram）供检索。中文、空格、Windows 全路径均按 UTF-8 正确处理。REPL 内 `/search <Q>` 与非交互 `hf search <Q>` 共用同一检索引擎；查询 ≥ 3 码点走 trigram 索引，更短的词回退到转义后的 `LIKE`。
+
+镜像以每会话稳定的键写入（进程级，与 JSON 文件命名解耦），故一次对话在库中是一行、随回合**增量追加**新消息（`append_messages` 仅写尾部），而非每回合重刷一份全量快照。当回合使转录缩短（compact）或原地改动已镜像行（`/pin` 翻标志、任务环重置换种子）时自动回退全量重写。JSON 始终权威，被拒的追加从不丢失或重复历史。
+
+因为库是从 JSON 派生的缓存，`hf doctor` 会对其跑一次结构体检（只读、非破坏）：默认用完整的 `PRAGMA integrity_check`，仅当库超 64 MiB 才降级为 `quick_check`。检出损坏时不会静默改数据，而是提示"JSON 转录仍为权威，删除 `heartflow.db` 即会在下次保存时重建检索索引"。
+
+## 恢复会话
+
+```bash
+hf --resume                 # 进选择器挑历史会话
+hf --resume=a.json          # 直接打开指定转录
+hf --resume --run /compact  # 恢复后立即执行 slash 命令
+```
+
+`/exit` 退出时会自动保存并打印可直接粘贴的 resume 命令。
+
+
+---
+
+<!-- file: agent-assets.md -->
+
+# Agent 资产
+
+仓库指令文件以 `AGENTS.md`（含 `AGENTS.local.md`、逐级向上到仓库根）为主注入系统提示词；仅当同目录没有 `AGENTS.md` 时才回退读取旧名 `CLAUDE.md`（排他回退，避免双注入）；`hf init` / REPL `/init` 生成中性的 `AGENTS.md` 骨架。规则与技能分用户层与项目层，项目同名覆盖用户。
+
+```text
+AGENTS.md / CLAUDE.md    仓库指令（项目上下文，逐级向上聚合）
+~/.agent/rules/*.md      全量注入（按名排序，上限 32 个，单个截断 32KB）
+~/.agent/skills/*/SKILL.md  仅注入 name/description 元数据，正文按需读取
+.agent/...               项目层同构
+```
+
+## 自迭代记忆
+
+`~/.heartflow/MEMORY.md`（或项目 `.heartflow/MEMORY.md`）作为跨会话的坑/决策/偏好记录，以极小 token（截断 4KB）注入系统提示词的 Memory 段；`/remember` 手动追加（去重），任务环遇硬坑自动记录（非向量嵌入）。user 与 project 两层各自按行公平夹紧，避免一层饿死另一层。
+
+
+---
+
+<!-- file: env-vars.md -->
+
+# 环境变量
+
+| 变量 | 作用 |
+|------|------|
+| ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY | 默认 anthropic 模式密钥 |
+| DEEPSEEK_API_KEY | 内置 deepseek provider 密钥 |
+| HEARTFLOW_LOG | 日志级别门，默认 warn，输出至 stderr |
+| HEARTFLOW_PERMISSION_MODE | read-only / workspace-write（默认）/ full，REPL 内 /mode 可切换 |
+| HEARTFLOW_SHELL | 覆盖 bash 工具的 shell 程序 |
+| HEARTFLOW_AUTO_COMPACT_TOKENS | 模型上下文窗口 tokens；设后即启用回合内 `>50%` 预压缩，未设则回退到 `config.toml` 的 `[provider] context_window`，两者皆无则关闭。用 `hf --provider NAME models` 查窗口 |
+| HEARTFLOW_REPLAY_VERBATIM_TAIL | 恢复注入时逐字保留的最近 tool_result 条数（默认 12；`>0` 生效，否则回落默认） |
+| HEARTFLOW_IMAGE_API_KEY / HEARTFLOW_IMAGE_BASE_URL | 配置后启用 `generate_image` 工具 |
+| HEARTFLOW_RESTART_DEPTH | 内部重启深度守卫（自举用，勿手工设置） |
+
+
+---
+
+<!-- file: architecture.md -->
+
+# 架构
+
+Workspace 结构（`crates/*`，依赖单向 cli → {runtime, api, tools, mcp, store, commands}）：
+
+```text
+crates/
+├── api       传输层：Anthropic/OpenAI 客户端、SSE 解析、重试
+├── runtime   会话循环：流消费、工具调度、compact、系统提示词
+├── tools     原生工具实现与注册
+├── mcp       MCP 客户端（stdio + Streamable-HTTP/SSE JSON-RPC 2.0）
+├── commands  请求/响应数据结构
+├── store     系统级 SQLite 历史库：FTS5 全文检索、用量聚合、事务写入、best-effort 镜像
+└── cli       hf 入口：REPL、配置、渲染、输入编辑
+```
+
+## 上下文注入纪律
+
+磁盘转录 ≠ 喂给模型的注入视图。每次构造请求时，`conversation.rs::build_replay_messages` 会把超出最近 `replay_verbatim_tail`（默认 12）条的旧 `tool_result` 正文折成占位，落盘 session 仍存全文；`tool_use`/`tool_result` 配对与顺序不可破，`/pin` 的消息不改写。Memory 段按 user/project 两层公平夹紧，防避坑条目被饿死。
+
+## 健壮性
+
+connect/read 双超时、子进程 `kill_on_drop`、全链路 UTF-8（BOM 剥除、非 UTF-8 字节经 `chardetng` 嗅探 + `encoding_rs` 解码 GBK 等遗留码页、CJK 宽度对齐）、工具输出 32K 截断、缓存目录剪枝；工具入参执行前用 `jsonschema` crate 做完整 JSON-Schema 校验。
+
+
+---
+
+<!-- file: mcp-servers.md -->
+
+# 接入 MCP 服务
+
+heartflow 既是 MCP **客户端**（挂载外部工具），本身也是一个可被别的 agent 调用的终端工具。本页讲如何给 hf 挂上现成的文档类 MCP 服务，让 agent 在写代码时拉到最新 API 文档。
+
+## 远程 MCP（Streamable-HTTP / SSE）
+
+给 `[mcp.servers.NAME]` 填 `url`（而非 `command`）即走远程传输。值支持 `${ENV_VAR}` 展开：
+
+```toml
+# Context7：拉取库的最新版本文档与代码示例（https://context7.com）
+[mcp.servers.context7]
+url = "https://mcp.context7.com/mcp"
+headers = { "CONTEXT7_API_KEY" = "${CONTEXT7_API_KEY}" }  # 可选：提高限额/私有仓库
+read_only = true
+
+# DeepWiki：对任意 GitHub 仓库做 RAG 问答与架构解读（https://deepwiki.com）
+[mcp.servers.deepwiki]
+url = "https://mcp.deepwiki.com/sse"
+read_only = true
+```
+
+配置后在 REPL 用 `/mcp` 列出已连服务器与工具。`read_only = true` 让这两个纯查询型服务在 `read-only` / `/plan` 受限模式下也放行。
+
+## 本地 stdio MCP
+
+给 `command`（+`args`）即走本地进程：
+
+```toml
+[mcp.servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+```
+
+## 失败行为
+
+MCP 握手（initialize + tools/list）失败按 200/400ms 退避重试 3 次（幂等）；工具调用本身不自动重试（非幂等危险），交由模型层决策。原生工具优先于同名 MCP 工具。
+
+
+---
+
+<!-- file: ai-integration.md -->
+
+# AI 文档集成
+
+本页记录 heartflow 面向"文档可被人和 AI 工具消费"的整套适配：文档站点（web/wiki）、API 文档（rustdoc）、`llms.txt`、Context7、DeepWiki 与 GitHub Wiki。地基是 `docs/` 下的 mdBook——其余各项都从中派生。
+
+## 文档站（web / wiki）
+
+- **引擎**：mdBook（纯 Rust，零 Node，与发布流水线取向一致）。源在 `docs/src/`，目录见 `docs/src/SUMMARY.md`，输出到 `docs/book/`（已 gitignore）。
+- **本地预览**：`cargo install mdbook && mdbook serve -p 3000 --open -d docs`。
+- **部署（当前暂未启用）**：Pages 工作流以 `.github/workflows/docs.yml.bak` 形式暂存（与仓库 `ci.yml.bak` 约定一致，GitHub 不识别 `.bak` 故不触发）。启用三步：① 改回 `docs.yml`；② 仓库 Settings → Pages → Source 选 "GitHub Actions"；③ 如需自定义域名，把 `docs/book.toml` 的 `site-url` 改 `/` 并填 `cname`。项目页默认子路径为 `/heartflow/`。
+
+## API 文档（rustdoc）
+
+同一 workflow 跑 `cargo doc --workspace --no-deps`，把产物挂到站点 `/api` 路径，与用户手册并列。用户手册讲"怎么用"，rustdoc 讲"每个公开项的签名"。
+
+## llms.txt
+
+`scripts/gen-llms.sh` 按 **llms.txt 规范 v2**（<https://llmstxt.org>）生成两份供 AI 读取的产物，**默认落在仓库根并已随仓库提交**（Pages 未上线时也可经 raw.githubusercontent 直接取用）：
+
+- `llms.txt`：H1 站名 + 摘要 blockquote + details 段，随后 `## Documentation` / `## Optional` 两个文件列表，每项链接到**对应章节的原始 markdown**（v2 要求链接 LLM 友好版而非 HTML），次要页（路线图/贡献）归入 `## Optional` 供 agent 按需跳过。
+- `llms-full.txt`：全部章节按 SUMMARY 顺序拼接成自包含单文件，供一次性读入。
+
+改文档后重跑 `bash scripts/gen-llms.sh` 刷新根目录两份文件；Pages 上线后工作流会以 `bash scripts/gen-llms.sh docs/book docs/src` 另生成到站根。Cursor `#Docs` 与各家 MCP 摄取器直接添加 `https://raw.githubusercontent.com/SantaChains/heartflow/main/llms.txt`（或上线后的 `<site>/llms.txt`）即可。mdBook 另有 `mdbook-llms-txt` 后端可作原生替代，当前用零依赖脚本自足。
+
+## Context7
+
+Context7 把仓库文档解析→抽取代码片段→向量索引，供 AI 助手实时检索。**要求仓库含 md/mdx/txt/rst 格式的实际文档**——这正是 `docs/src/` 提供的。收录两种方式：
+
+1. **Web（推荐，自动处理）**：到 <https://context7.com/add-library> 粘贴仓库或文档站 URL，处理后得到库 ID `/SantaChains/heartflow`。
+2. **声明式 PR**：按 `docs/context7.json` 的字段向 Context7 仓库提 PR；合并后即索引。**该 JSON 的键需以 add-library 页面给出的当前 schema 为准**（本仓库里的 `docs/context7.json` 是可直接提交的初稿，字段若被上游调整以官方为准）。
+
+收录后，用户提问时加 `use context7` 即可命中最新文档。README 已挂 Context7 徽章链接。
+
+## DeepWiki
+
+- **零配置浏览**：把任意 heartflow 页面 URL 的 `github.com` 改成 `deepwiki.com`，或在 <https://deepwiki.com> "Add repo" 粘贴 `SantaChains/heartflow`。公开仓库免费，自动出 wiki + 架构图 + RAG 问答。
+- **可控化**：仓库根 `.devin/wiki.json` 的 `repo_notes` 引导生成，`pages`（若提供）会跳过自动聚类、严格按指定页面生成，确保关键模块不被漏。内容见该文件；随文档结构稳定后逐步补 `pages`。
+- **自托管（可选）**：如需私有部署或自带模型，用 [deepwiki-open](https://github.com/AsyncFuncAI/deepwiki-open)（Docker，支持 PAT 私有仓库）或其 GitHub Action 重生成并发到 Pages。会引入模型 API key 与外呼，按需评估。
+
+## GitHub Wiki
+
+GitHub Wiki 是独立仓库（`heartflow.wiki.git`），不与主仓库共用工作树。种子页在 `docs/wiki/`（`Home.md` 等），发布方式：
+
+```bash
+git clone https://github.com/SantaChains/heartflow.wiki.git wiki-checkout
+cp docs/wiki/*.md wiki-checkout/
+cd wiki-checkout && git add -A && git commit -m "docs: seed wiki" && git push
+```
+
+建议保持精简：`Home.md` 做导航并指向本文档站，避免与 mdBook 双份长文漂移。
+
+
+---
+
+<!-- file: roadmap.md -->
+
+# 路线图
+
+以下方向已明确规划但**尚未实现**，仅作路线记录：
+
+- **Browser use / computer use**：驱动浏览器与 Windows 桌面操作（点击、输入、截屏、表单填充）的原生工具。
+- **长期记忆**：基于向量/embedding 检索的跨会话持久记忆，区别于当前的 FTS5 全文检索。
+- **DeepSeek Responses API + 原生联网搜索**：接入 Responses 协议与 DeepSeek 服务端原生 web search。
+- **`hf logs` 子命令**：当前日志仅按 `HEARTFLOW_LOG` 走 stderr、不落盘；要支持一条命令直出历史日志需先引入文件 sink（`tracing-appender`）+ 存储目录 + 轮转策略。
+- **全局开关 `--no-confirm` / `--color`**：非交互危险命令的确认策略已在 `--help` 的 INTERACTION CONTRACT 文档化；显式开关会改变安全/渲染语义，按需再评估。
+
+
+---
+
+<!-- file: contributing.md -->
+
+# 贡献与质量门
+
+日常迭代按效率优先：提交前保证下列四条绿。pedantic 级风格 clippy 仅作提示不阻断，但 `clippy::all` 正确性 lint 仍为阻断门。
+
+```bash
+cargo fmt --all -- --check
+cargo test --workspace
+cargo build --release
+cargo clippy --workspace --all-targets -- -D warnings -A clippy::pedantic   # 阻断正确性；pedantic 仅提示
+```
+
+## 提交规范
+
+版本语义由 git-cliff 从提交信息推导：`feat:` → minor，`fix:` → patch，`!` 或 `BREAKING CHANGE:` → major；`chore/docs/test/ci/style/build` 不触发发版。scope 用 crate 名，如 `feat(tools): ...`。
+
+## 文档
+
+改 README 里列出的 CLI/REPL 接口时，同步更新 `docs/src/` 对应章节与 `--help`。文档站构建见 [AI 文档集成](ai-integration.md)。
+
+## License
+
+本项目以 [Apache License 2.0](https://github.com/SantaChains/heartflow/blob/main/LICENSE) 开源。

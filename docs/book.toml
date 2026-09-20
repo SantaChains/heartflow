@@ -1,0 +1,22 @@
+[book]
+authors = ["SantaChains"]
+language = "zh"
+src = "src"
+title = "heartflow 文档"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "ayu"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/SantaChains/heartflow"
+edit-url-template = "https://github.com/SantaChains/heartflow/edit/main/docs/{path}"
+# GitHub Pages 项目页默认子路径；若配了自定义域名，把这里改成 "/" 并填 cname。
+site-url = "/heartflow/"
+# cname = "docs.example.com"
+
+[output.html.fold]
+enable = true
+level = 1

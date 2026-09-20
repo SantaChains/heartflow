@@ -10,7 +10,13 @@ target/
 # 发布脚本本地预演产物(scripts/release.sh),不入库
 release-notes.md
 
+# mdBook 构建产物与生成的 llms 索引(docs/src 才是源),不入库
+docs/book/
+
 # 本地个人笔记/参考资料,不随仓库发布
 openmemory.md
 ref.md
 error.md
+
+
+*.log

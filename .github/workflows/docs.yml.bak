@@ -1,0 +1,64 @@
+# ⚠ 暂未启用:GitHub Pages 现在不搭工作流。启用步骤——
+#   1) 本文件改名 docs.yml.bak → docs.yml;
+#   2) 仓库 Settings → Pages → Source 选 "GitHub Actions";
+#   3) 若上自定义域名,改 docs/book.toml 的 site-url/cname 与本文件 GEN_LLS_SITE_URL/RAW_BASE。
+# 命名成 .bak 与仓库既有 ci.yml.bak 约定一致(GitHub 不识别 .bak,故不会被触发)。
+#
+# heartflow 文档站:mdBook 用户手册 + rustdoc API + llms.txt,一并发 GitHub Pages。零 Node。
+# action 版本取当前稳定大版:checkout@v6 / configure-pages@v5 / upload-pages-artifact@v4 / deploy-pages@v4。
+
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "scripts/gen-llms.sh"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Setup Pages
+        id: pages
+        uses: actions/configure-pages@v5
+      - name: install mdbook
+        run: cargo install mdbook --version "^0.5" --locked
+      - name: build book
+        run: mdbook build docs
+      - name: generate llms.txt / llms-full.txt
+        env:
+          GEN_LLS_SITE_URL: ${{ steps.pages.outputs.base_url }}
+        run: bash scripts/gen-llms.sh docs/book docs/src
+      - name: build rustdoc (API)
+        run: cargo doc --workspace --no-deps
+      - name: mount API docs under /api
+        run: cp -r target/doc docs/book/api
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: docs/book
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

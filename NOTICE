@@ -1,0 +1,9 @@
+heartflow
+Copyright 2026 SantaChains
+
+This product includes software developed as part of the heartflow project
+(https://github.com/SantaChains/heartflow).
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file for the
+full text and conditions. Third-party component licenses are recorded by each
+dependency's own manifest (see Cargo.lock / the upstream crates).

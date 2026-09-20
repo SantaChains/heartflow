@@ -1,0 +1,10 @@
+{
+  "libraryName": "heartflow",
+  "title": "heartflow",
+  "description": "Rust terminal AI agent (command: hf). Streaming multi-turn agent with Anthropic/OpenAI dual protocol, native tools (bash/file/search/apply_patch/todo), MCP client over stdio and Streamable-HTTP/SSE, task loop, session persistence with SQLite FTS5 search, and context compaction.",
+  "githubUrl": "https://github.com/SantaChains/heartflow",
+  "baseUrl": "https://santachains.github.io/heartflow",
+  "docsFiles": ["docs/src/"],
+  "language": "rust",
+  "categories": ["cli", "ai-agent", "terminal", "llm", "mcp"]
+}
