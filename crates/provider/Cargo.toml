@@ -1,0 +1,23 @@
+[package]
+name = "heartflow-provider"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+description = "Provider configuration and streaming API adapters for heartflow"
+publish.workspace = true
+
+[lib]
+name = "provider"
+
+[dependencies]
+api = { workspace = true }
+runtime = { workspace = true }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "sync"] }
+toml = "0.9"
+tracing = "0.1"
+
+[lints]
+workspace = true

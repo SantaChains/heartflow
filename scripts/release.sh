@@ -161,7 +161,7 @@ do_publish() {
     --title "heartflow ${tag} (${bump_label})" \
     --notes-file release-notes.md
   # crates.io registry 发布:内部 crate 挂 heartflow- 前缀,按依赖拓扑逐个发(先依赖后使用者)
-  for crate in heartflow-runtime heartflow-api heartflow-mcp heartflow-tools heartflow-store heartflow-commands heartflow; do
+  for crate in heartflow-provider heartflow-runtime heartflow-api heartflow-mcp heartflow-tools heartflow-store heartflow-commands heartflow; do
     note "publishing ${crate} to crates.io"
     publish_retry "$crate"
   done

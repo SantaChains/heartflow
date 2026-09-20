@@ -29,7 +29,7 @@ CLI 冒烟:`cargo run -p heartflow -- --help`、`... -- doctor`、`... -- system
 
 ## Workspace 结构
 
-依赖方向单向:`cli → {runtime, api, tools, mcp, store, commands}`;`runtime` 不感知传输细节,`api/runtime/cli` 三层边界不得破。
+依赖方向单向:`cli → {provider, runtime, api, tools, mcp, store, commands}`;`provider → {api, runtime}`;`runtime` 不感知传输细节,`api/runtime/cli` 三层边界不得破。
 
 ```text
 crates/
@@ -40,7 +40,8 @@ crates/
 ├── mcp        MCP 客户端:stdio JSON-RPC 2.0 传输。
 ├── commands   请求/响应数据结构(薄)。
 ├── store      系统级 SQLite 历史库:每会话 JSON 快照权威 + best-effort 镜像到 ~/.heartflow/heartflow.db(FTS5 trigram 检索、用量聚合、integrity_check)。
-└── cli        hf 入口:REPL、clap CLI、配置解析、渲染、行编辑、权限交互。
+├── provider   provider 配置解析([provider] 表)与 API 流式桥接(阻塞 api 客户端 → 异步 TurnStream)。
+└── cli        hf 入口:REPL、clap CLI、装配、渲染、行编辑、权限交互。
 ```
 
 ## 运行时数据与配置

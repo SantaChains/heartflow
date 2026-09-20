@@ -31,6 +31,7 @@ inquire = "0.9"
 mcp = { workspace = true }
 os_info = "3"
 pulldown-cmark = "0.13"
+provider = { workspace = true }
 ratatui = "0.29"
 runtime = { workspace = true }
 serde = { version = "1", features = ["derive"] }

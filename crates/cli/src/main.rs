@@ -1,4 +1,3 @@
-mod adapter;
 mod config;
 mod core;
 mod editor;
@@ -33,13 +32,12 @@ use store::{role_str, Integrity, SearchHit, SearchMethod, SessionMeta, Store, St
 use tokio_util::sync::CancellationToken;
 use tools::{task_id, todo_tool_spec, TodoLedger};
 
-use adapter::{AnthropicStreamClient, TransportClient};
-use config::{
-    config_file_paths, load_merged_mcp, load_merged_settings, load_provider_selection,
-    ConfigWatcher, McpServerConfig, ProviderProtocol, ProviderSelection, ProviderSettings,
-    CONFIG_VERSION,
-};
+use config::{load_merged_mcp, load_provider_selection, ConfigWatcher, McpServerConfig};
 use core::{build_guide, guide_log_line, GuideSections, HeartModel};
+use provider::{
+    config_file_paths, load_merged_settings, AnthropicStreamClient, ProviderProtocol,
+    ProviderSelection, ProviderSettings, TransportClient, CONFIG_VERSION,
+};
 use render::{ColorTheme, Spinner, TerminalRenderer};
 
 /// Fallback date only when the system clock reads before the Unix epoch; the

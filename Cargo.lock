@@ -817,6 +817,7 @@ dependencies = [
  "heartflow-api",
  "heartflow-commands",
  "heartflow-mcp",
+ "heartflow-provider",
  "heartflow-runtime",
  "heartflow-store",
  "heartflow-tools",
@@ -862,6 +863,18 @@ dependencies = [
  "reqwest",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "heartflow-provider"
+version = "1.0.1"
+dependencies = [
+ "heartflow-api",
+ "heartflow-runtime",
+ "serde_json",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
 ]
 
 [[package]]
