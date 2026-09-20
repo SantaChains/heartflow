@@ -10,8 +10,8 @@
 use std::time::{Duration, Instant};
 
 use runtime::{
-    estimate_tokens_from, glob_search, grep_search, search_files, ConversationMessage,
-    GrepSearchInput,
+    apply_patch, estimate_tokens_from, glob_search, grep_search, search_files, validate_tool_input,
+    write_file, ConversationMessage, GrepSearchInput, PatchChange,
 };
 
 fn bench<F: FnMut()>(name: &str, mut f: F) -> Duration {
@@ -96,6 +96,64 @@ fn main() {
         scan.as_secs_f64() * 500.0 * 1000.0,
         scan.as_secs_f64() * 1000.0,
     );
+
+    // Write path: atomic write (temp file + rename) per tool call.
+    let write_dir = std::env::temp_dir().join("hf-bench-write");
+    std::fs::create_dir_all(&write_dir).expect("write dir");
+    bench("write_file: atomic temp+rename of 4 KB", || {
+        write_file(
+            &write_dir.join("bench.txt").to_string_lossy(),
+            &content_4k(),
+        )
+        .expect("write");
+    });
+
+    // Patch path: transactional multi-edit (validate-then-write).
+    let patch_target = write_dir.join("patch-target.rs");
+    write_file(
+        &patch_target.to_string_lossy(),
+        &format!("{}\n// uniqueseed\n", content_4k()),
+    )
+    .expect("seed file");
+    bench("apply_patch: 1 edit over 4 KB file", || {
+        apply_patch(&[PatchChange {
+            path: patch_target.to_string_lossy().into_owned(),
+            old_string: String::from("// uniqueseed"),
+            new_string: String::from("// uniqueseed // patched"),
+            replace_all: false,
+        }])
+        .expect("patch");
+        // Restore the unpatched anchor for the next iteration.
+        apply_patch(&[PatchChange {
+            path: patch_target.to_string_lossy().into_owned(),
+            old_string: String::from("// uniqueseed // patched"),
+            new_string: String::from("// uniqueseed"),
+            replace_all: false,
+        }])
+        .expect("unpatch");
+    });
+
+    // Schema validation: the process-level cache means repeat calls with the
+    // same schema skip recompilation — this measures the warm path.
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "command": { "type": "string" },
+            "timeout": { "type": "integer", "minimum": 1 }
+        },
+        "required": ["command"],
+        "additionalProperties": false
+    });
+    let payload = serde_json::json!({ "command": "cargo test", "timeout": 60 }).to_string();
+    bench("validate_tool_input: warm schema cache", || {
+        validate_tool_input(&schema, &payload).expect("valid input");
+    });
 }
 
 const MESSAGE_SAMPLE: &str = "The quick brown fox jumps over the lazy dog while the agent tokens estimate runs across the session transcript with mixed case identifiers like searchDocuments and MAX_TOTAL_MATCHES sprinkled through 240 chars of representative prose.";
+
+const CONTENT_4K: &str = "fn sample_line_for_benchmark() {\n    let payload = compute_next_state(&buffer, index);\n    if payload.is_empty() { return None; }\n    Some(payload)\n}\n";
+
+fn content_4k() -> String {
+    CONTENT_4K.repeat(48)
+}

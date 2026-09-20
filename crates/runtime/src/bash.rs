@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::io;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -59,6 +60,13 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     runtime.block_on(execute_bash_async(input, wrapped))
 }
 
+/// Foreground-command timeout ceiling; the model may override it per call.
+const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+const MAX_TIMEOUT_MS: u64 = 600_000;
+
+/// Background tasks tee stdout/stderr into a shared log file (returned as
+/// `raw_output_path`) instead of discarding them, so the agent can read
+/// progress later with `read_file` and stop the task by PID with bash.
 fn spawn_background(
     program: &str,
     args: &[&str],
@@ -69,29 +77,81 @@ fn spawn_background(
     for arg in args {
         spawn.arg(arg);
     }
+    // The log file must be openable before spawn (both output streams point
+    // at it), so it gets a unique pre-generated name; the PID is returned as
+    // the task id and the log path as `raw_output_path`.
+    let (log_file, log_path) = tempfile_log()?;
+
     let child = spawn
         .arg(wrapped)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(
+            log_file
+                .try_clone()
+                .map_err(|error| io::Error::other(error.to_string()))?,
+        ))
+        .stderr(Stdio::from(log_file))
         .spawn()?;
 
-    Ok(BashCommandOutput {
-        stdout: String::new(),
+    let pid = child.id();
+    // Unix keeps the child as a zombie until reaped; a detached reaper thread
+    // collects it (Windows has no zombies and reaps on handle close).
+    #[cfg(unix)]
+    {
+        let mut reaper = child;
+        std::thread::spawn(move || {
+            let _ = reaper.wait();
+        });
+    }
+    #[cfg(not(unix))]
+    drop(child);
+
+    Ok(background_output(input, pid, &log_path.to_string_lossy()))
+}
+
+fn background_output(input: &BashCommandInput, pid: u32, log_path: &str) -> BashCommandOutput {
+    BashCommandOutput {
+        stdout: format!(
+            "background task started: pid {pid}, log at {log_path} \
+             (read it later with read_file; stop with `kill`/`Stop-Process -Id {pid}`)"
+        ),
         stderr: String::new(),
-        raw_output_path: None,
+        raw_output_path: Some(log_path.to_string()),
         interrupted: false,
         is_image: None,
-        background_task_id: Some(child.id().to_string()),
+        background_task_id: Some(pid.to_string()),
         backgrounded_by_user: Some(false),
         assistant_auto_backgrounded: Some(false),
         dangerously_disable_sandbox: input.dangerously_disable_sandbox,
         return_code_interpretation: None,
-        no_output_expected: Some(true),
+        no_output_expected: Some(false),
         structured_content: None,
         persisted_output_path: None,
         persisted_output_size: None,
-    })
+    }
+}
+
+/// A unique, pre-opened log file in the shared background-log directory;
+/// returned with its path because `File` alone does not expose it.
+fn tempfile_log() -> io::Result<(std::fs::File, std::path::PathBuf)> {
+    let dir = env::temp_dir().join("heartflow-bg");
+    fs::create_dir_all(&dir)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    for attempt in 0..64u32 {
+        let path = dir.join(format!("bg-{nanos}-{attempt}.log"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((file, path)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::other("could not create a background log file"))
 }
 
 async fn execute_bash_async(
@@ -162,10 +222,6 @@ async fn execute_bash_async(
         persisted_output_size: None,
     })
 }
-
-/// Default ceiling for a foreground command; the model may override it.
-const DEFAULT_TIMEOUT_MS: u64 = 120_000;
-const MAX_TIMEOUT_MS: u64 = 600_000;
 
 /// Decode child-process bytes to text. A UTF-8 BOM is stripped; valid UTF-8 is
 /// returned unchanged (the common case once the PowerShell UTF-8 prefix applies).
@@ -327,6 +383,8 @@ pub fn is_dangerous_command(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::{execute_bash, is_dangerous_command, resolve_shell, BashCommandInput};
 
     #[test]
@@ -386,6 +444,34 @@ mod tests {
         let (program, args) = resolve_shell(Some("bash"), true);
         assert_eq!(program, "bash");
         assert_eq!(args, vec!["-lc"]);
+    }
+
+    #[test]
+    fn background_task_logs_output_and_returns_pid() {
+        let output = execute_bash(BashCommandInput {
+            command: String::from("echo bg-marker"),
+            timeout: None,
+            description: None,
+            run_in_background: Some(true),
+            dangerously_disable_sandbox: Some(false),
+        })
+        .expect("background spawn should succeed");
+
+        let task_id = output.background_task_id.expect("pid as task id");
+        assert_ne!(task_id, "");
+        let log_path = output.raw_output_path.expect("log path");
+        // The shell cold start can exceed a second on a loaded machine; poll
+        // for the marker instead of sleeping a fixed amount.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut log = String::new();
+        while Instant::now() < deadline {
+            log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            if log.contains("bg-marker") {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("log never contained the marker; content: {log:?}");
     }
 
     #[test]
