@@ -23,7 +23,7 @@ use inquire::{Confirm, MultiSelect, Select, Text};
 use mcp::{HttpTransport, McpClient, McpTool, StdioTransport, Transport};
 use runtime::{
     execute_bash, is_dangerous_command, load_system_prompt, normalize_tool_schema, redact_session,
-    should_compact, truncate_chars, AgentEvent, BashCommandInput, CompactionConfig, ContentBlock,
+    truncate_chars, AgentEvent, BashCommandInput, CompactionConfig, ContentBlock,
     ConversationMessage, ConversationRuntime, MessageRole, PermissionMode, PermissionPolicy,
     PermissionPromptDecision, PermissionPrompter, PermissionRequest, Session, TokenUsage,
     ToolError, ToolExecutor, ToolSpec,
@@ -1998,7 +1998,7 @@ fn maybe_auto_compact(runtime: &mut AgentRuntime) {
     if config.context_window_tokens == 0 {
         return;
     }
-    if should_compact(runtime.session(), config) {
+    if runtime.should_compact(config) {
         let result = runtime.compact(config);
         note_mirror_rewrite();
         println!(
@@ -2788,7 +2788,12 @@ async fn run_turn_interactive(
 
     let mut notify = |event: &AgentEvent| turn.render(event);
     let result = runtime
-        .run_turn_with_blocks(expand_attachments(input_text), prompter, &mut notify, &cancel)
+        .run_turn_with_blocks(
+            expand_attachments(input_text),
+            prompter,
+            &mut notify,
+            &cancel,
+        )
         .await;
     listener.abort();
 

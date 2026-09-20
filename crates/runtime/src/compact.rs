@@ -41,15 +41,40 @@ pub struct CompactionResult {
 
 #[must_use]
 pub fn estimate_session_tokens(session: &Session) -> usize {
-    session.messages.iter().map(estimate_message_tokens).sum()
+    estimate_tokens_from(&session.messages, 0, 0)
+}
+
+/// Incremental core of [`estimate_session_tokens`]: `base` is a trusted sum
+/// over `messages[..from]`, only the tail is re-scored. Kept beside the
+/// per-message estimator so the block rules stay in one place.
+#[must_use]
+pub fn estimate_tokens_from(messages: &[ConversationMessage], from: usize, base: usize) -> usize {
+    base + messages[from..]
+        .iter()
+        .map(estimate_message_tokens)
+        .sum::<usize>()
 }
 
 #[must_use]
 pub fn should_compact(session: &Session, config: CompactionConfig) -> bool {
-    if session.messages.len() <= config.preserve_recent_messages {
+    should_compact_with_estimate(
+        session.messages.len(),
+        estimate_session_tokens(session),
+        config,
+    )
+}
+
+/// [`should_compact`] for callers that already hold an estimate (the
+/// amortized-O(1) path): same thresholds, no re-scan of the session.
+#[must_use]
+pub fn should_compact_with_estimate(
+    message_count: usize,
+    estimated: usize,
+    config: CompactionConfig,
+) -> bool {
+    if message_count <= config.preserve_recent_messages {
         return false;
     }
-    let estimated = estimate_session_tokens(session);
     if config.context_window_tokens > 0 {
         estimated >= config.context_window_tokens / 2
     } else {

@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
@@ -7,8 +8,8 @@ use tokio::task::{AbortHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::compact::{
-    compact_session, estimate_session_tokens, should_compact, truncate_chars, CompactionConfig,
-    CompactionResult,
+    compact_session, estimate_tokens_from, should_compact_with_estimate, truncate_chars,
+    CompactionConfig, CompactionResult,
 };
 use crate::permissions::{PermissionOutcome, PermissionPolicy, PermissionPrompter};
 use crate::schema::validate_tool_input;
@@ -305,6 +306,11 @@ pub struct ConversationRuntime<C, T> {
     /// Window-based pre-compaction policy applied inside `run_turn`. Disabled
     /// unless `context_window_tokens` is set (via `with_compaction`).
     compaction: CompactionConfig,
+    /// Amortized-O(1) token-estimate cache: the trusted message-prefix length
+    /// and its estimated sum. Appends extend the prefix (the only in-place
+    /// mutation); `compact` and `reset_for_task` replace `messages` wholesale
+    /// and reset this to zero.
+    token_prefix: Cell<(usize, usize)>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -331,6 +337,7 @@ where
             max_continuations: 3,
             usage_tracker,
             compaction: CompactionConfig::default(),
+            token_prefix: Cell::new((0, 0)),
         }
     }
 
@@ -412,9 +419,7 @@ where
 
             // Hermes-style >50% pre-compaction: shrink the context before
             // spending a request on it, but only when a window is configured.
-            if self.compaction.context_window_tokens > 0
-                && should_compact(&self.session, self.compaction)
-            {
+            if self.should_compact(self.compaction) {
                 self.compact(self.compaction);
             }
 
@@ -800,6 +805,7 @@ where
     pub fn compact(&mut self, config: CompactionConfig) -> CompactionResult {
         let result = compact_session(&self.session, config);
         self.session = result.compacted_session.clone();
+        self.token_prefix.set((0, 0));
         result
     }
 
@@ -824,9 +830,28 @@ where
         self.session.messages.iter().filter(|m| m.pinned).count()
     }
 
+    /// Amortized-O(1) token estimate: appends only re-score the new tail;
+    /// `compact` and `reset_for_task` reset the cached prefix, so the next
+    /// call re-scores the (much shorter) session once.
     #[must_use]
     pub fn estimated_tokens(&self) -> usize {
-        estimate_session_tokens(&self.session)
+        let messages = &self.session.messages;
+        let (prefix_len, prefix_sum) = self.token_prefix.get();
+        let (from, base) = if prefix_len <= messages.len() {
+            (prefix_len, prefix_sum)
+        } else {
+            (0, 0) // defensive: a wholesale replacement nobody reset for
+        };
+        let total = estimate_tokens_from(messages, from, base);
+        self.token_prefix.set((messages.len(), total));
+        total
+    }
+
+    /// Same gate as [`should_compact`], fed by the amortized estimate so the
+    /// per-request pressure check costs O(new messages) instead of O(session).
+    #[must_use]
+    pub fn should_compact(&self, config: CompactionConfig) -> bool {
+        should_compact_with_estimate(self.session.messages.len(), self.estimated_tokens(), config)
     }
 
     #[must_use]
@@ -868,6 +893,7 @@ where
     /// per-task reset the Hermes loop relies on.
     pub fn reset_for_task(&mut self, seeds: Vec<ConversationMessage>) {
         self.session.messages = seeds;
+        self.token_prefix.set((0, 0));
     }
 
     /// Swap the permission policy in place. Used to move a live session between
@@ -1218,6 +1244,67 @@ mod tests {
             MessageRole::System
         );
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+    }
+
+    #[test]
+    fn incremental_estimate_matches_full_rescan_across_mutations() {
+        // The client is never driven: this test only exercises the estimate
+        // cache across `reset_for_task` / `compact` mutations.
+        struct IdleApiClient;
+        impl ApiClient for IdleApiClient {
+            fn stream(&mut self, _request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+                Err(RuntimeError::new("not used in this test"))
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            IdleApiClient,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::Allow),
+            vec!["system".to_string()],
+        );
+        let config = CompactionConfig {
+            preserve_recent_messages: 2,
+            max_estimated_tokens: 1,
+            ..CompactionConfig::default()
+        };
+        let seed = |text: &str| {
+            vec![
+                ConversationMessage::user_text(text.repeat(300)),
+                ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "tail".to_string(),
+                }]),
+                ConversationMessage::user_text("latest".to_string()),
+            ]
+        };
+
+        // Warm the prefix cache, then re-read: the cached path must agree
+        // with a full re-scan.
+        runtime.reset_for_task(seed("seed "));
+        let warmed = runtime.estimated_tokens();
+        assert_eq!(runtime.estimated_tokens(), warmed);
+        assert_eq!(
+            runtime.estimated_tokens(),
+            crate::compact::estimate_session_tokens(runtime.session())
+        );
+
+        // Compaction replaces `messages` wholesale; the estimate must recover
+        // from the reset cache and stay equal to a full re-scan.
+        runtime.compact(config);
+        assert_eq!(
+            runtime.estimated_tokens(),
+            crate::compact::estimate_session_tokens(runtime.session())
+        );
+        assert!(runtime.estimated_tokens() < warmed, "compaction shrank it");
+
+        // Same for the fresh-context task reset.
+        runtime.reset_for_task(seed("other "));
+        assert_eq!(
+            runtime.estimated_tokens(),
+            crate::compact::estimate_session_tokens(runtime.session())
+        );
+        assert!(runtime.should_compact(config), "gate sees the estimate");
     }
 
     #[tokio::test]
