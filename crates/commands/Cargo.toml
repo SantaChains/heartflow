@@ -3,6 +3,7 @@ name = "heartflow-commands"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+readme.workspace = true
 repository.workspace = true
 description = "Slash command handlers for heartflow"
 publish.workspace = true

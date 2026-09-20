@@ -3,6 +3,7 @@ name = "heartflow"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+readme.workspace = true
 repository.workspace = true
 description = "Terminal-native coding agent (binary: hf)"
 publish.workspace = true

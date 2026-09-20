@@ -3,6 +3,7 @@ name = "heartflow-tools"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+readme.workspace = true
 repository.workspace = true
 description = "Built-in tools for the heartflow coding agent"
 publish.workspace = true
