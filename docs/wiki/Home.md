@@ -1,3 +1,6 @@
+暂时停用：GitHub Wiki 通道未启用，本页为种子内容，保留备用。恢复步骤见 `docs/src/ai-integration.md` 的 GitHub Wiki 一节。
+
+<!--
 # heartflow
 
 Rust 实现的终端 AI agent，命令名 `hf`。本页是 GitHub Wiki 种子页，只做导航，正文一律以文档站为准，避免两份内容漂移。
@@ -35,3 +38,4 @@ hf --provider deepseek
 - 贡献与质量门 <https://santachains.github.io/heartflow/contributing.html>
 
 > 本页由主仓库 `docs/wiki/Home.md` 同步而来；改内容请改主仓库 `docs/`，再按 ai-integration 的 GitHub Wiki 节推送。
+-->

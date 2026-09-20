@@ -22,7 +22,7 @@ Rust 实现的终端 AI agent。二进制命令 `hf`，在 REPL 中通过流式�
 - **MCP 支持**：JSON-RPC 2.0 双传输——本地 stdio 与远程 Streamable-HTTP/SSE。
 - **任务自迭代**：todo_write 登记计划，未完成任务自动续推；Hermes 任务环逐任务在新鲜上下文里执行。
 - **上下文工程**：`>50%` 窗口预压缩（summarize-then-compact）、`/compact` 手动压缩、`/pin` 免疫压缩。
-- **会话持久化**：JSONL 权威存储 + SQLite FTS5 全文检索，支持 resume 与跨会话检索。
+- **会话持久化**：每会话 JSON 快照为权威存储 + SQLite FTS5 镜像，支持 resume 与跨会话检索。
 - **自迭代记忆**：`~/.heartflow/MEMORY.md` 以极小 token 注入系统提示词。
 
 完整能力矩阵与逐条实现细节以 [仓库 README 的「特性」节](https://github.com/SantaChains/heartflow#特性) 为准，本文档站聚焦"怎么用"。
@@ -113,13 +113,14 @@ hf search QUERY [--limit N] [--json]              跨会话全文检索历史（
 hf --resume[=SESSION.json] [--run /compact]       恢复会话（省略 PATH 进选择器），--run 恢复后立即执行 slash 命令
 hf config export [--output FILE]                  导出配置（不含密钥）
 hf config import FILE                             导入配置（自动备份 .bak）
-hf doctor [--fix]                                 诊断环境（含历史库完整性）；--fix 应用安全修复
+hf doctor [--fix] [--ai]                          诊断环境（含历史库完整性）；--fix 应用安全修复，--ai 请内置模型给修复建议
 hf init [--force]                                 在当前目录生成 AGENTS.md 指令骨架（已存在不动，--force 覆盖）
 hf --provider NAME models [--balance]             provider 自举：列模型、报当前模型上下文窗口；--balance 才查余额（省额度）
 hf system-prompt [--cwd PATH] [--date YYYY-MM-DD] 打印系统提示词
+hf -v | -V | --version                            打印版本号
 ```
 
-版本：`hf -V` / `hf -v` / `hf --version` 均可。
+`hf prompt` 的 TEXT 省略时从 stdin 读提示词；`hf search` 的 `--limit` 默认 20。
 
 ## 交互契约与退出码
 
@@ -149,17 +150,18 @@ hf system-prompt [--cwd PATH] [--date YYYY-MM-DD] 打印系统提示词
 /sessions 列出已存会话      /open N       跳回第 N 个已存会话（同 /sessions 编号）
 /remember T 追加一条长期记忆到 ~/.heartflow/MEMORY.md（自动去重）
 /mcp      列出 MCP 服务器与工具
-/search Q 全文检索历史      /exit         退出（自动保存并打印 resume 命令）
+/search Q 全文检索历史      /exit         退出（自动保存并打印 resume 命令；/quit 为别名）
 /init     生成 AGENTS.md 骨架  /expand [ID]  展开上次折叠的工具输出
 /guide T  本地零 token 组装“前情/现状/下一步”三段引导草稿，供编辑后发送
 /queue [pop|clear]  查看/撤回回合运行期间排队的后续消息（入队注入随 TUI 事件循环上线）
 !CMD  不经模型直接跑一条 shell 命令取输出（Windows 走 pwsh，危险命令先确认，输出同工具一样可折叠/展开）
 /plan GOAL 规划先行（写仅门禁到 plans/）  /plan approve 逐任务新鲜上下文执行+收尾复盘  /plan end 退出规划
+/restart 以全新的配置与 MCP 装载重启进程（链式重启受深度上限约束）
 ```
 
 ## 权限模式
 
-`read-only` / `workspace-write` / `full` 三档，工具级覆盖，REPL 内 `/mode` 热切换。`/plan` 规划模式是硬门禁：仅可写 `.heartflow/plans/*.md`，其余写/bash 一律拒绝；审批后进入 Hermes 任务环逐任务在新鲜上下文执行，收尾把复盘写入 `.heartflow/reflections/`。`read-only` 与 `plan` 两档自动放行标注为只读的 MCP 工具。
+`read-only` / `workspace-write` / `full` 三档，工具级覆盖，REPL 内 `/mode` 热切换（`auto` 归一为 `full`；`HEARTFLOW_PERMISSION_MODE` 另接受 `plan`）。`/plan` 规划模式是硬门禁：仅可写 `.heartflow/plans/*.md`，其余写/bash 一律拒绝；审批后进入 Hermes 任务环逐任务在新鲜上下文执行，收尾把复盘写入 `.heartflow/reflections/`。`read-only` 与 `plan` 两档自动放行标注为只读的 MCP 工具。
 
 
 ---
@@ -191,10 +193,12 @@ REPL 运行期间编辑并保存任一 `config.toml`，下一回合会自动热�
 version = 1
 
 [provider.deepseek]
-protocol = "openai"          # "openai" 或 "anthropic"
+protocol = "openai"          # anthropic | openai(兼容别名 openai-compatible/openai_compat) | openai-responses(别名 responses)
 base_url = "https://api.deepseek.com/v1"
-api_key_env = "DEEPSEEK_API_KEY"
+api_key_env = "DEEPSEEK_API_KEY"   # 只写环境变量名；也可用 api_key 直接内联明文（导出时永不写出）
+auth_token_env = "DEEPSEEK_AUTH_TOKEN"  # 可选：Bearer token 来源变量
 model = "deepseek-chat"
+max_tokens = 4096              # 缺省 4096
 reasoning_effort = "high"      # 思考等级：openai 协议直传，anthropic 协议映射为 extended thinking 预算
 context_window = 65536         # 模型上下文窗口 tokens，驱动回合内 >50% 预压缩（等价于 HEARTFLOW_AUTO_COMPACT_TOKENS，后者优先）
 
@@ -206,6 +210,7 @@ api_key_env = "MY_PROXY_TOKEN"
 [mcp.servers.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+env = { "NODE_OPTIONS" = "--max-old-space-size=512" }  # 子进程环境变量
 
 [mcp.servers.remote-search]            # 远程/网络型 MCP：给 url 即走 Streamable-HTTP/SSE（无需 command）
 url = "https://mcp.example.com/stream" # 与 command 二选一；两者都缺则跳过并告警
@@ -214,11 +219,13 @@ bearer_token_env = "SEARCH_MCP_TOKEN"  # 从此环境变量读 Bearer token（�
 read_only = true                       # 声明该 server 工具均只读：read-only/plan 模式下也放行
 ```
 
+`[provider]` 的字段全部可选，未识别字段仅记 debug 日志，坏字段跳过而不阻断启动；`version` 高于当前 schema（1）时按现有 schema 解析并告警。
+
 ## 内置 provider
 
 - `deepseek`：OpenAI 协议，`api_key_env = "DEEPSEEK_API_KEY"`，默认模型 `deepseek-v4-flash`。
-- `anthropic`：Anthropic 协议，`api_key_env = "ANTHROPIC_API_KEY"`。
-- 任意 `[provider.NAME]` 表项即自定义 provider。
+- `anthropic`：Anthropic 协议，`api_key_env = "ANTHROPIC_API_KEY"`，基址可被 `ANTHROPIC_BASE_URL` 覆盖。
+- 任意 `[provider.NAME]` 表项即自定义 provider；都未命中且无内置名时回退到环境变量选路，此时默认模型为 `mimo-v2.5-pro`。
 
 ## 终端配色（theme.toml）
 
@@ -241,7 +248,9 @@ error = "#f7768e"        # 失败
 
 # 会话与历史库
 
-对话以 JSONL 为权威存储写入 `~/.heartflow/sessions`；同时 best-effort 镜像进系统级 SQLite 库 `~/.heartflow/heartflow.db`（镜像失败绝不阻断保存）。库采用 WAL、外键级联与 `user_version` 迁移，历史消息存于 `messages`、`messages_fts`（FTS5 trigram）供检索。中文、空格、Windows 全路径均按 UTF-8 正确处理。REPL 内 `/search <Q>` 与非交互 `hf search <Q>` 共用同一检索引擎；查询 ≥ 3 码点走 trigram 索引，更短的词回退到转义后的 `LIKE`。
+对话以每会话一份 JSON 快照为权威存储写入 `~/.heartflow/sessions/<id>.json`（原子 temp+rename 覆盖同一文件，绝不留下截断转录）；同时 best-effort 镜像进系统级 SQLite 库 `~/.heartflow/heartflow.db`（镜像失败绝不阻断保存）。库采用 WAL、外键级联与 `user_version` 迁移，历史消息存于 `messages`、`messages_fts`（FTS5 trigram）供检索。中文、空格、Windows 全路径均按 UTF-8 正确处理。REPL 内 `/search <Q>` 与非交互 `hf search <Q>` 共用同一检索引擎；查询 ≥ 3 码点走 trigram 索引，更短的词回退到转义后的 `LIKE`。
+
+快照旁的 `<id>.jsonl` 是只读的追加段：头部记录它所扩展的快照长度，其后每行一条 JSON 消息；段缺失、不可读或不可信时降级为只用快照并给出提示，绝不让恢复失败。
 
 镜像以每会话稳定的键写入（进程级，与 JSON 文件命名解耦），故一次对话在库中是一行、随回合**增量追加**新消息（`append_messages` 仅写尾部），而非每回合重刷一份全量快照。当回合使转录缩短（compact）或原地改动已镜像行（`/pin` 翻标志、任务环重置换种子）时自动回退全量重写。JSON 始终权威，被拒的追加从不丢失或重复历史。
 
@@ -286,16 +295,17 @@ AGENTS.md / CLAUDE.md    仓库指令（项目上下文，逐级向上聚合）
 
 | 变量 | 作用 |
 |------|------|
-| ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY | 默认 anthropic 模式密钥 |
-| DEEPSEEK_API_KEY | 内置 deepseek provider 密钥 |
+| ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL | 环境型 provider 的密钥与基址 |
+| DEEPSEEK_API_KEY | 内置 deepseek provider 密钥（默认模型 `deepseek-v4-flash`） |
 | HEARTFLOW_LOG | 日志级别门，默认 warn，输出至 stderr |
-| HEARTFLOW_PERMISSION_MODE | read-only / workspace-write（默认）/ full，REPL 内 /mode 可切换 |
+| HEARTFLOW_PERMISSION_MODE | read-only / workspace-write（交互式默认）/ full（非交互默认）；另接受 plan 与 auto（=full）。REPL 内 /mode 可切换前三个，plan 由 /plan 进入 |
 | HEARTFLOW_SHELL | 覆盖 bash 工具的 shell 程序 |
 | HEARTFLOW_AUTO_COMPACT_TOKENS | 模型上下文窗口 tokens；设后即启用回合内 `>50%` 预压缩，未设则回退到 `config.toml` 的 `[provider] context_window`，两者皆无则关闭。用 `hf --provider NAME models` 查窗口 |
 | HEARTFLOW_REPLAY_VERBATIM_TAIL | 恢复注入时逐字保留的最近 tool_result 条数（默认 12；`>0` 生效，否则回落默认） |
-| HEARTFLOW_IMAGE_API_KEY / HEARTFLOW_IMAGE_BASE_URL | 配置后启用 `generate_image` 工具 |
-| HEARTFLOW_RESTART_DEPTH | 内部重启深度守卫（自举用，勿手工设置） |
-
+| HEARTFLOW_IMAGE_API_KEY / HEARTFLOW_IMAGE_BASE_URL / HEARTFLOW_IMAGE_MODEL / HEARTFLOW_IMAGE_SIZE | 配置后启用 `generate_image` 工具并参数化端点、模型与尺寸 |
+| HEARTFLOW_COOKIE_JAR | 指向一个文件即开启 `web_fetch` 的会话 cookie 复用 |
+| HEARTFLOW_CONFIG_HOME | 覆盖用户配置根（默认 `~/.heartflow`）的 config.toml 查找位置 |
+| HEARTFLOW_RESTART_DEPTH | 内部重启深度守卫（`/restart` 链式重启用，勿手工设置） |
 
 ---
 
@@ -303,18 +313,21 @@ AGENTS.md / CLAUDE.md    仓库指令（项目上下文，逐级向上聚合）
 
 # 架构
 
-Workspace 结构（`crates/*`，依赖单向 cli → {runtime, api, tools, mcp, store, commands}）：
+Workspace 结构（`crates/*`，依赖单向 `cli → {provider, runtime, api, tools, mcp, store, commands}`，`provider → {api, runtime}`；`runtime` 不感知传输细节）：
 
 ```text
 crates/
-├── api       传输层：Anthropic/OpenAI 客户端、SSE 解析、重试
-├── runtime   会话循环：流消费、工具调度、compact、系统提示词
+├── api       传输层：Anthropic / OpenAI Chat / OpenAI Responses 客户端、SSE 解析、重试
+├── runtime   会话循环：流消费、工具调度、compact、系统提示词、权限、doc_search
 ├── tools     原生工具实现与注册
-├── mcp       MCP 客户端（stdio + Streamable-HTTP/SSE JSON-RPC 2.0）
+├── mcp       MCP 客户端（stdio 与 Streamable-HTTP/SSE JSON-RPC 2.0）
 ├── commands  请求/响应数据结构
 ├── store     系统级 SQLite 历史库：FTS5 全文检索、用量聚合、事务写入、best-effort 镜像
+├── provider  provider 配置解析与协议桥接（阻塞 api 客户端 → 异步 TurnStream）
 └── cli       hf 入口：REPL、配置、渲染、输入编辑
 ```
+
+发布顺序即依赖拓扑的线性化：`heartflow-runtime → heartflow-api → heartflow-provider → heartflow-mcp → heartflow-tools → heartflow-store → heartflow-commands → heartflow`（`scripts/release.sh` 为唯一事实源）。
 
 ## 上下文注入纪律
 
@@ -373,13 +386,13 @@ MCP 握手（initialize + tools/list）失败按 200/400ms 退避重试 3 次（
 
 # AI 文档集成
 
-本页记录 heartflow 面向"文档可被人和 AI 工具消费"的整套适配：文档站点（web/wiki）、API 文档（rustdoc）、`llms.txt`、Context7、DeepWiki 与 GitHub Wiki。地基是 `docs/` 下的 mdBook——其余各项都从中派生。
+本页记录 heartflow 面向"文档可被人和 AI 工具消费"的整套适配：文档站点（mdBook → GitHub Pages）、API 文档（rustdoc）、`llms.txt`、Context7 与 DeepWiki。地基是 `docs/` 下的 mdBook——其余各项都从中派生。
 
-## 文档站（web / wiki）
+## 文档站（web）
 
 - **引擎**：mdBook（纯 Rust，零 Node，与发布流水线取向一致）。源在 `docs/src/`，目录见 `docs/src/SUMMARY.md`，输出到 `docs/book/`（已 gitignore）。
 - **本地预览**：`cargo install mdbook && mdbook serve docs -p 3000 --open`（mdBook 0.5+；book 根为 `docs`，输出默认 `docs/book`）。
-- **部署**：Pages 工作流是 `.github/workflows/docs.yml`，在 push 到 main 且 `docs/**`、`scripts/gen-llms.sh` 或该 workflow 本身有变动时触发，也可 `workflow_dispatch` 手动跑。唯一的一次性前提：仓库 Settings → Pages → Source 选 "GitHub Actions"，否则 deploy 那步会失败。上自定义域名时，除把 `docs/book.toml` 的 `site-url` 改成 `/` 并填 `cname`，还要改 workflow 里 gen-llms 步骤的 `SITE_URL`（该变量名固定，写成别的名字不报错但会被静默忽略）。项目页默认子路径为 `/heartflow/`，站点 <https://santachains.github.io/heartflow/>。
+- **部署**：Pages 工作流是 `.github/workflows/docs.yml`，在 push 到 main 且 `docs/**`、`scripts/gen-llms.sh` 或该 workflow 本身有变动时触发，也可 `workflow_dispatch` 手动跑。一次性前提是把仓库 Settings → Pages 的 Source 选为 "GitHub Actions"（本仓库已配好），否则 deploy 那步会失败。上自定义域名时，除把 `docs/book.toml` 的 `site-url` 改成 `/` 并填 `cname`，还要改 workflow 里 gen-llms 步骤的 `SITE_URL`（该变量名固定，写成别的名字不报错但会被静默忽略）。项目页默认子路径为 `/heartflow/`，站点 <https://santachains.github.io/heartflow/>。
 
 ## API 文档（rustdoc）
 
@@ -409,6 +422,16 @@ Context7 把仓库文档解析→抽取代码片段→向量索引，供 AI 助�
 - **可控化**：仓库根 `.devin/wiki.json` 的 `repo_notes` 引导生成，`pages`（若提供）会跳过自动聚类、严格按指定页面生成，确保关键模块不被漏。内容见该文件；随文档结构稳定后逐步补 `pages`。
 - **自托管（可选）**：如需私有部署或自带模型，用 [deepwiki-open](https://github.com/AsyncFuncAI/deepwiki-open)（Docker，支持 PAT 私有仓库）或其 GitHub Action 重生成并发到 Pages。会引入模型 API key 与外呼，按需评估。
 
+## GitHub Wiki（暂时停用）
+
+本仓库暂不做 GitHub Wiki 通道：种子页停在 `docs/wiki/Home.md`（内容同样注释保留），不推 `heartflow.wiki.git`。
+
+<!-- 恢复时依次做三件事,然后解开下一段的注释:
+     1. Settings → Features 勾上 Wikis;
+     2. 到 wiki 页面点一次 Create the first page 保存——首次建页之前 GitHub 尚未创建 wiki 的
+        git 仓库,clone .../heartflow.wiki.git 会报 Repository not found,这一步不能省;
+     3. 解开 docs/wiki/Home.md 的注释,按下面命令推送。
+
 ## GitHub Wiki
 
 GitHub Wiki 是独立仓库（`heartflow.wiki.git`），不与主仓库共用工作树。种子页在 `docs/wiki/`（`Home.md` 等），发布方式：
@@ -422,6 +445,7 @@ cd wiki-checkout && git add -A && git commit -m "docs: seed wiki" && git push
 两个一次性前提（仓库设置，文件里配不了）：Settings → Features 勾上 Wikis；再到 wiki 页面点一次 Create the first page 保存。第二点不能省——首次建页之前 GitHub 尚未创建 wiki 的 git 仓库，`clone .../heartflow.wiki.git` 会报 Repository not found。
 
 建议保持精简：`Home.md` 做导航并指向本文档站，避免与 mdBook 双份长文漂移。
+-->
 
 
 ---
@@ -434,7 +458,7 @@ cd wiki-checkout && git add -A && git commit -m "docs: seed wiki" && git push
 
 - **Browser use / computer use**：驱动浏览器与 Windows 桌面操作（点击、输入、截屏、表单填充）的原生工具。
 - **长期记忆**：基于向量/embedding 检索的跨会话持久记忆，区别于当前的 FTS5 全文检索。
-- **DeepSeek Responses API + 原生联网搜索**：接入 Responses 协议与 DeepSeek 服务端原生 web search。
+- **DeepSeek 服务端原生联网搜索**：Responses 方言已可用（`protocol = "openai-responses"`），尚未接的是 DeepSeek 服务端内置的 web search。
 - **`hf logs` 子命令**：当前日志仅按 `HEARTFLOW_LOG` 走 stderr、不落盘；要支持一条命令直出历史日志需先引入文件 sink（`tracing-appender`）+ 存储目录 + 轮转策略。
 - **全局开关 `--no-confirm` / `--color`**：非交互危险命令的确认策略已在 `--help` 的 INTERACTION CONTRACT 文档化；显式开关会改变安全/渲染语义，按需再评估。
 

@@ -1,92 +1,134 @@
 # AGENTS.md
 
-本文件为在此仓库中工作的 agent 提供指引。heartflow 加载仓库指令时以 `AGENTS.md` 为主(中性跨工具标准),并为兼容旧仓库继续读取 `CLAUDE.md`。
+本仓库的 agent 指令文件。heartflow 逐级向上读取 `<dir>/AGENTS.md` 与 `<dir>/AGENTS.local.md`，仅当同目录无 `AGENTS.md` 时回退旧名 `CLAUDE.md`（排他回退，避免双注入）——`crates/runtime/src/prompt.rs:291`。
 
-## 项目概览
+## 定位与硬约束
 
-heartflow 是一个 Rust 实现的终端 AI agent(仓库名 `heartflow`,二进制 `hf`)。REPL 中通过 SSE 真流式与模型协作,执行 shell、读写文件、检索代码、挂载 MCP 工具,并以任务循环自迭代完成多步工作。
+- crate 名 `heartflow`，二进制 `hf`，edition 2021，MSRV 1.88（下限来自依赖，声明在根 `Cargo.toml` 的 `[workspace.package] rust-version`），工具链由 `rust-toolchain.toml` 钉在 1.93.1 + rustfmt/clippy。
+- 身份不变量：`FRONTIER_MODEL_NAME = "heartflow"`（`crates/runtime/src/prompt.rs:39`）。系统提示词禁止模型冒充其他厂商身份，改提示词时保留该约束。
+- 版本号唯一维护点：根 `Cargo.toml` 的 `[workspace.package]`；各 crate 一律 `version.workspace = true`。
+- 分层边界不可破：`api`（传输，仅 reqwest/serde/tokio）→ `provider`（协议桥接）→ `runtime`（会话循环，不感知传输细节）；`cli` 只做装配与交互。`runtime` 不得引用具体协议类型。
 
-- 语言/工具链:Rust 1.88+(真实下限来自依赖的 MSRV;本机由 `rust-toolchain.toml` 钉定,不用 nightly),edition 2021
-- 形态:Cargo workspace,`members = ["crates/*"]`,每个 crate 都是独立库,`cli` 产出二进制 `hf`
-- 身份约束:`FRONTIER_MODEL_NAME = "heartflow"`(`crates/runtime/src/prompt.rs:39`)。系统提示词强制“永远是 heartflow,不得冒充其他厂商/身份”。改动提示词时保留此约束。
-
-## 常用命令
-
-所有命令在仓库根(含 `Cargo.toml`)执行。
-
-```bash
-cargo build --release          # 产物 target/release/hf(.exe)
-cargo run -p heartflow         # 直接进入 REPL
-cargo fmt --all -- --check     # 格式门
-cargo clippy --workspace --all-targets -- -D warnings -A clippy::pedantic   # 质量门:阻断 clippy::all 正确性;pedantic 降为提示(效率优先)
-cargo test --workspace         # 全部测试
-cargo test -p store            # 单 crate 测试(store/tests/io_correctness.rs 为 I/O 正确性重点)
-```
-
-单测粒度:`cargo test -p <crate> <test_name>`。
-
-CLI 冒烟:`cargo run -p heartflow -- --help`、`... -- doctor`、`... -- system-prompt`。
-
-## Workspace 结构
-
-依赖方向单向:`cli → {provider, runtime, api, tools, mcp, store, commands}`;`provider → {api, runtime}`;`runtime` 不感知传输细节,`api/runtime/cli` 三层边界不得破。
+## 依赖拓扑与发布顺序
 
 ```text
-crates/
-├── api        传输层:Anthropic / OpenAI Chat / OpenAI Responses 客户端、SSE 解析、重试。仅依赖 reqwest/serde/tokio。
-├── runtime    会话循环:流消费、工具调度、compact、系统提示词、权限、bash/file_ops、agent 资产发现。
-│              agent 循环核心在 conversation.rs(ConversationRuntime、ToolExecutor、TurnStream、AgentEvent)。
-├── tools      原生工具的线上规格(wire spec)与执行:bash/read/write/edit/glob/grep、search_files(nucleo 模糊检索)、apply_patch(事务式多文件编辑)、todo、ask_user、web_fetch、web_search、verify_graphics、generate_image。新工具(search_files/apply_patch)的入参 schema 由 schemars 从输入类型派生;其余工具仍为手写 `json!` schema。
-├── mcp        MCP 客户端:stdio JSON-RPC 2.0 传输。
-├── commands   请求/响应数据结构(薄)。
-├── store      系统级 SQLite 历史库:每会话 JSON 快照权威 + best-effort 镜像到 ~/.heartflow/heartflow.db(FTS5 trigram 检索、用量聚合、integrity_check)。
-├── provider   provider 配置解析([provider] 表)与 API 流式桥接(阻塞 api 客户端 → 异步 TurnStream)。
-└── cli        hf 入口:REPL、clap CLI、装配、渲染、行编辑、权限交互。
+cli ─→ {provider, runtime, api, tools, mcp, store, commands}
+provider ─→ {api, runtime}      tools ─→ runtime      store ─→ runtime      commands ─→ runtime
+runtime / api / mcp ─→ 无内部依赖
 ```
 
-## 运行时数据与配置
+`runtime`、`api`、`mcp` 无内部依赖，故 `scripts/release.sh` 按
+`heartflow-runtime → heartflow-api → heartflow-provider → heartflow-mcp → heartflow-tools → heartflow-store → heartflow-commands → heartflow` 逐个发。
 
-- 会话:`~/.heartflow/sessions/<id>.json`(一对话一个权威快照文件,原子 temp+rename 写入,`<id>` 为起始时间戳-PID;每回合覆盖同一文件而非另存新档。resume/`/open` 沿用其 `<id>` 原地续写,`/clear` 轮换到新 `<id>`。JSON 为权威,SQLite 为派生缓存)
-- 历史库:`~/.heartflow/heartflow.db`(从 JSON 派生的缓存;损坏可删除重建,不阻断保存)
-- 配置优先级:`CLI 参数 > 项目 .heartflow/config.toml > 用户 ~/.heartflow/config.toml > 内置 provider 表 > 环境变量`。同名字段逐项覆盖,坏字段跳过告警,单条不阻断启动。REPL 每回合按 mtime 热重载。
-- Agent 资产:规则 `~/.agent/rules/*.md`(全量注入,上限 32 个/单个 32KB)与 `.agent/rules/`(项目层覆盖用户层);技能 `~/.agent/skills/*/SKILL.md` 仅注入 name/description 元数据。
-- 权限模式:`read-only / workspace-write(默认, 由 HEARTFLOW_PERMISSION_MODE 控制) / full`,REPL 内 `/mode` 热切换,工具级可覆盖。
+## 构建与质量门
 
-关键环境变量:`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY`、`DEEPSEEK_API_KEY`、`HEARTFLOW_LOG`(默认 warn,输出 stderr)、`HEARTFLOW_PERMISSION_MODE`、`HEARTFLOW_SHELL`、`HEARTFLOW_IMAGE_API_KEY`(生图工具,可选)。
+```bash
+cargo build --release          # target/release/hf(.exe)
+cargo run -p heartflow         # 直接进 REPL
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings -A clippy::pedantic
+cargo test --workspace         # 单测:cargo test -p <crate> <name>;重点 crates/store/tests/io_correctness.rs
+```
+
+`clippy::all` 为零告警是硬门；pedantic 已降为提示（存量基线 ~27 处，效率优先，不强求清零）。冒烟：`cargo run -p heartflow -- --help`、`... -- doctor`、`... -- system-prompt`。
+
+CI 只有两条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/**`/`scripts/gen-llms.sh` 变动才触发）；`ci.yml.bak` 是刻意停用的质量门，改名 `.bak` 后 GitHub 不识别。Actions 不跑代码检查。
+
+## 接口面
+
+改下列任一公共契约，须同步 README、`docs/src`、根 `llms.txt`/`llms-full.txt`（`bash scripts/gen-llms.sh`）、`bucket/heartflow.json` 的 notes、`.devin/wiki.json`。
+
+### CLI（`crates/cli/src/main.rs:675` 起的 clap 结构）
+
+全局：`--provider NAME`、`--model MODEL`、`--version`（`-v`，`-V` 为可见短别名；内建版本 flag 已禁用）、`--resume[=PATH]`（`require_equals`，裸形式进选择器）、`--run CMD`（`requires = "resume"`）。
+
+子命令：`chat`、`prompt [TEXT...] [-q|--quiet] [--json]`、`search <QUERY...> [--limit N=20] [--json]`、`system-prompt [--cwd PATH] [--date YYYY-MM-DD]`、`config export [--output FILE]` / `config import FILE`、`doctor [--fix] [--ai]`、`init [--force]`、`models [--provider] [--model] [--balance]`。
+
+交互契约：无参数或 `hf chat` 进 REPL（唯一可弹确认的模式）；子命令永不阻塞等人。退出码 0 成功 / 1 运行时与 provider 错误 / 2 用法错误。
+
+### 权限策略（`crates/cli/src/main.rs:3708` `default_permission_mode`、`:3728` `permission_policy_for_mode`）
+
+默认模式：`HEARTFLOW_PERMISSION_MODE` 优先；未设时交互式 `workspace-write`、非交互 `full`。`/mode` 认 `read-only`/`workspace-write`/`full`（`auto` 归一为 `full`）；环境变量另外接受 `plan`，其硬门禁只允许写 `.heartflow/plans/*.md`。`read-only` 与 `plan` 两档把 `McpToolset::read_only_tool_names` 并入 Allow，使远程只读 MCP 可用。
+
+### REPL（`crates/cli/src/main.rs:1689` `dispatch_slash_command`）
+
+`/help /status /model [NAME] /mode [NAME] /plan [GOAL|approve|end|status] /compact /pin /save /clear /sessions /open N /remember T /search Q /mcp /expand [ID] /queue [pop|clear] /guide TASK /init /restart /exit`（`/quit` 为别名），以及不走模型的 `!CMD` 前缀。
+
+### 原生工具（`crates/tools/src/lib.rs:137` 注册，`:362` `execute_tool` 分发）
+
+固定注册：`bash`、`read_file`、`write_file`、`edit_file`、`glob_search`、`grep_search`、`search_files`（nucleo 模糊路径检索）、`apply_patch`（先全量校验后写入的事务式多文件编辑）、`todo_write`（`crates/tools/src/todo.rs:156`）、`ask_user`、`verify_graphics`、`web_fetch`、`web_search`、`generate_image`。
+
+条件注册：`search_documents`，仅当外部 `rga`（ripgrep-all）在 PATH 上时下发（`crates/runtime/src/doc_search.rs:124` `rga_available`，装配点在 `crates/cli/src/main.rs:3424` `ToolExecutor::specs`），用于 zip/tar/docx/pdf/epub 内文本检索。
+
+执行归属：`ask_user` 的实现留在 CLI 层（需真终端），`tools` crate 只持 wire spec；其余经 `execute_tool`。新增工具须同时补 spec、`execute_tool` 分支、`specs()` 装配与权限策略条目。`search_files`/`apply_patch` 的入参 schema 由 schemars 从输入类型派生，其余为手写 `json!`。
+
+并发调度：`crates/cli/src/main.rs:3462` `is_concurrent_safe` 决定哪些工具可批跑——只读类（read/glob/grep/search_files/search_documents/verify_graphics/web_fetch/web_search）并行，写类与交互类（bash/write/edit/apply_patch/generate_image/todo_write/ask_user 及非只读 MCP）严格串行。
+
+### 环境变量
+
+| 变量                                                                | 语义                                                          | 读取处                                        |
+|---------------------------------------------------------------------|---------------------------------------------------------------|-----------------------------------------------|
+| `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | 环境型 provider 的密钥与基址                                  | `crates/api/src/client.rs:159`、provider 解析 |
+| `DEEPSEEK_API_KEY`                                                  | 内置 `deepseek` provider 密钥（默认模型 `deepseek-v4-flash`） | `crates/provider/src/config.rs:105`           |
+| `HEARTFLOW_LOG`                                                     | tracing 过滤，默认 `warn`，仅 stderr                          | `crates/cli/src/main.rs:185`                  |
+| `HEARTFLOW_PERMISSION_MODE`                                         | 见权限策略                                                    | `crates/cli/src/main.rs:3711`                 |
+| `HEARTFLOW_SHELL`                                                   | 覆盖 bash 工具的 shell                                        | `crates/runtime/src/bash.rs:338`              |
+| `HEARTFLOW_AUTO_COMPACT_TOKENS`                                     | 模型窗口 tokens，优先级高于 `[provider] context_window`       | `crates/cli/src/main.rs:2126`                 |
+| `HEARTFLOW_REPLAY_VERBATIM_TAIL`                                    | 回放时逐字保留的近期 `tool_result` 条数，默认 12              | `crates/cli/src/main.rs:2170`                 |
+| `HEARTFLOW_IMAGE_API_KEY` / `_BASE_URL` / `_MODEL` / `_SIZE`        | 启用并参数化 `generate_image`                                 | `crates/tools/src/image.rs:166`               |
+| `HEARTFLOW_COOKIE_JAR`                                              | 指定文件即开启 `web_fetch` 会话 cookie 复用                   | `crates/tools/src/web.rs:162`                 |
+| `HEARTFLOW_CONFIG_HOME`                                             | 覆盖用户配置根（默认 `~/.heartflow`）                         | `crates/runtime/src/config.rs:69`             |
+| `HEARTFLOW_RESTART_DEPTH`                                           | `/restart` 链式重启深度守卫，勿手工设置                       | `crates/cli/src/main.rs:148`                  |
+
+### 配置键（`version` 当前为 1，`crates/provider/src/config.rs:12`）
+
+`[provider]`：`name`、`protocol`（`anthropic` | `openai`/`openai-compatible`/`openai_compat` | `openai-responses`/`responses`/`openai_responses`）、`base_url`、`api_key_env`、`api_key`（内联明文，导出时永不写出）、`auth_token_env`、`model`、`max_tokens`、`reasoning_effort`、`context_window`（`crates/provider/src/config.rs:123-140`、`:165-181`）。字段全可选，未识别字段仅 debug 记录，坏字段跳过不阻断。缺省模型 `mimo-v2.5-pro`、缺省 `max_tokens` 4096（`crates/provider/src/config.rs:7-8`）。
+
+`[mcp.servers.NAME]`：`command`、`args`、`env`、`url`、`headers`（值支持 `${VAR}` 展开）、`bearer_token_env`、`read_only`。`url` 与 `command` 二选一，两者皆缺则跳过并告警；`url` 存在即走 Streamable-HTTP/SSE（`crates/cli/src/config.rs:12-29`、`:55-110`）。
+
+`[theme]`：`heading`、`accent`、`muted`、`success`、`error`，可选 `emphasis`、`strong`、`inline_code`、`link`、`quote`。用户层 `~/.heartflow/theme.toml`、项目层 `.heartflow/theme.toml` 逐项覆盖（`crates/cli/src/theme.rs:284`）。
+
+配置优先级：CLI 参数 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量；同名字段逐项覆盖，REPL 每回合按 mtime 热重载。
+
+### 运行时可写路径
+
+| 路径                                             | 角色                                                                                                                                               |
+|--------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
+| `~/.heartflow/sessions/<id>.json`                | 权威会话快照，simd-json 序列化后 temp+rename 原子覆盖（`crates/runtime/src/session.rs:157`）                                                       |
+| `~/.heartflow/sessions/<id>.jsonl`               | 只读的追加段（header 记录其扩展的快照长度），坏段降级回快照（`crates/runtime/src/session.rs:204`）                                                 |
+| `~/.heartflow/heartflow.db`                      | SQLite 镜像缓存：WAL、FTS5 trigram、`user_version` 迁移；`append_messages` 增量追加，转录缩短或原地改动时回退全量重写。JSON 恒为权威，库可删库重建 |
+| `~/.heartflow/MEMORY.md`、`.heartflow/MEMORY.md` | 跨会话长期记忆，user/project 两层公平夹紧后注入提示词 Memory 段                                                                                    |
+| `~/.agent/rules/*.md`、`.agent/rules/`           | 规则全量注入（按名排序，上限 32 个，单个截断 32KB）                                                                                                |
+| `~/.agent/skills/*/SKILL.md`、`.agent/skills/`   | 技能仅注入 name/description 元数据（上限 64 个），正文按需读取                                                                                     |
+| `.heartflow/plans/`                              | `/plan` 规划期唯一可写目录；`.heartflow/reflections/` 收尾复盘；可选沉淀为 `.agent/skills/<slug>/SKILL.md`                                         |
+
+## 上下文注入纪律
+
+磁盘转录 ≠ 注入视图。构造请求时 `crates/runtime/src/conversation.rs` 的 `build_replay_messages` 把超出 `replay_verbatim_tail`（默认 12）条的旧 `tool_result` 正文折成占位，落盘仍存全文；`tool_use`/`tool_result` 的配对与顺序不可破；`/pin` 标记的消息逐字存活于压缩之后。窗口压缩阈值取半窗（`>50%`，summarize-then-compact）。
 
 ## 代码约定
 
-- Clippy:workspace 级 `pedantic = warn`,`unsafe_code = forbid`。禁止 `unwrap`/`expect` 出现在可失败路径,用 `Result` + 错误类型传递。提交时以 `clippy::all` 为零告警硬门(正确性);pedantic 属风格建议,按效率优先仅作提示不阻断(存量 ~27 处为历史一次性清扫后的基线,不强求清零)。
-- 错误类型:crate 内自定义(`ApiError`、`StoreError`、`RuntimeError`、`ConfigError`),不用 `anyhow` 风格泛型下沉到库。
-- 工具注册:线上规格集中在 `crates/tools/src/lib.rs` 的 `mvp_tool_specs()` 与各 `*_tool_spec()`;分发在 `execute_tool`。新增工具须同时补 spec、execute 分支、`ToolRegistry::entries` 并接线到 adapter。`ask_user` 的**执行**在 CLI 层(需真实终端),`tools` crate 只持有 wire spec。
-- 全链路 UTF-8:文件读写支持 BOM 剥除、CJK 宽度对齐;Windows 走 PowerShell(pwsh 优先),命令需可移植。中文/空格路径必须正确处理。
-- 输出风格:纯文本精简,不使用 emoji、分隔线、无谓注释;只注释关键逻辑。
-- 日志:`tracing` + `HEARTFLOW_LOG` 门控,一律 stderr,不污染渲染 stdout。
+- `unsafe_code = forbid`；可失败路径禁用 `unwrap`/`expect`，用 `Result` + crate 内自定义错误（`ApiError`/`StoreError`/`RuntimeError`/`ConfigError`），不把 `anyhow` 风格泛型下沉到库。
+- 工具入参在执行前用 `jsonschema` crate 做完整 JSON-Schema 校验（draft 全能力；空/布尔/编译失败的 schema 一律放行，不误拦合法调用）；转发 provider 前对 MCP schema 做规整（object 补 `properties`、array 补 `items`、单元素 `type` 联合折叠）。
+- 全链路 UTF-8：BOM 剥除、非 UTF-8 字节经 `chardetng` 嗅探 + `encoding_rs` 解码遗留码页、CJK 宽度对齐；工具输出 32K 截断。Windows 走 PowerShell（`pwsh` 优先），提交的命令须跨平台可移植。
+- 日志走 `tracing` + `HEARTFLOW_LOG` 门控，一律 stderr，不污染渲染 stdout。
+- 输出风格：纯文本精简，不用 emoji、分隔线、无谓注释，只注释关键逻辑。
+- 传输层与事件流的缺口只有真服务器冒烟能暴露（历史缺陷：SSE `message_stop` 未转发、工具输入拼接损坏）。改流式或工具往返必须跑端到端冒烟。
 
-## 测试要求
+## 发布流程
 
-- 工具/history/store 的 I/O 与风险路径须经得起测试,且不得损坏数据(见 `crates/store/tests/io_correctness.rs`)。
-- 传输层与事件流转换的缺口只有真服务器冒烟能暴露(历史缺陷:SSE `message_stop` 未转发、工具输入拼接损坏)。涉及流式/工具往返的改动须跑端到端冒烟。
-- 提交前跑齐质量门:fmt + test + release build(必绿)+ clippy(仅 `all` 阻断,pedantic 提示)。
+三段式 `plan(dry) → publish → windows-zip`，零 Node；发布逻辑集中在 `scripts/release.sh`，CI 与本地共用同一事实源。
 
-## 发布流程(自动化)
+- 本地预检（必须先于 push，不得用 Actions 试错）：`bash scripts/release.sh plan`；`RELEASE_DRY_RUN=1 bash scripts/release.sh publish`（只读预演，需本地 git-cliff）。质量门本地全绿后才 push。
+- 版本语义：`feat:` → minor、`fix:` → patch、`!` 或 `BREAKING CHANGE:` → major；`chore/docs/test/ci/style/build` 不入正文且 plan job 秒级短路（规则见根 `cliff.toml`）。提交 scope 用 crate 名，如 `feat(tools): ...`。
+- crates.io：裸名 `api/runtime/mcp/tools/store/commands` 已被占用，内部 crate 统一挂 `heartflow-` 前缀发布，`[lib] name` 与源码 `use` 保持不变（靠 `[workspace.dependencies]` 的 `package =` 重命名）。认证走仓库 secret `CRATES_IO_TOKEN`；单 crate 失败自动重试（429 退避），"already uploaded" 幂等跳过；版本一次性，同版本不可重发。
+- 续发：publish 中途失败时 tag 与 Release 已建，重跑整链会因 "tag 之后无 feat/fix" 判 `released=false` 而短路；改用 `RELEASE_TAG=<tag> RELEASE_BUMP=<bump> bash scripts/release.sh publish`。
+- 机器人提交 `chore(release): vX.Y.Z [skip ci]` 自动同步 Cargo.toml/Cargo.lock/CHANGELOG、打 tag、建 Release；勿手工仿写。
+- Windows amd64 便携 zip（`hf.exe` 置于包根 + `.sha256` + `SHA256SUMS` + SLSA provenance）随发布上传；`bucket/heartflow.json` 的 version/url/hash 由 windows-zip job 按 tag 确定性回写（CI 是唯一写入者，哈希取自本地构建产物）。自托管 bucket 无自动更新机器人，故不配 autoupdate 块，仅留 checkver。
+- git-cliff 版本钉在 `.github/actions/install-git-cliff/action.yml`（模板引擎行为随版本变动，升级须显式改并先过本地 dry-run）。所有 action 按 SHA 固定。
 
-`.github/workflows/release.yml` 在 push main 时以 Conventional Commits 自动驱动版本、GitHub Release、crates.io 与 Windows 便携包,三段式 `plan(dry) → publish → windows-zip`,零 Node(不引入 semantic-release/cargo 插件链):发布逻辑集中在 `scripts/release.sh`,CI 与本地共用同一事实源。
+## 其他
 
-- 本地预检(必须先于 push,不得用 Actions 试错):`bash scripts/release.sh plan`;`RELEASE_DRY_RUN=1 bash scripts/release.sh publish`(只读预演,需本地装 git-cliff);质量门 fmt/clippy/test 本地全绿后才 push,Actions 只跑真实发布。
-- 版本语义:`feat:` → minor,`fix:` → patch,`!` 或 `BREAKING CHANGE:` → major;`chore/docs/test/ci/style/build` 不触发发版,在 plan job 秒级短路(文案与过滤规则见根目录 `cliff.toml`)。
-- 提交 scope 用 crate 名,如 `feat(tools): ...`;Release Notes 按中文分栏并加粗 scope。
-- 版本号唯一维护点在根 `Cargo.toml` 的 `[workspace.package]`;各 crate 一律 `version.workspace = true`,禁止写死版本号。
-- crates.io:api/runtime/mcp/tools/store/commands 裸名已被占用,内部 crate 统一挂 `heartflow-` 前缀发布,`[lib] name` 保持旧 extern 名,依赖经 `[workspace.dependencies]` 的 `package =` 重命名(源码 `use` 不变);publish job 按依赖拓扑逐个发,单 crate 失败自动重试 5 次(429 限流 2 分钟退避,"already uploaded" 幂等跳过),认证走仓库 secret `CRATES_IO_TOKEN`;版本一次性,同版本不可重发。
-- 机器人提交 `chore(release): vX.Y.Z [skip ci]` 自动同步 Cargo.toml/Cargo.lock/CHANGELOG、打 tag、建 GitHub Release;勿手工仿写此类提交。
-- Windows amd64 便携 zip(hf.exe 置于压缩包根 + .sha256)随每次发布上传到 Release;本仓库 `bucket/` 目录兼作 scoop bucket。清单 `bucket/heartflow.json` 的 version/url/hash 由 windows-zip job 在每次发布时按 tag 确定性写入实际值(CI 是唯一写入者,url 恒等于 release 下载地址、以 homepage 为基不硬编码 host,能自愈历史漂移;哈希取自本地构建产物零回下),scoop install 只认字符串 hash。自托管 bucket 无自动更新机器人,故不配 autoupdate 块(会成第二事实源且永不执行);仅保留 checkver 供维护者手动核对最新 tag。用户先 `scoop bucket add heartflow <仓库url>` 再 `scoop install heartflow`。
-- git-cliff 版本钉在 `.github/actions/install-git-cliff/action.yml`(模板引擎行为随版本变动,升级需显式改并先过本地 dry-run)。
-- 若 main 启用分支保护,需允许 GitHub Actions 直接推送;发布流水线不做代码检查。
-
-## 注意
-
-- `.gitignore` 忽略 `target/`、`.heartflow/`、`archive/`、`.history/`、`.trae/`,以及本地笔记 `openmemory.md`、`ref.md`、`error.md`(个人头脑风暴/参考资料,不发布)。
-- 质量门当前以本地为准(fmt + clippy `-D warnings -A clippy::pedantic`(仅正确性阻断)+ test + release);CI 里只有两条链:`release.yml`(发版)与 `docs.yml`(文档站,`docs/**` 变动才触发),`ci.yml.bak` 是刻意停用的质量门(改名 `.bak` 后 GitHub 不识别);许可证 Apache-2.0(见 `LICENSE`)。
-- 修改 README 中列出的 CLI/REPL 接口时,同步更新 README 与 `--help`。
-- 文档站源在 `docs/src`(mdBook);`scripts/gen-llms.sh` 按 **llms.txt v2** 从 `docs/src/SUMMARY.md` 生成仓库根 `llms.txt`/`llms-full.txt`(已提交),改文档后重跑该脚本(本机 PATH 的 `bash` 若不是 GNU bash 会缺 `mapfile`,用 Git 的 bash)。GitHub Pages 由 `.github/workflows/docs.yml` 发布,一次性前提是 Settings → Pages 的 Source 选 "GitHub Actions"。
-- 改 CLI 工具名/接口/安装口径时,口径逐字同步 README、`docs/src`、`bucket/heartflow.json` notes、`.devin/wiki.json`、仓库根 `llms.txt`。
+- `.gitignore` 忽略 `target/`、`.heartflow/`、`archive/`、`.history/`、`.trae/`，以及本地笔记 `openmemory.md`、`ref.md`、`error.md`。
+- 文档源在 `docs/src`（mdBook，输出 `docs/book/` 已忽略）；`scripts/gen-llms.sh` 按 llms.txt v2 从 `docs/src/SUMMARY.md` 生成仓库根 `llms.txt`/`llms-full.txt`，改文档后重跑（本机 PATH 的 `bash` 若非 GNU bash 会缺 `mapfile`，用 Git 的 bash）。GitHub Pages 由 `docs.yml` 发布。
+- 许可证 Apache-2.0（`LICENSE`）。

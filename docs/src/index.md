@@ -12,7 +12,7 @@ Rust 实现的终端 AI agent。二进制命令 `hf`，在 REPL 中通过流式�
 - **MCP 支持**：JSON-RPC 2.0 双传输——本地 stdio 与远程 Streamable-HTTP/SSE。
 - **任务自迭代**：todo_write 登记计划，未完成任务自动续推；Hermes 任务环逐任务在新鲜上下文里执行。
 - **上下文工程**：`>50%` 窗口预压缩（summarize-then-compact）、`/compact` 手动压缩、`/pin` 免疫压缩。
-- **会话持久化**：JSONL 权威存储 + SQLite FTS5 全文检索，支持 resume 与跨会话检索。
+- **会话持久化**：每会话 JSON 快照为权威存储 + SQLite FTS5 镜像，支持 resume 与跨会话检索。
 - **自迭代记忆**：`~/.heartflow/MEMORY.md` 以极小 token 注入系统提示词。
 
 完整能力矩阵与逐条实现细节以 [仓库 README 的「特性」节](https://github.com/SantaChains/heartflow#特性) 为准，本文档站聚焦"怎么用"。

@@ -10,13 +10,14 @@ hf search QUERY [--limit N] [--json]              跨会话全文检索历史（
 hf --resume[=SESSION.json] [--run /compact]       恢复会话（省略 PATH 进选择器），--run 恢复后立即执行 slash 命令
 hf config export [--output FILE]                  导出配置（不含密钥）
 hf config import FILE                             导入配置（自动备份 .bak）
-hf doctor [--fix]                                 诊断环境（含历史库完整性）；--fix 应用安全修复
+hf doctor [--fix] [--ai]                          诊断环境（含历史库完整性）；--fix 应用安全修复，--ai 请内置模型给修复建议
 hf init [--force]                                 在当前目录生成 AGENTS.md 指令骨架（已存在不动，--force 覆盖）
 hf --provider NAME models [--balance]             provider 自举：列模型、报当前模型上下文窗口；--balance 才查余额（省额度）
 hf system-prompt [--cwd PATH] [--date YYYY-MM-DD] 打印系统提示词
+hf -v | -V | --version                            打印版本号
 ```
 
-版本：`hf -V` / `hf -v` / `hf --version` 均可。
+`hf prompt` 的 TEXT 省略时从 stdin 读提示词；`hf search` 的 `--limit` 默认 20。
 
 ## 交互契约与退出码
 

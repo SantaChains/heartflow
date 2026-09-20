@@ -1,12 +1,12 @@
 # AI 文档集成
 
-本页记录 heartflow 面向"文档可被人和 AI 工具消费"的整套适配：文档站点（web/wiki）、API 文档（rustdoc）、`llms.txt`、Context7、DeepWiki 与 GitHub Wiki。地基是 `docs/` 下的 mdBook——其余各项都从中派生。
+本页记录 heartflow 面向"文档可被人和 AI 工具消费"的整套适配：文档站点（mdBook → GitHub Pages）、API 文档（rustdoc）、`llms.txt`、Context7 与 DeepWiki。地基是 `docs/` 下的 mdBook——其余各项都从中派生。
 
-## 文档站（web / wiki）
+## 文档站（web）
 
 - **引擎**：mdBook（纯 Rust，零 Node，与发布流水线取向一致）。源在 `docs/src/`，目录见 `docs/src/SUMMARY.md`，输出到 `docs/book/`（已 gitignore）。
 - **本地预览**：`cargo install mdbook && mdbook serve docs -p 3000 --open`（mdBook 0.5+；book 根为 `docs`，输出默认 `docs/book`）。
-- **部署**：Pages 工作流是 `.github/workflows/docs.yml`，在 push 到 main 且 `docs/**`、`scripts/gen-llms.sh` 或该 workflow 本身有变动时触发，也可 `workflow_dispatch` 手动跑。唯一的一次性前提：仓库 Settings → Pages → Source 选 "GitHub Actions"，否则 deploy 那步会失败。上自定义域名时，除把 `docs/book.toml` 的 `site-url` 改成 `/` 并填 `cname`，还要改 workflow 里 gen-llms 步骤的 `SITE_URL`（该变量名固定，写成别的名字不报错但会被静默忽略）。项目页默认子路径为 `/heartflow/`，站点 <https://santachains.github.io/heartflow/>。
+- **部署**：Pages 工作流是 `.github/workflows/docs.yml`，在 push 到 main 且 `docs/**`、`scripts/gen-llms.sh` 或该 workflow 本身有变动时触发，也可 `workflow_dispatch` 手动跑。一次性前提是把仓库 Settings → Pages 的 Source 选为 "GitHub Actions"（本仓库已配好），否则 deploy 那步会失败。上自定义域名时，除把 `docs/book.toml` 的 `site-url` 改成 `/` 并填 `cname`，还要改 workflow 里 gen-llms 步骤的 `SITE_URL`（该变量名固定，写成别的名字不报错但会被静默忽略）。项目页默认子路径为 `/heartflow/`，站点 <https://santachains.github.io/heartflow/>。
 
 ## API 文档（rustdoc）
 
@@ -36,6 +36,16 @@ Context7 把仓库文档解析→抽取代码片段→向量索引，供 AI 助�
 - **可控化**：仓库根 `.devin/wiki.json` 的 `repo_notes` 引导生成，`pages`（若提供）会跳过自动聚类、严格按指定页面生成，确保关键模块不被漏。内容见该文件；随文档结构稳定后逐步补 `pages`。
 - **自托管（可选）**：如需私有部署或自带模型，用 [deepwiki-open](https://github.com/AsyncFuncAI/deepwiki-open)（Docker，支持 PAT 私有仓库）或其 GitHub Action 重生成并发到 Pages。会引入模型 API key 与外呼，按需评估。
 
+## GitHub Wiki（暂时停用）
+
+本仓库暂不做 GitHub Wiki 通道：种子页停在 `docs/wiki/Home.md`（内容同样注释保留），不推 `heartflow.wiki.git`。
+
+<!-- 恢复时依次做三件事,然后解开下一段的注释:
+     1. Settings → Features 勾上 Wikis;
+     2. 到 wiki 页面点一次 Create the first page 保存——首次建页之前 GitHub 尚未创建 wiki 的
+        git 仓库,clone .../heartflow.wiki.git 会报 Repository not found,这一步不能省;
+     3. 解开 docs/wiki/Home.md 的注释,按下面命令推送。
+
 ## GitHub Wiki
 
 GitHub Wiki 是独立仓库（`heartflow.wiki.git`），不与主仓库共用工作树。种子页在 `docs/wiki/`（`Home.md` 等），发布方式：
@@ -49,3 +59,4 @@ cd wiki-checkout && git add -A && git commit -m "docs: seed wiki" && git push
 两个一次性前提（仓库设置，文件里配不了）：Settings → Features 勾上 Wikis；再到 wiki 页面点一次 Create the first page 保存。第二点不能省——首次建页之前 GitHub 尚未创建 wiki 的 git 仓库，`clone .../heartflow.wiki.git` 会报 Repository not found。
 
 建议保持精简：`Home.md` 做导航并指向本文档站，避免与 mdBook 双份长文漂移。
+-->

@@ -8,10 +8,12 @@ REPL 运行期间编辑并保存任一 `config.toml`，下一回合会自动热�
 version = 1
 
 [provider.deepseek]
-protocol = "openai"          # "openai" 或 "anthropic"
+protocol = "openai"          # anthropic | openai(兼容别名 openai-compatible/openai_compat) | openai-responses(别名 responses)
 base_url = "https://api.deepseek.com/v1"
-api_key_env = "DEEPSEEK_API_KEY"
+api_key_env = "DEEPSEEK_API_KEY"   # 只写环境变量名；也可用 api_key 直接内联明文（导出时永不写出）
+auth_token_env = "DEEPSEEK_AUTH_TOKEN"  # 可选：Bearer token 来源变量
 model = "deepseek-chat"
+max_tokens = 4096              # 缺省 4096
 reasoning_effort = "high"      # 思考等级：openai 协议直传，anthropic 协议映射为 extended thinking 预算
 context_window = 65536         # 模型上下文窗口 tokens，驱动回合内 >50% 预压缩（等价于 HEARTFLOW_AUTO_COMPACT_TOKENS，后者优先）
 
@@ -23,6 +25,7 @@ api_key_env = "MY_PROXY_TOKEN"
 [mcp.servers.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+env = { "NODE_OPTIONS" = "--max-old-space-size=512" }  # 子进程环境变量
 
 [mcp.servers.remote-search]            # 远程/网络型 MCP：给 url 即走 Streamable-HTTP/SSE（无需 command）
 url = "https://mcp.example.com/stream" # 与 command 二选一；两者都缺则跳过并告警
@@ -31,11 +34,13 @@ bearer_token_env = "SEARCH_MCP_TOKEN"  # 从此环境变量读 Bearer token（�
 read_only = true                       # 声明该 server 工具均只读：read-only/plan 模式下也放行
 ```
 
+`[provider]` 的字段全部可选，未识别字段仅记 debug 日志，坏字段跳过而不阻断启动；`version` 高于当前 schema（1）时按现有 schema 解析并告警。
+
 ## 内置 provider
 
 - `deepseek`：OpenAI 协议，`api_key_env = "DEEPSEEK_API_KEY"`，默认模型 `deepseek-v4-flash`。
-- `anthropic`：Anthropic 协议，`api_key_env = "ANTHROPIC_API_KEY"`。
-- 任意 `[provider.NAME]` 表项即自定义 provider。
+- `anthropic`：Anthropic 协议，`api_key_env = "ANTHROPIC_API_KEY"`，基址可被 `ANTHROPIC_BASE_URL` 覆盖。
+- 任意 `[provider.NAME]` 表项即自定义 provider；都未命中且无内置名时回退到环境变量选路，此时默认模型为 `mimo-v2.5-pro`。
 
 ## 终端配色（theme.toml）
 

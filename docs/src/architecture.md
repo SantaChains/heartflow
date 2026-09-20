@@ -1,17 +1,20 @@
 # 架构
 
-Workspace 结构（`crates/*`，依赖单向 cli → {runtime, api, tools, mcp, store, commands}）：
+Workspace 结构（`crates/*`，依赖单向 `cli → {provider, runtime, api, tools, mcp, store, commands}`，`provider → {api, runtime}`；`runtime` 不感知传输细节）：
 
 ```text
 crates/
-├── api       传输层：Anthropic/OpenAI 客户端、SSE 解析、重试
-├── runtime   会话循环：流消费、工具调度、compact、系统提示词
+├── api       传输层：Anthropic / OpenAI Chat / OpenAI Responses 客户端、SSE 解析、重试
+├── runtime   会话循环：流消费、工具调度、compact、系统提示词、权限、doc_search
 ├── tools     原生工具实现与注册
-├── mcp       MCP 客户端（stdio + Streamable-HTTP/SSE JSON-RPC 2.0）
+├── mcp       MCP 客户端（stdio 与 Streamable-HTTP/SSE JSON-RPC 2.0）
 ├── commands  请求/响应数据结构
 ├── store     系统级 SQLite 历史库：FTS5 全文检索、用量聚合、事务写入、best-effort 镜像
+├── provider  provider 配置解析与协议桥接（阻塞 api 客户端 → 异步 TurnStream）
 └── cli       hf 入口：REPL、配置、渲染、输入编辑
 ```
+
+发布顺序即依赖拓扑的线性化：`heartflow-runtime → heartflow-api → heartflow-provider → heartflow-mcp → heartflow-tools → heartflow-store → heartflow-commands → heartflow`（`scripts/release.sh` 为唯一事实源）。
 
 ## 上下文注入纪律
 

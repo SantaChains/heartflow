@@ -1,7 +1,7 @@
 {
   "$schema": "https://context7.com/schema/context7.json",
   "projectTitle": "heartflow",
-  "description": "Rust 实现的终端 AI agent（命令名 hf）：SSE 真流式、Anthropic/OpenAI 双协议、原生工具、MCP 客户端（stdio 与 Streamable-HTTP/SSE）、任务环、SQLite FTS5 会话检索、上下文压缩。",
+  "description": "Rust 实现的终端 AI agent（命令名 hf）：SSE 真流式、Anthropic/OpenAI Chat/OpenAI Responses 三方言、原生工具、MCP 客户端（stdio 与 Streamable-HTTP/SSE）、任务环、SQLite FTS5 会话检索、上下文压缩。",
   "folders": ["docs/src"],
   "excludeFolders": ["docs/book", "docs/wiki"],
   "excludeFiles": ["CHANGELOG.md"],

@@ -16,7 +16,7 @@
   "pages": [
     {
       "title": "Overview",
-      "purpose": "项目定位、核心能力(流式、双协议、原生工具、MCP、任务自迭代、上下文工程)与 README 特性矩阵的高层导览"
+      "purpose": "项目定位、核心能力(流式、Anthropic/OpenAI Chat/OpenAI Responses 三方言、原生工具、MCP、任务自迭代、上下文工程)与 README 特性矩阵的高层导览"
     },
     {
       "title": "Installation & Distribution",
@@ -24,11 +24,11 @@
     },
     {
       "title": "CLI Reference",
-      "purpose": "crates/cli 的子命令面(prompt/search/config/doctor/init/models/system-prompt)、全局参数、--resume 交互契约与退出码"
+      "purpose": "crates/cli 的子命令面(chat/prompt/search/config/doctor/init/models/system-prompt)、全局参数与 -v/--version、doctor 的 --fix/--ai、--resume 交互契约与退出码 0/1/2"
     },
     {
       "title": "REPL & Slash Commands",
-      "purpose": "REPL 内联视口交互与全部 slash 命令(/help /model /mode /status /compact /pin /sessions /remember /mcp /search /plan /guide /queue 等),权限三档与 /plan 门禁"
+      "purpose": "REPL 内联视口交互与全部 slash 命令(/help /model /mode /status /compact /pin /save /sessions /open /remember /mcp /search /expand /init /restart /exit 与 !CMD,/plan /guide /queue 等),权限三档(KNOWN_PERMISSION_MODES)与 /plan 门禁"
     },
     {
       "title": "Configuration",
@@ -52,7 +52,7 @@
     },
     {
       "title": "API Crate (Transport)",
-      "purpose": "crates/api:Anthropic/OpenAI 客户端、SSE 解析、错误与重试"
+      "purpose": "crates/api:Anthropic / OpenAI Chat / OpenAI Responses 三方言客户端、SSE 解析、错误与重试"
     },
     {
       "title": "Runtime Crate (Conversation Loop)",
@@ -60,7 +60,7 @@
     },
     {
       "title": "Tools Crate",
-      "purpose": "crates/tools:mvp_tool_specs 原生工具规格与 execute_tool 分发、todo、graphics"
+      "purpose": "crates/tools:mvp_tool_specs 原生工具规格与 execute_tool 分发、search_documents(rga 在 PATH 时条件下发)、todo、graphics"
     },
     {
       "title": "MCP Client",
@@ -76,7 +76,7 @@
     },
     {
       "title": "Docs & AI Integration",
-      "purpose": "docs/src mdBook 文档站、GitHub Pages 工作流(.github/workflows/docs.yml，push docs/** 时发布)、scripts/gen-llms.sh 按 llms.txt v2 生成仓库根 llms.txt/llms-full.txt、.devin/wiki.json(本页)、仓库根 context7.json 与 GitHub Wiki 种子(docs/wiki/)"
+      "purpose": "docs/src mdBook 文档站、GitHub Pages 工作流(.github/workflows/docs.yml，push docs/** 时发布)、scripts/gen-llms.sh 按 llms.txt v2 生成仓库根 llms.txt/llms-full.txt、.devin/wiki.json(本页)、仓库根 context7.json；GitHub Wiki 通道暂时停用"
     }
   ]
 }
