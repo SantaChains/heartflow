@@ -1,6 +1,6 @@
 # heartflow
 
-[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![license: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 
 Rust 实现的终端 AI agent。二进制命令 `hf`，在 REPL 中通过流式输出与模型协作，可执行 shell、读写文件、检索代码、挂载 MCP 工具，并以任务循环自迭代完成多步工作。
@@ -242,4 +242,4 @@ cargo clippy --workspace --all-targets -- -D warnings -A clippy::pedantic   # �
 
 ## License
 
-本项目以 [MIT License](LICENSE) 开源。
+本项目以 [Apache License 2.0](LICENSE) 开源。

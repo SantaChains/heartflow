@@ -85,5 +85,5 @@ crates/
 ## 注意
 
 - `.gitignore` 忽略 `target/`、`.heartflow/`、`archive/`、`.history/`、`.trae/`,以及本地笔记 `openmemory.md`、`ref.md`、`error.md`(个人头脑风暴/参考资料,不发布)。
-- 质量门当前以本地为准(fmt + clippy `-D warnings -A clippy::pedantic`(仅正确性阻断)+ test + release);`ci.yml.bak` 为暂存的 CI 工作流,启用时改回 `ci.yml`;许可证 MIT(见 `LICENSE`)。
+- 质量门当前以本地为准(fmt + clippy `-D warnings -A clippy::pedantic`(仅正确性阻断)+ test + release);`ci.yml.bak` 为暂存的 CI 工作流,启用时改回 `ci.yml`;许可证 Apache-2.0(见 `LICENSE`)。
 - 修改 README 中列出的 CLI/REPL 接口时,同步更新 README 与 `--help`。

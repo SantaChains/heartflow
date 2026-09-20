@@ -2,7 +2,7 @@
   "version": "1.0.1",
   "description": "Terminal-native coding agent in Rust (binary: hf).",
   "homepage": "https://github.com/SantaChains/heartflow",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "notes": "首次运行先配置模型提供方,详见 https://github.com/SantaChains/heartflow",
   "architecture": {
     "64bit": {
