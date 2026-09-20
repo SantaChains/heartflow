@@ -231,6 +231,8 @@ const EXTERNAL_TOOL_HINTS: &[(&str, &str)] = &[
     ("hyperfine", "statistical command benchmarking"),
     ("difft", "structural (syntax-aware) diff"),
     ("xsv", "query and reshape CSV"),
+    ("xh", "curl-like HTTP calls with httpie ergonomics"),
+    ("websocat", "WebSocket client for poking ws/wss endpoints"),
     ("tldr", "concise vetted examples for a command"),
     ("gh", "GitHub issues, PRs, and checks from the CLI"),
 ];

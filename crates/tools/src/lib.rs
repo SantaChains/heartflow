@@ -185,7 +185,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "grep_search",
-            description: "Search file contents with a regex pattern.",
+            description: "Search file contents with a regex pattern. Searches plain-text source files only; it cannot see inside binaries, PDFs, Office files or archives. For text inside zip/tar/docx/pdf documents use search_documents when it is offered.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -209,18 +209,20 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
         },
         search_files_tool_spec(),
-        search_documents_tool_spec(),
         apply_patch_tool_spec(),
     ]
 }
 
 /// `search_documents` spec: regex search through document/archive content via
 /// an external `rga` (ripgrep-all), which owns the parsing and its cache.
+/// Registered only when `rga` is on PATH, so the model never sees (and never
+/// calls) a tool that cannot run; without it, plain-text search stays on
+/// `grep_search`.
 #[must_use]
-fn search_documents_tool_spec() -> ToolSpec {
+pub fn search_documents_tool_spec() -> ToolSpec {
     ToolSpec {
         name: "search_documents",
-        description: "Search the extracted text INSIDE documents and archives (zip, tar, tar.gz, tgz, gz, docx, pdf, epub and more) with a regex. Powered by the external `rga` (ripgrep-all) binary; requires it on PATH and reports how to install it otherwise. Hits inside archives are reported as `archive.zip!inner/path` with line numbers. Use grep_search for plain source files and this for specifications, manuals, changelogs or backups shipped as documents.",
+        description: "Search the extracted text INSIDE documents and archives (zip, tar, tar.gz, tgz, gz, docx, pdf, epub and more) with a regex. Powered by the external `rga` (ripgrep-all) binary; only registered when it is on PATH. Hits inside archives are reported as `archive.zip!inner/path` with line numbers. Use grep_search for plain source files and this for specifications, manuals, changelogs or backups shipped as documents.",
         input_schema: json!({
             "type": "object",
             "properties": {

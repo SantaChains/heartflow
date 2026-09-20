@@ -27,7 +27,7 @@ pub use conversation::{
     AgentEvent, ApiClient, ApiRequest, ConversationRuntime, RuntimeError, StaticToolExecutor,
     ToolError, ToolExecutor, ToolSpec, TurnStream, TurnSummary,
 };
-pub use doc_search::{search_documents, DocSearchInput, DocSearchOutput};
+pub use doc_search::{rga_available, search_documents, DocSearchInput, DocSearchOutput};
 pub use file_ops::{
     apply_patch, edit_file, glob_search, grep_search, read_file, search_files, write_file,
     ApplyPatchOutput, EditFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput,

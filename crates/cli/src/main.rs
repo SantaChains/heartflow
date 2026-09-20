@@ -3249,7 +3249,18 @@ impl ToolExecutor for NativeToolExecutor {
             tools::web_fetch_tool_spec(),
             tools::web_search_tool_spec(),
             tools::generate_image_tool_spec(),
-        ] {
+            // Document search needs the external rga binary; advertise the
+            // tool only when it exists so the model never sees a dead entry.
+        ]
+        .into_iter()
+        .chain(
+            if runtime::rga_available() {
+                vec![tools::search_documents_tool_spec()]
+            } else {
+                Vec::new()
+            },
+        )
+        {
             specs.push(ToolSpec {
                 name: spec.name.to_string(),
                 description: spec.description.to_string(),
