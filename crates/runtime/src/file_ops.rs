@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use glob::Pattern;
 use ignore::WalkState;
@@ -148,6 +148,8 @@ pub struct GrepSearchOutput {
 const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
 /// Default line window when the caller does not pass an explicit limit.
 const DEFAULT_READ_LINES: usize = 2_000;
+/// Wait before the single retry of a read interrupted by another process.
+const READ_RETRY_DELAY: Duration = Duration::from_millis(50);
 /// Directories that are never worth searching (VCS and build caches).
 const SKIP_DIRS: &[&str] = &[
     ".git",
@@ -179,7 +181,37 @@ const DEFAULT_SEARCH_LIMIT: usize = 50;
 /// Most fuzzy file hits `search_files` may return in one call.
 const MAX_SEARCH_LIMIT: usize = 500;
 
+/// Run an idempotent read, retrying once on transient OS failures.
+///
+/// Editors, indexers and virus scanners briefly hold files open while an
+/// agent reads them; one short retry turns that race into a success.
+/// Windows sharing/lock violations surface as `WouldBlock`, as does
+/// `EAGAIN` on unix; `Interrupted` covers interrupted syscalls. Permanent
+/// failures (not found, invalid input, real permission errors) return
+/// immediately without a delay.
+fn with_read_retry<T>(op: impl Fn() -> io::Result<T>) -> io::Result<T> {
+    op().or_else(|error| {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+        ) {
+            std::thread::sleep(READ_RETRY_DELAY);
+            op()
+        } else {
+            Err(error)
+        }
+    })
+}
+
 pub fn read_file(
+    path: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> io::Result<ReadFileOutput> {
+    with_read_retry(|| read_file_once(path, offset, limit))
+}
+
+fn read_file_once(
     path: &str,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -451,6 +483,10 @@ fn write_text_atomic(path: &Path, content: &str) -> io::Result<()> {
 }
 
 pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
+    with_read_retry(|| glob_search_once(pattern, path))
+}
+
+fn glob_search_once(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
     let started = Instant::now();
     let base_dir = path
         .map(normalize_path)
@@ -499,6 +535,14 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
 /// `limit` absolute paths, best match first. It reuses the shared `ignore`
 /// crawler, so `.gitignore`/build caches are respected without a human TTY.
 pub fn search_files(
+    query: &str,
+    path: Option<&str>,
+    limit: Option<usize>,
+) -> io::Result<SearchFilesOutput> {
+    with_read_retry(|| search_files_once(query, path, limit))
+}
+
+fn search_files_once(
     query: &str,
     path: Option<&str>,
     limit: Option<usize>,
@@ -553,6 +597,10 @@ pub fn search_files(
 }
 
 pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
+    with_read_retry(|| grep_search_once(input))
+}
+
+fn grep_search_once(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let base_path = input
         .path
         .as_deref()
@@ -990,7 +1038,7 @@ mod tests {
 
     use super::{
         apply_patch, edit_file, glob_search, grep_search, make_patch, read_file, search_files,
-        write_file, ApplyPatchOutput, GrepSearchInput, PatchChange,
+        with_read_retry, write_file, ApplyPatchOutput, GrepSearchInput, PatchChange,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -1011,6 +1059,38 @@ mod tests {
         let read_output = read_file(path.to_string_lossy().as_ref(), Some(1), Some(1))
             .expect("read should succeed");
         assert_eq!(read_output.file.content, "two");
+    }
+
+    #[test]
+    fn transient_read_errors_are_retried_once() {
+        use std::io;
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        let attempts = AtomicUsize::new(0);
+        let result: io::Result<u32> = with_read_retry(|| {
+            let attempt = attempts.fetch_add(1, SeqCst);
+            if attempt == 0 {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!(result.expect("retry should succeed"), 7);
+        assert_eq!(attempts.load(SeqCst), 2);
+    }
+
+    #[test]
+    fn permanent_read_errors_are_not_retried() {
+        use std::io;
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        let attempts = AtomicUsize::new(0);
+        let result: io::Result<u32> = with_read_retry(|| {
+            attempts.fetch_add(1, SeqCst);
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        });
+        assert!(result.is_err());
+        assert_eq!(attempts.load(SeqCst), 1);
     }
 
     #[test]
