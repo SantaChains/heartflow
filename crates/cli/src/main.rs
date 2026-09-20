@@ -27,7 +27,7 @@ use runtime::{
     PermissionPromptDecision, PermissionPrompter, PermissionRequest, Session, TokenUsage,
     ToolError, ToolExecutor, ToolSpec,
 };
-use store::{role_str, Integrity, SearchHit, SearchMethod, SessionMeta, Store};
+use store::{role_str, Integrity, SearchHit, SearchMethod, SessionMeta, Store, StoreError};
 use tokio_util::sync::CancellationToken;
 use tools::{task_id, todo_tool_spec, TodoLedger};
 
@@ -1194,7 +1194,7 @@ fn save_session(session: &Session) -> io::Result<PathBuf> {
         .map_err(|error| io::Error::other(error.to_string()))?;
     // Best-effort mirror into the searchable store; the JSON file stays
     // authoritative, so a store failure must never fail the save.
-    mirror_to_store(&millis.to_string(), &path, session);
+    mirror_to_store(&path, session);
     Ok(path)
 }
 
@@ -1215,7 +1215,7 @@ fn shared_store() -> Option<&'static Store> {
         .as_ref()
 }
 
-fn mirror_to_store(session_id: &str, json_path: &Path, session: &Session) {
+fn mirror_to_store(json_path: &Path, session: &Session) {
     let now = unix_secs();
     let meta = SessionMeta {
         created_at: now,
@@ -1229,9 +1229,100 @@ fn mirror_to_store(session_id: &str, json_path: &Path, session: &Session) {
     let Some(store) = shared_store() else {
         return;
     };
-    if let Err(error) = store.save_session(session_id, &meta, &session.messages) {
-        tracing::debug!("history store mirror failed: {error}");
+    let Ok(mut guard) = MIRROR.lock() else {
+        return;
+    };
+    let tracker = guard.get_or_insert_with(|| MirrorTracker {
+        id: mirror_id(),
+        last_len: 0,
+        force_full: true,
+    });
+
+    // Append is only sound when the transcript is a strict extension of the last
+    // mirrored prefix; a shrink (compaction) or forced rewrite (pin/task reset)
+    // falls through to the full rewrite, which is always correct.
+    let len = session.messages.len();
+    let can_append = tracker.can_append(len);
+    let result = if can_append {
+        store.append_messages(
+            &tracker.id,
+            &meta,
+            tracker.last_len,
+            &session.messages[tracker.last_len..],
+            tracker.last_len,
+        )
+    } else {
+        store.save_session(&tracker.id, &meta, &session.messages)
+    };
+
+    match result {
+        Ok(()) => {
+            tracker.last_len = len;
+            tracker.force_full = false;
+        }
+        // The stored base moved under us (another process rewrote it, or the DB
+        // was rebuilt): recover once with a full rewrite, which cannot drift.
+        Err(StoreError::Drift { .. }) => {
+            if store
+                .save_session(&tracker.id, &meta, &session.messages)
+                .is_ok()
+            {
+                tracker.last_len = len;
+                tracker.force_full = false;
+            } else {
+                tracing::debug!("history store mirror fallback failed");
+            }
+        }
+        Err(error) => tracing::debug!("history store mirror failed: {error}"),
     }
+}
+
+/// Per-process mirror bookkeeping so the SQLite history is written incrementally
+/// instead of re-dumping the whole transcript every turn.
+///
+/// The JSON transcript stays authoritative and keeps its per-save file naming;
+/// this governs only the *mirror*. A single stable `id` represents the current
+/// conversation inside the history DB, so search returns one row per
+/// conversation rather than a snapshot per turn. `last_len` is how many messages
+/// are already mirrored under `id`; `force_full` marks that the stored prefix is
+/// no longer a trustworthy base (an in-place pin toggle, a compaction, or a
+/// task-context reset changed/shortened already-mirrored rows), so the next
+/// write must be a full rewrite rather than a tail append.
+struct MirrorTracker {
+    id: String,
+    last_len: usize,
+    force_full: bool,
+}
+
+impl MirrorTracker {
+    /// Whether this turn's mirror may be an incremental append onto the existing
+    /// base. Sound only when the transcript strictly extends the last mirrored
+    /// prefix: no rewrite was forced (pin/compaction/task-reset), at least one
+    /// row is already stored (otherwise there is no base to extend), and the
+    /// session did not shrink (a shorter transcript means earlier rows changed).
+    /// When false, the caller performs a full `save_session` rewrite.
+    #[must_use]
+    fn can_append(&self, len: usize) -> bool {
+        !self.force_full && self.last_len > 0 && len >= self.last_len
+    }
+}
+
+static MIRROR: Mutex<Option<MirrorTracker>> = Mutex::new(None);
+
+/// Force the next mirror to fully rewrite. Called after any operation that
+/// mutates already-mirrored rows without necessarily growing the transcript.
+fn note_mirror_rewrite() {
+    if let Ok(mut guard) = MIRROR.lock() {
+        if let Some(tracker) = guard.as_mut() {
+            tracker.force_full = true;
+        }
+    }
+}
+
+/// Mint a stable mirror key for this process's conversation. PID + start millis
+/// keeps it unique across concurrent `hf` processes that share the history DB.
+fn mirror_id() -> String {
+    format!("{}-{}", std::process::id(), unix_millis())
 }
 
 fn list_sessions() -> Vec<PathBuf> {
@@ -1786,6 +1877,7 @@ fn maybe_auto_compact(runtime: &mut AgentRuntime) {
     }
     if should_compact(runtime.session(), config) {
         let result = runtime.compact(config);
+        note_mirror_rewrite();
         println!(
             "auto-compacted {} older messages into a summary (context pressure).",
             result.removed_message_count
@@ -1808,6 +1900,7 @@ fn force_compact(runtime: &mut AgentRuntime) {
     if result.removed_message_count == 0 {
         println!("nothing to compact: session is within the preserve window.");
     } else {
+        note_mirror_rewrite();
         println!(
             "Compacted {} messages into a resumable summary.",
             result.removed_message_count
@@ -1821,14 +1914,22 @@ fn force_compact(runtime: &mut AgentRuntime) {
 /// stay in context. Reports the new state and how many messages are pinned.
 fn handle_pin_command(runtime: &mut AgentRuntime) {
     match runtime.toggle_pin_latest() {
-        Some(true) => println!(
-            "pinned the last message - it will survive compaction ({} pinned total).",
-            runtime.pinned_count()
-        ),
-        Some(false) => println!(
-            "unpinned the last message ({} pinned total).",
-            runtime.pinned_count()
-        ),
+        Some(pinned) => {
+            // Pinning flips a flag on an already-mirrored row without changing
+            // the transcript length, so the mirror must be fully rewritten.
+            note_mirror_rewrite();
+            if pinned {
+                println!(
+                    "pinned the last message - it will survive compaction ({} pinned total).",
+                    runtime.pinned_count()
+                );
+            } else {
+                println!(
+                    "unpinned the last message ({} pinned total).",
+                    runtime.pinned_count()
+                );
+            }
+        }
         None => println!("nothing to pin yet - send a message first."),
     }
 }
@@ -3555,6 +3656,9 @@ async fn run_one_task(
                 return Ok(TaskLoopStatus::Completed);
             }
             runtime.reset_for_task(build_task_seeds(memory));
+            // A fresh task context replaces the transcript wholesale, so the
+            // prior mirror rows are no longer a valid append base.
+            note_mirror_rewrite();
             let outcome = run_turn_interactive(
                 runtime,
                 &task_kickoff(&task.id, &task.content, attempt),
@@ -3761,6 +3865,28 @@ mod tests {
             .expect("args should parse")
             .into_action()
             .expect("action should build")
+    }
+
+    #[test]
+    fn mirror_append_routing_tracks_transcript_growth() {
+        use super::MirrorTracker;
+        let tracker = |last_len: usize, force_full: bool| MirrorTracker {
+            id: String::from("x"),
+            last_len,
+            force_full,
+        };
+        // Nothing mirrored yet: always full-write, never append onto an empty base.
+        assert!(!tracker(0, true).can_append(5));
+        assert!(!tracker(0, false).can_append(5), "no base to extend");
+        // A grown transcript over a trustworthy base extends by append.
+        assert!(tracker(5, false).can_append(6));
+        // A shrink (compaction) invalidated the prefix: fall back to full rewrite.
+        assert!(!tracker(5, false).can_append(3));
+        // A forced rewrite (pin/task reset) must full-write even when it grew.
+        assert!(
+            !tracker(5, true).can_append(8),
+            "forced rewrite wins over growth"
+        );
     }
 
     #[test]
