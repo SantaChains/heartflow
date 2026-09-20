@@ -13,6 +13,7 @@ name = "tools"
 
 [dependencies]
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 imagesize = "0.15"
 quick-xml = "0.42"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }

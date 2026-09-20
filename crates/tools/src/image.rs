@@ -1,8 +1,9 @@
 use std::env;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
+use image::{DynamicImage, ImageDecoder as _, ImageFormat, ImageReader};
 use runtime::ContentBlock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -30,6 +31,14 @@ const ATTACHMENT_MEDIA_TYPES: &[(&str, &str)] = &[
 /// Attachment cap. The transcript keeps the encoded bytes, so stay far below
 /// the 48 MiB request ceiling every gateway shares.
 const MAX_ATTACHMENT_BYTES: u64 = 4 * 1024 * 1024;
+/// Longest edge a vision encoder actually keeps. Providers resize anything
+/// larger themselves (Claude tops out near 1568 px), so pixels past this point
+/// only buy upload bytes, per-turn transcript rewriting, memory, and disk for
+/// detail the model never sees.
+const VISION_MAX_EDGE: u32 = 1568;
+/// JPEG quality for the reshaped path. The original is kept whenever shrinking
+/// fails to produce fewer bytes, so reshaping can never inflate an attachment.
+const JPEG_QUALITY: u8 = 85;
 
 /// Media type for a file extension providers accept, `None` otherwise.
 #[must_use]
@@ -46,6 +55,11 @@ pub fn attachment_media_type(path: &str) -> Option<&'static str> {
 
 /// Read a local image into an inline content block, base64 encoded as every
 /// dialect expects it on the wire.
+///
+/// The bytes are reshaped to the vision grid first (see
+/// [`shrink_to_vision_grid`]): a transcript is rewritten, mirrored, and
+/// re-uploaded on every single turn, so an oversized photo would cost its full
+/// size per turn for pixels the provider discards anyway.
 pub fn read_image_attachment(path: &str) -> Result<ContentBlock, ImageError> {
     let media_type = attachment_media_type(path)
         .ok_or_else(|| ImageError::Invalid(format!("unsupported image type: {path}")))?;
@@ -60,10 +74,78 @@ pub fn read_image_attachment(path: &str) -> Result<ContentBlock, ImageError> {
         )));
     }
     let bytes = std::fs::read(path).map_err(|error| ImageError::Io(error.to_string()))?;
+    let (media_type, bytes) = match shrink_to_vision_grid(media_type, &bytes) {
+        Some((media_type, reshaped)) => (media_type, reshaped),
+        None => (media_type.to_string(), bytes),
+    };
     Ok(ContentBlock::Image {
-        media_type: media_type.to_string(),
+        media_type,
         data: base64::engine::general_purpose::STANDARD.encode(&bytes),
     })
+}
+
+/// Reshape an attachment down to what a vision encoder can use, or `None` when
+/// the bytes are already fine and must travel verbatim.
+///
+/// Only the two formats a camera or a screenshot tool produces are touched, and
+/// only when a cheap header probe says the long edge is over the grid. Those are
+/// by far the bulky attachments; gif and webp may be animated, and re-encoding a
+/// single decoded frame would silently drop the animation. A file that will not
+/// decode is passed through too: refusing it here would break formats the
+/// provider itself accepts.
+fn shrink_to_vision_grid(media_type: &str, bytes: &[u8]) -> Option<(String, Vec<u8>)> {
+    let format = match media_type {
+        "image/jpeg" => ImageFormat::Jpeg,
+        "image/png" => ImageFormat::Png,
+        _ => return None,
+    };
+    let size = imagesize::blob_size(bytes).ok()?;
+    if size.width.max(size.height) <= VISION_MAX_EDGE as usize {
+        return None;
+    }
+    let scaled = decode_oriented(bytes)?.resize(
+        VISION_MAX_EDGE,
+        VISION_MAX_EDGE,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let reshaped = encode(&scaled, format)?;
+    // Keep whichever encoding is smaller: a re-encode of an already efficient
+    // file can grow, and the grid cap must never cost more bytes than it saves.
+    if reshaped.len() >= bytes.len() {
+        return None;
+    }
+    Some((media_type.to_string(), reshaped))
+}
+
+/// Decode an attachment and apply its EXIF orientation, so a phone photo taken
+/// in portrait does not reach the model lying on its side.
+fn decode_oriented(bytes: &[u8]) -> Option<DynamicImage> {
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut decoder = reader.into_decoder().ok()?;
+    let orientation = decoder.orientation().ok()?;
+    let mut image = DynamicImage::from_decoder(decoder).ok()?;
+    image.apply_orientation(orientation);
+    Some(image)
+}
+
+/// Re-encode in the attachment's own format, which keeps PNG lossless (and its
+/// alpha) and JPEG photographic rather than converting between the two.
+fn encode(image: &DynamicImage, format: ImageFormat) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    match format {
+        ImageFormat::Jpeg => {
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY)
+                .encode_image(&image.to_rgb8())
+                .ok()?;
+        }
+        ImageFormat::Png => image
+            .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
+            .ok()?,
+        _ => return None,
+    }
+    Some(out)
 }
 
 /// Credentials and endpoint are opt-in via environment so this never shadows the
@@ -287,9 +369,16 @@ pub fn generate_image(input: &GenerateImageInput) -> Result<GenerateImageReport,
 
 #[cfg(test)]
 mod tests {
-    use super::{build_request_body, resolve_output_path, BytesSource, ImageConfig};
+    use super::{
+        build_request_body, read_image_attachment, resolve_output_path, BytesSource, ImageConfig,
+        VISION_MAX_EDGE,
+    };
     use crate::image::{source_from_response, ImageResponse};
+    use base64::Engine as _;
+    use runtime::ContentBlock;
     use serde_json::json;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn config() -> ImageConfig {
         ImageConfig {
@@ -348,5 +437,110 @@ mod tests {
         assert!(generated.starts_with("generated_"));
         assert!(generated.contains(".png"));
         assert!(resolve_output_path(Some("   ")).starts_with("generated_"));
+    }
+
+    /// A smooth gradient: compressible, so a wide test image stays well under the
+    /// attachment cap while still exceeding the vision grid.
+    fn gradient(width: u32, height: u32) -> image::RgbImage {
+        let mut image = image::RgbImage::new(width, height);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8]);
+        }
+        image
+    }
+
+    fn temp_path(tag: &str, extension: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("tools-image-{tag}-{nanos}.{extension}"))
+    }
+
+    fn attach(pixels: &image::RgbImage, tag: &str, format: image::ImageFormat) -> ContentBlock {
+        let extension = format.extensions_str()[0];
+        let path = temp_path(tag, extension);
+        pixels
+            .save_with_format(&path, format)
+            .expect("test image should save");
+        let block = read_image_attachment(path.to_str().expect("utf8 temp path"))
+            .expect("attachment should read");
+        let _ = std::fs::remove_file(&path);
+        block
+    }
+
+    fn image_payload(block: &ContentBlock) -> (String, Vec<u8>) {
+        match block {
+            ContentBlock::Image { media_type, data } => (
+                media_type.clone(),
+                base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .expect("payload should be base64"),
+            ),
+            other => panic!("expected an image block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shrinks_oversized_png_to_the_vision_grid() {
+        let block = attach(
+            &gradient(2400, 1200),
+            "oversized-png",
+            image::ImageFormat::Png,
+        );
+        let (media_type, bytes) = image_payload(&block);
+        assert_eq!(media_type, "image/png");
+
+        let size = imagesize::blob_size(&bytes).expect("reshaped size");
+        assert_eq!(size.width, VISION_MAX_EDGE as usize);
+        assert_eq!(size.height, (VISION_MAX_EDGE / 2) as usize);
+    }
+
+    #[test]
+    fn shrinks_oversized_jpeg_to_the_vision_grid() {
+        let block = attach(
+            &gradient(3000, 1000),
+            "oversized-jpeg",
+            image::ImageFormat::Jpeg,
+        );
+        let (media_type, bytes) = image_payload(&block);
+        assert_eq!(media_type, "image/jpeg");
+
+        let size = imagesize::blob_size(&bytes).expect("reshaped size");
+        assert_eq!(size.width, VISION_MAX_EDGE as usize);
+        assert!(
+            bytes.len() < 200 * 1024,
+            "reshaped jpeg stayed large: {}",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn keeps_an_attachment_inside_the_grid_byte_identical() {
+        let path = temp_path("small-png", "png");
+        gradient(320, 200)
+            .save_with_format(&path, image::ImageFormat::Png)
+            .expect("test image should save");
+        let raw = std::fs::read(&path).expect("read back");
+        let block = read_image_attachment(path.to_str().expect("utf8 temp path")).expect("read");
+        let _ = std::fs::remove_file(&path);
+
+        let (_, bytes) = image_payload(&block);
+        assert_eq!(bytes, raw);
+    }
+
+    #[test]
+    fn passes_non_photographic_formats_through_untouched() {
+        // gif and webp may be animated, so they must never be re-encoded frame by
+        // frame; the bytes are handed over exactly as they are on disk.
+        let path = temp_path("pass-through", "gif");
+        let raw = b"GIF89a-not-actually-decoded".to_vec();
+        std::fs::write(&path, &raw).expect("write raw bytes");
+        let block = read_image_attachment(path.to_str().expect("utf8 temp path")).expect("read");
+        let _ = std::fs::remove_file(&path);
+
+        let (media_type, bytes) = image_payload(&block);
+        assert_eq!(media_type, "image/gif");
+        assert_eq!(bytes, raw);
     }
 }
