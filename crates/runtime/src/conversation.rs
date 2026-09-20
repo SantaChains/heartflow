@@ -108,6 +108,14 @@ pub trait ToolExecutor: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Whether `tool_name` mutates nothing that another tool could touch
+    /// concurrently, so a run of such tools may overlap in parallel. Defaults
+    /// to `false` (fail-closed): an unknown tool is run alone. Executors
+    /// override this for their pure-read tools.
+    fn is_concurrent_safe(&self, _tool_name: &str) -> bool {
+        false
+    }
+
     /// Unfinished tasks in the agent's plan ledger. When the model ends its
     /// message while this is non-zero, the loop nudges it to continue instead
     /// of ending the turn; executors without a plan ledger report zero.
@@ -628,9 +636,16 @@ where
         valid
     }
 
-    /// Execute allowed tools concurrently on the blocking pool, emitting
-    /// `ToolResult` events as they complete while appending transcript entries
-    /// in submission order. Returns true when cancelled mid-flight.
+    /// Execute allowed tools preserving the model's submission order while
+    /// still overlapping work that cannot interfere: maximal runs of
+    /// concurrency-safe tools (reads, searches, fetches) run together in
+    /// parallel; every state-mutating or interactive tool (bash, write/edit/
+    /// patch, `ask_user`, non-read-only MCP tools) runs alone. This stops a
+    /// write racing a concurrent read of the same file and keeps two prompts
+    /// from fighting for the terminal, while leaving the fast path of several
+    /// independent reads untouched. Transcript entries are appended in
+    /// submission order regardless of completion order. Returns true when
+    /// cancelled mid-flight.
     async fn execute_tools(
         &mut self,
         allowed: Vec<(String, String, String)>,
@@ -638,19 +653,63 @@ where
         notify: &mut (dyn FnMut(&AgentEvent) + Send),
         cancel: &CancellationToken,
     ) -> bool {
+        let mut outcomes: Vec<Option<Result<String, ToolError>>> =
+            (0..allowed.len()).map(|_| None).collect();
+        let mut interrupted = false;
+        let mut index = 0usize;
+        while index < allowed.len() {
+            if cancel.is_cancelled() {
+                interrupted = true;
+                break;
+            }
+            // A run of consecutive concurrency-safe tools forms one parallel
+            // batch; anything else is a batch of exactly one, run alone.
+            let start = index;
+            if self.tool_executor.is_concurrent_safe(&allowed[index].1) {
+                while index < allowed.len()
+                    && self.tool_executor.is_concurrent_safe(&allowed[index].1)
+                {
+                    index += 1;
+                }
+            } else {
+                index += 1;
+            }
+            let group: Vec<usize> = (start..index).collect();
+            if self
+                .run_tool_group(&allowed, &group, &mut outcomes, cancel)
+                .await
+            {
+                interrupted = true;
+                break;
+            }
+        }
+        self.record_tool_results(&allowed, outcomes, tool_results, notify);
+        interrupted
+    }
+
+    /// Run one batch of tool calls (`group` indexes into `allowed`) on the
+    /// blocking pool, writing each result into its slot. A group is either a
+    /// parallel run of concurrency-safe tools or a single mutating tool, so one
+    /// `JoinSet` path serves both. Returns true if cancelled before the group
+    /// drained, abandoning the in-flight tasks (their slots stay `None`).
+    async fn run_tool_group(
+        &self,
+        allowed: &[(String, String, String)],
+        group: &[usize],
+        outcomes: &mut [Option<Result<String, ToolError>>],
+        cancel: &CancellationToken,
+    ) -> bool {
         let mut join_set = JoinSet::new();
-        for (index, (_, tool_name, input)) in allowed.iter().enumerate() {
+        for &index in group {
             let executor = Arc::clone(&self.tool_executor);
-            let tool_name = tool_name.clone();
-            let input = input.clone();
+            let tool_name = allowed[index].1.clone();
+            let input = allowed[index].2.clone();
             join_set.spawn_blocking(move || {
                 let result = executor.execute(&tool_name, &input);
                 (index, result)
             });
         }
 
-        let mut outcomes: Vec<Option<Result<String, ToolError>>> =
-            (0..allowed.len()).map(|_| None).collect();
         let mut interrupted = false;
         while !join_set.is_empty() {
             tokio::select! {
@@ -661,9 +720,12 @@ where
                 joined = join_set.join_next() => match joined {
                     Some(Ok((index, result))) => outcomes[index] = Some(result),
                     Some(Err(error)) => {
-                        if let Some(index) = outcomes.iter().position(Option::is_none) {
-                            outcomes[index] =
-                                Some(Err(ToolError::new(format!("tool task failed: {error}"))));
+                        // A panicked/cancelled task: blame an unfinished slot
+                        // in this group so the model still gets a result line.
+                        if let Some(&slot) = group.iter().find(|&&i| outcomes[i].is_none()) {
+                            outcomes[slot] = Some(Err(ToolError::new(format!(
+                                "tool task failed: {error}"
+                            ))));
                         }
                     }
                     None => break,
@@ -674,7 +736,20 @@ where
                 break;
             }
         }
+        interrupted
+    }
 
+    /// Fold execution outcomes into transcript `tool_result` messages in
+    /// submission order, emitting the `ToolResult` events and truncating
+    /// oversized output. A slot left `None` means the tool never completed
+    /// (cancelled) and is recorded as an interruption error.
+    fn record_tool_results(
+        &mut self,
+        allowed: &[(String, String, String)],
+        outcomes: Vec<Option<Result<String, ToolError>>>,
+        tool_results: &mut Vec<ConversationMessage>,
+        notify: &mut (dyn FnMut(&AgentEvent) + Send),
+    ) {
         for ((tool_use_id, tool_name, _), slot) in allowed.iter().zip(outcomes) {
             let (output, is_error) = match slot {
                 Some(Ok(output)) => (truncate_tool_output(&output), false),
@@ -692,7 +767,6 @@ where
             self.session.messages.push(message.clone());
             tool_results.push(message);
         }
-        interrupted
     }
 
     /// Compact the session in place, keeping a resumable system summary.
@@ -845,6 +919,7 @@ mod tests {
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::usage::TokenUsage;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
     fn noop_notify() -> impl FnMut(&AgentEvent) + Send {
@@ -1664,5 +1739,104 @@ mod tests {
             &messages[0].blocks[0],
             ContentBlock::ToolResult { output, .. } if output == &bulk
         ));
+    }
+
+    /// Records whether a mutating tool ever overlapped an in-flight read, and
+    /// the peak number of concurrent reads, to pin the scheduler contract.
+    #[derive(Default)]
+    struct SchedulingProbe {
+        active_reads: std::sync::atomic::AtomicUsize,
+        max_reads: std::sync::atomic::AtomicUsize,
+        write_saw_concurrent: std::sync::atomic::AtomicBool,
+    }
+
+    struct ProbeExecutor {
+        probe: Arc<SchedulingProbe>,
+    }
+
+    impl ToolExecutor for ProbeExecutor {
+        fn execute(&self, tool_name: &str, _input: &str) -> Result<String, ToolError> {
+            use std::sync::atomic::Ordering;
+            if tool_name.starts_with("read") {
+                let now = self.probe.active_reads.fetch_add(1, Ordering::SeqCst) + 1;
+                self.probe.max_reads.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                self.probe.active_reads.fetch_sub(1, Ordering::SeqCst);
+            } else if self.probe.active_reads.load(Ordering::SeqCst) > 0 {
+                self.probe
+                    .write_saw_concurrent
+                    .store(true, Ordering::SeqCst);
+            }
+            Ok(String::from("ok"))
+        }
+
+        fn is_concurrent_safe(&self, tool_name: &str) -> bool {
+            tool_name.starts_with("read")
+        }
+    }
+
+    struct ToolBatchClient {
+        call_count: usize,
+    }
+
+    impl ApiClient for ToolBatchClient {
+        fn stream(&mut self, _request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+            self.call_count += 1;
+            if self.call_count == 1 {
+                // Two independent reads (a parallel batch) then one mutating
+                // tool that must not run alongside them.
+                Ok(TurnStream::from_events(vec![
+                    AgentEvent::ToolUse {
+                        id: "a".to_string(),
+                        name: "read_a".to_string(),
+                        input: "{}".to_string(),
+                    },
+                    AgentEvent::ToolUse {
+                        id: "b".to_string(),
+                        name: "read_b".to_string(),
+                        input: "{}".to_string(),
+                    },
+                    AgentEvent::ToolUse {
+                        id: "c".to_string(),
+                        name: "write_c".to_string(),
+                        input: "{}".to_string(),
+                    },
+                    AgentEvent::MessageStop,
+                ]))
+            } else {
+                Ok(TurnStream::from_events(vec![
+                    AgentEvent::TextDelta("done".to_string()),
+                    AgentEvent::MessageStop,
+                ]))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn writes_are_serialized_against_concurrent_reads() {
+        use std::sync::atomic::Ordering;
+        let probe = Arc::new(SchedulingProbe::default());
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ToolBatchClient { call_count: 0 },
+            ProbeExecutor {
+                probe: Arc::clone(&probe),
+            },
+            PermissionPolicy::new(PermissionMode::Allow),
+            vec!["system".to_string()],
+        );
+        runtime
+            .run_turn("go", None, &mut noop_notify(), &CancellationToken::new())
+            .await
+            .expect("turn");
+
+        assert!(
+            !probe.write_saw_concurrent.load(Ordering::SeqCst),
+            "a mutating tool ran while a read was still in flight"
+        );
+        assert!(
+            probe.max_reads.load(Ordering::SeqCst) >= 2,
+            "consecutive independent reads should still run in parallel"
+        );
     }
 }

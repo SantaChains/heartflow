@@ -2,10 +2,15 @@
 
 [![license: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+[![docs](https://img.shields.io/badge/docs-mdBook-informational)](https://github.com/SantaChains/heartflow/tree/main/docs/src)
+[![context7](https://img.shields.io/badge/Context7-enabled-blue)](https://context7.com/santachains/heartflow)
+[![deepwiki](https://img.shields.io/badge/DeepWiki-ask-green)](https://deepwiki.com/SantaChains/heartflow)
 
 Rust 实现的终端 AI agent。二进制命令 `hf`，在 REPL 中通过流式输出与模型协作，可执行 shell、读写文件、检索代码、挂载 MCP 工具，并以任务循环自迭代完成多步工作。
 
 仓库：[github.com/SantaChains/heartflow](https://github.com/SantaChains/heartflow)
+
+文档：[文档源 docs/src](https://github.com/SantaChains/heartflow/tree/main/docs/src) · [llms.txt](https://raw.githubusercontent.com/SantaChains/heartflow/main/llms.txt) · [llms-full.txt](https://raw.githubusercontent.com/SantaChains/heartflow/main/llms-full.txt) · [DeepWiki](https://deepwiki.com/SantaChains/heartflow) · [Context7](https://context7.com/santachains/heartflow)。Pages 文档站当前暂存为 `docs.yml.bak`，启用方式见 [docs/src/ai-integration.md](https://github.com/SantaChains/heartflow/blob/main/docs/src/ai-integration.md)。
 
 ## 特性
 
@@ -13,10 +18,10 @@ Rust 实现的终端 AI agent。二进制命令 `hf`，在 REPL 中通过流式�
 - 双协议接入：Anthropic 消息协议与 OpenAI Chat Completions 方言；内置 DeepSeek，自定义 provider 可接任意兼容端点
 - 原生工具：bash、read_file、write_file、edit_file、glob_search、grep_search、search_files（nucleo 模糊文件检索，fzf 的非交互正解）、apply_patch（跨多文件事务式批量编辑，先全量校验再写入，任一 old_string 缺失/歧义则整批不落盘）、todo_write、ask_user、verify_graphics、web_fetch（SSRF 防护，仅 http/https，拒绝内网/回环/云元数据地址）；write/edit/apply_patch 的输出用 `similar` 生成真正的行级带上下文 unified diff（非整文件 -旧/+新 转储）
 - MCP 支持：JSON-RPC 2.0 双传输——本地 stdio 与远程 Streamable-HTTP/SSE（`[mcp.servers.NAME]` 给 `command` 走 stdio、给 `url` 走 HTTP，零新依赖复用已内置的 reqwest/tokio），`readOnlyHint` 标注或 `read_only` 配置声明只读工具，原生工具优先
-- 任务循环：todo_write 登记计划，未完成任务自动续推，受最大续推次数约束
+- 任务循环：todo_write 登记计划，未完成任务自动续推，受最大续推次数约束。工具调度按读/写分类：连续的只读工具（read_file/grep/glob/search_files/web_fetch）并行批跑，写类与交互式工具（bash/write/edit/apply_patch/generate_image/todo_write/ask_user 及非只读 MCP）严格串行，保证写不会与并发读竞态、两个 ask_user 不抢终端
 - Hermes 任务环：`/plan approve` 后逐任务执行，每个任务在新鲜上下文里跑（复用同一 runtime，仅重置会话消息、绝不重连 MCP），确定性 verify（无 judge，看工具错误与完成标记），失败按 重试→换策略→询问 升级，收尾落盘复盘
 - 上下文工程：`>50%` 窗口预压缩——设 `config.toml` 的 `[provider] context_window` 或环境变量 `HEARTFLOW_AUTO_COMPACT_TOKENS`（= 模型上下文窗口 tokens，env 优先）后，回合内每次请求前若会话估算越过半窗即 summarize-then-compact（旧消息折成可续摘要、近若干条原样保留）；`/compact` 为手动强制压缩（忽略阈值立即压缩）。摘要按近期加权：越靠近存活窗口的轮次保留越多细节（每块 80→240 字预算）；`/pin` 把关键消息标记为永不压缩，逐字存活于每次压缩之后
-- 会话持久化：JSONL 转录原子写入 `~/.heartflow/sessions`，支持 resume 与 compact；`/exit` 打印本段 resume 命令，`/open N` 在 REPL 内直接跳回历史会话
+- 会话持久化：每个对话一份权威 JSON 快照，原子（temp+rename）写入 `~/.heartflow/sessions/<id>.json`，每回合覆盖同一文件而非另存新档；resume/`/open` 沿用同一 `<id>` 原地续写，`/clear` 轮换到新 `<id>`。支持 compact；`/exit` 打印本段 resume 命令，`/open N` 在 REPL 内直接跳回历史会话
 - 全文历史检索：每回合自动镜像进系统级 SQLite 库 `~/.heartflow/heartflow.db`（FTS5 trigram，中英文通吃，JSON 仍为权威存储），`hf search` 与 REPL `/search` 跨会话检索
 - 自迭代记忆：`~/.heartflow/MEMORY.md`（或项目 `.heartflow/MEMORY.md`）作为跨会话的坑/决策/偏好记录，以极小 token（截断 4KB）注入系统提示词的 Memory 段；`/remember` 手动追加（去重），任务环遇硬坑（多次尝试失败被跳过）自动记录（非向量嵌入）
 - Unix 管道组合：stdin 被管道时读入为上下文，`git diff | hf prompt "评审这次改动"`；`--quiet` 只输出答案、`--json` 输出结构化结果，方便脚本串联
@@ -74,7 +79,7 @@ export DEEPSEEK_API_KEY=sk-...
 hf --provider deepseek
 ```
 
-无参数启动即进入 REPL。输入基于 ratatui 内联视口（保留原生 scrollback、真实光标供 CJK/IME 候选）：Enter 发送，Shift/Alt+Enter 或 Ctrl+J 换行，↑/↓ 翻历史，Tab 补全 `/` 命令，Ctrl+C 取消当前回合（空闲行则仅清空），/exit 退出。
+无参数启动即进入 REPL。输入基于 ratatui 内联视口（保留原生 scrollback、真实光标供 CJK/IME 候选）：Enter 发送，Shift/Alt+Enter 或 Ctrl+J 换行，输入 `/` 在下方弹出可选命令列表（↑/↓ 选择、高亮项按 Enter 或 Tab 补全、Esc 取消高亮；无高亮时 Enter 原样发送），空闲时 ↑/↓ 翻历史，Ctrl+C 取消当前回合（空闲行则仅清空），/exit 退出。命令列表需要高度随候选增减的内联视口，而 stock `Viewport::Inline` 高度构造时固定、一改即整屏 clear，故 `crates/cli/src/viewport_term.rs` 按 astrcodey/codex 的 resize-reflow 思路实现了动态高度行内视口终端（仅用 ratatui 公开 Backend/Buffer，零新依赖）；非 `/` 路径仍锁定 2 行，输入体验与既往逐像素一致。
 
 > **进不去 REPL / 输出乱码？** 几乎都是终端环境问题而非程序故障。一是密钥只在别的 shell 会话里设过：在**当前**终端重新 `export`（Windows 用 `setx` 后要重启终端），再 `hf doctor` 复核 provider 与密钥是否解析成功。二是 Windows 控制台默认 GBK 代码页把 UTF-8 显示成乱码（库内字节始终正确）：执行 `chcp 65001` 或 `[Console]::OutputEncoding=[Text.Encoding]::UTF8`，并换用支持中文的等宽字体即可。
 
@@ -127,9 +132,9 @@ hf search 中文笔记 --json | jq -r '.[].snippet'   # ≥ 3 码点走 FTS5 tri
 
 ## 会话历史库
 
-对话以 JSONL 为权威存储写入 `~/.heartflow/sessions`；同时 best-effort 镜像进系统级 SQLite 库 `~/.heartflow/heartflow.db`（镜像失败绝不阻断保存）。库采用 WAL、外键级联与 `user_version` 迁移，历史消息存于 `messages`、`messages_fts`（FTS5 trigram）供检索。中文、空格、Windows 全路径均按 UTF-8 正确处理。REPL 内 `/search <Q>` 与非交互 `hf search <Q>` 共用同一检索引擎；查询 ≥ 3 码点走 trigram 索引，更短的词回退到转义后的 `LIKE`。
+对话以每会话一份 JSON 快照为权威存储写入 `~/.heartflow/sessions/<id>.json`（原子 temp+rename，一对话一文件）；同时 best-effort 镜像进系统级 SQLite 库 `~/.heartflow/heartflow.db`（镜像失败绝不阻断保存）。库采用 WAL、外键级联与 `user_version` 迁移，历史消息存于 `messages`、`messages_fts`（FTS5 trigram）供检索。中文、空格、Windows 全路径均按 UTF-8 正确处理。REPL 内 `/search <Q>` 与非交互 `hf search <Q>` 共用同一检索引擎；查询 ≥ 3 码点走 trigram 索引，更短的词回退到转义后的 `LIKE`。
 
-镜像以每会话稳定的键写入（进程级，与 JSON 文件命名解耦），故一次对话在库中是一行、随回合**增量追加**新消息（`append_messages` 仅写尾部），而非每回合重刷一份全量快照——把逐回合镜像从 O(会话长度) 降到 O(新增消息)。当回合使转录**缩短**（compact）或原地改动已镜像行（`/pin` 翻标志、任务环重置换种子）时自动回退全量重写；若发现镜像基数漂移（其他进程改写或库被重建），追加会在不动一行的前提下拒绝并即时回退全量。JSON 始终权威，被拒的追加从不丢失或重复历史，只是让位于已验证的重写。
+镜像与会话文件共用同一个稳定 `<id>`（resume/`/open` 沿用、`/clear` 轮换），故一次对话在库中恒为一行、跨进程续写也归并到同一行，且随回合**增量追加**新消息（`append_messages` 仅写尾部），而非每回合重刷一份全量快照——把逐回合镜像从 O(会话长度) 降到 O(新增消息)。当回合使转录**缩短**（compact）或原地改动已镜像行（`/pin` 翻标志、任务环重置换种子）时自动回退全量重写；若发现镜像基数漂移（其他进程改写或库被重建），追加会在不动一行的前提下拒绝并即时回退全量。JSON 始终权威，被拒的追加从不丢失或重复历史，只是让位于已验证的重写。
 
 因为库是从 JSON 派生的缓存，`hf doctor` 会对其跑一次结构体检（只读、非破坏）：默认用完整的 `PRAGMA integrity_check`（逐页/逐索引/含 FTS5 影子表），仅当库超 64 MiB 才降级为跳过索引交叉校验的 `quick_check` 以保持秒级响应。检出损坏时不会静默改数据，而是提示“JSON 转录仍为权威，删除 `heartflow.db` 即会在下次保存时重建检索索引”。
 
@@ -182,7 +187,7 @@ error = "#f7768e"        # 失败
 
 ### 终端伴侣（mascot）
 
-REPL 内置一个纯几何、零素材、零第三方动画库的小机器形象（`crates/cli/src/mascot.rs`），呼应 agent 状态：启动横幅展示会呼吸/眨眼的圆脸 blob；空闲输入框右端有一枚随呼吸节律眨眼的单行眼睛伴侣（终端过窄时自动隐藏，从不挤占输入）；工具运行的状态行用扫描表情替代通用 spinner。动画由一个临界阻尼弹簧积分器驱动（与所参考的 JS 实现同一类数学），仅在时钟或状态变化时重算，配合 ratatui diff 使静帧开销近零。造型全为自绘几何字形，不含任何外部素材/商标，配色沿用上面的主题。完整的 `idle/thinking/busy/done/error` 状态机与多行彩色投影是就绪的公共 API，随 ratatui 状态栏（P4-c.3）接入后全量点亮。
+REPL 内置一个纯几何、零素材、零第三方动画库的小机器形象（`crates/cli/src/mascot.rs`），呼应 agent 状态：启动横幅用 **braille 点阵**（每格 2×4 子像素，与 ratatui `Canvas`/`Marker::Braille` 同源编码）绘出会呼吸/浮动的圆脸 blob，随节律眨眼；空闲输入框右端有一枚单行眼睛伴侣（终端过窄时自动隐藏，从不挤占输入）；工具运行的状态行用扫描表情替代通用 spinner。渲染借鉴 TermAVG 的「像素缓冲 → 终端格点编码」分层，动画由一个临界阻尼弹簧积分器驱动（与所参考的 JS 实现同一类数学），仅在时钟或状态变化时重算，配合 ratatui diff 使静帧开销近零。造型全为自绘几何/点阵，不含任何外部素材/商标，配色沿用上面的主题。半块真彩合成（更高分辨率）作为 ratatui 全屏重构（P4）的升级路径预留。完整的 `idle/thinking/busy/done/error` 状态机与多行彩色投影是就绪的公共 API，随 ratatui 状态栏（P4-c.3）接入后全量点亮。
 
 ## Agent 资产
 

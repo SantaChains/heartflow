@@ -39,13 +39,13 @@ crates/
 ├── tools      原生工具的线上规格(wire spec)与执行:bash/read/write/edit/glob/grep、search_files(nucleo 模糊检索)、apply_patch(事务式多文件编辑)、todo、ask_user、web_fetch、verify_graphics、generate_image。新工具(search_files/apply_patch)的入参 schema 由 schemars 从输入类型派生;其余工具仍为手写 `json!` schema。
 ├── mcp        MCP 客户端:stdio JSON-RPC 2.0 传输。
 ├── commands   请求/响应数据结构(薄)。
-├── store      系统级 SQLite 历史库:JSONL 权威 + best-effort 镜像到 ~/.heartflow/heartflow.db(FTS5 trigram 检索、用量聚合、integrity_check)。
+├── store      系统级 SQLite 历史库:每会话 JSON 快照权威 + best-effort 镜像到 ~/.heartflow/heartflow.db(FTS5 trigram 检索、用量聚合、integrity_check)。
 └── cli        hf 入口:REPL、clap CLI、配置解析、渲染、行编辑、权限交互。
 ```
 
 ## 运行时数据与配置
 
-- 会话:`~/.heartflow/sessions/*.jsonl`(JSONL 为权威存储,原子写入)
+- 会话:`~/.heartflow/sessions/<id>.json`(一对话一个权威快照文件,原子 temp+rename 写入,`<id>` 为起始时间戳-PID;每回合覆盖同一文件而非另存新档。resume/`/open` 沿用其 `<id>` 原地续写,`/clear` 轮换到新 `<id>`。JSON 为权威,SQLite 为派生缓存)
 - 历史库:`~/.heartflow/heartflow.db`(从 JSON 派生的缓存;损坏可删除重建,不阻断保存)
 - 配置优先级:`CLI 参数 > 项目 .heartflow/config.toml > 用户 ~/.heartflow/config.toml > 内置 provider 表 > 环境变量`。同名字段逐项覆盖,坏字段跳过告警,单条不阻断启动。REPL 每回合按 mtime 热重载。
 - Agent 资产:规则 `~/.agent/rules/*.md`(全量注入,上限 32 个/单个 32KB)与 `.agent/rules/`(项目层覆盖用户层);技能 `~/.agent/skills/*/SKILL.md` 仅注入 name/description 元数据。
@@ -78,7 +78,7 @@ crates/
 - 版本号唯一维护点在根 `Cargo.toml` 的 `[workspace.package]`;各 crate 一律 `version.workspace = true`,禁止写死版本号。
 - crates.io:api/runtime/mcp/tools/store/commands 裸名已被占用,内部 crate 统一挂 `heartflow-` 前缀发布,`[lib] name` 保持旧 extern 名,依赖经 `[workspace.dependencies]` 的 `package =` 重命名(源码 `use` 不变);publish job 按依赖拓扑逐个发,单 crate 失败自动重试 5 次(429 限流 2 分钟退避,"already uploaded" 幂等跳过),认证走仓库 secret `CRATES_IO_TOKEN`;版本一次性,同版本不可重发。
 - 机器人提交 `chore(release): vX.Y.Z [skip ci]` 自动同步 Cargo.toml/Cargo.lock/CHANGELOG、打 tag、建 GitHub Release;勿手工仿写此类提交。
-- Windows amd64 便携 zip(hf.exe 置于压缩包根 + .sha256)随每次发布上传到 Release;本仓库 `bucket/` 目录兼作 scoop bucket,清单 `bucket/heartflow.json` 的 version 与 hash 由发布流水线写入实际值(scoop install 只认字符串 hash,url+find 形态仅 autoupdate 可解析,自托管 bucket 无自动更新机器人),checkver/autoupdate 块保留备用(用户先 `scoop bucket add heartflow <仓库url>` 再 `scoop install heartflow`)。
+- Windows amd64 便携 zip(hf.exe 置于压缩包根 + .sha256)随每次发布上传到 Release;本仓库 `bucket/` 目录兼作 scoop bucket。清单 `bucket/heartflow.json` 的 version/url/hash 由 windows-zip job 在每次发布时按 tag 确定性写入实际值(CI 是唯一写入者,url 恒等于 release 下载地址、以 homepage 为基不硬编码 host,能自愈历史漂移;哈希取自本地构建产物零回下),scoop install 只认字符串 hash。自托管 bucket 无自动更新机器人,故不配 autoupdate 块(会成第二事实源且永不执行);仅保留 checkver 供维护者手动核对最新 tag。用户先 `scoop bucket add heartflow <仓库url>` 再 `scoop install heartflow`。
 - git-cliff 版本钉在 `.github/actions/install-git-cliff/action.yml`(模板引擎行为随版本变动,升级需显式改并先过本地 dry-run)。
 - 若 main 启用分支保护,需允许 GitHub Actions 直接推送;发布流水线不做代码检查。
 
@@ -87,3 +87,5 @@ crates/
 - `.gitignore` 忽略 `target/`、`.heartflow/`、`archive/`、`.history/`、`.trae/`,以及本地笔记 `openmemory.md`、`ref.md`、`error.md`(个人头脑风暴/参考资料,不发布)。
 - 质量门当前以本地为准(fmt + clippy `-D warnings -A clippy::pedantic`(仅正确性阻断)+ test + release);`ci.yml.bak` 为暂存的 CI 工作流,启用时改回 `ci.yml`;许可证 Apache-2.0(见 `LICENSE`)。
 - 修改 README 中列出的 CLI/REPL 接口时,同步更新 README 与 `--help`。
+- 文档站源在 `docs/src`(mdBook);`scripts/gen-llms.sh` 按 **llms.txt v2** 从 `docs/src/SUMMARY.md` 生成仓库根 `llms.txt`/`llms-full.txt`(已提交),改文档后重跑 `bash scripts/gen-llms.sh`。GitHub Pages 工作流暂存为 `docs.yml.bak`(与 `ci.yml.bak` 同约定,不触发),启用时改回 `docs.yml` 并在 Settings → Pages 选 GitHub Actions。
+- 改 CLI 工具名/接口/安装口径时,口径逐字同步 README、`docs/src`、`bucket/heartflow.json` notes、`.devin/wiki.json`、仓库根 `llms.txt`。

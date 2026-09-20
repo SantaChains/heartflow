@@ -420,7 +420,11 @@ impl Mascot {
     }
 
     /// Plot the mouth with the mood's expression.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
     fn plot_mouth(&self, cv: &mut Braille, cx: f64, cy: f64) {
         let my = cy + (DOT_HEIGHT as f64) * 0.20;
         match self.mood {

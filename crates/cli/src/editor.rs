@@ -7,11 +7,12 @@
 //! real terminal cursor is parked on the input cell so the OS/terminal draws
 //! CJK IME candidates in place (self-drawn candidates are not viable).
 //!
-//! Slash completion is fish-style (inline ghost hint + Tab cycles) rather than
-//! a dropdown: a dropdown would need a viewport whose height changes as the
-//! candidate list grows, but `Viewport::Inline` height is fixed at
-//! construction, so a stable 2-row viewport (input row + hint row) is both
-//! simpler and free of the resize/scroll class of bugs.
+//! Slash completion is a dropdown menu: typing `/` lists the matching commands
+//! below the prompt (fish-style Tab still completes). A dropdown needs a viewport
+//! whose height grows with the candidate list, which stock `Viewport::Inline`
+//! cannot do without a full-screen clear; [`crate::viewport_term::CompanionTerminal`]
+//! supplies a dynamic-height inline viewport (astrcodey/codex resize-reflow) for
+//! exactly this, while the non-slash path keeps the stable 2-row viewport.
 
 use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Write};
@@ -23,15 +24,16 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
-use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
+use ratatui::widgets::{Paragraph, Widget};
 use tui_textarea::{CursorMove, TextArea};
 
 use crate::mascot::Mascot;
 use crate::theme::{glyphs, Theme};
+use crate::viewport_term::CompanionTerminal;
 
 /// REPL slash commands surfaced by completion and the "did you mean" hint.
 /// Kept in sync with `print_repl_help` in main.rs; add new commands to both.
@@ -122,6 +124,15 @@ pub fn completion_candidates(prefix: &str) -> Vec<&'static str> {
             head.starts_with(prefix).then_some(head)
         })
         .collect()
+}
+
+/// One-line description for a command head name, for the dropdown rows.
+#[must_use]
+fn command_desc(name: &str) -> &'static str {
+    COMMANDS
+        .iter()
+        .find(|(full, _)| full.split([' ', '<']).next().unwrap_or(full) == name)
+        .map_or("", |(_, desc)| *desc)
 }
 
 /// The scrollback lines a submitted input leaves behind: the first line is
@@ -308,10 +319,7 @@ impl ReplEditor {
     fn read_line_tui(&mut self) -> io::Result<Exit> {
         enable_raw_mode()?;
         let backend = CrosstermBackend::new(io::stdout());
-        let options = TerminalOptions {
-            viewport: Viewport::Inline(VIEWPORT_ROWS),
-        };
-        let mut terminal = match Terminal::with_options(backend, options) {
+        let mut terminal = match CompanionTerminal::with_inline(backend, VIEWPORT_ROWS) {
             Ok(terminal) => terminal,
             Err(error) => {
                 let _ = disable_raw_mode();
@@ -360,7 +368,7 @@ impl ReplEditor {
     #[allow(clippy::too_many_arguments)]
     fn edit_loop(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        terminal: &mut CompanionTerminal<CrosstermBackend<io::Stdout>>,
         textarea: &mut TextArea<'static>,
         status: &mut Option<String>,
         completions: &mut Vec<&'static str>,
@@ -378,18 +386,26 @@ impl ReplEditor {
                 status.take().as_deref(),
             );
 
-            let frame = terminal.draw(|frame| draw_frame(frame, textarea, &hint, &mascot))?;
-            // Park the real terminal cursor on the input cell (the IME anchor).
-            let (cursor_row, cursor_col) = textarea.cursor();
-            let column = if cursor_row == 0 {
-                u16::try_from(cursor_col).unwrap_or(u16::MAX)
+            // The dropdown lives in rows below the fixed input+hint viewport; only
+            // the slash path grows the height, so ordinary typing keeps it at 2 and
+            // behaves exactly like the old stable inline viewport.
+            let menu_rows = if prefix.is_some() {
+                completions.len()
             } else {
                 0
             };
-            let area = frame.area;
-            let x = (area.x + PROMPT_WIDTH + column).min(area.x + area.width.saturating_sub(1));
-            terminal.set_cursor_position(Position::new(x, area.y))?;
-            terminal.show_cursor()?;
+            let height = VIEWPORT_ROWS.saturating_add(u16::try_from(menu_rows).unwrap_or(0));
+            terminal.draw(height, |buf, area| {
+                draw_frame(
+                    buf,
+                    area,
+                    textarea,
+                    &hint,
+                    &mascot,
+                    completions,
+                    *completion_idx,
+                )
+            })?;
 
             // Poll instead of a blocking read so the mascot can tick while the
             // user is idle; on timeout we advance the animation and redraw
@@ -461,6 +477,17 @@ impl ReplEditor {
                     {
                         textarea.insert_newline();
                         false
+                    } else if menu_accept_on_enter(
+                        completions,
+                        *completion_idx,
+                        &textarea.lines().join("\n"),
+                    )
+                    .is_some()
+                    {
+                        // A dropdown row is highlighted and differs from what is
+                        // typed: Enter completes it rather than sending a partial.
+                        complete_menu(textarea, completions, completion_idx);
+                        false
                     } else {
                         *exit = Exit::Submit(textarea.lines().join("\n"));
                         true
@@ -480,7 +507,7 @@ impl ReplEditor {
                     false
                 }
                 KeyCode::Up => {
-                    if completion_idx.is_some() {
+                    if !completions.is_empty() {
                         cycle_completion(completions, completion_idx, true);
                     } else if textarea.cursor().0 == 0 {
                         if let Some(entry) = self.history.prev() {
@@ -492,7 +519,7 @@ impl ReplEditor {
                     false
                 }
                 KeyCode::Down => {
-                    if completion_idx.is_some() {
+                    if !completions.is_empty() {
                         cycle_completion(completions, completion_idx, false);
                     } else if textarea.cursor().0 + 1 >= textarea.lines().len() {
                         *textarea = match self.history.next() {
@@ -516,13 +543,26 @@ impl ReplEditor {
     }
 }
 
-/// Render one frame: the `› ` gutter, the textarea in the remaining input
-/// cells, the idle mascot badge parked at the far right of the input row, and
-/// the hint row beneath. Rect math is done by hand to avoid coupling to the
-/// layout-algorithm API across ratatui releases.
-fn draw_frame(frame: &mut Frame<'_>, textarea: &TextArea<'static>, hint: &str, mascot: &Mascot) {
+/// Render one frame into the viewport buffer: the `› ` gutter, the textarea in
+/// the remaining input cells, the idle mascot badge parked at the far right of
+/// the input row, the hint row beneath, and (when a `/` prefix is active) the
+/// command dropdown below that. Returns the absolute terminal cursor position so
+/// the caller can park the real cursor on the input cell (the IME anchor). Rect
+/// math is done by hand to avoid coupling to the layout-algorithm API.
+// The render-closure contract returns `Option` (`None` hides the cursor), even
+// though this frame always parks it on the input cell.
+#[allow(clippy::unnecessary_wraps)]
+fn draw_frame(
+    buf: &mut Buffer,
+    area: Rect,
+    textarea: &TextArea<'static>,
+    hint: &str,
+    mascot: &Mascot,
+    completions: &[&'static str],
+    completion_idx: Option<usize>,
+) -> Option<Position> {
     let theme = Theme::current();
-    let size = frame.area();
+    let size = area;
     let gutter = Rect::new(size.x, size.y, PROMPT_WIDTH.min(size.width), 1);
     // The mascot owns a few columns at the right of the input row; hide it on
     // narrow terminals rather than crowd the prompt, and never let it eat the
@@ -542,14 +582,12 @@ fn draw_frame(frame: &mut Frame<'_>, textarea: &TextArea<'static>, hint: &str, m
         1,
     );
     let hint_area = Rect::new(size.x, size.y + 1, size.width, 1);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            glyphs::PROMPT,
-            Style::default().fg(theme.accent().ratatui()),
-        ))),
-        gutter,
-    );
-    frame.render_widget(textarea, editor);
+    Paragraph::new(Line::from(Span::styled(
+        glyphs::PROMPT,
+        Style::default().fg(theme.accent().ratatui()),
+    )))
+    .render(gutter, buf);
+    textarea.render(editor, buf);
     if show_mascot {
         let badge_area = Rect::new(
             size.x + size.width.saturating_sub(badge_width),
@@ -557,21 +595,77 @@ fn draw_frame(frame: &mut Frame<'_>, textarea: &TextArea<'static>, hint: &str, m
             badge_width,
             1,
         );
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                badge,
-                Style::default().fg(theme.muted().ratatui()),
-            ))),
-            badge_area,
-        );
-    }
-    frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            hint.to_string(),
+            badge,
             Style::default().fg(theme.muted().ratatui()),
-        ))),
-        hint_area,
-    );
+        )))
+        .render(badge_area, buf);
+    }
+    Paragraph::new(Line::from(Span::styled(
+        hint.to_string(),
+        Style::default().fg(theme.muted().ratatui()),
+    )))
+    .render(hint_area, buf);
+
+    render_menu(buf, size, completions, completion_idx, theme);
+
+    // Park the real terminal cursor on the input cell (the IME anchor).
+    let (cursor_row, cursor_col) = textarea.cursor();
+    let column = if cursor_row == 0 {
+        u16::try_from(cursor_col).unwrap_or(u16::MAX)
+    } else {
+        0
+    };
+    let x = (size.x + PROMPT_WIDTH + column).min(size.x + size.width.saturating_sub(1));
+    Some(Position::new(x, size.y))
+}
+
+/// Draw the slash command dropdown: one row per candidate, the selected row
+/// marked and accented, each command's description in muted text. The rows are
+/// reserved by [`ReplEditor::edit_loop`] via the viewport height, so this only
+/// paints while the list is actually shown.
+fn render_menu(
+    buf: &mut Buffer,
+    size: Rect,
+    completions: &[&'static str],
+    completion_idx: Option<usize>,
+    theme: &Theme,
+) {
+    let menu_top = size.y + VIEWPORT_ROWS;
+    let name_col = completions
+        .iter()
+        .map(|name| name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .saturating_add(2);
+    for (i, name) in completions.iter().enumerate() {
+        let Some(row_y) = menu_top.checked_add(u16::try_from(i).unwrap_or(u16::MAX)) else {
+            break;
+        };
+        if row_y >= size.y + size.height {
+            break; // viewport was clamped to the screen; drop overflow rows
+        }
+        let row = Rect::new(size.x, row_y, size.width, 1);
+        let is_sel = completion_idx == Some(i);
+        let name_style = if is_sel {
+            Style::default()
+                .fg(theme.accent().ratatui())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Reset)
+        };
+        let pad = name_col.saturating_sub(name.chars().count());
+        let line = Line::from(vec![
+            Span::styled(if is_sel { "> " } else { "  " }, name_style),
+            Span::styled((*name).to_string(), name_style),
+            Span::styled(" ".repeat(pad), Style::default()),
+            Span::styled(
+                command_desc(name).to_string(),
+                Style::default().fg(theme.muted().ratatui()),
+            ),
+        ]);
+        Paragraph::new(line).render(row, buf);
+    }
 }
 
 /// The slash token typed so far, but only while it is a bare leading command
@@ -594,32 +688,67 @@ fn build_hint(
     if let Some(status) = status {
         return status.to_string();
     }
-    match prefix {
-        Some(prefix) => {
-            // Recompute candidates only when the prefix stops matching the
-            // current set, so repeated keystrokes stay stable.
-            let still_valid = completions
-                .first()
-                .is_some_and(|first| first.starts_with(prefix));
-            if !still_valid {
-                *completions = completion_candidates(prefix);
-                completions.truncate(MAX_COMPLETIONS);
-                *completion_idx = None;
-            }
-            if completions.is_empty() {
-                return format!("no command matches {prefix}");
-            }
-            let shown = completion_idx
-                .and_then(|idx| completions.get(idx).copied())
-                .unwrap_or_else(|| completions.first().copied().unwrap_or(prefix));
-            let count = completions.len();
-            let pos = completion_idx.map_or(1, |idx| idx + 1);
-            format!("{shown}  ({pos}/{count}) · Tab completes")
+    if let Some(prefix) = prefix {
+        // Recompute candidates only when the prefix stops matching the
+        // current set, so repeated keystrokes stay stable.
+        let still_valid = completions
+            .first()
+            .is_some_and(|first| first.starts_with(prefix));
+        if !still_valid {
+            *completions = completion_candidates(prefix);
+            completions.truncate(MAX_COMPLETIONS);
+            *completion_idx = None;
         }
-        None => String::from(
-            "Enter send · Alt+Enter newline · ↑/↓ history · Tab complete · Ctrl+D quit",
-        ),
+        if completions.is_empty() {
+            return format!("no command matches {prefix}");
+        }
+        let shown = completion_idx
+            .and_then(|idx| completions.get(idx).copied())
+            .unwrap_or_else(|| completions.first().copied().unwrap_or(prefix));
+        let count = completions.len();
+        let pos = completion_idx.map_or(1, |idx| idx + 1);
+        format!("{shown}  ({pos}/{count}) · Tab completes")
+    } else {
+        // Leaving the slash prefix closes the menu: drop stale candidates so
+        // the viewport height and dropdown rows follow the current input.
+        completions.clear();
+        *completion_idx = None;
+        String::from(
+            "Enter send · Alt+Enter newline · / commands · ↑/↓ select · Tab complete · Ctrl+D quit",
+        )
     }
+}
+
+/// Complete the highlighted dropdown row into the buffer and close the menu
+/// (Enter while a row is actively selected).
+fn complete_menu(
+    textarea: &mut TextArea<'static>,
+    completions: &mut Vec<&'static str>,
+    completion_idx: &mut Option<usize>,
+) {
+    if let Some(candidate) = accept_completion(completions, completion_idx) {
+        *textarea = blank_textarea();
+        textarea.insert_str(format!("{candidate} "));
+    }
+    completions.clear();
+    *completion_idx = None;
+}
+
+/// Whether Enter should complete a highlighted dropdown row instead of
+/// submitting: only when the menu is up, a row is actively highlighted (via
+/// Up/Down/Tab), and that candidate is not already the whole typed token. A
+/// `None` return means Enter submits the line exactly as typed.
+#[must_use]
+fn menu_accept_on_enter(
+    completions: &[&'static str],
+    completion_idx: Option<usize>,
+    text: &str,
+) -> Option<&'static str> {
+    if !text.starts_with('/') || text.contains(char::is_whitespace) {
+        return None;
+    }
+    let candidate = completion_idx.and_then(|i| completions.get(i).copied())?;
+    (candidate != text).then_some(candidate)
 }
 
 /// Take the currently offered completion and advance the cycle to the next one.
@@ -703,9 +832,33 @@ fn read_line_fallback() -> io::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        completion_candidates, decode_history, echo_lines, encode_history_line, suggest_command,
-        History,
+        command_desc, completion_candidates, decode_history, echo_lines, encode_history_line,
+        menu_accept_on_enter, suggest_command, History,
     };
+
+    #[test]
+    fn enter_completes_only_an_active_highlight() {
+        let cands = completion_candidates("/comp");
+        assert_eq!(cands, vec!["/compact"]);
+        // No row highlighted yet: Enter submits the partial rather than completing.
+        assert_eq!(menu_accept_on_enter(&cands, None, "/comp"), None);
+        // A highlighted row that differs from the token: Enter completes it.
+        assert_eq!(
+            menu_accept_on_enter(&cands, Some(0), "/comp"),
+            Some("/compact")
+        );
+        // The exact command already typed: Enter submits (nothing to complete).
+        let exact = completion_candidates("/compact");
+        assert_eq!(menu_accept_on_enter(&exact, Some(0), "/compact"), None);
+        // Once an argument has begun the menu is closed, so Enter submits.
+        assert_eq!(menu_accept_on_enter(&cands, Some(0), "/comp x"), None);
+    }
+
+    #[test]
+    fn command_desc_resolves_heads_only() {
+        assert_eq!(command_desc("/compact"), "Compact session history");
+        assert_eq!(command_desc("/nope"), "");
+    }
 
     #[test]
     #[allow(clippy::assert_is_empty)]

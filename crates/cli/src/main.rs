@@ -5,6 +5,7 @@ mod editor;
 mod mascot;
 mod render;
 mod theme;
+mod viewport_term;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -208,6 +209,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None => {
                     let session = Session::load_from_path(&session_path)
                         .map_err(|error| format!("failed to restore session: {error}"))?;
+                    // Continue this transcript in place: adopt its id so later
+                    // turns overwrite the same file and update the same row.
+                    adopt_session_path(&session_path);
                     let selection = resolve_selection(provider.as_deref(), model.as_deref())?;
                     println!(
                         "Restored session from {} ({} messages).",
@@ -892,6 +896,9 @@ fn handle_clear_command(
             *runtime = fresh;
             *planning = false;
             *plan_path = None;
+            // A cleared session is a new conversation: give it a fresh file and
+            // history row instead of appending onto the one just wiped.
+            rotate_session_id();
             println!("session cleared.");
         }
         Err(error) => println!("failed to reset session: {error}"),
@@ -1188,8 +1195,10 @@ fn unix_millis() -> u128 {
 fn save_session(session: &Session) -> io::Result<PathBuf> {
     let dir = sessions_dir();
     fs::create_dir_all(&dir)?;
-    let millis = unix_millis();
-    let path = dir.join(format!("{millis}.json"));
+    // One file per conversation, keyed by the stable id (see current_session_id):
+    // each turn overwrites it via the atomic temp+rename in `save_to_path`, so a
+    // crash keeps the last complete snapshot rather than a truncated tail.
+    let path = dir.join(format!("{}.json", current_session_id()));
     session
         .save_to_path(&path)
         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -1234,7 +1243,7 @@ fn mirror_to_store(json_path: &Path, session: &Session) {
         return;
     };
     let tracker = guard.get_or_insert_with(|| MirrorTracker {
-        id: mirror_id(),
+        id: current_session_id(),
         last_len: 0,
         force_full: true,
     });
@@ -1320,10 +1329,59 @@ fn note_mirror_rewrite() {
     }
 }
 
-/// Mint a stable mirror key for this process's conversation. PID + start millis
-/// keeps it unique across concurrent `hf` processes that share the history DB.
-fn mirror_id() -> String {
-    format!("{}-{}", std::process::id(), unix_millis())
+/// Stable on-disk identity of the conversation this process persists. A single
+/// `hf` run is one conversation, so `save_session` keeps writing the SAME file
+/// (`sessions/<id>.json`) instead of minting a fresh timestamped snapshot every
+/// turn. The old per-turn naming fragmented one conversation across N files and
+/// re-dumped the whole transcript each turn; one atomic snapshot per
+/// conversation is durable and keeps `/sessions` at one row each. The id is a
+/// start timestamp so listings stay newest-first; it is adopted when a run
+/// resumes/opens a transcript and rotated on `/clear`.
+static SESSION_ID: Mutex<Option<String>> = Mutex::new(None);
+
+/// A fresh conversation id: start millis then PID, unique across concurrent
+/// `hf` processes sharing the history DB and sortable by recency.
+fn new_session_id() -> String {
+    format!("{}-{}", unix_millis(), std::process::id())
+}
+
+/// The active conversation id, minted on first use. A poisoned lock falls back
+/// to a fresh id rather than blocking persistence.
+fn current_session_id() -> String {
+    match SESSION_ID.lock() {
+        Ok(mut guard) => guard.get_or_insert_with(new_session_id).clone(),
+        Err(_) => new_session_id(),
+    }
+}
+
+/// Rebind persistence to `id`: point future saves at that conversation and drop
+/// the mirror tracker so the next write re-initializes (full, not append) under
+/// the same id, keeping the JSON file and the SQLite row keyed identically.
+fn rebind_conversation(id: String) {
+    if let Ok(mut guard) = SESSION_ID.lock() {
+        *guard = Some(id);
+    }
+    if let Ok(mut guard) = MIRROR.lock() {
+        *guard = None;
+    }
+}
+
+/// Start a brand-new conversation (after `/clear`): a fresh id for both the
+/// transcript file and the history mirror.
+fn rotate_session_id() {
+    rebind_conversation(new_session_id());
+}
+
+/// Adopt the conversation persisted at `path` (resume / `/open`): continuing it
+/// overwrites the same file and updates the same history row instead of
+/// branching into a new one.
+fn adopt_session_path(path: &Path) {
+    let id = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(new_session_id);
+    rebind_conversation(id);
 }
 
 fn list_sessions() -> Vec<PathBuf> {
@@ -1705,6 +1763,9 @@ fn handle_open_command(
         Ok(session) => match build_runtime(session, selection.clone(), true, mode) {
             Ok(fresh) => {
                 *runtime = fresh;
+                // Own this transcript's identity so subsequent turns keep
+                // writing the same file and history row.
+                adopt_session_path(path);
                 println!("opened session {index}: {}", path.display());
             }
             Err(error) => println!("failed to start runtime for session {index}: {error}"),
@@ -3041,6 +3102,22 @@ impl ToolExecutor for NativeToolExecutor {
         self.todo.pending_tasks()
     }
 
+    fn is_concurrent_safe(&self, tool_name: &str) -> bool {
+        // Pure reads, searches and a network fetch mutate no workspace state, so
+        // several may overlap. bash and write/edit/patch/generate_image touch the
+        // workspace, todo_write mutates the shared ledger, and ask_user needs the
+        // terminal; each must run alone.
+        matches!(
+            tool_name,
+            "read_file"
+                | "glob_search"
+                | "grep_search"
+                | "search_files"
+                | "verify_graphics"
+                | "web_fetch"
+        )
+    }
+
     fn seed_plan(&self, input: &str) -> Result<String, ToolError> {
         self.todo.write(input).map_err(ToolError::new)
     }
@@ -3140,6 +3217,20 @@ impl ToolExecutor for AgentToolExecutor {
 
     fn seed_plan(&self, input: &str) -> Result<String, ToolError> {
         self.native.seed_plan(input)
+    }
+
+    fn is_concurrent_safe(&self, tool_name: &str) -> bool {
+        if tool_name.starts_with("mcp__") {
+            // A namespaced MCP tool overlaps only when it (or its server) is
+            // annotated read-only; mutating tools run alone. Reuses the same
+            // read-only set the permission policy relies on.
+            self.mcp
+                .read_only_tool_names()
+                .iter()
+                .any(|name| name == tool_name)
+        } else {
+            self.native.is_concurrent_safe(tool_name)
+        }
     }
 
     fn specs(&self) -> Vec<ToolSpec> {
@@ -3891,6 +3982,60 @@ mod tests {
             !tracker(5, true).can_append(8),
             "forced rewrite wins over growth"
         );
+    }
+
+    #[test]
+    fn session_identity_adopts_a_transcript_and_rotates_to_a_new_id() {
+        use super::{adopt_session_path, current_session_id, rotate_session_id};
+        use std::path::Path;
+        // Adopting a transcript rebinds persistence to its file stem, so a
+        // resumed conversation keeps writing the same file and history row.
+        adopt_session_path(Path::new("/x/sessions/123-45.json"));
+        assert_eq!(current_session_id(), "123-45");
+        // Rotating (after /clear) mints a fresh, non-empty, different id.
+        let before = current_session_id();
+        rotate_session_id();
+        let after = current_session_id();
+        assert!(!after.is_empty(), "a fresh id is never empty");
+        assert_ne!(before, after, "rotate must start a new conversation id");
+    }
+
+    #[test]
+    fn native_read_only_tools_are_the_only_concurrent_safe_ones() {
+        use super::{NativeToolExecutor, ToolExecutor};
+        let exec = NativeToolExecutor::new(None);
+        // Pure reads/searches/fetches may overlap.
+        for tool in [
+            "read_file",
+            "glob_search",
+            "grep_search",
+            "search_files",
+            "verify_graphics",
+            "web_fetch",
+        ] {
+            assert!(
+                exec.is_concurrent_safe(tool),
+                "{tool} must be concurrent-safe"
+            );
+        }
+        // Anything that mutates the workspace, the ledger, or needs the
+        // terminal runs alone.
+        for tool in [
+            "bash",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "generate_image",
+            "todo_write",
+            "ask_user",
+        ] {
+            assert!(
+                !exec.is_concurrent_safe(tool),
+                "{tool} must run sequentially"
+            );
+        }
+        // Unknown/fail-closed.
+        assert!(!exec.is_concurrent_safe("mcp__server__do_thing"));
     }
 
     #[test]
