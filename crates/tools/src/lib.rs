@@ -109,6 +109,30 @@ struct ApplyPatchInput {
     changes: Vec<ApplyPatchChange>,
 }
 
+/// Glob search accepts one pattern or an array; arrays match in a single
+/// crawl via globset, so cost grows with files visited, not pattern count.
+#[must_use]
+fn glob_search_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "glob_search",
+        description: "Find files by glob pattern. Accepts one glob string or an array of globs; an array matches all patterns in a single crawl, so prefer [\"**/*.rs\", \"**/*.toml\"] over two calls. Gitignore'd trees (build output) are skipped.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "anyOf": [
+                        { "type": "string" },
+                        { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+                    ]
+                },
+                "path": { "type": "string" }
+            },
+            "required": ["pattern"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 #[must_use]
 pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
@@ -170,19 +194,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
         },
-        ToolSpec {
-            name: "glob_search",
-            description: "Find files by glob pattern.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "pattern": { "type": "string" },
-                    "path": { "type": "string" }
-                },
-                "required": ["pattern"],
-                "additionalProperties": false
-            }),
-        },
+        glob_search_tool_spec(),
         ToolSpec {
             name: "grep_search",
             description: "Search file contents with a regex pattern. Searches plain-text source files only; it cannot see inside binaries, PDFs, Office files or archives. For text inside zip/tar/docx/pdf documents use search_documents when it is offered.",
@@ -401,7 +413,8 @@ fn run_edit_file(input: EditFileInput) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn run_glob_search(input: GlobSearchInputValue) -> Result<String, String> {
     to_pretty_json(
-        glob_search(&input.pattern, input.path.as_deref()).map_err(|e| io_to_string(&e))?,
+        glob_search(&input.pattern.patterns(), input.path.as_deref())
+            .map_err(|e| io_to_string(&e))?,
     )
 }
 
@@ -467,10 +480,28 @@ struct EditFileInput {
     replace_all: Option<bool>,
 }
 
+/// `pattern` accepts one glob string or an array of them; arrays match in a
+/// single crawl via globset (cost grows with files visited, not patterns).
 #[derive(Debug, Deserialize)]
 struct GlobSearchInputValue {
-    pattern: String,
+    pattern: GlobPattern,
     path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum GlobPattern {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl GlobPattern {
+    fn patterns(&self) -> Vec<String> {
+        match self {
+            GlobPattern::One(pattern) => vec![pattern.clone()],
+            GlobPattern::Many(patterns) => patterns.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

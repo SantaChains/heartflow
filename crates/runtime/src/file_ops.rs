@@ -482,74 +482,63 @@ fn write_text_atomic(path: &Path, content: &str) -> io::Result<()> {
     result
 }
 
-pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
-    with_read_retry(|| glob_search_once(pattern, path))
+/// One or more glob patterns over the shared `ignore` crawler (ripgrep's
+/// `globset` semantics). A single pattern keeps the literal-prefix walk-root
+/// optimization; several patterns walk the common base and match with one
+/// `GlobSet`, so cost grows with files visited, not with pattern count.
+pub fn glob_search(patterns: &[String], path: Option<&str>) -> io::Result<GlobSearchOutput> {
+    with_read_retry(|| glob_search_once(patterns, path))
 }
 
-fn glob_search_once(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
-    let started = Instant::now();
-    let base_dir = path
-        .map(normalize_path)
-        .transpose()?
-        .unwrap_or(std::env::current_dir()?);
-    let search_pattern = if Path::new(pattern).is_absolute() {
-        pattern.to_owned()
-    } else {
-        base_dir.join(pattern).to_string_lossy().into_owned()
-    };
-
-    // Split the glob into its literal directory prefix (the walk root) and
-    // the wildcarded remainder (the match target). Walking with `ignore`
-    // honors .gitignore, so build-output trees like target/ are skipped —
-    // the `glob` crate crawler scanned them and took seconds per query.
-    let full_path = Path::new(&search_pattern);
+/// Split one glob into its literal directory prefix (walk root candidate)
+/// and the wildcarded remainder joined with the platform separator.
+fn split_glob(full: &str) -> (std::path::PathBuf, Option<String>) {
     let mut root = std::path::PathBuf::new();
-    let mut rest_components: Vec<String> = Vec::new();
+    let mut rest: Vec<String> = Vec::new();
     let mut wildcard_seen = false;
-    for component in full_path.components() {
+    for component in Path::new(full).components() {
         let text = component.as_os_str().to_string_lossy();
         if wildcard_seen || text.contains(['*', '?', '[', ']']) {
             wildcard_seen = true;
-            rest_components.push(text.into_owned());
+            rest.push(text.into_owned());
         } else {
             root.push(component.as_os_str());
         }
     }
     let separator = if cfg!(windows) { '\\' } else { '/' };
-    let rest_pattern = rest_components.join(&separator.to_string());
-
-    let mut matches = Vec::new();
-    if rest_components.is_empty() {
-        // Literal path with no wildcard at all.
-        if fs::metadata(&root).is_ok_and(|metadata| metadata.is_file()) {
-            matches.push(root);
-        }
+    let rest = if rest.is_empty() {
+        None
     } else {
-        let glob = globset::GlobBuilder::new(&rest_pattern)
-            .literal_separator(true)
-            .build()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let glob_set = globset::GlobSetBuilder::new()
-            .add(glob)
-            .build()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        for entry in ignore::WalkBuilder::new(&root)
-            .hidden(false)
-            .build()
-            .flatten()
-        {
-            if !entry
-                .file_type()
-                .is_some_and(|file_type| file_type.is_file())
-            {
-                continue;
-            }
-            let relative = entry.path().strip_prefix(&root).unwrap_or(entry.path());
-            if glob_set.is_match(relative) {
-                matches.push(entry.into_path());
-            }
-        }
+        Some(rest.join(&separator.to_string()))
+    };
+    (root, rest)
+}
+
+fn glob_search_once(patterns: &[String], path: Option<&str>) -> io::Result<GlobSearchOutput> {
+    let started = Instant::now();
+    if patterns.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "at least one glob pattern is required",
+        ));
     }
+    let base_dir = path
+        .map(normalize_path)
+        .transpose()?
+        .unwrap_or(std::env::current_dir()?);
+    let absolutize = |pattern: &str| -> String {
+        if Path::new(pattern).is_absolute() {
+            pattern.to_owned()
+        } else {
+            base_dir.join(pattern).to_string_lossy().into_owned()
+        }
+    };
+
+    let mut matches = if patterns.len() == 1 {
+        collect_single_glob(&absolutize(&patterns[0]))?
+    } else {
+        collect_multi_glob(&base_dir, patterns.iter().map(|p| absolutize(p)))?
+    };
 
     matches.sort_by_key(|path| {
         fs::metadata(path)
@@ -571,6 +560,88 @@ fn glob_search_once(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchO
         filenames,
         truncated,
     })
+}
+
+/// Single pattern: walk only the literal prefix of the glob, so a query like
+/// `crates/**/*.rs` never leaves `crates/`.
+fn collect_single_glob(full: &str) -> io::Result<Vec<std::path::PathBuf>> {
+    let (root, rest) = split_glob(full);
+    let Some(rest_pattern) = rest else {
+        // Literal path with no wildcard at all.
+        return Ok(if fs::metadata(&root).is_ok_and(|m| m.is_file()) {
+            vec![root]
+        } else {
+            Vec::new()
+        });
+    };
+    let glob_set = globset::GlobSetBuilder::new()
+        .add(
+            globset::GlobBuilder::new(&rest_pattern)
+                .literal_separator(true)
+                .build()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?,
+        )
+        .build()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let mut matches = Vec::new();
+    for entry in ignore::WalkBuilder::new(&root)
+        .hidden(false)
+        .build()
+        .flatten()
+    {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let relative = entry.path().strip_prefix(&root).unwrap_or(entry.path());
+        if glob_set.is_match(relative) {
+            matches.push(entry.into_path());
+        }
+    }
+    Ok(matches)
+}
+
+/// Several patterns in one crawl: relative globs match entries under the
+/// base; absolute globs cover out-of-base roots. Matching cost grows with
+/// files visited, not with pattern count (aho-corasick prefilter inside).
+fn collect_multi_glob<I: IntoIterator<Item = String>>(
+    base_dir: &Path,
+    full_patterns: I,
+) -> io::Result<Vec<std::path::PathBuf>> {
+    let build_glob = |pattern: &str| -> io::Result<globset::Glob> {
+        globset::GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .build()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
+    };
+    let mut relative_globs = globset::GlobSetBuilder::new();
+    let mut absolute_globs = globset::GlobSetBuilder::new();
+    for full in full_patterns {
+        match Path::new(&full).strip_prefix(base_dir) {
+            Ok(relative) => relative_globs.add(build_glob(&relative.to_string_lossy())?),
+            Err(_) => absolute_globs.add(build_glob(&full)?),
+        };
+    }
+    let relative_set = relative_globs
+        .build()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let absolute_set = absolute_globs
+        .build()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let mut matches = Vec::new();
+    for entry in ignore::WalkBuilder::new(base_dir)
+        .hidden(false)
+        .build()
+        .flatten()
+    {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let relative = entry.path().strip_prefix(base_dir).unwrap_or(entry.path());
+        if relative_set.is_match(relative) || absolute_set.is_match(entry.path()) {
+            matches.push(entry.into_path());
+        }
+    }
+    Ok(matches)
 }
 
 /// Non-interactive fuzzy file finder — the machine-friendly answer to `fzf`.
@@ -1298,9 +1369,21 @@ mod tests {
         )
         .expect("file write should succeed");
 
-        let globbed = glob_search("**/*.rs", Some(dir.to_string_lossy().as_ref()))
-            .expect("glob should succeed");
+        let globbed = glob_search(
+            &[String::from("**/*.rs")],
+            Some(dir.to_string_lossy().as_ref()),
+        )
+        .expect("glob should succeed");
         assert_eq!(globbed.num_files, 1);
+
+        // Multi-pattern searches match in one crawl via a single GlobSet.
+        std::fs::write(dir.join("other.toml"), b"[x]\n").expect("toml");
+        let multi = glob_search(
+            &[String::from("**/*.rs"), String::from("**/*.toml")],
+            Some(dir.to_string_lossy().as_ref()),
+        )
+        .expect("multi glob should succeed");
+        assert_eq!(multi.num_files, 2);
 
         let grep_output = grep_search(&GrepSearchInput {
             pattern: String::from("hello"),

@@ -65,7 +65,13 @@ fn main() {
     });
 
     bench("glob_search: **/*.rs over repo", || {
-        let output = glob_search("**/*.rs", None).expect("glob");
+        let output = glob_search(&[String::from("**/*.rs")], None).expect("glob");
+        assert!(output.num_files > 0);
+    });
+
+    bench("glob_search: multi [rs, toml] single crawl", || {
+        let output =
+            glob_search(&[String::from("**/*.rs"), String::from("**/*.toml")], None).expect("glob");
         assert!(output.num_files > 0);
     });
 
