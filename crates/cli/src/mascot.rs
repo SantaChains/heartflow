@@ -5,9 +5,9 @@
 //! spring physics, and each uses the dot-matrix packing that suits its size:
 //!   * [`Mascot::render_head_cells`] rasterises a **half-block truecolor** head
 //!     (`▀`/`▄`/`█`, two full-colour pixels per cell — foreground = top pixel,
-//!     background = bottom). A rounded head is filled and *shaded* (a dome
-//!     normal lit from the upper-left, a specular glint, a soft rim) so it reads
-//!     as a glossy, organic character rather than a wireframe. This is the
+//!     background = bottom). The design language is the grok-bot school: a
+//!     floating porcelain egg in a calm vertical gradient, two large ink eyes,
+//!     no mouth at rest, and an orbiting spark of theme emphasis. This is the
 //!     startup banner, drawn in colour via [`draw_banner`].
 //!   * [`Mascot::badge`] draws a tiny **braille** face (2×4 sub-pixels per cell,
 //!     the same sub-cell technique ratatui's `Canvas` uses) that fits the fixed
@@ -207,13 +207,18 @@ fn col_from(rgb: Rgb) -> Col {
     }
 }
 
-/// The mood-resolved palette the renderers share, so the head, antenna, eyes,
-/// and mouth all stay harmonised.
+/// The mood-resolved palette the renderers share, so the head, spark, eyes,
+/// and mouth all stay harmonised. The design language is deliberately
+/// minimal (the grok-bot school): a porcelain shell carrying only two ink
+/// eyes, with mood signalled by shell tint and the orbiting spark.
 struct Palette {
-    base: Col,
-    dark: Col,
-    outline: Col,
-    iris: Col,
+    /// Porcelain body hue (mood-tinted toward white).
+    shell: Col,
+    /// Bottom-gradient / soft-rim shade of the shell.
+    shade: Col,
+    /// Near-black ink for the eyes.
+    ink: Col,
+    /// Orbiting spark, from the theme's emphasis hue.
     glow: Col,
 }
 
@@ -526,19 +531,20 @@ impl Mascot {
         self.mood.blinks() && self.lid.value() < 0.5
     }
 
-    /// The mood-resolved palette (base hue + derived shade, iris, antenna glow).
+    /// The mood-resolved palette: a porcelain shell washed toward white with
+    /// the mood hue, its darker shade, ink eyes, and the theme's spark hue.
     fn palette(&self, theme: &Theme) -> Palette {
         let base = col_from(match self.mood {
             Mood::Done => theme.success(),
             Mood::Error => theme.error(),
             _ => theme.accent(),
         });
+        let shell = base.mix(Col::WHITE, 0.62);
         Palette {
-            dark: base.scale(0.40),
-            outline: base.scale(0.30),
-            iris: col_from(theme.link()),
+            shade: shell.scale(0.82),
+            ink: Col::SOCKET,
             glow: col_from(theme.emphasis()),
-            base,
+            shell,
         }
     }
 
@@ -552,10 +558,10 @@ impl Mascot {
         }
     }
 
-    /// Render the banner head as half-block truecolor cells: a spring-squashed,
-    /// lit dome with an antenna, big expressive eyes (blinking, scanning, or
-    /// mood-shaped), and a mouth. This is the "glossy character" the old
-    /// wireframe blob aspired to.
+    /// Render the banner head as half-block truecolor cells: a floating
+    /// porcelain egg with two ink eyes and an orbiting spark. Flat vertical
+    /// gradient only — radial shading read as banding at this size, which is
+    /// what made the old lit dome look like a striped bee.
     #[must_use]
     #[allow(
         clippy::cast_possible_truncation,
@@ -565,21 +571,18 @@ impl Mascot {
     fn render_head_cells(&self, theme: &Theme) -> Vec<Vec<Cell>> {
         let pal = self.palette(theme);
         let breath = (self.elapsed / 2.6 * std::f64::consts::PI).sin();
-        let bob = (self.elapsed / 3.9 * std::f64::consts::PI).sin();
+        let bob = (self.elapsed / 3.3 * std::f64::consts::PI).sin();
         let mut buf = HalfBuf::new(HEAD_W, HEAD_H);
         let cx = f64::from((HEAD_W - 1) as u32) / 2.0;
-        let cy = HEAD_H as f64 * 0.56 + bob * 0.8;
-        // Radii tuned for a round silhouette in half-block space (rx ~ 1.3 * ry,
-        // since a half-block pixel is ~1.3x taller than wide).
-        let rx = 9.0;
-        let ry = 6.9 * (1.0 + 0.03 * breath);
+        let cy = HEAD_H as f64 * 0.58 + bob * 0.7;
+        // Egg ratio (rx < 1.3 * ry) and a low centre leave generous negative
+        // space above the head for the orbiting spark.
+        let rx = 7.6;
+        let ry = 6.5 * (1.0 + 0.02 * breath);
 
-        // Clean, minimal fill: a near-flat body with a gentle centre-bright
-        // falloff and one soft top-left highlight, plus a crisp outline ring.
-        // Deliberately no specular/rim terms — at this size they read as
-        // horizontal banding, which is what made the old lit dome look ugly.
-        let hx = cx - rx * 0.34;
-        let hy = cy - ry * 0.46;
+        // Porcelain shell: a calm top-to-bottom gradient plus a barely-there
+        // soft rim at the silhouette edge. Nothing else — no dome shading, no
+        // specular term, no stripes.
         for y in 0..HEAD_H {
             for x in 0..HEAD_W {
                 let nx = (x as f64 - cx) / rx;
@@ -588,48 +591,39 @@ impl Mascot {
                 if e > 1.0 {
                     continue;
                 }
-                let mut c = pal.base.scale(1.0 - 0.12 * e);
-                let dx = (x as f64 - hx) / rx;
-                let dy = (y as f64 - hy) / ry;
-                let hl = (-(dx * dx + dy * dy) * 2.4).exp();
-                c = c.mix(Col::WHITE, hl * 0.18);
-                if e > 0.82 {
-                    c = c.mix(pal.outline, ((e - 0.82) / 0.18).clamp(0.0, 1.0) * 0.9);
+                let t = ((y as f64 - (cy - ry)) / (2.0 * ry)).clamp(0.0, 1.0);
+                let mut c = pal.shell.mix(pal.shade, t * 0.8);
+                if e > 0.88 {
+                    c = c.mix(pal.shade, ((e - 0.88) / 0.12).clamp(0.0, 1.0) * 0.5);
                 }
                 buf.set(x, y, c);
             }
         }
 
-        self.paint_antenna(&mut buf, &pal, cx, cy, ry);
+        self.paint_spark(&mut buf, &pal, cx, cy, ry);
         self.paint_eyes(&mut buf, &pal, cx, cy);
         self.paint_mouth(&mut buf, &pal, cx, cy);
         buf.encode()
     }
 
-    /// A swaying antenna with a glowing tip above the head.
+    /// A spark of theme emphasis orbiting above the head: one bright core in a
+    /// four-point halo, drifting on slow sines. This is the character's "alive"
+    /// accent — it replaced the antenna, which read as clutter.
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-    fn paint_antenna(&self, buf: &mut HalfBuf, pal: &Palette, cx: f64, cy: f64, ry: f64) {
-        let sway = (self.elapsed / 1.7 * std::f64::consts::PI).sin() * 2.2;
-        let base_y = cy - ry;
-        let tip_x = cx + sway;
-        let tip_y = base_y - 3.5;
-        for i in 0..=6 {
-            let t = f64::from(i) / 6.0;
-            buf.set_f(cx + (tip_x - cx) * t, base_y - t * 3.5, pal.dark);
-        }
-        for dy in 0..2 {
-            for dx in 0..2 {
-                buf.set_f(
-                    tip_x - 0.5 + f64::from(dx),
-                    tip_y - 0.5 + f64::from(dy),
-                    pal.glow,
-                );
-            }
-        }
+    fn paint_spark(&self, buf: &mut HalfBuf, pal: &Palette, cx: f64, cy: f64, ry: f64) {
+        let t = self.elapsed;
+        let sx = cx + (t / 1.9).sin() * 6.2;
+        let sy = cy - ry - 2.4 + (t / 2.9).sin() * 0.9;
+        buf.set_f(sx, sy, pal.glow);
+        buf.set_f(sx - 1.0, sy, pal.glow.scale(0.55));
+        buf.set_f(sx + 1.0, sy, pal.glow.scale(0.55));
+        buf.set_f(sx, sy - 1.0, pal.glow.scale(0.55));
+        buf.set_f(sx, sy + 1.0, pal.glow.scale(0.55));
     }
 
-    /// Both eyes with the mood's shape, scaled by blink openness and nudged by
-    /// a slow look-around (idle) or a fast scan (busy).
+    /// Both eyes with the mood's shape: large ink ovals with a single glint,
+    /// scaled by blink openness and nudged by look-around (idle), an up-left
+    /// gaze (thinking), or a fast scan (busy).
     #[allow(clippy::cast_precision_loss)]
     fn paint_eyes(&self, buf: &mut HalfBuf, pal: &Palette, cx: f64, cy: f64) {
         let openness = if self.mood.blinks() {
@@ -637,74 +631,73 @@ impl Mascot {
         } else {
             1.0
         };
-        let drift = match self.mood {
-            Mood::Busy => (self.elapsed * 1.6).sin() * 2.0,
-            _ => (self.elapsed * 0.5).sin() * 0.6,
+        let (mut dx, mut dy) = match self.mood {
+            Mood::Busy => ((self.elapsed * 1.6).sin() * 1.5, 0.0),
+            Mood::Thinking => (-0.7, -0.6),
+            _ => ((self.elapsed * 0.5).sin() * 0.5, 0.0),
         };
-        let ecy = cy - 1.5;
+        if openness < 0.3 {
+            // Lids: shut eyes become short horizontal lines pressed onto the
+            // shell, so a blink reads as a calm close, not a vanish.
+            dx = 0.0;
+            dy = 0.0;
+        }
+        let ecy = cy - 0.6 + dy;
         for sign in [-1.0, 1.0] {
-            let ecx = cx + sign * 4.3;
+            let ecx = cx + sign * 3.1 + dx;
             match self.mood {
                 Mood::Error => {
                     for i in -2..=2 {
                         let d = f64::from(i);
-                        buf.set_f(ecx + d, ecy + d, pal.iris);
-                        buf.set_f(ecx + d, ecy - d, pal.iris);
+                        buf.set_f(ecx + d, ecy + d, pal.ink);
+                        buf.set_f(ecx + d, ecy - d, pal.ink);
                     }
                 }
                 Mood::Done => {
                     for i in -2..=2 {
                         let d = f64::from(i);
-                        buf.set_f(ecx + d, ecy - (1.0 - (d / 2.0).abs()) * 1.4, pal.iris);
+                        buf.set_f(
+                            ecx + d,
+                            ecy + 0.9 - (1.0 - (d / 2.0).powi(2)) * 1.7,
+                            pal.ink,
+                        );
                     }
                 }
                 _ if openness < 0.3 => {
                     for i in -2..=2 {
-                        buf.set_f(ecx + f64::from(i), ecy, Col::SOCKET);
+                        buf.set_f(ecx + f64::from(i), ecy, pal.shade.mix(pal.ink, 0.55));
                     }
                 }
                 _ => {
-                    // Big, clean eyes: dark socket, mood iris, one white glint.
-                    let ery = 3.5 * (0.3 + 0.7 * openness);
-                    fill_ellipse(buf, ecx, ecy, 2.5, ery, Col::SOCKET);
-                    fill_ellipse(buf, ecx + drift * 0.3, ecy, 1.7, ery * 0.68, pal.iris);
-                    buf.set_f(ecx + drift * 0.3 - 0.8, ecy - 1.1, Col::WHITE);
+                    let ery = 2.6 * (0.25 + 0.75 * openness);
+                    fill_ellipse(buf, ecx, ecy, 1.6, ery, pal.ink);
+                    buf.set_f(ecx - 0.6, ecy - ery * 0.45, Col::WHITE);
                 }
             }
         }
     }
 
-    /// The mouth with the mood's expression.
+    /// The mouth, only when a mood truly needs one. Idle and thinking are
+    /// mouthless (the grok-bot minimalism — the eyes carry the expression);
+    /// done/error earn a small arc.
     #[allow(clippy::cast_precision_loss)]
     fn paint_mouth(&self, buf: &mut HalfBuf, pal: &Palette, cx: f64, cy: f64) {
-        let my = cy + 3.6;
+        let my = cy + 3.4;
+        let ink = pal.shade.mix(pal.ink, 0.7);
         match self.mood {
             Mood::Error => {
-                for i in -3..=3 {
+                for i in -1..=1 {
                     let d = f64::from(i);
-                    buf.set_f(cx + d, my + 1.5 - (d / 3.0).powi(2) * 1.5, pal.dark);
+                    buf.set_f(cx + d, my + 1.0 - d * d * 0.9, ink);
                 }
             }
             Mood::Done => {
-                for i in -3..=3 {
-                    let d = f64::from(i);
-                    buf.set_f(cx + d, my - 1.0 + (d / 3.0).powi(2) * 1.8, pal.dark);
-                }
-            }
-            Mood::Thinking => {
                 for i in -1..=1 {
-                    buf.set_f(cx + f64::from(i), my, pal.dark);
-                    buf.set_f(cx + f64::from(i), my + 1.5, pal.dark);
-                }
-                buf.set_f(cx - 1.0, my + 0.75, pal.dark);
-                buf.set_f(cx + 1.0, my + 0.75, pal.dark);
-            }
-            _ => {
-                for i in -2..=2 {
                     let d = f64::from(i);
-                    buf.set_f(cx + d, my + (d / 2.0).powi(2) * 0.8, pal.dark);
+                    buf.set_f(cx + d, my - 0.4 + d * d * 0.9, ink);
                 }
             }
+            _ => {}
         }
     }
 

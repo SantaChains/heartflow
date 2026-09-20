@@ -29,6 +29,11 @@ pub struct CompanionTerminal<B: Backend> {
     viewport_area: Rect,
     last_known_cursor_pos: Position,
     hidden_cursor: bool,
+    /// Where the real cursor was last parked, so a static frame skips the
+    /// `show cursor` + `move cursor` pair entirely. Re-emitting `ESC[?25h`
+    /// every tick resets the cursor's blink phase, which reads as flicker on
+    /// Windows Terminal.
+    parked_at: Option<Position>,
 }
 
 impl<B: Backend> CompanionTerminal<B> {
@@ -44,6 +49,7 @@ impl<B: Backend> CompanionTerminal<B> {
             viewport_area,
             last_known_cursor_pos: cursor_pos,
             hidden_cursor: false,
+            parked_at: None,
         })
     }
 
@@ -57,25 +63,58 @@ impl<B: Backend> CompanionTerminal<B> {
     /// Draw one frame at `height` rows. `render` fills the viewport buffer and
     /// returns the absolute terminal cursor position (the IME anchor), or `None`
     /// to hide the cursor. Only cells that changed since the last frame are
-    /// written, so a static frame costs nothing.
+    /// written, so a static frame costs nothing; when nothing changed at all,
+    /// even the cursor sequences are skipped (blink-phase flicker).
     pub fn draw<F>(&mut self, height: u16, render: F) -> io::Result<()>
     where
         F: FnOnce(&mut Buffer, Rect) -> Option<Position>,
     {
+        self.heal_anchor_drift()?;
         self.set_inline_height(height)?;
         let area = self.viewport_area;
         let cursor_position = render(&mut self.buffers[self.current], area);
-        self.flush()?;
+        let painted = self.flush()?;
         match cursor_position {
             Some(pos) => {
-                self.show_cursor()?;
-                self.set_cursor_position(pos)?;
+                // Re-park only when something actually moved the cursor: the
+                // diff writes leave it at the last updated cell, or the parked
+                // spot changed between frames.
+                if painted || self.parked_at != Some(pos) {
+                    self.set_cursor_position(pos)?;
+                    self.parked_at = Some(pos);
+                }
+                if self.hidden_cursor {
+                    self.show_cursor()?;
+                }
                 self.last_known_cursor_pos = pos;
             }
             None => self.hide_cursor()?,
         }
         self.swap_buffers();
         self.backend.flush()
+    }
+
+    /// Re-anchor the viewport when the real cursor has escaped its rows (an
+    /// external print, a scroll, or a terminal resize shifted the screen under
+    /// us). Without this the painted frame and the parked cursor drift apart by
+    /// whole rows and never recover — the classic "cursor one line below the
+    /// prompt" bug. A healthy viewport leaves the cursor untouched.
+    fn heal_anchor_drift(&mut self) -> io::Result<()> {
+        let actual = self.backend.get_cursor_position()?;
+        let area = self.viewport_area;
+        if actual.y >= area.y && actual.y < area.bottom() && actual.x < area.width {
+            return Ok(());
+        }
+        let size = self.backend.size()?;
+        let (fresh, _) = compute_inline_size(&mut self.backend, area.height, size, 0)?;
+        if fresh != area {
+            self.backend.set_cursor_position(fresh.as_position())?;
+            self.backend.clear_region(ClearType::AfterCursor)?;
+            self.set_viewport_area(fresh);
+            self.buffers[1 - self.current].reset();
+            self.parked_at = None;
+        }
+        Ok(())
     }
 
     /// Clear the viewport and force a full repaint on the next frame. Used on
@@ -94,6 +133,7 @@ impl<B: Backend> CompanionTerminal<B> {
     pub fn hide_cursor(&mut self) -> io::Result<()> {
         self.backend.hide_cursor()?;
         self.hidden_cursor = true;
+        self.parked_at = None;
         Ok(())
     }
 
@@ -139,6 +179,7 @@ impl<B: Backend> CompanionTerminal<B> {
             self.backend.clear_region(ClearType::AfterCursor)?;
             self.set_viewport_area(area);
             self.buffers[1 - self.current].reset();
+            self.parked_at = None;
         }
         Ok(changed)
     }
@@ -149,12 +190,16 @@ impl<B: Backend> CompanionTerminal<B> {
         self.viewport_area = area;
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    /// Write the diff to the backend. Returns whether any cell changed (and so
+    /// whether the real cursor moved during the writes).
+    fn flush(&mut self) -> io::Result<bool> {
         let updates = self.buffers[1 - self.current].diff(&self.buffers[self.current]);
         if let Some((col, row, _)) = updates.last() {
             self.last_known_cursor_pos = Position::new(*col, *row);
         }
-        self.backend.draw(updates.into_iter())
+        let painted = !updates.is_empty();
+        self.backend.draw(updates.into_iter())?;
+        Ok(painted)
     }
 
     fn swap_buffers(&mut self) {
@@ -287,5 +332,21 @@ mod tests {
             area.bottom() <= 10,
             "grown viewport overflows screen: {area:?}"
         );
+    }
+
+    #[test]
+    fn drifted_cursor_reanchors_the_viewport() {
+        // An external print dragged the real cursor well below the viewport;
+        // the next draw must re-anchor the viewport at the cursor instead of
+        // painting the frame in one place and parking the cursor in another.
+        let backend = TestBackend::new(40, 12);
+        let mut term = CompanionTerminal::with_inline(backend, 2).unwrap();
+        term.backend
+            .set_cursor_position(Position::new(0, 6))
+            .unwrap();
+        term.draw(2, blank).unwrap();
+        let area = term.viewport_area();
+        assert_eq!(area.y, 6, "viewport re-anchored at the drifted cursor");
+        assert_eq!(area.height, 2);
     }
 }

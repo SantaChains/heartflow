@@ -420,11 +420,16 @@ impl ReplEditor {
             })?;
 
             // Poll instead of a blocking read so the mascot can tick while the
-            // user is idle; on timeout we advance the animation and redraw
-            // (ratatui diffs, so an unchanged frame emits nothing).
+            // user is idle. A tick that produces no visible change skips the
+            // frame entirely: with the cursor parking deduped downstream, an
+            // idle REPL emits zero escape sequences until the mascot actually
+            // blinks — the root fix for the Windows Terminal cursor flicker.
             if !event::poll(MASCOT_TICK)? {
+                let before = self.mascot.badge();
                 self.mascot.advance(MASCOT_TICK.as_secs_f64());
-                continue;
+                if self.mascot.badge() == before {
+                    continue;
+                }
             }
             let key = match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => key,
