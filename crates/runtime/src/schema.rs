@@ -7,7 +7,33 @@
 //! allowed to block a call — only a definite mismatch against a well-formed
 //! schema rejects input.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use serde_json::Value;
+
+/// Process-wide cache of compiled validators, keyed by the schema's canonical
+/// JSON text. A tool's schema never changes within a session, so each distinct
+/// schema compiles once instead of on every tool call (compilation is the
+/// expensive part; `Validator` is `Send + Sync` and cheap to clone).
+fn validator_cache() -> &'static Mutex<HashMap<String, jsonschema::Validator>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, jsonschema::Validator>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Compile (or fetch from cache) the validator for `schema`. `None` means
+/// "uncompilable or cache unavailable" — the caller applies the permissive
+/// contract and lets the call through.
+fn compiled_validator(schema: &Value) -> Option<jsonschema::Validator> {
+    let key = serde_json::to_string(schema).ok()?;
+    let mut cache = validator_cache().lock().ok()?;
+    if let Some(validator) = cache.get(&key) {
+        return Some(validator.clone());
+    }
+    let validator = jsonschema::validator_for(schema).ok()?;
+    cache.insert(key, validator.clone());
+    Some(validator)
+}
 
 /// Validate `input` (a tool's raw JSON arguments) against `schema`. `Ok(())`
 /// means "acceptable" (including when the schema is empty or unknown); `Err`
@@ -21,8 +47,8 @@ pub fn validate_tool_input(schema: &Value, input: &str) -> Result<(), String> {
     }
     let parsed: Value = serde_json::from_str(input)
         .map_err(|error| format!("tool input is not valid JSON: {error}"))?;
-    match jsonschema::validator_for(schema) {
-        Ok(validator) => validator.validate(&parsed).map_err(|error| {
+    match compiled_validator(schema) {
+        Some(validator) => validator.validate(&parsed).map_err(|error| {
             let reason = error.to_string();
             // ValidationError renders multi-line; keep the transcript single-line.
             let first = reason.lines().next().unwrap_or(reason.as_str()).trim();
@@ -30,7 +56,7 @@ pub fn validate_tool_input(schema: &Value, input: &str) -> Result<(), String> {
         }),
         // Uncompilable schema (unsupported draft content, unresolvable $ref):
         // never block what we cannot interpret.
-        Err(_) => Ok(()),
+        None => Ok(()),
     }
 }
 
