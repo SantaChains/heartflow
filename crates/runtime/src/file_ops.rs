@@ -498,12 +498,56 @@ fn glob_search_once(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchO
         base_dir.join(pattern).to_string_lossy().into_owned()
     };
 
+    // Split the glob into its literal directory prefix (the walk root) and
+    // the wildcarded remainder (the match target). Walking with `ignore`
+    // honors .gitignore, so build-output trees like target/ are skipped —
+    // the `glob` crate crawler scanned them and took seconds per query.
+    let full_path = Path::new(&search_pattern);
+    let mut root = std::path::PathBuf::new();
+    let mut rest_components: Vec<String> = Vec::new();
+    let mut wildcard_seen = false;
+    for component in full_path.components() {
+        let text = component.as_os_str().to_string_lossy();
+        if wildcard_seen || text.contains(['*', '?', '[', ']']) {
+            wildcard_seen = true;
+            rest_components.push(text.into_owned());
+        } else {
+            root.push(component.as_os_str());
+        }
+    }
+    let separator = if cfg!(windows) { '\\' } else { '/' };
+    let rest_pattern = rest_components.join(&separator.to_string());
+
     let mut matches = Vec::new();
-    let entries = glob::glob(&search_pattern)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-    for entry in entries.flatten() {
-        if entry.is_file() {
-            matches.push(entry);
+    if rest_components.is_empty() {
+        // Literal path with no wildcard at all.
+        if fs::metadata(&root).is_ok_and(|metadata| metadata.is_file()) {
+            matches.push(root);
+        }
+    } else {
+        let glob = globset::GlobBuilder::new(&rest_pattern)
+            .literal_separator(true)
+            .build()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let glob_set = globset::GlobSetBuilder::new()
+            .add(glob)
+            .build()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        for entry in ignore::WalkBuilder::new(&root)
+            .hidden(false)
+            .build()
+            .flatten()
+        {
+            if !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+            {
+                continue;
+            }
+            let relative = entry.path().strip_prefix(&root).unwrap_or(entry.path());
+            if glob_set.is_match(relative) {
+                matches.push(entry.into_path());
+            }
         }
     }
 

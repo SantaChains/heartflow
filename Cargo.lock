@@ -951,6 +951,7 @@ dependencies = [
  "chardetng",
  "encoding_rs",
  "glob",
+ "globset",
  "ignore",
  "jsonschema",
  "memchr",
