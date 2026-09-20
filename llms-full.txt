@@ -396,12 +396,12 @@ MCP 握手（initialize + tools/list）失败按 200/400ms 退避重试 3 次（
 
 ## Context7
 
-Context7 把仓库文档解析→抽取代码片段→向量索引，供 AI 助手实时检索。**要求仓库含 md/mdx/txt/rst 格式的实际文档**——这正是 `docs/src/` 提供的。收录两种方式：
+Context7 把仓库文档解析→抽取代码片段→向量索引，供 AI 助手实时检索。**要求仓库含 md/mdx/txt/rst 格式的实际文档**——这正是 `docs/src/` 提供的。两步：
 
-1. **Web（推荐，自动处理）**：到 <https://context7.com/add-library> 粘贴仓库或文档站 URL，处理后得到库 ID `/SantaChains/heartflow`。
-2. **声明式 PR**：按 `docs/context7.json` 的字段向 Context7 仓库提 PR；合并后即索引。**该 JSON 的键需以 add-library 页面给出的当前 schema 为准**（本仓库里的 `docs/context7.json` 是可直接提交的初稿，字段若被上游调整以官方为准）。
+1. **提交收录**（自助，无需所有者身份）：到 <https://context7.com/add-library> 选 GitHub 标签，粘贴 `https://github.com/SantaChains/heartflow`，提交后得到库 ID `/santachains/heartflow`。入库前该地址返回 404。
+2. **约束解析范围**：仓库根 `context7.json`（Context7 的 robots.txt 式约定，只在解析时读取）把索引范围收在 `docs/src`，排除生成物 `docs/book` 与 `docs/wiki`，并把安装口径与 `hf` 命令名作为 rules 直接投喂给调用方 agent。字段以官方 <https://context7.com/docs/library-owners> 为准。
 
-收录后，用户提问时加 `use context7` 即可命中最新文档。README 已挂 Context7 徽章链接。
+收录后，用户提问时加 `use context7` 即可命中最新文档。README 已挂 Context7 徽章链接。文档每次 push 后由 Context7 按热度自动刷新，不必额外接线。
 
 ## DeepWiki
 
@@ -418,6 +418,8 @@ git clone https://github.com/SantaChains/heartflow.wiki.git wiki-checkout
 cp docs/wiki/*.md wiki-checkout/
 cd wiki-checkout && git add -A && git commit -m "docs: seed wiki" && git push
 ```
+
+两个一次性前提（仓库设置，文件里配不了）：Settings → Features 勾上 Wikis；再到 wiki 页面点一次 Create the first page 保存。第二点不能省——首次建页之前 GitHub 尚未创建 wiki 的 git 仓库，`clone .../heartflow.wiki.git` 会报 Repository not found。
 
 建议保持精简：`Home.md` 做导航并指向本文档站，避免与 mdBook 双份长文漂移。
 

@@ -162,7 +162,7 @@ do_publish() {
     --notes-file release-notes.md
   # crates.io registry 发布:内部 crate 挂 heartflow- 前缀,按依赖拓扑逐个发(先依赖后使用者)
   # provider 依赖 api/runtime,必须排在其后:先发依赖,否则 cargo publish 解析不到对应版本
-  # (registry 里没有的路径依赖会被判 no matching package,七连发第一发就挂)
+  # (registry 里没有的路径依赖会被判 no matching package,连发第一个包就挂)
   for crate in heartflow-runtime heartflow-api heartflow-provider heartflow-mcp heartflow-tools heartflow-store heartflow-commands heartflow; do
     note "publishing ${crate} to crates.io"
     publish_retry "$crate"

@@ -11,6 +11,10 @@ name: Release
 #   - ci.yml 暂存为 ci.yml.bak(改名 .bak 后 GitHub 不识别),本链不做每 push 的 CI 质量门;
 #     文档站是另一条独立链,见 docs.yml(仅在 docs/** 变动时触发)。
 #   - 本地预检:bash scripts/release.sh plan;RELEASE_DRY_RUN=1 bash scripts/release.sh publish
+#   - 续发:publish 中途失败(超时/限流耗尽)时 tag 已打、Release 已建,再 push 或重跑本链都会因
+#     "tag 之后没有 feat/fix" 判 released=false 而整体短路;此时本地续发:
+#     RELEASE_TAG=<tag> RELEASE_BUMP=<bump> bash scripts/release.sh publish
+#     已上传的包由 publish_retry 的 "already uploaded" 分支幂等跳过,不会重发同版本。
 
 on:
   push:
@@ -52,12 +56,19 @@ jobs:
     needs: plan
     if: needs.plan.outputs.released == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30 # 七连发 verify 构建 + 最坏 ~10 分钟的 crates.io 429 退避
+    # 八个包逐个 cargo publish,每个都跑一次 verify 构建(源码解到 target/package/<name>-<ver>,
+    # 但构建共用 workspace 的 target,故依赖只编一遍);再叠最坏约 10 分钟的 crates.io 429 退避。
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       - uses: ./.github/actions/install-git-cliff
+      - name: install toolchain(rust-toolchain.toml 为唯一版本源)
+        # verify 构建也在本 job 内发生:不用 runner 预装的 stable,否则同一 tag 的校验编译器
+        # 会随 runner 镜像漂移,与本地 fmt/clippy/test 用的不是同一版本。
+        run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: release.sh publish
         env:
           RELEASE_TAG: ${{ needs.plan.outputs.tag }}
@@ -73,10 +84,13 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     permissions:
-      contents: write
-      # attest-build-provenance mints an in-toto/SLSA provenance statement and
-      # needs to sign it with the workflow's OIDC token.
+      contents: write # gh release upload
+      # attest-build-provenance 需要两个 scope:id-token 用来换 Sigstore 签名证书,
+      # attestations 用来把生成的 in-toto/SLSA 证明存进仓库的 attestations API。
+      # 只给 id-token 会在签发后写回那步 403——官方 v2 README 的必需项是这两条一起给。
+      # 仓库为 public,符合 attestation 的可用前提(私有库需 Enterprise Cloud)。
       id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "heartflow",
+  "description": "Rust 实现的终端 AI agent（命令名 hf）：SSE 真流式、Anthropic/OpenAI 双协议、原生工具、MCP 客户端（stdio 与 Streamable-HTTP/SSE）、任务环、SQLite FTS5 会话检索、上下文压缩。",
+  "folders": ["docs/src"],
+  "excludeFolders": ["docs/book", "docs/wiki"],
+  "excludeFiles": ["CHANGELOG.md"],
+  "rules": [
+    "安装二选一：Windows 用 `scoop bucket add heartflow https://github.com/SantaChains/heartflow` 后 `scoop install heartflow`，跨平台用 `cargo install heartflow`。",
+    "二进制命令名是 `hf`，不是 `heartflow`；无参数启动进入 REPL，`hf --help` 看全部用法。",
+    "首次运行前需配置 provider 密钥：环境变量 `DEEPSEEK_API_KEY` 或 `ANTHROPIC_API_KEY`，配置文件写在 `~/.heartflow/config.toml`；用 `hf doctor` 自检。"
+  ]
+}
