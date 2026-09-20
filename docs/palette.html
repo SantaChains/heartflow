@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>heartflow 终端色板 · 黑泽明</title>
+<style>
+  :root {
+    --bg: #0e0f12;
+    --panel: #16181d;
+    --text: #e6e3dd;
+
+    --heading: #e4613c;    /* 朱漆 · 罗生门山门 */
+    --emphasis: #a98bd8;   /* 梦 · 紫 */
+    --strong: #e8b44a;     /* 金箔 · 影武者 */
+    --inline-code: #8fbf6a;/* 苔 · 罗生门林间 */
+    --link: #6fbfa8;       /* 青磁 */
+    --quote: #8a93a3;      /* 蜘蛛巢城 · 雾 */
+    --accent: #5588ee;     /* 乱 · 三郎的蓝旗 */
+    --muted: #7d7269;      /* 麻布 */
+    --success: #8fbf6a;    /* 苔 */
+    --error: #e14b63;      /* 绯 · 天国与地狱 */
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 40px 32px 64px;
+    background: var(--bg); color: var(--text);
+    font: 13px/1.7 ui-monospace, "Cascadia Mono", "Sarasa Mono SC", Consolas, monospace;
+  }
+  header { margin-bottom: 32px; }
+  h1 { font-size: 15px; font-weight: 600; letter-spacing: .18em; margin: 0 0 6px; color: var(--accent); }
+  header p { margin: 0; color: var(--muted); }
+  h2 { font-size: 12px; font-weight: 600; letter-spacing: .14em; color: var(--muted);
+       margin: 40px 0 14px; text-transform: uppercase; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: 10px; }
+  .card { background: var(--panel); border: 1px solid #22252c; border-radius: 4px; padding: 0 0 12px; overflow: hidden; }
+  .chip { height: 54px; }
+  .meta { padding: 10px 12px 0; display: flex; justify-content: space-between; gap: 8px; }
+  .role { font-size: 12px; }
+  .hex { font-size: 11px; color: var(--muted); }
+  .ratio { font-size: 11px; color: var(--muted); padding: 4px 12px 0; }
+  .motif { font-size: 12px; color: var(--muted); padding: 4px 12px 0; }
+  pre {
+    margin: 0; background: var(--panel); border: 1px solid #22252c; border-radius: 4px;
+    padding: 18px 20px; overflow-x: auto; font: inherit;
+  }
+  .r { color: var(--muted); }        /* 状态/提示 */
+  .h { color: var(--heading); font-weight: 600; }
+  .s { color: var(--strong); font-weight: 600; }
+  .e { color: var(--emphasis); font-style: italic; }
+  .c { color: var(--inline-code); }
+  .a { color: var(--accent); }
+  .l { color: var(--link); text-decoration: underline; }
+  .q { color: var(--quote); }
+  .ok { color: var(--success); }
+  .er { color: var(--error); }
+</style>
+</head>
+<body>
+<header>
+  <h1>HEARTFLOW · TERMINAL PALETTE</h1>
+  <p>取自黑泽明影片中的物象与色彩，一色一职。正文不着色，继承终端前景色。</p>
+</header>
+
+<section class="grid" id="swatches"></section>
+
+<h2>终端预览</h2>
+<pre><span class="r">· </span><span class="h">## 会话摘要</span>
+
+<span class="r">› </span>把 crates/cli/src/theme.rs 的调色板换成新的一组
+
+<span class="a">◐ </span><span class="r">正在读取 theme.rs</span>
+<span class="s">✔ </span><span class="r">read_file</span> <span class="c">crates/cli/src/theme.rs</span>
+
+<span class="h">### 改动</span>
+把 <span class="c">heading</span> 从 <span class="c">#C95B3F</span> 改为 <span class="c">#E4613C</span>，
+<span class="e">签名色</span>交给 <span class="l">accent</span>，见 <span class="l">docs/palette.html</span>。
+
+<span class="q">│ 一色一职，明度成阶梯：标题居中最亮，正文最暗。</span>
+
+<span class="ok">✔ </span>完成 <span class="r">3 个文件 · 1.8s</span>
+<span class="er">✘ </span>写入失败 <span class="r">permission denied</span>
+<span class="r">◌ </span>已取消</pre>
+
+<script>
+  const roles = [
+    ["heading", "朱漆 · 罗生门山门"],
+    ["emphasis", "梦 · 紫（桃园天色）"],
+    ["strong", "金箔 · 影武者金屏"],
+    ["inline_code", "苔 · 罗生门林间"],
+    ["link", "青磁釉"],
+    ["quote", "蜘蛛巢城 · 雾"],
+    ["accent", "乱 · 三郎的蓝旗"],
+    ["muted", "麻布（增量/次要）"],
+    ["success", "苔（完成态）"],
+    ["error", "绯 · 天国与地狱"],
+  ];
+  const bg = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim();
+  const lin = (c) => { c /= 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; };
+  const lum = (hex) => {
+    const n = parseInt(hex.slice(1), 16);
+    return 0.2126 * lin(n >> 16) + 0.7152 * lin((n >> 8) & 255) + 0.0722 * lin(n & 255);
+  };
+  const ratio = (a, b) => {
+    const [x, y] = [lum(a), lum(b)].sort((p, q) => q - p);
+    return ((x + 0.05) / (y + 0.05)).toFixed(2);
+  };
+  document.getElementById("swatches").innerHTML = roles.map(([role, motif]) => {
+    const hex = getComputedStyle(document.documentElement)
+      .getPropertyValue("--" + role.replace(/_/g, "-")).trim();
+    return `<div class="card">
+      <div class="chip" style="background:${hex}"></div>
+      <div class="meta"><span class="role" style="color:${hex}">${role}</span><span class="hex">${hex.toUpperCase()}</span></div>
+      <div class="motif">${motif}</div>
+      <div class="ratio">对比度 ${ratio(hex, bg)} : 1（底色 ${bg}）</div>
+    </div>`;
+  }).join("");
+</script>
+</body>
+</html>
