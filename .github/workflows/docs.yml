@@ -1,11 +1,11 @@
-# ⚠ 暂未启用:GitHub Pages 现在不搭工作流。启用步骤——
-#   1) 本文件改名 docs.yml.bak → docs.yml;
-#   2) 仓库 Settings → Pages → Source 选 "GitHub Actions";
-#   3) 若上自定义域名,改 docs/book.toml 的 site-url/cname 与本文件 GEN_LLS_SITE_URL/RAW_BASE。
-# 命名成 .bak 与仓库既有 ci.yml.bak 约定一致(GitHub 不识别 .bak,故不会被触发)。
-#
 # heartflow 文档站:mdBook 用户手册 + rustdoc API + llms.txt,一并发 GitHub Pages。零 Node。
-# action 版本取当前稳定大版:checkout@v6 / configure-pages@v5 / upload-pages-artifact@v4 / deploy-pages@v4。
+#
+# 启用前提(一次性,文件里配不了):仓库 Settings → Pages → Source 必须选 "GitHub Actions",
+# 否则 deploy job 会在 deploy-pages 那步失败。上自定义域名时改 docs/book.toml 的
+# site-url/cname,并把下面 gen-llms 步骤的 SITE_URL 一起改。
+#
+# action 一律钉 commit SHA(与 release.yml 同策略):浮动大版被上游改指,即可在本仓库
+# runner 上执行任意代码。工具链版本不写在这里,由仓库根 rust-toolchain.toml 决定。
 
 name: Docs
 
@@ -29,27 +29,32 @@ concurrency:
 
 jobs:
   build:
+    name: mdBook + rustdoc + llms.txt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: install toolchain(rust-toolchain.toml 为唯一版本源)
+        run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Setup Pages
         id: pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
       - name: install mdbook
-        run: cargo install mdbook --version "^0.5" --locked
+        # 钉死小版:mdBook 0.5.x 尚在演进,浮动 ^0.5 会让同一次提交在不同日子产出不同站点。
+        run: cargo install mdbook --version "=0.5.4" --locked
       - name: build book
         run: mdbook build docs
       - name: generate llms.txt / llms-full.txt
+        # 变量名必须是 SITE_URL:gen-llms.sh 读的就是它,写成别的名字不会报错,
+        # 只会静默退回脚本内置的默认站点地址,换域名后 llms-full.txt 里的链接不跟着改。
         env:
-          GEN_LLS_SITE_URL: ${{ steps.pages.outputs.base_url }}
+          SITE_URL: ${{ steps.pages.outputs.base_url }}
         run: bash scripts/gen-llms.sh docs/book docs/src
       - name: build rustdoc (API)
         run: cargo doc --workspace --no-deps
       - name: mount API docs under /api
         run: cp -r target/doc docs/book/api
-      - uses: actions/upload-pages-artifact@v4
+      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
         with:
           path: docs/book
 
@@ -61,4 +66,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

@@ -6,7 +6,7 @@
 
 heartflow 是一个 Rust 实现的终端 AI agent(仓库名 `heartflow`,二进制 `hf`)。REPL 中通过 SSE 真流式与模型协作,执行 shell、读写文件、检索代码、挂载 MCP 工具,并以任务循环自迭代完成多步工作。
 
-- 语言/工具链:Rust 1.85+(本机为 nightly),edition 2021
+- 语言/工具链:Rust 1.88+(真实下限来自依赖的 MSRV;本机由 `rust-toolchain.toml` 钉定,不用 nightly),edition 2021
 - 形态:Cargo workspace,`members = ["crates/*"]`,每个 crate 都是独立库,`cli` 产出二进制 `hf`
 - 身份约束:`FRONTIER_MODEL_NAME = "heartflow"`(`crates/runtime/src/prompt.rs:39`)。系统提示词强制“永远是 heartflow,不得冒充其他厂商/身份”。改动提示词时保留此约束。
 
@@ -86,7 +86,7 @@ crates/
 ## 注意
 
 - `.gitignore` 忽略 `target/`、`.heartflow/`、`archive/`、`.history/`、`.trae/`,以及本地笔记 `openmemory.md`、`ref.md`、`error.md`(个人头脑风暴/参考资料,不发布)。
-- 质量门当前以本地为准(fmt + clippy `-D warnings -A clippy::pedantic`(仅正确性阻断)+ test + release);`ci.yml.bak` 为暂存的 CI 工作流,启用时改回 `ci.yml`;许可证 Apache-2.0(见 `LICENSE`)。
+- 质量门当前以本地为准(fmt + clippy `-D warnings -A clippy::pedantic`(仅正确性阻断)+ test + release);CI 里只有两条链:`release.yml`(发版)与 `docs.yml`(文档站,`docs/**` 变动才触发),`ci.yml.bak` 是刻意停用的质量门(改名 `.bak` 后 GitHub 不识别);许可证 Apache-2.0(见 `LICENSE`)。
 - 修改 README 中列出的 CLI/REPL 接口时,同步更新 README 与 `--help`。
-- 文档站源在 `docs/src`(mdBook);`scripts/gen-llms.sh` 按 **llms.txt v2** 从 `docs/src/SUMMARY.md` 生成仓库根 `llms.txt`/`llms-full.txt`(已提交),改文档后重跑 `bash scripts/gen-llms.sh`。GitHub Pages 工作流暂存为 `docs.yml.bak`(与 `ci.yml.bak` 同约定,不触发),启用时改回 `docs.yml` 并在 Settings → Pages 选 GitHub Actions。
+- 文档站源在 `docs/src`(mdBook);`scripts/gen-llms.sh` 按 **llms.txt v2** 从 `docs/src/SUMMARY.md` 生成仓库根 `llms.txt`/`llms-full.txt`(已提交),改文档后重跑该脚本(本机 PATH 的 `bash` 若不是 GNU bash 会缺 `mapfile`,用 Git 的 bash)。GitHub Pages 由 `.github/workflows/docs.yml` 发布,一次性前提是 Settings → Pages 的 Source 选 "GitHub Actions"。
 - 改 CLI 工具名/接口/安装口径时,口径逐字同步 README、`docs/src`、`bucket/heartflow.json` notes、`.devin/wiki.json`、仓库根 `llms.txt`。

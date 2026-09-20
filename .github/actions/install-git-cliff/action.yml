@@ -1,5 +1,5 @@
 name: install git-cliff
-description: 下载 git-cliff 预编译二进制并校验 sha512(ubuntu only;plan/publish/gate 均在 ubuntu 跑)
+description: 下载 git-cliff 预编译二进制并校验 sha512(ubuntu only;release.yml 的 plan/publish 两个 job 都在 ubuntu 跑)
 runs:
   using: composite
   steps:

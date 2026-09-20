@@ -10,7 +10,7 @@ Rust 实现的终端 AI agent。二进制命令 `hf`，在 REPL 中通过流式�
 
 仓库：[github.com/SantaChains/heartflow](https://github.com/SantaChains/heartflow)
 
-文档：[文档源 docs/src](https://github.com/SantaChains/heartflow/tree/main/docs/src) · [llms.txt](https://raw.githubusercontent.com/SantaChains/heartflow/main/llms.txt) · [llms-full.txt](https://raw.githubusercontent.com/SantaChains/heartflow/main/llms-full.txt) · [DeepWiki](https://deepwiki.com/SantaChains/heartflow) · [Context7](https://context7.com/santachains/heartflow)。Pages 文档站当前暂存为 `docs.yml.bak`，启用方式见 [docs/src/ai-integration.md](https://github.com/SantaChains/heartflow/blob/main/docs/src/ai-integration.md)。
+文档：[文档源 docs/src](https://github.com/SantaChains/heartflow/tree/main/docs/src) · [文档站](https://santachains.github.io/heartflow/) · [llms.txt](https://raw.githubusercontent.com/SantaChains/heartflow/main/llms.txt) · [llms-full.txt](https://raw.githubusercontent.com/SantaChains/heartflow/main/llms-full.txt) · [DeepWiki](https://deepwiki.com/SantaChains/heartflow) · [Context7](https://context7.com/santachains/heartflow)。站点由 [.github/workflows/docs.yml](https://github.com/SantaChains/heartflow/blob/main/.github/workflows/docs.yml) 构建，首次上线需在仓库 Settings → Pages 把 Source 选为 "GitHub Actions"；细节见 [docs/src/ai-integration.md](https://github.com/SantaChains/heartflow/blob/main/docs/src/ai-integration.md)。
 
 ## 特性
 
@@ -58,7 +58,7 @@ cargo install --git https://github.com/SantaChains/heartflow --locked heartflow
 
 ## 构建
 
-需要 Rust 1.85+。
+需要 Rust 1.88+。
 
 ```bash
 # 克隆后在仓库根目录（含 Cargo.toml）执行

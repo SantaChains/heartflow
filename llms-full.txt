@@ -66,7 +66,7 @@ cargo install --git https://github.com/SantaChains/heartflow --locked heartflow
 
 ## 从源码构建
 
-需要 Rust 1.85+。
+需要 Rust 1.88+。
 
 ```bash
 # 克隆后在仓库根目录（含 Cargo.toml）执行
@@ -379,7 +379,7 @@ MCP 握手（initialize + tools/list）失败按 200/400ms 退避重试 3 次（
 
 - **引擎**：mdBook（纯 Rust，零 Node，与发布流水线取向一致）。源在 `docs/src/`，目录见 `docs/src/SUMMARY.md`，输出到 `docs/book/`（已 gitignore）。
 - **本地预览**：`cargo install mdbook && mdbook serve docs -p 3000 --open`（mdBook 0.5+；book 根为 `docs`，输出默认 `docs/book`）。
-- **部署（当前暂未启用）**：Pages 工作流以 `.github/workflows/docs.yml.bak` 形式暂存（与仓库 `ci.yml.bak` 约定一致，GitHub 不识别 `.bak` 故不触发）。启用三步：① 改回 `docs.yml`；② 仓库 Settings → Pages → Source 选 "GitHub Actions"；③ 如需自定义域名，把 `docs/book.toml` 的 `site-url` 改 `/` 并填 `cname`。项目页默认子路径为 `/heartflow/`。
+- **部署**：Pages 工作流是 `.github/workflows/docs.yml`，在 push 到 main 且 `docs/**`、`scripts/gen-llms.sh` 或该 workflow 本身有变动时触发，也可 `workflow_dispatch` 手动跑。唯一的一次性前提：仓库 Settings → Pages → Source 选 "GitHub Actions"，否则 deploy 那步会失败。上自定义域名时，除把 `docs/book.toml` 的 `site-url` 改成 `/` 并填 `cname`，还要改 workflow 里 gen-llms 步骤的 `SITE_URL`（该变量名固定，写成别的名字不报错但会被静默忽略）。项目页默认子路径为 `/heartflow/`，站点 <https://santachains.github.io/heartflow/>。
 
 ## API 文档（rustdoc）
 
@@ -387,12 +387,12 @@ MCP 握手（initialize + tools/list）失败按 200/400ms 退避重试 3 次（
 
 ## llms.txt
 
-`scripts/gen-llms.sh` 按 **llms.txt 规范 v2**（<https://llmstxt.org>）生成两份供 AI 读取的产物，**默认落在仓库根并已随仓库提交**（Pages 未上线时也可经 raw.githubusercontent 直接取用）：
+`scripts/gen-llms.sh` 按 **llms.txt 规范 v2**（<https://llmstxt.org>）生成两份供 AI 读取的产物，**默认落在仓库根并已随仓库提交**（不必等 Pages 上线，raw.githubusercontent 当下即可取用）：
 
 - `llms.txt`：H1 站名 + 摘要 blockquote + details 段，随后 `## Documentation` / `## Optional` 两个文件列表，每项链接到**对应章节的原始 markdown**（v2 要求链接 LLM 友好版而非 HTML），次要页（路线图/贡献）归入 `## Optional` 供 agent 按需跳过。
 - `llms-full.txt`：全部章节按 SUMMARY 顺序拼接成自包含单文件，供一次性读入。
 
-改文档后重跑 `bash scripts/gen-llms.sh` 刷新根目录两份文件；Pages 上线后工作流会以 `bash scripts/gen-llms.sh docs/book docs/src` 另生成到站根。Cursor `#Docs` 与各家 MCP 摄取器直接添加 `https://raw.githubusercontent.com/SantaChains/heartflow/main/llms.txt`（或上线后的 `<site>/llms.txt`）即可。mdBook 另有 `mdbook-llms-txt` 后端可作原生替代，当前用零依赖脚本自足。
+改文档后重跑 `bash scripts/gen-llms.sh` 刷新根目录两份文件（注意本机 PATH 上的 `bash` 若不是 GNU bash，脚本会因缺 `mapfile` 而失败，用 Git 的 bash）。Pages 工作流跑的是 `bash scripts/gen-llms.sh docs/book docs/src`，另生成一份到站根。Cursor `#Docs` 与各家 MCP 摄取器直接添加 `https://raw.githubusercontent.com/SantaChains/heartflow/main/llms.txt`（或 `<site>/llms.txt`）即可。mdBook 另有 `mdbook-llms-txt` 后端可作原生替代，当前用零依赖脚本自足。
 
 ## Context7
 

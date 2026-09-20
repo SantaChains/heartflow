@@ -29,6 +29,6 @@
     { "title": "MCP Client", "purpose": "crates/mcp:JSON-RPC 2.0 双传输(stdio 与 Streamable-HTTP/SSE)、protocol、transport、握手重试与只读放行" },
     { "title": "CLI Rendering & TUI", "purpose": "crates/cli 的渲染层(render.rs)、编辑器/输入(editor.rs)、mascot 伴侣、动态行内视口终端(viewport_term.rs)" },
     { "title": "MCP Servers Integration", "purpose": "文档说明如何给 hf 挂载 context7/deepwiki 等远程 MCP,以及本地 stdio server 配置" },
-    { "title": "Docs & AI Integration", "purpose": "docs/src mdBook 文档站、GitHub Pages 工作流(当前暂存为 .github/workflows/docs.yml.bak)、scripts/gen-llms.sh 按 llms.txt v2 生成仓库根 llms.txt/llms-full.txt、.devin/wiki.json(本页)、docs/context7.json 与 GitHub Wiki 种子" }
+    { "title": "Docs & AI Integration", "purpose": "docs/src mdBook 文档站、GitHub Pages 工作流(.github/workflows/docs.yml，push docs/** 时发布)、scripts/gen-llms.sh 按 llms.txt v2 生成仓库根 llms.txt/llms-full.txt、.devin/wiki.json(本页)、docs/context7.json 与 GitHub Wiki 种子" }
   ]
 }

@@ -27,7 +27,7 @@ cargo install --git https://github.com/SantaChains/heartflow --locked heartflow
 
 ## 从源码构建
 
-需要 Rust 1.85+。
+需要 Rust 1.88+。
 
 ```bash
 # 克隆后在仓库根目录（含 Cargo.toml）执行

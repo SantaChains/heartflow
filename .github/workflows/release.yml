@@ -8,7 +8,8 @@ name: Release
 #   - bucket manifest 由 windows-zip job 直接写真实 version/url/hash(CI 单一写入者,无外部 autoupdate 机器人)
 #   - 本链只做"发版":不跑 fmt/clippy/test,不做任何代码风格检查。风格与测试由作者在
 #     push 之前本地过完再推,CI 每 push 跑门只烧额度不增加信息(见 ci.yml.bak 头注)
-#   - ci.yml 暂存为 ci.yml.bak(与 docs.yml.bak 同约定,GitHub 不识别 .bak),不做每 push 的 CI
+#   - ci.yml 暂存为 ci.yml.bak(改名 .bak 后 GitHub 不识别),本链不做每 push 的 CI 质量门;
+#     文档站是另一条独立链,见 docs.yml(仅在 docs/** 变动时触发)。
 #   - 本地预检:bash scripts/release.sh plan;RELEASE_DRY_RUN=1 bash scripts/release.sh publish
 
 on:
@@ -81,8 +82,8 @@ jobs:
         with:
           ref: ${{ needs.plan.outputs.tag }}
           fetch-depth: 1
-      # 工具链版本只认仓库根的 rust-toolchain.toml:workflow 里不写死版本,否则
-      # CI 跟随 stable 漂移,同一次提交在本地与 CI 的 fmt/clippy 结论会分叉。
+      # 工具链版本只认仓库根的 rust-toolchain.toml:workflow 里不写死版本,否则 runner
+      # 上的 stable 与本地开发用的编译器会分叉,同一个 tag 不再可复现。
       - name: install toolchain(rust-toolchain.toml 为唯一版本源)
         run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
