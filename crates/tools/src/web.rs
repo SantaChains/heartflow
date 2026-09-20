@@ -124,7 +124,11 @@ pub fn web_fetch(input: &WebFetchInput) -> Result<WebFetchReport, WebError> {
             || body.trim_start().starts_with("<!DOCTYPE")
             || body.trim_start().starts_with("<html"));
     let title = is_html.then(|| extract_title(&body)).flatten();
-    let mut text = if is_html { html_to_text(&body) } else { body };
+    let mut text = if is_html {
+        html_to_markdown(&body)
+    } else {
+        body
+    };
 
     let mut truncated = over_cap;
     if text.chars().count() > MAX_TEXT_CHARS {
@@ -408,12 +412,400 @@ fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Decode HTML entities in a tag-free text run (reusing [`decode_entity`]).
+fn decode_html_text(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'&' {
+            let window = &lower[i..(i + 12).min(lower.len())];
+            if let Some(semi) = window.find(';') {
+                let entity = &lower[i + 1..i + semi];
+                out.push_str(&decode_entity(entity));
+                i += semi + 1;
+                continue;
+            }
+        }
+        let ch = text[i..].chars().next().unwrap_or('\u{fffd}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Ensure `out` sits at the start of a fresh line (no-op at buffer start or when
+/// already on a new line), so block elements break without stacking blank rows.
+fn ensure_newline(out: &mut String) {
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+}
+
+/// Append decoded text, collapsing any whitespace run to a single space (unless
+/// `collapse` is false, i.e. inside a `<pre>` block) and never starting a line
+/// with a stray space.
+fn push_text(out: &mut String, text: &str, collapse: bool) {
+    let decoded = decode_html_text(text);
+    if !collapse {
+        out.push_str(&decoded);
+        return;
+    }
+    for ch in decoded.chars() {
+        if ch.is_whitespace() {
+            if !out.is_empty() && !out.ends_with('\n') && !out.ends_with(' ') && !out.ends_with('[')
+            {
+                out.push(' ');
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+}
+
+/// Extract the value of attribute `key` from an opening tag's interior (the text
+/// after `<`). Byte offsets of the lower-cased copy line up with the original
+/// because only ASCII folding differs, so the value is sliced case-preservingly
+/// (URL paths are case sensitive) and entity-decoded.
+fn attr(tag: &str, key: &str) -> Option<String> {
+    let lower_tag = tag.to_ascii_lowercase();
+    let at = lower_tag.find(key)?;
+    let after = &lower_tag[at + key.len()..];
+    let ws = after.len() - after.trim_start().len();
+    let eq = after.trim_start();
+    if !eq.starts_with('=') {
+        return None;
+    }
+    let value_from = at + key.len() + ws + 1; // just past '='
+    let rest = tag.get(value_from..)?.trim_start();
+    let first = *rest.as_bytes().first()?;
+    let value = if first == b'"' || first == b'\'' {
+        let s = &rest[1..];
+        let end = s.find(first as char)?;
+        &s[..end]
+    } else {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        &rest[..end]
+    };
+    (!value.is_empty()).then(|| decode_html_text(value))
+}
+
+/// Turn an HTML document into lightweight, structure-preserving markdown, so a
+/// documentation page reaches the model as readable sections rather than one
+/// collapsed line. It drops non-prose blocks (`script`/`style`/`head`/...), puts
+/// block elements on their own line, marks headings with `#`, list items with
+/// `- `, fences `<pre>` as code, and keeps anchors as `[text](url)` so the agent
+/// can act on the URL (a keyless, dependency-free idea borrowed from how good
+/// agent fetch tools spend tokens). Not a full DOM parser: unrecognised markup
+/// degrades to its text content.
+#[allow(clippy::too_many_lines)] // one cohesive linear HTML scanner
+fn html_to_markdown(html: &str) -> String {
+    const SKIP: [&str; 6] = ["script", "style", "head", "noscript", "template", "svg"];
+    const BLOCK: [&str; 22] = [
+        "p",
+        "div",
+        "section",
+        "article",
+        "header",
+        "footer",
+        "nav",
+        "aside",
+        "main",
+        "blockquote",
+        "table",
+        "thead",
+        "tbody",
+        "tfoot",
+        "ul",
+        "ol",
+        "dl",
+        "dt",
+        "dd",
+        "figure",
+        "figcaption",
+        "form",
+    ];
+    let lower = html.to_ascii_lowercase();
+    let bytes = html.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(html.len() / 2 + 8);
+    let mut i = 0usize;
+    let mut link_href: Option<String> = None;
+    let mut in_pre = false;
+    while i < n {
+        if bytes[i] == b'<' {
+            let mut j = i + 1;
+            while j < n && bytes[j] != b'>' {
+                j += 1;
+            }
+            let inner = &html[i + 1..j.min(n)];
+            i = if j < n { j + 1 } else { n };
+            if inner.is_empty() {
+                continue;
+            }
+            let closing = inner.starts_with('/');
+            let body = if closing { &inner[1..] } else { inner };
+            if body.starts_with('!') {
+                continue; // comment or doctype
+            }
+            let name_end = body.find(char::is_whitespace).unwrap_or(body.len());
+            let name = body[..name_end].to_ascii_lowercase();
+            if SKIP.contains(&name.as_str()) {
+                if !closing {
+                    i = match lower[i..].find(&format!("</{name}")) {
+                        Some(rel) => i + rel,
+                        None => n,
+                    };
+                }
+                continue;
+            }
+            match name.as_str() {
+                "br" => out.push('\n'),
+                "hr" => ensure_newline(&mut out),
+                "pre" => {
+                    ensure_newline(&mut out);
+                    out.push_str("```\n");
+                    in_pre = !closing;
+                }
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                    if closing {
+                        ensure_newline(&mut out);
+                    } else {
+                        ensure_newline(&mut out);
+                        let level = name.as_bytes()[1] - b'0';
+                        for _ in 0..level {
+                            out.push('#');
+                        }
+                        out.push(' ');
+                    }
+                }
+                "li" => {
+                    if closing {
+                        ensure_newline(&mut out);
+                    } else {
+                        ensure_newline(&mut out);
+                        out.push_str("- ");
+                    }
+                }
+                "a" => {
+                    if closing {
+                        if let Some(href) = link_href.take() {
+                            out.push_str("](");
+                            out.push_str(&href);
+                            out.push(')');
+                        }
+                    } else if let Some(href) = attr(body, "href") {
+                        if href.starts_with("http://") || href.starts_with("https://") {
+                            link_href = Some(href);
+                            out.push('[');
+                        }
+                    }
+                }
+                _ => {
+                    if BLOCK.contains(&name.as_str()) {
+                        ensure_newline(&mut out);
+                    }
+                }
+            }
+        } else {
+            let mut k = i;
+            while k < n && bytes[k] != b'<' {
+                k += 1;
+            }
+            push_text(&mut out, &html[i..k], !in_pre);
+            i = k;
+        }
+    }
+    finalize_markdown(&out)
+}
+
+/// Collapse runs of newlines to at most one blank line and trim the ends.
+fn finalize_markdown(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut newlines = 0usize;
+    for ch in src.chars() {
+        if ch == '\n' {
+            newlines += 1;
+            continue;
+        }
+        if newlines > 0 {
+            out.push('\n');
+            if newlines > 1 {
+                out.push('\n');
+            }
+            newlines = 0;
+        }
+        out.push(ch);
+    }
+    out.trim().to_string()
+}
+
+/// One ranked search result: a title, its URL (the actionable handle to pass to
+/// `web_fetch`), and a short snippet.
+#[derive(Debug, Clone, Serialize)]
+pub struct WebSearchHit {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
+/// Output of [`web_search`]. `provider` names the engine used so the model (and
+/// a future BYOK path) can tell where results came from.
+#[derive(Debug, Serialize)]
+pub struct WebSearchReport {
+    pub query: String,
+    pub provider: &'static str,
+    pub hits: Vec<WebSearchHit>,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WebSearchInput {
+    pub query: String,
+    pub max_results: Option<usize>,
+}
+
+/// Default and cap for the number of results returned.
+const SEARCH_DEFAULT_RESULTS: usize = 8;
+const SEARCH_MAX_RESULTS: usize = 25;
+
+/// Keyless web search over one engine (`DuckDuckGo`'s HTML endpoint), returning
+/// ranked `(title, url, snippet)` references rather than page bodies — the
+/// agent then fetches the URL it wants. Deliberately lean: a single engine and a
+/// pure, unit-tested parser, not a multi-engine consensus/rerank stack. Empty
+/// results are reported honestly (never a fabricated answer).
+pub fn web_search(input: &WebSearchInput) -> Result<WebSearchReport, WebError> {
+    let limit = input
+        .max_results
+        .unwrap_or(SEARCH_DEFAULT_RESULTS)
+        .clamp(1, SEARCH_MAX_RESULTS);
+    let mut endpoint = reqwest::Url::parse("https://html.duckduckgo.com/html/")
+        .map_err(|e| WebError::InvalidUrl(e.to_string()))?;
+    endpoint.query_pairs_mut().append_pair("q", &input.query);
+    ensure_public(&endpoint)?;
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .map_err(|e| WebError::Http(e.to_string()))?;
+    let response = client
+        .get(endpoint)
+        .send()
+        .map_err(|e| WebError::Http(e.to_string()))?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(WebError::Http(format!("search engine returned {status}")));
+    }
+    let mut buf = Vec::new();
+    response
+        .take(MAX_RESPONSE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| WebError::Http(e.to_string()))?;
+    if buf.len() as u64 > MAX_RESPONSE_BYTES {
+        buf.truncate(usize::try_from(MAX_RESPONSE_BYTES).unwrap_or(usize::MAX));
+    }
+    let body = String::from_utf8_lossy(&buf).into_owned();
+
+    let mut hits = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for hit in parse_duckduckgo(&body) {
+        if hit.url.is_empty() || hit.title.is_empty() || !seen.insert(hit.url.clone()) {
+            continue;
+        }
+        hits.push(hit);
+        if hits.len() >= limit {
+            break;
+        }
+    }
+    let note = hits.is_empty().then(|| {
+        "no results from the keyless engine; refine the query or web_fetch a known URL".to_string()
+    });
+    Ok(WebSearchReport {
+        query: input.query.clone(),
+        provider: "duckduckgo",
+        hits,
+        note,
+    })
+}
+
+/// Parse `DuckDuckGo`'s HTML SERP into ranked hits. Each result is an anchor with
+/// `class="result__a"` (the title, behind a `uddg=` redirect) followed by a
+/// `class="result__snippet"` anchor. Pure and offline-testable; the live fetch
+/// only feeds it bytes.
+fn parse_duckduckgo(html: &str) -> Vec<WebSearchHit> {
+    let lower = html.to_ascii_lowercase();
+    let mut hits = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find("result__a") {
+        let at = from + rel;
+        let Some(gt_rel) = html[at..].find('>') else {
+            break;
+        };
+        let gt = at + gt_rel;
+        let a_start = html[..at].rfind("<a").unwrap_or(at);
+        let href = attr(&html[a_start..gt], "href").unwrap_or_default();
+        let Some(close_rel) = lower[gt..].find("</a>") else {
+            break;
+        };
+        let close = gt + close_rel;
+        let title = collapse_whitespace(&html_to_text(&html[gt + 1..close]));
+        let snippet = match lower[close..].find("result__snippet") {
+            Some(rel2) => {
+                let sp = close + rel2;
+                let sgt = html[sp..].find('>').map_or(sp, |g| sp + g);
+                let scl = html[sgt..].find("</a>").map_or(sgt, |c| sgt + c);
+                let raw = html.get((sgt + 1).min(scl)..scl).unwrap_or("");
+                collapse_whitespace(&html_to_text(raw))
+            }
+            None => String::new(),
+        };
+        let url = decode_ddg_redirect(&href);
+        if !url.is_empty() && !title.is_empty() {
+            hits.push(WebSearchHit {
+                title,
+                url,
+                snippet,
+            });
+        }
+        from = close.max(at + 1);
+    }
+    hits
+}
+
+/// `DuckDuckGo` wraps every result URL as `//duckduckgo.com/l/?uddg=<encoded>`.
+/// Unwrap the real target (percent-decoded via the URL parser); pass through a
+/// plain http(s) link, and drop anything else (e.g. ad or internal links).
+fn decode_ddg_redirect(href: &str) -> String {
+    let candidate = if href.strip_prefix("//").is_some() {
+        format!("https:{href}")
+    } else {
+        href.to_string()
+    };
+    if let Ok(u) = reqwest::Url::parse(&candidate) {
+        if let Some(target) = u
+            .query_pairs()
+            .find(|(k, _)| k == "uddg")
+            .map(|(_, v)| v.into_owned())
+        {
+            return target;
+        }
+        if matches!(u.scheme(), "http" | "https") {
+            return candidate;
+        }
+    }
+    String::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        build_cookie_header, collapse_whitespace, decode_entity, ensure_public, extract_title,
-        host_matches, html_to_text, is_blocked_ip, load_cookie_jar, parse_set_cookie,
-        save_cookie_jar, store_set_cookies, CookieJar,
+        attr, build_cookie_header, collapse_whitespace, decode_ddg_redirect, decode_entity,
+        ensure_public, extract_title, host_matches, html_to_markdown, html_to_text, is_blocked_ip,
+        load_cookie_jar, parse_duckduckgo, parse_set_cookie, save_cookie_jar, store_set_cookies,
+        CookieJar,
     };
     use std::net::IpAddr;
 
@@ -538,5 +930,98 @@ mod tests {
         save_cookie_jar(&path, &jar);
         assert_eq!(load_cookie_jar(&path), jar);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn markdown_preserves_structure_not_one_line() {
+        let html = "<h1>Title</h1><p>Para one.</p><ul><li>alpha</li><li>beta</li></ul>\
+            <p>See <a href=\"https://x.example/p\">the docs &amp; ref</a> for more.</p>\
+            <pre>let x = 1;</pre><script>evil()</script>";
+        let md = html_to_markdown(html);
+        assert!(md.contains("# Title"), "heading marker: {md:?}");
+        assert!(md.contains("Para one."), "paragraph text");
+        assert!(
+            md.contains("- alpha") && md.contains("- beta"),
+            "list items"
+        );
+        assert!(
+            md.contains("[the docs & ref](https://x.example/p)"),
+            "link kept as text+url: {md:?}"
+        );
+        assert!(
+            md.contains("```") && md.contains("let x = 1;"),
+            "code fence"
+        );
+        assert!(!md.contains("evil"), "script dropped");
+        assert!(!md.contains('<'), "no raw tags survive: {md:?}");
+        // The point of the change: the body is multi-line, not one collapsed blob.
+        assert!(md.lines().count() >= 5, "structured into lines: {md:?}");
+    }
+
+    #[test]
+    fn markdown_decodes_entities_and_keeps_cjk() {
+        let md = html_to_markdown("<p>\u{4f60}\u{597d} &amp; world &lt;3</p>");
+        assert!(
+            md.contains("\u{4f60}\u{597d} & world <3"),
+            "cjk+entities: {md:?}"
+        );
+    }
+
+    #[test]
+    fn markdown_drops_head_and_whitespace_runs() {
+        let md = html_to_markdown(
+            "<head><title>T</title><meta x=1></head><body><div>  a   b  </div></body>",
+        );
+        assert!(!md.contains('T'), "head dropped: {md:?}");
+        assert_eq!(md.trim(), "a b", "inner run collapsed to one space");
+    }
+
+    #[test]
+    fn attr_reads_quoted_and_unquoted_values() {
+        assert_eq!(
+            attr(r#"a href="https://e.com/x?a=1&amp;b=2" class="r""#, "href").as_deref(),
+            Some("https://e.com/x?a=1&b=2")
+        );
+        assert_eq!(
+            attr(r"a href=https://e.com/x title=y", "href").as_deref(),
+            Some("https://e.com/x")
+        );
+        assert_eq!(attr("a rel=\"n\"", "href"), None, "missing attr");
+        assert_eq!(
+            attr("a hrefx=\"y\"", "href"),
+            None,
+            "href must be followed by ="
+        );
+    }
+
+    #[test]
+    fn ddg_redirect_unwraps_real_url() {
+        let encoded = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdoc&rut=abc";
+        assert_eq!(decode_ddg_redirect(encoded), "https://example.com/doc");
+        assert_eq!(decode_ddg_redirect("https://e.com/p"), "https://e.com/p");
+        assert_eq!(decode_ddg_redirect("/ads/ban.gif"), "", "non-http dropped");
+    }
+
+    #[test]
+    fn parse_duckduckgo_extracts_ranked_hits() {
+        let serp = r#"<div class="result">
+            <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Frust-lang.org%2Fbook">The Rust Programming Language</a>
+            <a class="result__snippet" href="...">A long &amp; detailed <b>book</b> about Rust.</a>
+        </div>
+        <div class="result">
+            <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust-lang.org%2Fstd">std - Rust</a>
+            <a class="result__snippet" href="...">Standard library docs.</a>
+        </div>"#;
+        let hits = parse_duckduckgo(serp);
+        assert_eq!(hits.len(), 2, "two results");
+        assert_eq!(hits[0].url, "https://rust-lang.org/book");
+        assert_eq!(hits[0].title, "The Rust Programming Language");
+        assert_eq!(hits[0].snippet, "A long & detailed book about Rust.");
+        assert_eq!(hits[1].url, "https://doc.rust-lang.org/std");
+        assert_eq!(
+            parse_duckduckgo("<p>no results here</p>").len(),
+            0,
+            "empty SERP"
+        );
     }
 }

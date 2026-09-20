@@ -616,4 +616,67 @@ mod tests {
         assert_eq!(lines.len(), m.render().len());
         assert!(lines.len() >= 5, "expected a full blob: {lines:?}");
     }
+
+    #[test]
+    fn braille_cell_encodes_dots_to_exact_glyph() {
+        // A single 2x4 cell. The bit map is col0 rows0..3 = 0x01,0x02,0x04,0x40
+        // and col1 rows0..3 = 0x08,0x10,0x20,0x80. A wrong dx<->dy or column swap
+        // would still yield *a* valid braille glyph, so the blob-invariant tests
+        // cannot catch it — this golden locks the encoding table itself.
+        let mut cv = Braille::new(2, 4);
+        assert_eq!(cv.render()[0], " ", "empty cell is a space");
+        cv.set(0, 0, true);
+        assert_eq!(cv.render()[0], "\u{2801}", "col0 row0 => dot 0x01");
+        let mut pair = Braille::new(2, 4);
+        pair.set(0, 0, true);
+        pair.set(1, 3, true);
+        assert_eq!(
+            pair.render()[0],
+            "\u{2881}",
+            "col0 row0 + col1 row3 => 0x81"
+        );
+        let mut full = Braille::new(2, 4);
+        for (x, y) in [
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 0),
+            (1, 1),
+            (1, 2),
+            (1, 3),
+        ] {
+            full.set(x, y, true);
+        }
+        assert_eq!(
+            full.render()[0],
+            "\u{28FF}",
+            "all eight dots => full braille"
+        );
+    }
+
+    #[test]
+    fn braille_float_set_rounds_and_clips() {
+        let mut cv = Braille::new(2, 4);
+        cv.set_f(0.6, 1.4, true); // rounds to (1,1) => dot 0x10
+        assert_eq!(
+            cv.render()[0],
+            "\u{2810}",
+            "float coordinate rounds to nearest dot"
+        );
+        let mut neg = Braille::new(2, 4);
+        neg.set_f(-1.0, 2.0, true); // negative x is dropped, cell stays dark
+        assert_eq!(neg.render()[0], " ", "negative coordinate is ignored");
+    }
+
+    #[test]
+    fn braille_set_ignores_out_of_range() {
+        let mut cv = Braille::new(2, 4);
+        cv.set(9, 9, true); // past the buffer: a no-op, never a panic
+        assert_eq!(
+            cv.render(),
+            vec![" ".to_string()],
+            "out-of-range writes ignored"
+        );
+    }
 }

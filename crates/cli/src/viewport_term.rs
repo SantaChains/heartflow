@@ -255,4 +255,37 @@ mod tests {
         assert_eq!(seen, term.viewport_area());
         assert_eq!(seen.width, 30);
     }
+
+    #[test]
+    fn placement_near_bottom_keeps_viewport_on_screen() {
+        // Cursor on the last row: a 4-row inline viewport cannot hang below the
+        // screen, so construction must lift its top so the whole rect fits. This
+        // exercises compute_inline_size's `missing_lines` pull-up path.
+        let mut backend = TestBackend::new(40, 12);
+        backend.set_cursor_position(Position::new(0, 11)).unwrap();
+        let term = CompanionTerminal::with_inline(backend, 4).unwrap();
+        let area = term.viewport_area();
+        assert_eq!(area.height, 4);
+        assert!(
+            area.bottom() <= 12,
+            "initial viewport overflows screen: {area:?}"
+        );
+    }
+
+    #[test]
+    fn growing_past_the_bottom_stays_on_screen() {
+        // Start near the bottom, then grow: the extra rows must be absorbed
+        // (append_lines scrolls history) and the top pulled up so the taller
+        // viewport still fits — the set_inline_height grow+clamp path.
+        let mut backend = TestBackend::new(40, 10);
+        backend.set_cursor_position(Position::new(0, 8)).unwrap();
+        let mut term = CompanionTerminal::with_inline(backend, 2).unwrap();
+        term.draw(6, blank).unwrap();
+        let area = term.viewport_area();
+        assert_eq!(area.height, 6);
+        assert!(
+            area.bottom() <= 10,
+            "grown viewport overflows screen: {area:?}"
+        );
+    }
 }

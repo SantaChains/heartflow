@@ -15,7 +15,10 @@ mod web;
 pub use graphics::{verify_graphics, GraphicsReport};
 pub use image::{generate_image, GenerateImageInput, GenerateImageReport, ImageConfig};
 pub use todo::{task_id, todo_tool_spec, TodoItem, TodoLedger, TodoStatus};
-pub use web::{web_fetch, WebFetchInput, WebFetchReport};
+pub use web::{
+    web_fetch, web_search, WebFetchInput, WebFetchReport, WebSearchHit, WebSearchInput,
+    WebSearchReport,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolManifestEntry {
@@ -284,7 +287,7 @@ pub fn verify_graphics_tool_spec() -> ToolSpec {
 pub fn web_fetch_tool_spec() -> ToolSpec {
     ToolSpec {
         name: "web_fetch",
-        description: "Fetch a URL over HTTP(S) and return its extracted text (page title included). Use to read documentation, APIs, or web pages when you need external information. Non-http(s) URLs and private/loopback/cloud-metadata hosts are refused for safety; output is size-limited. Set raw=true for the untransformed body.",
+        description: "Fetch a URL over HTTP(S) and return its text as lightweight markdown (headings, list items, and links preserved as [text](url), not one flattened line). Use to read documentation, APIs, or web pages when you need external information. Non-http(s) URLs and private/loopback/cloud-metadata hosts are refused for safety; output is size-limited. Set raw=true for the untransformed body.",
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -292,6 +295,25 @@ pub fn web_fetch_tool_spec() -> ToolSpec {
                 "raw": { "type": "boolean" }
             },
             "required": ["url"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+/// Search the web and return ranked (title, URL, snippet) references. Pairs with
+/// `web_fetch`: search to discover the right page, then fetch the URL you want.
+#[must_use]
+pub fn web_search_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "web_search",
+        description: "Search the web with a text query and return ranked results as (title, URL, snippet) references, not page bodies. Use it to discover which page answers a question, then web_fetch the URL you want. Keyless by default (one engine); returns few or zero results honestly rather than guessing. max_results defaults to 8, capped at 25.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string" },
+                "max_results": { "type": "integer", "minimum": 1, "maximum": 25 }
+            },
+            "required": ["query"],
             "additionalProperties": false
         }),
     }
@@ -309,6 +331,7 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
         "apply_patch" => from_value::<ApplyPatchInput>(input).and_then(run_apply_patch),
         "verify_graphics" => from_value::<VerifyGraphicsInput>(input).and_then(run_verify_graphics),
         "web_fetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
+        "web_search" => from_value::<WebSearchInput>(input).and_then(run_web_search),
         "generate_image" => from_value::<GenerateImageInput>(input).and_then(run_generate_image),
         _ => Err(format!("unsupported tool: {name}")),
     }
@@ -429,6 +452,11 @@ fn run_verify_graphics(input: VerifyGraphicsInput) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn run_web_fetch(input: WebFetchInput) -> Result<String, String> {
     to_pretty_json(web_fetch(&input).map_err(|error| error.to_string())?)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_web_search(input: WebSearchInput) -> Result<String, String> {
+    to_pretty_json(web_search(&input).map_err(|error| error.to_string())?)
 }
 
 /// Text-to-image tool spec. Provider-agnostic: uses an OpenAI-compatible

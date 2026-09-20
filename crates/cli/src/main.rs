@@ -3087,6 +3087,7 @@ impl ToolExecutor for NativeToolExecutor {
             tools::ask_user_tool_spec(),
             tools::verify_graphics_tool_spec(),
             tools::web_fetch_tool_spec(),
+            tools::web_search_tool_spec(),
             tools::generate_image_tool_spec(),
         ] {
             specs.push(ToolSpec {
@@ -3115,6 +3116,7 @@ impl ToolExecutor for NativeToolExecutor {
                 | "search_files"
                 | "verify_graphics"
                 | "web_fetch"
+                | "web_search"
         )
     }
 
@@ -3387,6 +3389,7 @@ fn permission_policy_for_mode(mode: &str, mcp_read_only: &[String]) -> Permissio
             .with_tool_mode("grep_search", PermissionMode::Allow)
             .with_tool_mode("search_files", PermissionMode::Allow)
             .with_tool_mode("web_fetch", PermissionMode::Allow)
+            .with_tool_mode("web_search", PermissionMode::Allow)
             .with_tool_mode("todo_write", PermissionMode::Allow)
             .with_tool_mode("verify_graphics", PermissionMode::Allow)
             .with_tool_mode("ask_user", PermissionMode::Allow)
@@ -3398,6 +3401,7 @@ fn permission_policy_for_mode(mode: &str, mcp_read_only: &[String]) -> Permissio
             .with_tool_mode("bash", PermissionMode::Prompt)
             // Network egress leaves the sandbox; ask like a dangerous command does.
             .with_tool_mode("web_fetch", PermissionMode::Prompt)
+            .with_tool_mode("web_search", PermissionMode::Prompt)
             .with_tool_mode("generate_image", PermissionMode::Prompt)
             .with_prompt_gate(confirm_only_when_risky),
     };
@@ -4012,6 +4016,7 @@ mod tests {
             "search_files",
             "verify_graphics",
             "web_fetch",
+            "web_search",
         ] {
             assert!(
                 exec.is_concurrent_safe(tool),
@@ -4107,6 +4112,9 @@ mod tests {
         // web_fetch reaches the network: prompts in workspace-write, denied in read-only.
         assert_eq!(write.mode_for("web_fetch"), PermissionMode::Prompt);
         assert_eq!(plan.mode_for("web_fetch"), PermissionMode::Deny);
+        // web_search reaches the network too: prompts in workspace-write, denied in read-only.
+        assert_eq!(write.mode_for("web_search"), PermissionMode::Prompt);
+        assert_eq!(plan.mode_for("web_search"), PermissionMode::Deny);
         // full: everything auto-approves.
         assert_eq!(
             permission_policy_for_mode("full", &[]).mode_for("bash"),

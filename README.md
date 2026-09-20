@@ -16,9 +16,9 @@ Rust 实现的终端 AI agent。二进制命令 `hf`，在 REPL 中通过流式�
 
 - 真流式架构：SSE 增量经 mpsc 通道推送，思考与正文实时渲染，markdown 与代码高亮输出
 - 双协议接入：Anthropic 消息协议与 OpenAI Chat Completions 方言；内置 DeepSeek，自定义 provider 可接任意兼容端点
-- 原生工具：bash、read_file、write_file、edit_file、glob_search、grep_search、search_files（nucleo 模糊文件检索，fzf 的非交互正解）、apply_patch（跨多文件事务式批量编辑，先全量校验再写入，任一 old_string 缺失/歧义则整批不落盘）、todo_write、ask_user、verify_graphics、web_fetch（SSRF 防护，仅 http/https，拒绝内网/回环/云元数据地址）；write/edit/apply_patch 的输出用 `similar` 生成真正的行级带上下文 unified diff（非整文件 -旧/+新 转储）
+- 原生工具：bash、read_file、write_file、edit_file、glob_search、grep_search、search_files（nucleo 模糊文件检索，fzf 的非交互正解）、apply_patch（跨多文件事务式批量编辑，先全量校验再写入，任一 old_string 缺失/歧义则整批不落盘）、todo_write、ask_user、verify_graphics、web_fetch（SSRF 防护，仅 http/https，拒绝内网/回环/云元数据地址；HTML 抽取为保留标题/列表/代码/链接结构的 markdown，而非压成一行的文本墙）、web_search（免 key 的 DuckDuckGo 文本检索，返回排好序的标题/链接/摘要引用，供 agent 挑定后 web_fetch 展开）；write/edit/apply_patch 的输出用 `similar` 生成真正的行级带上下文 unified diff（非整文件 -旧/+新 转储）
 - MCP 支持：JSON-RPC 2.0 双传输——本地 stdio 与远程 Streamable-HTTP/SSE（`[mcp.servers.NAME]` 给 `command` 走 stdio、给 `url` 走 HTTP，零新依赖复用已内置的 reqwest/tokio），`readOnlyHint` 标注或 `read_only` 配置声明只读工具，原生工具优先
-- 任务循环：todo_write 登记计划，未完成任务自动续推，受最大续推次数约束。工具调度按读/写分类：连续的只读工具（read_file/grep/glob/search_files/web_fetch）并行批跑，写类与交互式工具（bash/write/edit/apply_patch/generate_image/todo_write/ask_user 及非只读 MCP）严格串行，保证写不会与并发读竞态、两个 ask_user 不抢终端
+- 任务循环：todo_write 登记计划，未完成任务自动续推，受最大续推次数约束。工具调度按读/写分类：连续的只读工具（read_file/grep/glob/search_files/web_fetch/web_search）并行批跑，写类与交互式工具（bash/write/edit/apply_patch/generate_image/todo_write/ask_user 及非只读 MCP）严格串行，保证写不会与并发读竞态、两个 ask_user 不抢终端
 - Hermes 任务环：`/plan approve` 后逐任务执行，每个任务在新鲜上下文里跑（复用同一 runtime，仅重置会话消息、绝不重连 MCP），确定性 verify（无 judge，看工具错误与完成标记），失败按 重试→换策略→询问 升级，收尾落盘复盘
 - 上下文工程：`>50%` 窗口预压缩——设 `config.toml` 的 `[provider] context_window` 或环境变量 `HEARTFLOW_AUTO_COMPACT_TOKENS`（= 模型上下文窗口 tokens，env 优先）后，回合内每次请求前若会话估算越过半窗即 summarize-then-compact（旧消息折成可续摘要、近若干条原样保留）；`/compact` 为手动强制压缩（忽略阈值立即压缩）。摘要按近期加权：越靠近存活窗口的轮次保留越多细节（每块 80→240 字预算）；`/pin` 把关键消息标记为永不压缩，逐字存活于每次压缩之后
 - 会话持久化：每个对话一份权威 JSON 快照，原子（temp+rename）写入 `~/.heartflow/sessions/<id>.json`，每回合覆盖同一文件而非另存新档；resume/`/open` 沿用同一 `<id>` 原地续写，`/clear` 轮换到新 `<id>`。支持 compact；`/exit` 打印本段 resume 命令，`/open N` 在 REPL 内直接跳回历史会话

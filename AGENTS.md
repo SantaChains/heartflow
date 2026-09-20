@@ -36,7 +36,7 @@ crates/
 ├── api        传输层:Anthropic / OpenAI Chat / OpenAI Responses 客户端、SSE 解析、重试。仅依赖 reqwest/serde/tokio。
 ├── runtime    会话循环:流消费、工具调度、compact、系统提示词、权限、bash/file_ops、agent 资产发现。
 │              agent 循环核心在 conversation.rs(ConversationRuntime、ToolExecutor、TurnStream、AgentEvent)。
-├── tools      原生工具的线上规格(wire spec)与执行:bash/read/write/edit/glob/grep、search_files(nucleo 模糊检索)、apply_patch(事务式多文件编辑)、todo、ask_user、web_fetch、verify_graphics、generate_image。新工具(search_files/apply_patch)的入参 schema 由 schemars 从输入类型派生;其余工具仍为手写 `json!` schema。
+├── tools      原生工具的线上规格(wire spec)与执行:bash/read/write/edit/glob/grep、search_files(nucleo 模糊检索)、apply_patch(事务式多文件编辑)、todo、ask_user、web_fetch、web_search、verify_graphics、generate_image。新工具(search_files/apply_patch)的入参 schema 由 schemars 从输入类型派生;其余工具仍为手写 `json!` schema。
 ├── mcp        MCP 客户端:stdio JSON-RPC 2.0 传输。
 ├── commands   请求/响应数据结构(薄)。
 ├── store      系统级 SQLite 历史库:每会话 JSON 快照权威 + best-effort 镜像到 ~/.heartflow/heartflow.db(FTS5 trigram 检索、用量聚合、integrity_check)。

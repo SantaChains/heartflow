@@ -13,6 +13,10 @@ release-notes.md
 # mdBook 构建产物与生成的 llms 索引(docs/src 才是源),不入库
 docs/book/
 
+# mdbook serve 本地预览的 stdout/stderr 重定向产物,不入库
+mdbook_serve.out
+mdbook_serve.err
+
 # 本地个人笔记/参考资料,不随仓库发布
 openmemory.md
 ref.md
