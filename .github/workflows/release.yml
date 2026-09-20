@@ -6,7 +6,9 @@ name: Release
 #   - Windows amd64 便携 zip(hf.exe 置于压缩包根 + sha256)上传到 Release;附 SHA256SUMS 清单,
 #     并用 actions/attest-build-provenance 签发 SLSA/in-toto 构建溯源(id-token: write)
 #   - bucket manifest 由 windows-zip job 直接写真实 version/url/hash(CI 单一写入者,无外部 autoupdate 机器人)
-#   - 代码质量门由 ci.yml 独立负责,本流水线不做 fmt/clippy/test
+#   - 本链只做"发版":不跑 fmt/clippy/test,不做任何代码风格检查。风格与测试由作者在
+#     push 之前本地过完再推,CI 每 push 跑门只烧额度不增加信息(见 ci.yml.bak 头注)
+#   - ci.yml 暂存为 ci.yml.bak(与 docs.yml.bak 同约定,GitHub 不识别 .bak),不做每 push 的 CI
 #   - 本地预检:bash scripts/release.sh plan;RELEASE_DRY_RUN=1 bash scripts/release.sh publish
 
 on:
@@ -37,7 +39,7 @@ jobs:
       bump: ${{ steps.plan.outputs.bump }}
       tag: ${{ steps.plan.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       - uses: ./.github/actions/install-git-cliff
@@ -51,7 +53,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30 # 七连发 verify 构建 + 最坏 ~10 分钟的 crates.io 429 退避
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       - uses: ./.github/actions/install-git-cliff
@@ -75,14 +77,15 @@ jobs:
       # needs to sign it with the workflow's OIDC token.
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.plan.outputs.tag }}
           fetch-depth: 1
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@v2
+      # 工具链版本只认仓库根的 rust-toolchain.toml:workflow 里不写死版本,否则
+      # CI 跟随 stable 漂移,同一次提交在本地与 CI 的 fmt/clippy 结论会分叉。
+      - name: install toolchain(rust-toolchain.toml 为唯一版本源)
+        run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo build (hf.exe)
         run: cargo build --release -p heartflow --target x86_64-pc-windows-msvc
       - name: pack zip + sha256
@@ -123,7 +126,7 @@ jobs:
         # Binds hf.exe to this repo + commit + runner via an OIDC-signed
         # provenance statement, so consumers can verify the binary was built by
         # this pipeline rather than merely that its hash matches the manifest.
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: heartflow-*-win-amd64.zip
       - name: update bucket manifest (version + url + hash)
@@ -145,6 +148,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "418982825+github-actions[bot]@users.noreply.github.com"
           git add bucket/heartflow.json
+          # 幂等:同版本重传时 manifest 内容不变,不产生空提交。必须先暂存再用
+          # `git diff --cached --quiet` 判,且判 $LASTEXITCODE——PowerShell 拿命令
+          # 输出当布尔值判真假,直接写 `if (git diff ...)` 永远为真。
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) { Write-Host "manifest already current for $tag"; exit 0 }
           git commit -m "chore(bucket): update manifest for $tag [skip ci]"
-          if ($LASTEXITCODE -ne 0) { exit 0 } # 同版本重传时 manifest 无变化
           git push origin HEAD:main

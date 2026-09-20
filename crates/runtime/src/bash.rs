@@ -292,7 +292,7 @@ async fn execute_bash_async(
 }
 
 /// Decode child-process bytes to text. A UTF-8 BOM is stripped; valid UTF-8 is
-/// returned unchanged (the common case once the PowerShell UTF-8 prefix applies).
+/// returned unchanged (the common case once the `PowerShell` UTF-8 prefix applies).
 /// Only when the bytes are *not* UTF-8 do we sniff the charset (e.g. GBK on a
 /// legacy zh-CN console) and decode through it, so CJK output survives intact
 /// instead of collapsing into replacement characters under `from_utf8_lossy`.
@@ -319,8 +319,8 @@ fn decode_with(bytes: &[u8], encoding: &'static encoding_rs::Encoding) -> String
     encoding.decode(bytes).0.into_owned()
 }
 
-/// Force UTF-8 output encoding for PowerShell so Chinese text survives the
-/// pipe (Windows PowerShell defaults to the console code page, often GBK).
+/// Force UTF-8 output encoding for `PowerShell` so Chinese text survives the
+/// pipe (`Windows PowerShell` defaults to the console code page, often GBK).
 fn wrap_command_for_encoding(args: &[&str], command: &str) -> String {
     let is_power_shell = args.iter().any(|arg| arg.eq_ignore_ascii_case("-Command"));
     if is_power_shell {
@@ -333,7 +333,7 @@ fn wrap_command_for_encoding(args: &[&str], command: &str) -> String {
 }
 
 /// Resolve the shell for the current invocation: `HEARTFLOW_SHELL` override,
-/// else platform default (PowerShell on Windows, `sh -lc` elsewhere).
+/// else platform default (`PowerShell` on Windows, `sh -lc` elsewhere).
 fn current_shell() -> (String, Vec<&'static str>) {
     resolve_shell(env::var("HEARTFLOW_SHELL").ok().as_deref(), cfg!(windows))
 }

@@ -173,8 +173,11 @@ const HEART_H: f64 = 17.6;
 /// in every boundary pixel; more only costs time on the startup frames.
 const HEART_SAMPLES: usize = 180;
 /// Horizontal and vertical centre of the heart on the canvas. The bob and the
-/// breathing scale pivot on the vertical one.
+/// breathing scale pivot on the vertical one. Grid dimensions are tiny consts,
+/// so the widening cast is exact.
+#[allow(clippy::cast_precision_loss)]
 const HEART_CX: f64 = (HEAD_W - 1) as f64 / 2.0;
+#[allow(clippy::cast_precision_loss)]
 const HEART_CY: f64 = (HEAD_H - 1) as f64 / 2.0;
 /// The trace's rest line: the heart's own centre line, where the silhouette is
 /// still twelve pixels wide, so the trace clears the contour on both sides
@@ -197,7 +200,7 @@ const BUSY_SWAY: f64 = 3.5;
 const BEAT_PERIOD: f64 = 2.6;
 
 /// DEC private mode 2026 (begin/end synchronized output). Terminals that
-/// support it (Windows Terminal, kitty, WezTerm, foot) buffer everything
+/// support it (`Windows Terminal`, `kitty`, `WezTerm`, `foot`) buffer everything
 /// between the pair and present it as one atomic repaint, which removes the
 /// flicker of redrawing the banner head in place. Terminals that don't
 /// recognise the mode ignore the codes, so this degrades harmlessly.
@@ -401,6 +404,9 @@ fn heart_outline() -> Vec<[f64; 2]> {
 /// a point is inside exactly when a ray from it crosses the boundary an odd number
 /// of times. That resolves the cleft and the tip exactly, which sampling the curve
 /// per pixel would not.
+// x/y/cx/cy/k are the standard notation for the heart curve; renaming them
+// would obscure the math they mirror.
+#[allow(clippy::many_single_char_names)]
 fn heart_inside(outline: &[[f64; 2]], x: f64, y: f64, cx: f64, cy: f64, k: f64) -> bool {
     let u = (x - cx) / (HEART_HW * k);
     let v = (y - (cy - 0.5 * HEART_H * k)) / (HEART_H * k);
@@ -432,7 +438,7 @@ fn heart_inside(outline: &[[f64; 2]], x: f64, y: f64, cx: f64, cy: f64, k: f64) 
 /// quarter-integer windows no sampled column lands in the spike at all — the
 /// R spike vanishes and leaves a lone floating pixel behind.
 fn qrs(d: f64) -> f64 {
-    if d < -1.5 || d >= 2.5 {
+    if !(-1.5..2.5).contains(&d) {
         0.0
     } else if d < -0.5 {
         0.9
@@ -771,6 +777,7 @@ impl Mascot {
     #[must_use]
     #[allow(
         clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
         clippy::cast_sign_loss,
         clippy::cast_precision_loss
     )] // float art -> pixel grid

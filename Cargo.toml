@@ -5,6 +5,9 @@ resolver = "2"
 [workspace.package]
 version = "1.0.1"
 edition = "2021"
+# 真实下限来自依赖(image/time/simd-json/globset/ignore 均要求 1.88),声明后可让旧
+# 工具链得到明确报错而不是晦涩的依赖解析失败;开发用工具链见 rust-toolchain.toml
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/SantaChains/heartflow"
 readme = "README.md"

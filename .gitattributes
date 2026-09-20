@@ -1,2 +1,8 @@
-# shell 脚本强制 LF，保证 bash 兼容执行
+# 全部文本一律 LF。仓库在 Windows 与 Linux 两边开发,本机 core.autocrlf=true 会让
+# 同一份文件在两边得到不同行尾,git diff 与 cargo fmt 的结论随之分叉。统一 LF 后
+# 提交内容与工作树一致。二进制由 text=auto 自动识别,不受影响;真正需要 CRLF 的
+# 文件(如 .bat)在下面单独写例外。
+* text=auto eol=lf
+
+# shell 脚本强制 LF,保证 bash 兼容执行
 *.sh text eol=lf

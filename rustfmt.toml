@@ -1,0 +1,4 @@
+# 唯一显式项是行尾:Windows 本地检出为 CRLF、Linux CI 为 LF,而 rustfmt 的
+# newline_style 默认跟随平台,会让同一次提交在两边得到不同的 fmt --check 结论。
+# 其余保持 rustfmt 默认(行宽 100、edition 取自 Cargo.toml)。
+newline_style = "Unix"

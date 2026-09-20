@@ -1,9 +1,28 @@
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::Duration;
+
+/// Upper bound on buffered server lines. When full, the reader thread blocks,
+/// the stdout pipe fills, and the server's writes block in turn: backpressure
+/// reaches the server instead of growing our memory without bound. Bounded by
+/// line count, not bytes, but each line is a single JSON-RPC frame and a
+/// server that outpaces us by this many responses is already misbehaving.
+const READER_CHANNEL_LINES: usize = 1024;
+/// Ceiling for one stdin write. Matches the response timeout's spirit: a
+/// server that stops reading its stdin (deadlock) must surface as an error
+/// here instead of hanging the calling thread forever.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+enum WriteOutcome {
+    Done,
+    Failed(io::Error),
+}
+
+/// One queued stdin write plus the one-shot ack it must signal.
+type WriteCommand = (String, SyncSender<WriteOutcome>);
 
 /// Byte stream to an MCP peer, framed as newline-delimited JSON.
 pub trait Transport: Send {
@@ -15,10 +34,12 @@ pub trait Transport: Send {
 }
 
 /// Transport over a spawned server process: JSON-RPC lines in, JSON-RPC lines
-/// out. A reader thread drains stdout so responses can carry a deadline.
+/// out. A reader thread drains stdout so responses can carry a deadline; a
+/// writer thread owns stdin so a server that stops reading surfaces as a
+/// write timeout rather than a permanently hung caller.
 pub struct StdioTransport {
     child: Child,
-    stdin: ChildStdin,
+    writer: mpsc::Sender<WriteCommand>,
     lines: mpsc::Receiver<io::Result<String>>,
 }
 
@@ -47,7 +68,7 @@ impl StdioTransport {
             io::Error::new(io::ErrorKind::BrokenPipe, "mcp server stdout unavailable")
         })?;
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(READER_CHANNEL_LINES);
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
@@ -69,9 +90,30 @@ impl StdioTransport {
             }
         });
 
+        let (write_tx, write_rx): (mpsc::Sender<WriteCommand>, mpsc::Receiver<WriteCommand>) =
+            mpsc::channel();
+        thread::spawn(move || {
+            let mut stdin = stdin;
+            for (line, ack) in write_rx {
+                let outcome = (|| {
+                    stdin.write_all(line.as_bytes())?;
+                    stdin.write_all(b"\n")?;
+                    stdin.flush()
+                })();
+                let outcome = match outcome {
+                    Ok(()) => WriteOutcome::Done,
+                    Err(error) => WriteOutcome::Failed(error),
+                };
+                if ack.send(outcome).is_err() {
+                    break;
+                }
+            }
+            // Dropping stdin here signals EOF to the server.
+        });
+
         Ok(Self {
             child,
-            stdin,
+            writer: write_tx,
             lines: rx,
         })
     }
@@ -79,9 +121,22 @@ impl StdioTransport {
 
 impl Transport for StdioTransport {
     fn send_line(&mut self, line: &str) -> io::Result<()> {
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        self.writer
+            .send((line.to_string(), ack_tx))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "mcp server stdin closed"))?;
+        match ack_rx.recv_timeout(WRITE_TIMEOUT) {
+            Ok(WriteOutcome::Done) => Ok(()),
+            Ok(WriteOutcome::Failed(error)) => Err(error),
+            Err(RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "mcp server stdin writer stopped",
+            )),
+            Err(RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "mcp server stopped reading stdin",
+            )),
+        }
     }
 
     fn recv_line(&mut self, timeout: Duration) -> io::Result<Option<String>> {

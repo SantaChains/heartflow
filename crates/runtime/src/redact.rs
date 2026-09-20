@@ -1,7 +1,7 @@
 //! Persistence-boundary redaction.
 //!
 //! The transcript that reaches disk (the authoritative per-session JSON
-//! snapshot and the SQLite search mirror) must never carry live credentials:
+//! snapshot and the `SQLite` search mirror) must never carry live credentials:
 //! users paste keys into prompts, and tool output (curl, git, build logs)
 //! echoes secrets. Redaction runs on a *clone* at the single save choke-point,
 //! so the in-memory session that talks to the provider is never mutated — the

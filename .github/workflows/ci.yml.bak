@@ -1,3 +1,9 @@
+# 刻意停用:改名 .bak 后 GitHub 不再识别它。这是本仓库的既定选择,不是遗漏。
+# 本仓库不做每 push 的 CI 质量门——fmt/clippy/test 由作者在 push 之前本地跑完再推,
+# CI 里再跑一遍只烧 Actions 额度,不产生新信息。真正需要 CI 的只有 release.yml 的发版链。
+# 若日后要恢复:先改回 ci.yml,并注意下面 toolchain 写死的 "1.85" 低于依赖的 MSRV
+# (真实下限 1.88,见根 Cargo.toml 的 [workspace.package] rust-version)。
+
 name: CI
 
 on:

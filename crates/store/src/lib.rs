@@ -1,4 +1,4 @@
-//! System-level SQLite store for conversation history.
+//! System-level `SQLite` store for conversation history.
 //!
 //! Sessions persisted as loose JSON files are already retrievable; the value
 //! this crate adds is *queryable* history: full-text search across every past
@@ -44,7 +44,7 @@ pub enum Integrity {
     /// Every page, index, and FTS shadow table is structurally consistent.
     Ok,
     /// Inconsistencies were found. `problems` holds the raw diagnostic lines and
-    /// `truncated` is true when SQLite stopped early at its error cap, meaning
+    /// `truncated` is true when `SQLite` stopped early at its error cap, meaning
     /// more issues exist than are listed.
     Corrupt {
         problems: Vec<String>,
@@ -53,7 +53,7 @@ pub enum Integrity {
 }
 
 /// Interpret the rows returned by an integrity pragma. A healthy run yields a
-/// single `"ok"` row. Otherwise each row is one problem; SQLite appends a
+/// single `"ok"` row. Otherwise each row is one problem; `SQLite` appends a
 /// "suppressing further errors" line when it stops at its cap.
 fn classify_integrity(rows: Vec<String>) -> Integrity {
     if rows.len() == 1 && rows[0] == "ok" {
@@ -68,11 +68,11 @@ fn classify_integrity(rows: Vec<String>) -> Integrity {
     }
 }
 
-/// Owns the SQLite connection and exposes the persistence + retrieval API.
+/// Owns the `SQLite` connection and exposes the persistence + retrieval API.
 ///
 /// The connection is opened once and shared for the process lifetime. It is
 /// wrapped in a `Mutex` so every method is `&self` (a system store handed out
-/// by reference); SQLite's `busy_timeout` plus WAL keep concurrent readers and
+/// by reference); `SQLite`'s `busy_timeout` plus WAL keep concurrent readers and
 /// writers from erroring even across processes.
 pub struct Store {
     conn: Mutex<Connection>,
@@ -368,7 +368,7 @@ impl Store {
         Ok(())
     }
 
-    /// Run SQLite's full structural integrity scan of the database file. This
+    /// Run `SQLite`'s full structural integrity scan of the database file. This
     /// checks every page, index, and FTS5 shadow table; `Integrity::Ok` means the
     /// file is sound. Cost is a full O(size) scan, so callers gate it to on-demand
     /// diagnostics (see `quick_check` for the cheaper variant).
@@ -384,7 +384,7 @@ impl Store {
     }
 
     /// Run an integrity pragma and interpret its rows. A healthy run yields a
-    /// single `"ok"` row; otherwise SQLite emits one diagnostic line per problem
+    /// single `"ok"` row; otherwise `SQLite` emits one diagnostic line per problem
     /// (bounded by its own error cap) and may stop early.
     fn run_integrity(&self, pragma: &str) -> Result<Integrity, StoreError> {
         let conn = self.lock()?;

@@ -1,0 +1,10 @@
+# 开发与 CI 的单一工具链事实源。workflow 不再用 dtolnay/rust-toolchain@stable,而是
+# `rustup show`,由本文件决定版本——否则 CI 跟随 stable 漂移,本地与 CI 的 fmt/clippy
+# 结果不可复现。
+#
+# 下限来自依赖,不是偏好:image、time、simd-json、globset、ignore、encoding_rs 都要求
+# rustc >= 1.88。升级本文件时同步 [workspace.package] 的 rust-version 与 README 徽章,
+# 并重跑一次 cargo fmt 与 workspace 测试。
+[toolchain]
+channel = "1.93.1"
+components = ["rustfmt", "clippy"]

@@ -1,7 +1,7 @@
 # heartflow
 
 [![license: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 [![docs](https://img.shields.io/badge/docs-mdBook-informational)](https://github.com/SantaChains/heartflow/tree/main/docs/src)
 [![context7](https://img.shields.io/badge/Context7-enabled-blue)](https://context7.com/santachains/heartflow)
 [![deepwiki](https://img.shields.io/badge/DeepWiki-ask-green)](https://deepwiki.com/SantaChains/heartflow)

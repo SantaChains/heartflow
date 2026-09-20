@@ -361,11 +361,13 @@ fn html_to_text(html: &str) -> String {
             out.push(' ');
             continue;
         }
+        // Search the entity window by byte: `;` is ASCII, so its offset is always
+        // a char boundary, while `i + 12` need not be (a window cut mid-character
+        // would panic on the slice below).
         if bytes[i] == b'&' {
-            let window = &lower[i..(i + 12).min(lower.len())];
-            if let Some(semi) = window.find(';') {
-                let entity = &lower[i + 1..i + semi];
-                out.push_str(&decode_entity(entity));
+            let limit = (i + 12).min(bytes.len());
+            if let Some(semi) = bytes[i..limit].iter().position(|b| *b == b';') {
+                out.push_str(&decode_entity(&lower[i + 1..i + semi]));
                 i += semi + 1;
                 continue;
             }
@@ -419,11 +421,11 @@ fn decode_html_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0usize;
     while i < bytes.len() {
+        // Same byte-wise scan as `html_to_text`, for the same reason.
         if bytes[i] == b'&' {
-            let window = &lower[i..(i + 12).min(lower.len())];
-            if let Some(semi) = window.find(';') {
-                let entity = &lower[i + 1..i + semi];
-                out.push_str(&decode_entity(entity));
+            let limit = (i + 12).min(bytes.len());
+            if let Some(semi) = bytes[i..limit].iter().position(|b| *b == b';') {
+                out.push_str(&decode_entity(&lower[i + 1..i + semi]));
                 i += semi + 1;
                 continue;
             }
@@ -803,9 +805,9 @@ fn decode_ddg_redirect(href: &str) -> String {
 mod tests {
     use super::{
         attr, build_cookie_header, collapse_whitespace, decode_ddg_redirect, decode_entity,
-        ensure_public, extract_title, host_matches, html_to_markdown, html_to_text, is_blocked_ip,
-        load_cookie_jar, parse_duckduckgo, parse_set_cookie, save_cookie_jar, store_set_cookies,
-        CookieJar,
+        decode_html_text, ensure_public, extract_title, host_matches, html_to_markdown,
+        html_to_text, is_blocked_ip, load_cookie_jar, parse_duckduckgo, parse_set_cookie,
+        save_cookie_jar, store_set_cookies, CookieJar,
     };
     use std::net::IpAddr;
 
@@ -867,6 +869,18 @@ mod tests {
         assert_eq!(decode_entity("#x41"), "A");
         assert_eq!(decode_entity("unknown"), "&unknown;");
         assert_eq!(collapse_whitespace("  a \n b\tc  "), "a b c");
+    }
+
+    #[test]
+    fn entity_scan_never_splits_a_multibyte_character() {
+        // A bare `&` followed by CJK text used to cut the 12-byte scan window
+        // mid-character and panic on the slice.
+        assert_eq!(
+            html_to_text("<p>&中文中文中文中文</p>"),
+            "&中文中文中文中文"
+        );
+        assert_eq!(decode_html_text("&中文中文中文中文"), "&中文中文中文中文");
+        assert_eq!(decode_html_text("&amp;中文"), "&中文");
     }
 
     #[test]

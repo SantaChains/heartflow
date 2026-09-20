@@ -2,7 +2,7 @@
 //!
 //! hf does not reimplement PDF/Office/archive parsing: `rga` already does it
 //! through its adapter chain (zip, tar, gzip/xz/zstd, pdf, pandoc, ...) and
-//! caches preprocessed output in its own SQLite cache keyed by adapter
+//! caches preprocessed output in its own `SQLite` cache keyed by adapter
 //! version + path + mtime. When `rga` is on PATH this tool gives the agent
 //! one-shot regex search over `doc.zip!inner/file` content; when it is
 //! missing the error explains exactly what to install. The probe result is

@@ -206,25 +206,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Some(path) => path,
                 None => pick_session()?,
             };
-            match command {
+            if let Some(command) = command {
                 // One-shot slash command run against the saved session, then exit.
-                Some(command) => resume_session(&session_path, &command),
-                // No --run: reopen the interactive REPL with the conversation restored.
-                None => {
-                    let session = load_saved_session(&session_path)
-                        .map_err(|error| format!("failed to restore session: {error}"))?;
-                    // Continue this transcript in place: adopt its id so later
-                    // turns overwrite the same file and update the same row.
-                    adopt_session_path(&session_path);
-                    let selection = resolve_selection(provider.as_deref(), model.as_deref())?;
-                    println!(
-                        "Restored session from {} ({} messages).",
-                        session_path.display(),
-                        session.messages.len()
-                    );
-                    run_repl(selection, session).await?;
-                }
+                resume_session(&session_path, &command);
+                return Ok(());
             }
+            // No --run: reopen the interactive REPL with the conversation restored.
+            let session = load_saved_session(&session_path)
+                .map_err(|error| format!("failed to restore session: {error}"))?;
+            // Continue this transcript in place: adopt its id so later
+            // turns overwrite the same file and update the same row.
+            adopt_session_path(&session_path);
+            let selection = resolve_selection(provider.as_deref(), model.as_deref())?;
+            println!(
+                "Restored session from {} ({} messages).",
+                session_path.display(),
+                session.messages.len()
+            );
+            run_repl(selection, session).await?;
         }
         Action::Prompt {
             instruction,
@@ -246,7 +245,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             if quiet || json {
                 let (text, usage) = run_turn_capture(&mut runtime, &prompt).await?;
-                let saved = save_session(runtime.session()).ok();
+                let saved = save_session_async(runtime.session()).await.ok();
                 if json {
                     println!("{}", turn_json(&text, usage.as_ref(), saved.as_deref()));
                 } else {
@@ -439,7 +438,7 @@ fn run_doctor(fix: bool) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     Ok(problems)
 }
 
-/// Above this size `hf doctor` falls back to SQLite's cheaper `quick_check` so
+/// Above this size `hf doctor` falls back to `SQLite`'s cheaper `quick_check` so
 /// the diagnostic stays prompt; below it the full `integrity_check` runs because
 /// the scan is cheap and maximally thorough (index-vs-row cross-checks included).
 const QUICK_CHECK_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
@@ -700,6 +699,9 @@ struct Cli {
     /// opens a specific file. The value must use `=` so a bare `--resume` never
     /// swallows a following subcommand token.
     #[arg(long, num_args = 0..=1, require_equals = true, value_name = "PATH")]
+    // Two-level Option is the clap idiom for a tri-state flag: absent, bare
+    // `--resume`, or `--resume=PATH`. An enum would fight the derive macros.
+    #[allow(clippy::option_option)]
     resume: Option<Option<PathBuf>>,
     /// Slash command to run right after resuming (requires --resume).
     #[arg(long, value_name = "CMD", requires = "resume")]
@@ -814,7 +816,7 @@ impl Cli {
             resume,
             run,
             command,
-            version: _,
+            version: (),
         } = self;
         if let Some(session_path) = resume {
             if command.is_some() {
@@ -829,8 +831,7 @@ impl Cli {
             });
         }
         match command {
-            None => Ok(Action::Repl { provider, model }),
-            Some(Command::Chat) => Ok(Action::Repl { provider, model }),
+            None | Some(Command::Chat) => Ok(Action::Repl { provider, model }),
             Some(Command::Prompt { text, quiet, json }) => Ok(Action::Prompt {
                 instruction: text.join(" "),
                 provider,
@@ -1177,7 +1178,7 @@ fn sessions_dir() -> PathBuf {
     home_dir().join(".heartflow").join("sessions")
 }
 
-/// System-level SQLite history database (searchable mirror of saved sessions).
+/// System-level `SQLite` history database (searchable mirror of saved sessions).
 fn store_path() -> PathBuf {
     home_dir().join(".heartflow").join("heartflow.db")
 }
@@ -1227,6 +1228,16 @@ fn save_session(session: &Session) -> io::Result<PathBuf> {
     // authoritative, so a store failure must never fail the save.
     mirror_to_store(&path, &redacted);
     Ok(path)
+}
+
+/// Async wrapper around [`save_session`]: the whole chain (regex scrub,
+/// multi-MB serialize, file rename, `SQLite` mirror) is blocking work, so it
+/// runs on the blocking pool instead of stalling a reactor worker mid-turn.
+async fn save_session_async(session: &Session) -> io::Result<PathBuf> {
+    let session = session.clone();
+    tokio::task::spawn_blocking(move || save_session(&session))
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?
 }
 
 /// Per-process redaction cache: the redacted prefix of the current transcript,
@@ -1396,7 +1407,7 @@ fn mirror_to_store(json_path: &Path, session: &Session) {
     }
 }
 
-/// Per-process mirror bookkeeping so the SQLite history is written incrementally
+/// Per-process mirror bookkeeping so the `SQLite` history is written incrementally
 /// instead of re-dumping the whole transcript every turn.
 ///
 /// The JSON transcript stays authoritative and keeps its per-save file naming;
@@ -1473,7 +1484,7 @@ fn current_session_id() -> String {
 
 /// Rebind persistence to `id`: point future saves at that conversation and drop
 /// the mirror tracker so the next write re-initializes (full, not append) under
-/// the same id, keeping the JSON file and the SQLite row keyed identically.
+/// the same id, keeping the JSON file and the `SQLite` row keyed identically.
 fn rebind_conversation(id: String) {
     if let Ok(mut guard) = SESSION_ID.lock() {
         *guard = Some(id);
@@ -1545,42 +1556,22 @@ async fn run_repl(
     // already the final one.
     let mut model = HeartModel::new();
     mascot::draw_banner(theme::Theme::current(), &mut io::stdout())?;
-    println!("heartflow interactive mode");
-    println!(
-        "Input: Enter sends, Alt/Shift+Enter newline, Up/Down history, Tab completes / commands."
-    );
-    println!("Quit with /exit or Ctrl+D. Ctrl+C interrupts a running turn; on an idle line it just clears it.");
+    print_repl_preamble();
 
     loop {
-        // Turn boundary: a finished turn's queued follow-ups are merged into
-        // one injection message here (locked semantics: never interrupt, always
-        // deliver after the turn). A refused/failed injection is re-queued by
-        // the submit path below, so nothing is lost.
-        if let Some(injection) = model.queue_mut().drain_injection() {
-            model.begin_turn();
-            let delivery = if planning {
-                run_turn_interactive(&mut runtime, &injection, Some(&mut BlockPrompter)).await
-            } else {
-                run_turn_interactive(&mut runtime, &injection, Some(&mut prompter)).await
-            };
-            model.end_turn();
-            match delivery {
-                Ok(outcome) => {
-                    maybe_auto_compact(&mut runtime);
-                    editor.note_turn(outcome.ok);
-                }
-                Err(error) => {
-                    println!("queued delivery failed: {error}");
-                    editor.note_turn(false);
-                    let _ = model.enqueue(&injection);
-                }
-            }
-        }
+        deliver_queued_injection(
+            &mut runtime,
+            &mut model,
+            planning,
+            &mut prompter,
+            &mut editor,
+        )
+        .await;
         // Ctrl+D / EOF is a documented quit path (see the banner): save the
         // session and print the resume command just like `/exit`, so the
         // conversation is never silently dropped on the EOF path.
         let Some(line) = editor.read_line()? else {
-            exit_with_resume_hint(&runtime);
+            exit_with_resume_hint(&runtime).await;
             break;
         };
         // Config edited on disk since the last turn: re-resolve the provider and
@@ -1590,104 +1581,220 @@ async fn run_repl(
             planning = false;
         }
         let trimmed = line.trim();
-        match trimmed {
-            "" => {}
-            "/exit" | "/quit" => {
-                exit_with_resume_hint(&runtime);
-                break;
-            }
-            "/help" => print_repl_help(),
-            "/status" => print_status(&runtime, selection.model(), &mode),
-            "/save" => match save_session(runtime.session()) {
-                Ok(path) => println!("session saved -> {}", path.display()),
-                Err(error) => println!("failed to save session: {error}"),
-            },
-            "/clear" => handle_clear_command(
-                &selection,
-                &mode,
+        let control = if trimmed.starts_with('/') {
+            dispatch_slash_command(
+                trimmed,
                 &mut runtime,
+                &mut selection,
+                &mut mode,
                 &mut planning,
                 &mut plan_path,
-            ),
-            "/sessions" => print_sessions_listing(),
-            _ if trimmed == "/open" || trimmed.starts_with("/open ") => {
-                handle_open_command(trimmed, &selection, &mode, &mut runtime);
-            }
-            _ if trimmed == "/remember" || trimmed.starts_with("/remember ") => {
-                handle_remember_command(trimmed);
-            }
-            "/compact" => force_compact(&mut runtime),
-            "/pin" => handle_pin_command(&mut runtime),
-            "/mcp" => print_mcp_status(&runtime),
-            "/restart" => {
-                if confirm_restart() {
-                    RESTART_REQUESTED.store(true, Ordering::SeqCst);
-                    break;
+                &mut model,
+                &mut prompter,
+                &cwd,
+            )
+            .await?
+        } else if trimmed.starts_with('!') {
+            handle_bang_command(trimmed).await;
+            LoopControl::Continue
+        } else {
+            // Running turns cannot be submitted through the blocking line
+            // editor yet (P4-c); keep the queue routing explicit so the
+            // ratatui event loop only has to flip `begin_turn`.
+            if model.is_running() {
+                if !model.enqueue(trimmed) {
+                    println!("follow-up queue is full; /queue to inspect");
                 }
-                println!("restart cancelled.");
-            }
-            _ if trimmed == "/search" || trimmed.starts_with("/search ") => {
-                handle_search_command(trimmed);
-            }
-            _ if trimmed == "/expand" || trimmed.starts_with("/expand ") => {
-                handle_expand_command(trimmed);
-            }
-            _ if trimmed == "/queue" || trimmed.starts_with("/queue ") => {
-                handle_queue_command(trimmed, &mut model);
-            }
-            _ if trimmed == "/guide" || trimmed.starts_with("/guide ") => {
-                handle_guide_command(trimmed, &runtime);
-            }
-            "/init" => match write_agents_skeleton(&cwd, false) {
-                Ok(message) => println!("{message}"),
-                Err(error) => println!("failed to write AGENTS.md: {error}"),
-            },
-            _ if trimmed == "/mode" || trimmed.starts_with("/mode ") => {
-                handle_mode_command(trimmed, &mut mode, &selection, &mut runtime);
-                planning = false;
-            }
-            _ if trimmed == "/model" || trimmed.starts_with("/model ") => {
-                handle_model_command(trimmed, &mut selection, &mut runtime, &mode);
-                planning = false;
-            }
-            _ if trimmed == "/plan" || trimmed.starts_with("/plan ") => {
-                handle_plan_command(
-                    trimmed,
-                    &mut planning,
-                    &mut plan_path,
-                    &cwd,
-                    &mode,
-                    &mut runtime,
-                    &mut prompter,
-                )
-                .await?;
-            }
-            _ if trimmed.starts_with('!') => {
-                handle_bang_command(trimmed).await;
-            }
-            _ if trimmed.starts_with('/') => report_unknown_command(trimmed),
-            _ => {
-                // Running turns cannot be submitted through the blocking line
-                // editor yet (P4-c); keep the queue routing explicit so the
-                // ratatui event loop only has to flip `begin_turn`.
-                if model.is_running() {
-                    if !model.enqueue(trimmed) {
-                        println!("follow-up queue is full; /queue to inspect");
-                    }
+            } else {
+                let outcome = if planning {
+                    run_turn_interactive(&mut runtime, trimmed, Some(&mut BlockPrompter)).await?
                 } else {
-                    let outcome = if planning {
-                        run_turn_interactive(&mut runtime, trimmed, Some(&mut BlockPrompter))
-                            .await?
-                    } else {
-                        run_turn_interactive(&mut runtime, trimmed, Some(&mut prompter)).await?
-                    };
-                    editor.note_turn(outcome.ok);
-                }
-                maybe_auto_compact(&mut runtime);
+                    run_turn_interactive(&mut runtime, trimmed, Some(&mut prompter)).await?
+                };
+                editor.note_turn(outcome.ok);
             }
+            maybe_auto_compact(&mut runtime);
+            LoopControl::Continue
+        };
+        match control {
+            LoopControl::Continue => {}
+            LoopControl::Exit => break,
         }
     }
     Ok(())
+}
+
+/// What the REPL loop should do after one input line is fully handled.
+enum LoopControl {
+    Continue,
+    Exit,
+}
+
+/// Banner lines printed once before the loop starts.
+fn print_repl_preamble() {
+    println!("heartflow interactive mode");
+    println!(
+        "Input: Enter sends, Alt/Shift+Enter newline, Up/Down history, Tab completes / commands."
+    );
+    println!("Quit with /exit or Ctrl+D. Ctrl+C interrupts a running turn; on an idle line it just clears it.");
+}
+
+/// `/save` from the REPL: persist the live session and report the path or the
+/// failure inline (a failed save is a status message, never an abort).
+async fn save_and_report(runtime: &AgentRuntime) {
+    match save_session_async(runtime.session()).await {
+        Ok(path) => println!("session saved -> {}", path.display()),
+        Err(error) => println!("failed to save session: {error}"),
+    }
+}
+
+/// Turn boundary: a finished turn's queued follow-ups are merged into one
+/// injection message here (locked semantics: never interrupt, always deliver
+/// after the turn). A refused/failed injection is re-queued by the caller, so
+/// nothing is lost.
+async fn deliver_queued_injection(
+    runtime: &mut AgentRuntime,
+    model: &mut HeartModel,
+    planning: bool,
+    prompter: &mut CliPermissionPrompter,
+    editor: &mut editor::ReplEditor,
+) {
+    let Some(injection) = model.queue_mut().drain_injection() else {
+        return;
+    };
+    model.begin_turn();
+    let delivery = if planning {
+        run_turn_interactive(runtime, &injection, Some(&mut BlockPrompter)).await
+    } else {
+        run_turn_interactive(runtime, &injection, Some(prompter)).await
+    };
+    model.end_turn();
+    match delivery {
+        Ok(outcome) => {
+            maybe_auto_compact(runtime);
+            editor.note_turn(outcome.ok);
+        }
+        Err(error) => {
+            println!("queued delivery failed: {error}");
+            editor.note_turn(false);
+            let _ = model.enqueue(&injection);
+        }
+    }
+}
+
+/// Route one `/`-prefixed line. Slash handling is inherently wide: the
+/// subcommands touch every piece of REPL state, which is why this takes the
+/// state pieces as separate `&mut`s instead of a bundled struct.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_slash_command(
+    trimmed: &str,
+    runtime: &mut AgentRuntime,
+    selection: &mut ProviderSelection,
+    mode: &mut String,
+    planning: &mut bool,
+    plan_path: &mut Option<PathBuf>,
+    model: &mut HeartModel,
+    prompter: &mut CliPermissionPrompter,
+    cwd: &Path,
+) -> Result<LoopControl, Box<dyn std::error::Error>> {
+    // Every arm yields the loop-level control directly; the match is wrapped in
+    // `Ok` once so each arm stays one statement shorter.
+    Ok(match trimmed {
+        "/exit" | "/quit" => {
+            exit_with_resume_hint(runtime).await;
+            LoopControl::Exit
+        }
+        "/help" => {
+            print_repl_help();
+            LoopControl::Continue
+        }
+        "/status" => {
+            print_status(runtime, selection.model(), mode);
+            LoopControl::Continue
+        }
+        "/save" => {
+            save_and_report(runtime).await;
+            LoopControl::Continue
+        }
+        "/clear" => {
+            handle_clear_command(selection, mode, runtime, planning, plan_path);
+            LoopControl::Continue
+        }
+        "/sessions" => {
+            print_sessions_listing();
+            LoopControl::Continue
+        }
+        _ if trimmed == "/open" || trimmed.starts_with("/open ") => {
+            handle_open_command(trimmed, selection, mode, runtime);
+            LoopControl::Continue
+        }
+        _ if trimmed == "/remember" || trimmed.starts_with("/remember ") => {
+            handle_remember_command(trimmed);
+            LoopControl::Continue
+        }
+        "/compact" => {
+            force_compact(runtime);
+            LoopControl::Continue
+        }
+        "/pin" => {
+            handle_pin_command(runtime);
+            LoopControl::Continue
+        }
+        "/mcp" => {
+            print_mcp_status(runtime);
+            LoopControl::Continue
+        }
+        "/restart" => {
+            if confirm_restart() {
+                RESTART_REQUESTED.store(true, Ordering::SeqCst);
+                LoopControl::Exit
+            } else {
+                println!("restart cancelled.");
+                LoopControl::Continue
+            }
+        }
+        _ if trimmed == "/search" || trimmed.starts_with("/search ") => {
+            handle_search_command(trimmed);
+            LoopControl::Continue
+        }
+        _ if trimmed == "/expand" || trimmed.starts_with("/expand ") => {
+            handle_expand_command(trimmed);
+            LoopControl::Continue
+        }
+        _ if trimmed == "/queue" || trimmed.starts_with("/queue ") => {
+            handle_queue_command(trimmed, model);
+            LoopControl::Continue
+        }
+        _ if trimmed == "/guide" || trimmed.starts_with("/guide ") => {
+            handle_guide_command(trimmed, runtime);
+            LoopControl::Continue
+        }
+        "/init" => {
+            match write_agents_skeleton(cwd, false) {
+                Ok(message) => println!("{message}"),
+                Err(error) => println!("failed to write AGENTS.md: {error}"),
+            }
+            LoopControl::Continue
+        }
+        _ if trimmed == "/mode" || trimmed.starts_with("/mode ") => {
+            handle_mode_command(trimmed, mode, selection, runtime);
+            *planning = false;
+            LoopControl::Continue
+        }
+        _ if trimmed == "/model" || trimmed.starts_with("/model ") => {
+            handle_model_command(trimmed, selection, runtime, mode);
+            *planning = false;
+            LoopControl::Continue
+        }
+        _ if trimmed == "/plan" || trimmed.starts_with("/plan ") => {
+            handle_plan_command(trimmed, planning, plan_path, cwd, mode, runtime, prompter).await?;
+            LoopControl::Continue
+        }
+        _ => {
+            report_unknown_command(trimmed);
+            LoopControl::Continue
+        }
+    })
 }
 
 /// `/queue` — inspect and edit the pending follow-up messages.
@@ -1843,8 +1950,8 @@ fn print_sessions_listing() {
 
 /// Save the live session on the way out and print the exact command to resume
 /// this section later, so `/exit` leaves a clear path back to the conversation.
-fn exit_with_resume_hint(runtime: &AgentRuntime) {
-    match save_session(runtime.session()) {
+async fn exit_with_resume_hint(runtime: &AgentRuntime) {
+    match save_session_async(runtime.session()).await {
         Ok(path) => {
             println!("session saved -> {}", path.display());
             println!("to resume this section: hf --resume=\"{}\"", path.display());
@@ -2461,7 +2568,7 @@ fn handle_expand_command(input: &str) {
     println!("{}", log[index]);
 }
 
-/// Search saved conversation history (the SQLite store) for a text query.
+/// Search saved conversation history (the `SQLite` store) for a text query.
 fn handle_search_command(input: &str) {
     let query = input
         .strip_prefix("/search")
@@ -2941,7 +3048,7 @@ async fn run_turn_interactive(
             } else {
                 println!("{}", format!("✘ {error}").red());
             }
-            if let Ok(path) = save_session(runtime.session()) {
+            if let Ok(path) = save_session_async(runtime.session()).await {
                 println!(
                     "{}",
                     format!("· session saved to {}", path.display()).dark_grey()
@@ -2965,7 +3072,7 @@ async fn run_turn_interactive(
             .dark_grey()
         );
     }
-    if let Ok(path) = save_session(runtime.session()) {
+    if let Ok(path) = save_session_async(runtime.session()).await {
         println!("{}", format!("· saved {}", path.display()).dark_grey());
     }
     Ok(outcome)

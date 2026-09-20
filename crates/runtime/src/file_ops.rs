@@ -904,8 +904,9 @@ fn scan_file(
             let end = (index + input.after.unwrap_or(context) + 1).min(lines.len());
             for (i, line) in lines.iter().enumerate().take(end).skip(start) {
                 // Budget guard: 0 means exhausted (never decrement through it).
+                // `fetch_update` is the stable CAS loop; on 0 it errs untouched.
                 if content_budget
-                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                     .is_err()
                 {
                     return Some(FileScan {
