@@ -12,7 +12,7 @@ provider 配置解析与 API 流式桥接层:把 `[provider]` 配置归并成传
 
 ## 依赖方向
 
-`provider → api`,被 `runtime` 与 `cli` 消费。provider 不感知终端与渲染;api 不感知会话语义。
+`provider → {api, runtime}`,被 `cli` 消费。provider 不感知终端与渲染;api 不感知会话语义。
 
 ## 配置接入
 
