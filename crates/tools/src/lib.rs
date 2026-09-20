@@ -1,6 +1,6 @@
 use runtime::{
-    apply_patch, edit_file, execute_bash, glob_search, grep_search, read_file, search_files,
-    write_file, BashCommandInput, GrepSearchInput, PatchChange,
+    apply_patch, edit_file, execute_bash, glob_search, grep_search, read_file, search_documents,
+    search_files, write_file, BashCommandInput, DocSearchInput, GrepSearchInput, PatchChange,
 };
 use schemars::generate::SchemaSettings;
 use schemars::JsonSchema;
@@ -209,8 +209,31 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
         },
         search_files_tool_spec(),
+        search_documents_tool_spec(),
         apply_patch_tool_spec(),
     ]
+}
+
+/// `search_documents` spec: regex search through document/archive content via
+/// an external `rga` (ripgrep-all), which owns the parsing and its cache.
+#[must_use]
+fn search_documents_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "search_documents",
+        description: "Search the extracted text INSIDE documents and archives (zip, tar, tar.gz, tgz, gz, docx, pdf, epub and more) with a regex. Powered by the external `rga` (ripgrep-all) binary; requires it on PATH and reports how to install it otherwise. Hits inside archives are reported as `archive.zip!inner/path` with line numbers. Use grep_search for plain source files and this for specifications, manuals, changelogs or backups shipped as documents.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string" },
+                "path": { "type": "string" },
+                "case_insensitive": { "type": "boolean" },
+                "glob": { "type": "string" },
+                "head_limit": { "type": "integer", "minimum": 1, "maximum": 500 }
+            },
+            "required": ["pattern", "path"],
+            "additionalProperties": false
+        }),
+    }
 }
 
 /// `apply_patch` spec: schema generated from `ApplyPatchInput` via schemars.
@@ -331,6 +354,7 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
         "glob_search" => from_value::<GlobSearchInputValue>(input).and_then(run_glob_search),
         "grep_search" => from_value::<GrepSearchInput>(input).and_then(run_grep_search),
         "search_files" => from_value::<SearchFilesInput>(input).and_then(run_search_files),
+        "search_documents" => from_value::<DocSearchInput>(input).and_then(run_search_documents),
         "apply_patch" => from_value::<ApplyPatchInput>(input).and_then(run_apply_patch),
         "verify_graphics" => from_value::<VerifyGraphicsInput>(input).and_then(run_verify_graphics),
         "web_fetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
@@ -390,6 +414,11 @@ fn run_search_files(input: SearchFilesInput) -> Result<String, String> {
         search_files(&input.query, input.path.as_deref(), input.limit)
             .map_err(|e| io_to_string(&e))?,
     )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_search_documents(input: DocSearchInput) -> Result<String, String> {
+    to_pretty_json(search_documents(&input).map_err(|error| error.to_string())?)
 }
 
 #[allow(clippy::needless_pass_by_value)]

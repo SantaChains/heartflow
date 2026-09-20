@@ -2447,13 +2447,36 @@ fn read_piped_stdin() -> Option<String> {
     }
 }
 
-/// Path inside an `@mention` token, tolerating quotes and the punctuation that
-/// naturally trails a mention in prose.
-fn mention_path(token: &str) -> Option<&str> {
-    let path = token.strip_prefix('@')?;
-    let path = path.trim_matches(|ch| ch == '"' || ch == '\'');
-    let path = path.trim_end_matches([',', '.', ';', ':', ')', ']', '}']);
-    (!path.is_empty()).then_some(path)
+/// Paths named by `@mention` in one line. A bare mention runs to the next space;
+/// a quoted one (`@"my shot.png"`) may contain spaces, which paths routinely do.
+/// Only a mention starting at a word boundary counts, so `mail@example.com` is
+/// left alone.
+fn mention_paths(text: &str) -> Vec<&str> {
+    let mut paths = Vec::new();
+    for (index, _) in text.match_indices('@') {
+        if text[..index]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| !ch.is_whitespace())
+        {
+            continue;
+        }
+        let rest = &text[index + 1..];
+        let candidate = match rest.strip_prefix('"') {
+            Some(quoted) => match quoted.find('"') {
+                Some(end) => &quoted[..end],
+                None => continue,
+            },
+            None => &rest[..rest.find(char::is_whitespace).unwrap_or(rest.len())],
+        };
+        let path = candidate
+            .trim_matches('\'')
+            .trim_end_matches([',', '.', ';', ':', ')', ']', '}']);
+        if !path.is_empty() {
+            paths.push(path);
+        }
+    }
+    paths
 }
 
 /// Turn the typed line into content blocks, promoting every `@path` that names
@@ -2465,7 +2488,7 @@ fn expand_attachments(text: &str) -> Vec<ContentBlock> {
         text: text.to_string(),
     }];
     let mut paths: Vec<&str> = Vec::new();
-    for candidate in text.split_whitespace().filter_map(mention_path) {
+    for candidate in mention_paths(text) {
         if tools::attachment_media_type(candidate).is_none() || paths.contains(&candidate) {
             continue;
         }
@@ -3245,6 +3268,7 @@ impl ToolExecutor for NativeToolExecutor {
                 | "glob_search"
                 | "grep_search"
                 | "search_files"
+                | "search_documents"
                 | "verify_graphics"
                 | "web_fetch"
                 | "web_search"
@@ -3506,6 +3530,7 @@ fn permission_policy_for_mode(mode: &str, mcp_read_only: &[String]) -> Permissio
             .with_tool_mode("glob_search", PermissionMode::Allow)
             .with_tool_mode("grep_search", PermissionMode::Allow)
             .with_tool_mode("search_files", PermissionMode::Allow)
+            .with_tool_mode("search_documents", PermissionMode::Allow)
             .with_tool_mode("todo_write", PermissionMode::Allow)
             .with_tool_mode("verify_graphics", PermissionMode::Allow)
             .with_tool_mode("ask_user", PermissionMode::Allow),
@@ -3519,6 +3544,7 @@ fn permission_policy_for_mode(mode: &str, mcp_read_only: &[String]) -> Permissio
             .with_tool_mode("glob_search", PermissionMode::Allow)
             .with_tool_mode("grep_search", PermissionMode::Allow)
             .with_tool_mode("search_files", PermissionMode::Allow)
+            .with_tool_mode("search_documents", PermissionMode::Allow)
             .with_tool_mode("web_fetch", PermissionMode::Allow)
             .with_tool_mode("web_search", PermissionMode::Allow)
             .with_tool_mode("todo_write", PermissionMode::Allow)
@@ -4086,7 +4112,9 @@ fn maybe_sink_skill(
 
 #[cfg(test)]
 mod tests {
-    use super::{compose_prompt, write_agents_skeleton, Action, Cli};
+    use super::{
+        compose_prompt, expand_attachments, mention_paths, write_agents_skeleton, Action, Cli,
+    };
     use clap::Parser;
     use std::path::PathBuf;
 
@@ -4935,5 +4963,52 @@ mod tests {
                 model: None,
             }
         );
+    }
+
+    #[test]
+    fn mention_paths_tolerate_quotes_and_trailing_punctuation() {
+        assert_eq!(mention_paths("@shot.png"), vec!["shot.png"]);
+        assert_eq!(mention_paths("@\"my shot.png\""), vec!["my shot.png"]);
+        assert_eq!(mention_paths("@a/b/c.gif,"), vec!["a/b/c.gif"]);
+        assert_eq!(mention_paths("@mock(1).webp"), vec!["mock(1).webp"]);
+        assert_eq!(mention_paths("@'shot.png'"), vec!["shot.png"]);
+        // Mid-word `@` is an address, not a mention; empty mentions vanish.
+        assert!(mention_paths("mail@example.com").is_empty());
+        assert!(mention_paths("@").is_empty());
+        assert!(mention_paths("@'").is_empty());
+        // An unclosed quote names nothing rather than swallowing the line.
+        assert!(mention_paths("@\"unclosed.png").is_empty());
+    }
+
+    #[test]
+    fn expand_attachments_reads_only_supported_images() {
+        let dir = std::env::temp_dir().join(format!("hf-attach-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let png = dir.join("shot.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\npayload").expect("write png");
+        let notes = dir.join("notes.md");
+        std::fs::write(&notes, "plain text").expect("write md");
+
+        // Quoted because the temp path contains a space; the same file mentioned
+        // twice attaches once, and non-image mentions stay plain text.
+        let text = format!(
+            "compare @\"{0}\" and @\"{0}\" against @\"{1}\"",
+            png.display(),
+            notes.display()
+        );
+        let blocks = expand_attachments(&text);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0], runtime::ContentBlock::Text { text });
+        match &blocks[1] {
+            runtime::ContentBlock::Image { media_type, data } => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!(data, "iVBORw0KGgpwYXlsb2Fk");
+            }
+            other => panic!("expected an image block, got {other:?}"),
+        }
+
+        // A mention that does not resolve leaves the turn usable.
+        assert_eq!(expand_attachments("@ghost.png").len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
