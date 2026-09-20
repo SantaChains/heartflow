@@ -960,6 +960,7 @@ dependencies = [
  "serde",
  "serde_json",
  "similar",
+ "strsim",
  "tokio",
  "tokio-util",
 ]

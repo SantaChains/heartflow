@@ -289,7 +289,10 @@ pub fn edit_file(
     if !original_file.contains(old_string) {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "old_string not found in file",
+            format!(
+                "old_string not found in file{}",
+                nearest_snippet(&original_file, old_string).unwrap_or_default()
+            ),
         ));
     }
 
@@ -392,8 +395,9 @@ pub fn apply_patch(changes: &[PatchChange]) -> io::Result<ApplyPatchOutput> {
         let matches = entry.content.matches(change.old_string.as_str()).count();
         if matches == 0 {
             return Err(not_found(format!(
-                "old_string not found in {}",
-                change.path
+                "old_string not found in {}{}",
+                change.path,
+                nearest_snippet(&entry.content, &change.old_string).unwrap_or_default()
             )));
         }
         if matches > 1 && !change.replace_all {
@@ -1022,6 +1026,59 @@ fn apply_limit<T>(
     )
 }
 
+/// "Did you mean" hint for a failed exact replacement. Scans every window of
+/// the same line count as `old_string`: a cheap jaro-winkler pass ranks all
+/// candidates, the top few get a precise normalized-levenshtein score. Below
+/// the threshold nothing is returned - a wrong guess costs more than no hint.
+/// Returns `"; closest text at line N (82% similar):\n..."` ready to append.
+#[must_use]
+fn nearest_snippet(content: &str, old_string: &str) -> Option<String> {
+    const MIN_SIMILARITY: f64 = 0.7;
+    const COARSE_THRESHOLD: f64 = 0.5;
+    const MAX_WINDOWS: usize = 50_000;
+
+    let needle = old_string.trim_end();
+    if needle.is_empty() {
+        return None;
+    }
+    let span = needle.lines().count().max(1);
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() < span || lines.len() - span + 1 > MAX_WINDOWS {
+        return None;
+    }
+
+    let window_at = |start: usize| lines[start..start + span].join("\n");
+    let mut coarse: Vec<(usize, f64)> = (0..=lines.len() - span)
+        .map(|start| (start, strsim::jaro_winkler(needle, &window_at(start))))
+        .collect();
+    coarse.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut best: Option<(usize, f64)> = None;
+    for (start, score) in coarse.into_iter().take(10) {
+        if score < COARSE_THRESHOLD {
+            break;
+        }
+        let fine = strsim::normalized_levenshtein(needle, &window_at(start));
+        if best.is_none_or(|(_, top)| fine > top) {
+            best = Some((start, fine));
+        }
+    }
+    let (start, similarity) = best?;
+    if similarity < MIN_SIMILARITY {
+        return None;
+    }
+    let mut snippet = window_at(start);
+    if snippet.len() > 500 {
+        snippet.truncate(500);
+        snippet.push_str("...");
+    }
+    Some(format!(
+        "; closest text at line {} ({:.0}% similar):\n{snippet}",
+        start + 1,
+        similarity * 100.0
+    ))
+}
+
 /// Build real line-level diff hunks (with surrounding context) between the
 /// original and updated text. Uses `similar` (Myers) rather than a whole-file
 /// `-old/+new` dump, so callers and the model see a minimal, reviewable patch.
@@ -1386,6 +1443,27 @@ mod tests {
         assert_eq!(make_patch(original, updated).len(), 2, "two distant hunks");
         // Identical text produces no hunks at all.
         assert_eq!(make_patch(original, original).len(), 0);
+    }
+
+    #[test]
+    fn failed_edit_hints_at_the_closest_snippet() {
+        let content = "fn alpha() {\n    body_alpha();\n}\n\nfn beta() {\n    body_beta();\n}\n";
+        // One character off from the real `beta` block: similarity is high
+        // enough to surface a hint with the correct line number.
+        let hint = super::nearest_snippet(content, "fn beta() {\n    body_alpba();\n}\n")
+            .expect("close match should hint");
+        assert!(hint.contains("line 5"), "hint: {hint}");
+        assert!(hint.contains("similar"));
+
+        // Unrelated text stays silent - no wrong guesses.
+        assert_eq!(
+            super::nearest_snippet(content, "class completely_unrelated_signature"),
+            None
+        );
+        assert_eq!(
+            super::nearest_snippet("tiny", "x".repeat(50).as_str()),
+            None
+        );
     }
 
     #[test]
