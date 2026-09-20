@@ -3,6 +3,7 @@ use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
+use runtime::ContentBlock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -17,6 +18,53 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Images are a few MB; cap well above that but bounded.
 const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
 const USER_AGENT: &str = "heartflow/1.0";
+
+/// Media types accepted for a user attachment, keyed by file extension.
+const ATTACHMENT_MEDIA_TYPES: &[(&str, &str)] = &[
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("gif", "image/gif"),
+    ("webp", "image/webp"),
+];
+/// Attachment cap. The transcript keeps the encoded bytes, so stay far below
+/// the 48 MiB request ceiling every gateway shares.
+const MAX_ATTACHMENT_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Media type for a file extension providers accept, `None` otherwise.
+#[must_use]
+pub fn attachment_media_type(path: &str) -> Option<&'static str> {
+    let extension = std::path::Path::new(path)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)?
+        .to_ascii_lowercase();
+    ATTACHMENT_MEDIA_TYPES
+        .iter()
+        .find(|(candidate, _)| *candidate == extension)
+        .map(|(_, media_type)| *media_type)
+}
+
+/// Read a local image into an inline content block, base64 encoded as every
+/// dialect expects it on the wire.
+pub fn read_image_attachment(path: &str) -> Result<ContentBlock, ImageError> {
+    let media_type = attachment_media_type(path)
+        .ok_or_else(|| ImageError::Invalid(format!("unsupported image type: {path}")))?;
+    let metadata = std::fs::metadata(path).map_err(|error| ImageError::Io(error.to_string()))?;
+    if !metadata.is_file() {
+        return Err(ImageError::Io(format!("not a file: {path}")));
+    }
+    if metadata.len() > MAX_ATTACHMENT_BYTES {
+        return Err(ImageError::Invalid(format!(
+            "{path} exceeds {} MiB",
+            MAX_ATTACHMENT_BYTES / (1024 * 1024)
+        )));
+    }
+    let bytes = std::fs::read(path).map_err(|error| ImageError::Io(error.to_string()))?;
+    Ok(ContentBlock::Image {
+        media_type: media_type.to_string(),
+        data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+    })
+}
 
 /// Credentials and endpoint are opt-in via environment so this never shadows the
 /// chat provider's key. `HEARTFLOW_IMAGE_API_KEY` is required at call time.

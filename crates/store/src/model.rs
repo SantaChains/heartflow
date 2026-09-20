@@ -105,6 +105,8 @@ pub fn flatten_search_text(blocks: &[ContentBlock]) -> String {
                 continue;
             }
             ContentBlock::ToolResult { output, .. } => output.as_str(),
+            // Attachments carry no searchable text.
+            ContentBlock::Image { .. } => continue,
         };
         if !out.is_empty() {
             out.push(' ');

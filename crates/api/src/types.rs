@@ -106,6 +106,35 @@ pub enum InputContentBlock {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
     },
+    Image {
+        source: ImageSource,
+    },
+}
+
+/// Anthropic image envelope; only inline base64 payloads are modeled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageSource {
+    #[serde(rename = "type")]
+    pub kind: ImageSourceKind,
+    pub media_type: String,
+    pub data: String,
+}
+
+impl ImageSource {
+    #[must_use]
+    pub fn base64(media_type: impl Into<String>, data: impl Into<String>) -> Self {
+        Self {
+            kind: ImageSourceKind::Base64,
+            media_type: media_type.into(),
+            data: data.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageSourceKind {
+    Base64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

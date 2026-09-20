@@ -1,5 +1,10 @@
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
+/// Rough cost charged for one attached image while estimating context size.
+/// Providers bill by decoded pixels (~1 token per 750 px on a full-resolution
+/// tile), so a 1024x1024 attachment lands near this figure.
+const IMAGE_TOKEN_ESTIMATE: usize = 1_500;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionConfig {
     pub preserve_recent_messages: usize,
@@ -187,6 +192,7 @@ fn summarize_block(block: &ContentBlock, max_chars: usize) -> String {
             "tool_result {tool_name}: {}{output}",
             if *is_error { "error " } else { "" }
         ),
+        ContentBlock::Image { media_type, .. } => format!("image {media_type}"),
     };
     truncate_chars(&raw, max_chars)
 }
@@ -232,6 +238,10 @@ fn estimate_message_tokens(message: &ConversationMessage) -> usize {
             ContentBlock::ToolResult {
                 tool_name, output, ..
             } => estimate_text_tokens(tool_name) + estimate_text_tokens(output),
+            // Vision tokens track the decoded bitmap, not the base64 length:
+            // charging the payload would overestimate a large image by orders
+            // of magnitude and force premature compaction.
+            ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
         })
         .sum()
 }

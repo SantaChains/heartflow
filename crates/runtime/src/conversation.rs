@@ -48,6 +48,10 @@ pub enum AgentEvent {
     },
     Usage(TokenUsage),
     MessageStop,
+    /// The provider ended the turn early (`response.incomplete`, e.g. it ran
+    /// into `max_output_tokens`). Whatever streamed so far is kept and the turn
+    /// still finishes normally; the notice only warns that the answer is partial.
+    Truncated(String),
     Error(String),
 }
 
@@ -360,13 +364,33 @@ where
     pub async fn run_turn(
         &mut self,
         user_input: impl Into<String>,
+        prompter: Option<&mut dyn PermissionPrompter>,
+        notify: &mut (dyn FnMut(&AgentEvent) + Send),
+        cancel: &CancellationToken,
+    ) -> Result<TurnSummary, RuntimeError> {
+        self.run_turn_with_blocks(
+            vec![ContentBlock::Text {
+                text: user_input.into(),
+            }],
+            prompter,
+            notify,
+            cancel,
+        )
+        .await
+    }
+
+    /// Same turn loop as [`Self::run_turn`], for user input that carries more
+    /// than text (image attachments ride along as sibling blocks).
+    pub async fn run_turn_with_blocks(
+        &mut self,
+        blocks: Vec<ContentBlock>,
         mut prompter: Option<&mut dyn PermissionPrompter>,
         notify: &mut (dyn FnMut(&AgentEvent) + Send),
         cancel: &CancellationToken,
     ) -> Result<TurnSummary, RuntimeError> {
         self.session
             .messages
-            .push(ConversationMessage::user_text(user_input.into()));
+            .push(ConversationMessage::user_blocks(blocks));
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
@@ -535,6 +559,9 @@ where
                     Some(AgentEvent::MessageStop) => {
                         finished = true;
                         break;
+                    }
+                    Some(AgentEvent::Truncated(reason)) => {
+                        notify(&AgentEvent::Truncated(reason));
                     }
                     Some(AgentEvent::Error(message)) => {
                         error = Some(message);

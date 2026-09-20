@@ -13,7 +13,10 @@ mod todo;
 mod web;
 
 pub use graphics::{verify_graphics, GraphicsReport};
-pub use image::{generate_image, GenerateImageInput, GenerateImageReport, ImageConfig};
+pub use image::{
+    attachment_media_type, generate_image, read_image_attachment, GenerateImageInput,
+    GenerateImageReport, ImageConfig,
+};
 pub use todo::{task_id, todo_tool_spec, TodoItem, TodoLedger, TodoStatus};
 pub use web::{
     web_fetch, web_search, WebFetchInput, WebFetchReport, WebSearchHit, WebSearchInput,

@@ -202,11 +202,48 @@ pub struct ResponsesItem {
     pub arguments: Option<String>,
 }
 
-/// The terminal `response` payload (usage on completion).
+/// The terminal `response` payload (usage plus the reason a turn ended early).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResponsesPayload {
     #[serde(default)]
     pub usage: Option<ResponsesUsage>,
+    #[serde(default)]
+    pub incomplete_details: Option<IncompleteDetails>,
+    #[serde(default)]
+    pub error: Option<ResponsesError>,
+}
+
+impl ResponsesPayload {
+    /// Human-readable reason for an `incomplete` or `failed` response.
+    #[must_use]
+    pub fn failure_reason(&self) -> String {
+        if let Some(error) = &self.error {
+            let message = error.message.as_deref().unwrap_or("unknown error");
+            return match &error.code {
+                Some(code) => format!("{code}: {message}"),
+                None => message.to_string(),
+            };
+        }
+        self.incomplete_details
+            .as_ref()
+            .and_then(|details| details.reason.as_deref())
+            .unwrap_or("unknown reason")
+            .to_string()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IncompleteDetails {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResponsesError {
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

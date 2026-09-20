@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 
 use api::{
-    AnthropicClient, ApiError, ChatFunctionCall, ChatMessage, ChatRequest, ChatResponse, ChatRole,
-    ChatTool, ChatToolCall, ChatToolCallType, ChatToolChoice, ChatToolSpec, ContentBlockDelta,
-    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OpenAiClient,
-    OutputContentBlock, ResponsesClient, ResponsesEvent, ResponsesResponse, StreamEvent, Thinking,
+    AnthropicClient, ApiError, ChatContent, ChatContentPart, ChatFunctionCall, ChatImageUrl,
+    ChatMessage, ChatRequest, ChatResponse, ChatRole, ChatTool, ChatToolCall, ChatToolCallType,
+    ChatToolChoice, ChatToolSpec, ContentBlockDelta, ImageSource, InputContentBlock, InputMessage,
+    MessageRequest, MessageResponse, OpenAiClient, OutputContentBlock, ResponsesClient,
+    ResponsesEvent, ResponsesPayload, ResponsesResponse, ResponsesUsage, StreamEvent, Thinking,
     ThinkingControl, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use runtime::{
@@ -406,6 +407,9 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         }],
                         is_error: *is_error,
                     },
+                    ContentBlock::Image { media_type, data } => InputContentBlock::Image {
+                        source: ImageSource::base64(media_type.clone(), data.clone()),
+                    },
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -502,9 +506,10 @@ async fn drive_openai_stream(
 
 async fn emit_chat_response(response: ChatResponse, tx: &mpsc::Sender<AgentEvent>) {
     for choice in response.choices {
-        if let Some(text) = &choice.message.content {
+        if let Some(content) = &choice.message.content {
+            let text = content.text();
             if !text.is_empty() {
-                let _ = tx.send(AgentEvent::TextDelta(text.clone())).await;
+                let _ = tx.send(AgentEvent::TextDelta(text)).await;
             }
         }
         for call in choice.message.tool_calls.into_iter().flatten() {
@@ -541,7 +546,7 @@ fn build_chat_request(
     if !request.system_prompt.is_empty() {
         messages.push(ChatMessage {
             role: ChatRole::System,
-            content: Some(request.system_prompt.join("\n\n")),
+            content: Some(ChatContent::Text(request.system_prompt.join("\n\n"))),
             tool_calls: None,
             tool_call_id: None,
         });
@@ -582,11 +587,10 @@ fn convert_chat_messages(messages: &[ConversationMessage]) -> Vec<ChatMessage> {
     for message in messages {
         match message.role {
             MessageRole::System | MessageRole::User => {
-                let text = text_of_blocks(&message.blocks).join("");
-                if !text.is_empty() {
+                if let Some(content) = chat_content(&message.blocks) {
                     converted.push(ChatMessage {
                         role: ChatRole::User,
-                        content: Some(text),
+                        content: Some(content),
                         tool_calls: None,
                         tool_call_id: None,
                     });
@@ -612,7 +616,7 @@ fn convert_chat_messages(messages: &[ConversationMessage]) -> Vec<ChatMessage> {
                 if !text.is_empty() || !tool_calls.is_empty() {
                     converted.push(ChatMessage {
                         role: ChatRole::Assistant,
-                        content: (!text.is_empty()).then_some(text),
+                        content: (!text.is_empty()).then_some(ChatContent::Text(text)),
                         tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
                         tool_call_id: None,
                     });
@@ -634,7 +638,7 @@ fn convert_chat_messages(messages: &[ConversationMessage]) -> Vec<ChatMessage> {
                         };
                         converted.push(ChatMessage {
                             role: ChatRole::Tool,
-                            content: Some(content),
+                            content: Some(ChatContent::Text(content)),
                             tool_calls: None,
                             tool_call_id: Some(tool_use_id.clone()),
                         });
@@ -654,6 +658,40 @@ fn text_of_blocks(blocks: &[ContentBlock]) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// Inline base64 attachment as a data URL, the shape both `OpenAI` dialects
+/// accept in place of a remote image URL.
+fn image_data_url(media_type: &str, data: &str) -> String {
+    format!("data:{media_type};base64,{data}")
+}
+
+/// Content for one user message: a bare string, or ordered parts once the
+/// message carries attachments.
+fn chat_content(blocks: &[ContentBlock]) -> Option<ChatContent> {
+    if !blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Image { .. }))
+    {
+        let text = text_of_blocks(blocks).join("");
+        return (!text.is_empty()).then_some(ChatContent::Text(text));
+    }
+    let parts = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } if !text.is_empty() => {
+                Some(ChatContentPart::Text { text: text.clone() })
+            }
+            ContentBlock::Image { media_type, data } => Some(ChatContentPart::ImageUrl {
+                image_url: ChatImageUrl {
+                    url: image_data_url(media_type, data),
+                    detail: None,
+                },
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then_some(ChatContent::Parts(parts))
 }
 
 // ---------------------------------------------------------------------------
@@ -731,6 +769,24 @@ fn build_responses_body(
     body
 }
 
+/// Content parts for one `Responses` input message. Attachments are only legal
+/// on user turns, so a system-sourced message keeps its text alone.
+fn responses_content_parts(blocks: &[ContentBlock], allow_images: bool) -> Vec<serde_json::Value> {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } if !text.is_empty() => {
+                Some(serde_json::json!({ "type": "input_text", "text": text }))
+            }
+            ContentBlock::Image { media_type, data } if allow_images => Some(serde_json::json!({
+                "type": "input_image",
+                "image_url": image_data_url(media_type, data),
+            })),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Convert runtime history into `Responses` input items (messages, function
 /// calls, and function-call outputs).
 fn responses_input_items(messages: &[ConversationMessage]) -> Vec<serde_json::Value> {
@@ -738,11 +794,11 @@ fn responses_input_items(messages: &[ConversationMessage]) -> Vec<serde_json::Va
     for message in messages {
         match message.role {
             MessageRole::System | MessageRole::User => {
-                let text = text_of_blocks(&message.blocks).join("");
-                if !text.is_empty() {
+                let content = responses_content_parts(&message.blocks, message.role == MessageRole::User);
+                if !content.is_empty() {
                     items.push(serde_json::json!({
                         "role": "user",
-                        "content": [{ "type": "input_text", "text": text }],
+                        "content": content,
                     }));
                 }
             }
@@ -792,6 +848,15 @@ fn responses_input_items(messages: &[ConversationMessage]) -> Vec<serde_json::Va
     items
 }
 
+/// How a `Responses` stream declared the turn over. Exactly one of these
+/// arrives (there is no `[DONE]` sentinel in this dialect).
+#[derive(Debug, Clone)]
+enum ResponsesTerminal {
+    Completed,
+    Incomplete(String),
+    Failed(String),
+}
+
 async fn drive_responses_stream(
     client: &ResponsesClient,
     body: serde_json::Value,
@@ -799,6 +864,7 @@ async fn drive_responses_stream(
 ) -> Result<(), ApiError> {
     let mut stream = client.stream(&body).await?;
     let mut saw_content = false;
+    let mut terminal = None;
 
     while let Some(event) = stream.next_event().await? {
         let ResponsesEvent {
@@ -827,20 +893,52 @@ async fn drive_responses_stream(
                     })
                     .await;
             }
-        } else if kind == "response.completed" {
-            if let Some(usage) = response.and_then(|payload| payload.usage) {
-                let _ = tx
-                    .send(AgentEvent::Usage(TokenUsage {
-                        input_tokens: usage.input_tokens,
-                        output_tokens: usage.output_tokens,
-                        cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: usage
-                            .input_tokens_details
-                            .map_or(0, |details| details.cached_tokens),
-                    }))
-                    .await;
+        } else if matches!(
+            kind.as_str(),
+            "response.completed" | "response.incomplete" | "response.failed"
+        ) {
+            // Truncated and failed turns still report usage; record it before
+            // deciding how the turn ends.
+            if let Some(usage) = response.as_ref().and_then(|payload| payload.usage.as_ref()) {
+                let _ = tx.send(AgentEvent::Usage(responses_usage(usage))).await;
             }
+            terminal = Some(match kind.as_str() {
+                "response.completed" => ResponsesTerminal::Completed,
+                "response.failed" => ResponsesTerminal::Failed(
+                    response
+                        .as_ref()
+                        .map_or_else(|| "no error detail".to_string(), ResponsesPayload::failure_reason),
+                ),
+                _ => ResponsesTerminal::Incomplete(
+                    response
+                        .as_ref()
+                        .map_or_else(|| "unknown reason".to_string(), ResponsesPayload::failure_reason),
+                ),
+            });
         }
+    }
+
+    match terminal {
+        Some(ResponsesTerminal::Failed(reason)) => {
+            let _ = tx
+                .send(AgentEvent::Error(format!("responses request failed: {reason}")))
+                .await;
+            return Ok(());
+        }
+        // Nothing usable arrived, so the truncation is the only thing worth
+        // reporting; surfacing the partial stream would just fail downstream.
+        Some(ResponsesTerminal::Incomplete(reason)) if !saw_content => {
+            let _ = tx
+                .send(AgentEvent::Error(format!(
+                    "responses response ended incomplete: {reason}"
+                )))
+                .await;
+            return Ok(());
+        }
+        Some(ResponsesTerminal::Incomplete(reason)) => {
+            let _ = tx.send(AgentEvent::Truncated(reason)).await;
+        }
+        Some(ResponsesTerminal::Completed) | None => {}
     }
 
     if saw_content {
@@ -851,6 +949,20 @@ async fn drive_responses_stream(
     let response = client.send(&body).await?;
     emit_responses_response(response, tx).await;
     Ok(())
+}
+
+/// Map `Responses` token counts onto the runtime's usage type.
+fn responses_usage(usage: &ResponsesUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        // Native dialect reports cache hits only; nothing writes caches.
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: usage
+            .input_tokens_details
+            .as_ref()
+            .map_or(0, |details| details.cached_tokens),
+    }
 }
 
 async fn emit_responses_response(response: ResponsesResponse, tx: &mpsc::Sender<AgentEvent>) {
@@ -871,17 +983,8 @@ async fn emit_responses_response(response: ResponsesResponse, tx: &mpsc::Sender<
             }
         }
     }
-    if let Some(usage) = response.usage {
-        let _ = tx
-            .send(AgentEvent::Usage(TokenUsage {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: usage
-                    .input_tokens_details
-                    .map_or(0, |details| details.cached_tokens),
-            }))
-            .await;
+    if let Some(usage) = &response.usage {
+        let _ = tx.send(AgentEvent::Usage(responses_usage(usage))).await;
     }
     let _ = tx.send(AgentEvent::MessageStop).await;
 }
@@ -890,9 +993,10 @@ async fn emit_responses_response(response: ResponsesResponse, tx: &mpsc::Sender<
 mod tests {
     use super::{
         anthropic_thinking, append_tool_input, build_chat_request, build_message_request,
-        build_responses_body, convert_chat_messages, convert_messages, responses_input_items,
+        build_responses_body, chat_content, convert_chat_messages, convert_messages,
+        responses_input_items,
     };
-    use api::{ChatRole, ChatToolCallType};
+    use api::{ChatContent, ChatContentPart, ChatRole, ChatToolCallType};
     use runtime::{ApiRequest, ContentBlock, ConversationMessage, MessageRole, ToolSpec};
 
     #[test]
@@ -1005,7 +1109,7 @@ mod tests {
         let wire = build_chat_request(&request, "deepseek-flash", 8192, true, None);
         assert_eq!(wire.messages.len(), 2);
         assert_eq!(wire.messages[0].role, ChatRole::System);
-        assert_eq!(wire.messages[0].content.as_deref(), Some("be brief"));
+        assert_eq!(wire.messages[0].content.as_ref().map(ChatContent::text), Some("be brief".to_string()));
         assert_eq!(wire.messages[1].role, ChatRole::User);
         assert_eq!(wire.max_tokens, Some(8192));
         assert_eq!(wire.tools.as_ref().expect("tools").len(), 1);
@@ -1056,8 +1160,11 @@ mod tests {
         assert_eq!(calls[0].function.name, "bash");
         assert_eq!(converted[1].role, ChatRole::Tool);
         assert_eq!(converted[1].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(converted[1].content.as_deref(), Some("ok"));
-        assert_eq!(converted[2].content.as_deref(), Some("tool error: boom"));
+        assert_eq!(converted[1].content.as_ref().map(ChatContent::text), Some("ok".to_string()));
+        assert_eq!(
+            converted[2].content.as_ref().map(ChatContent::text),
+            Some("tool error: boom".to_string())
+        );
     }
 
     #[test]
@@ -1121,5 +1228,76 @@ mod tests {
         assert_eq!(items[2]["name"], "bash");
         assert_eq!(items[3]["type"], "function_call_output");
         assert_eq!(items[3]["output"], "ok");
+    }
+
+    fn image_message(role: MessageRole) -> ConversationMessage {
+        ConversationMessage {
+            role,
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "what is this".to_string(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "QUJD".to_string(),
+                },
+            ],
+            usage: None,
+            pinned: false,
+        }
+    }
+
+    #[test]
+    fn attaches_images_to_every_dialect() {
+        // Responses: an input_image part carrying an inline data URL.
+        let items = responses_input_items(&[image_message(MessageRole::User)]);
+        assert_eq!(items[0]["content"][0]["type"], "input_text");
+        assert_eq!(items[0]["content"][1]["type"], "input_image");
+        assert_eq!(
+            items[0]["content"][1]["image_url"],
+            "data:image/png;base64,QUJD"
+        );
+        // System-sourced history stays text-only: the provider rejects images
+        // outside user turns.
+        let system = responses_input_items(&[image_message(MessageRole::System)]);
+        assert_eq!(system[0]["content"].as_array().expect("parts").len(), 1);
+
+        // Chat dialect: parts appear only once an image is present.
+        let converted = convert_chat_messages(&[image_message(MessageRole::User)]);
+        let parts = match converted[0].content.as_ref().expect("content") {
+            ChatContent::Parts(parts) => parts,
+            ChatContent::Text(_) => panic!("expected image parts"),
+        };
+        assert!(matches!(parts[1], ChatContentPart::ImageUrl { .. }));
+        assert!(matches!(
+            chat_content(&[ContentBlock::Text {
+                text: "plain".to_string()
+            }]),
+            Some(ChatContent::Text(_))
+        ));
+
+        // Anthropic dialect: base64 source block.
+        let converted = convert_messages(&[image_message(MessageRole::User)]);
+        let json = serde_json::to_value(&converted[0].content[1]).expect("serialize");
+        assert_eq!(json["type"], "image");
+        assert_eq!(json["source"]["type"], "base64");
+        assert_eq!(json["source"]["media_type"], "image/png");
+        assert_eq!(json["source"]["data"], "QUJD");
+    }
+
+    #[test]
+    fn reports_responses_terminal_reasons() {
+        use api::ResponsesPayload;
+        let truncated: ResponsesPayload = serde_json::from_value(serde_json::json!({
+            "incomplete_details": { "reason": "max_output_tokens" }
+        }))
+        .expect("payload");
+        assert_eq!(truncated.failure_reason(), "max_output_tokens");
+
+        let failed: ResponsesPayload = serde_json::from_value(serde_json::json!({
+            "error": { "code": "server_error", "message": "boom" }
+        }))
+        .expect("payload");
+        assert_eq!(failed.failure_reason(), "server_error: boom");
     }
 }

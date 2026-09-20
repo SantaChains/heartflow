@@ -141,6 +141,8 @@ fn redact_block(block: &ContentBlock, literals: &[String]) -> ContentBlock {
             output: redact_text(output, literals),
             is_error: *is_error,
         },
+        // Image payloads are binary, not text; there is nothing to scrub.
+        ContentBlock::Image { .. } => block.clone(),
     }
 }
 

@@ -2447,6 +2447,42 @@ fn read_piped_stdin() -> Option<String> {
     }
 }
 
+/// Path inside an `@mention` token, tolerating quotes and the punctuation that
+/// naturally trails a mention in prose.
+fn mention_path(token: &str) -> Option<&str> {
+    let path = token.strip_prefix('@')?;
+    let path = path.trim_matches(|ch| ch == '"' || ch == '\'');
+    let path = path.trim_end_matches([',', '.', ';', ':', ')', ']', '}']);
+    (!path.is_empty()).then_some(path)
+}
+
+/// Turn the typed line into content blocks, promoting every `@path` that names
+/// a supported image into an attachment. The text is kept verbatim so the model
+/// can still tell which file each image came from; an unreadable attachment is
+/// reported and skipped instead of failing the turn.
+fn expand_attachments(text: &str) -> Vec<ContentBlock> {
+    let mut blocks = vec![ContentBlock::Text {
+        text: text.to_string(),
+    }];
+    let mut paths: Vec<&str> = Vec::new();
+    for candidate in text.split_whitespace().filter_map(mention_path) {
+        if tools::attachment_media_type(candidate).is_none() || paths.contains(&candidate) {
+            continue;
+        }
+        paths.push(candidate);
+    }
+    for path in paths {
+        match tools::read_image_attachment(path) {
+            Ok(block) => {
+                println!("· attached {path}");
+                blocks.push(block);
+            }
+            Err(error) => eprintln!("skipped {path}: {error}"),
+        }
+    }
+    blocks
+}
+
 /// Drive one turn silently and return the final assistant text plus its usage.
 /// Used by `--quiet`/`--json` so scripts receive only the answer.
 async fn run_turn_capture(
@@ -2455,7 +2491,10 @@ async fn run_turn_capture(
 ) -> Result<(String, Option<TokenUsage>), Box<dyn std::error::Error>> {
     let cancel = CancellationToken::new();
     let mut sink = |_event: &AgentEvent| {};
-    if let Err(error) = runtime.run_turn(input, None, &mut sink, &cancel).await {
+    if let Err(error) = runtime
+        .run_turn_with_blocks(expand_attachments(input), None, &mut sink, &cancel)
+        .await
+    {
         return Err(error.to_string().into());
     }
     let session = runtime.session();
@@ -2664,6 +2703,20 @@ impl TurnRenderer {
                     out.flush().ok();
                 }
             }
+            AgentEvent::Truncated(reason) => {
+                if self.spinner_active {
+                    self.spinner.finish("Truncated", &self.theme, &mut out).ok();
+                    self.spinner_active = false;
+                }
+                writeln!(
+                    out,
+                    "{}",
+                    format!("· response truncated by the provider ({reason})")
+                        .with(self.theme.muted())
+                )
+                .ok();
+                out.flush().ok();
+            }
             AgentEvent::Error(_) => {}
         }
     }
@@ -2735,7 +2788,7 @@ async fn run_turn_interactive(
 
     let mut notify = |event: &AgentEvent| turn.render(event);
     let result = runtime
-        .run_turn(input_text, prompter, &mut notify, &cancel)
+        .run_turn_with_blocks(expand_attachments(input_text), prompter, &mut notify, &cancel)
         .await;
     listener.abort();
 

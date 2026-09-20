@@ -33,6 +33,13 @@ pub enum ContentBlock {
         output: String,
         is_error: bool,
     },
+    /// Inline image attached by the user. `data` is the base64 payload without
+    /// a `data:` prefix; the media type travels alongside so every dialect can
+    /// rebuild its own envelope.
+    Image {
+        media_type: String,
+        data: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +181,17 @@ impl ConversationMessage {
         Self {
             role: MessageRole::User,
             blocks: vec![ContentBlock::Text { text: text.into() }],
+            usage: None,
+            pinned: false,
+        }
+    }
+
+    /// User message assembled from arbitrary blocks (text plus attachments).
+    #[must_use]
+    pub fn user_blocks(blocks: Vec<ContentBlock>) -> Self {
+        Self {
+            role: MessageRole::User,
+            blocks,
             usage: None,
             pinned: false,
         }

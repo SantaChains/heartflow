@@ -269,11 +269,57 @@ pub struct StreamOptions {
 pub struct ChatMessage {
     pub role: ChatRole,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<ChatContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ChatToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+}
+
+/// Message content in either form the dialect accepts: a bare string, or an
+/// ordered list of parts when the turn carries images.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ChatContent {
+    Text(String),
+    Parts(Vec<ChatContentPart>),
+}
+
+impl ChatContent {
+    /// Concatenate the text parts; image parts contribute nothing.
+    #[must_use]
+    pub fn text(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    ChatContentPart::Text { text } => Some(text.as_str()),
+                    ChatContentPart::ImageUrl { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatContentPart {
+    Text {
+        text: String,
+    },
+    ImageUrl {
+        image_url: ChatImageUrl,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatImageUrl {
+    /// Either an `http(s)` URL or an inline `data:<media>;base64,<payload>` URL.
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -438,8 +484,8 @@ pub struct Balance {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatChunk, ChatMessage, ChatRequest, ChatRole, ChatTool, ChatToolCallType, ChatToolChoice,
-        ChatToolSpec, ChatUsage, OpenAiClient, ThinkingControl,
+        ChatChunk, ChatContent, ChatMessage, ChatRequest, ChatRole, ChatTool, ChatToolCallType,
+        ChatToolChoice, ChatToolSpec, ChatUsage, OpenAiClient, ThinkingControl,
     };
     use serde_json::json;
 
@@ -449,7 +495,7 @@ mod tests {
             model: "deepseek-chat".to_string(),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
-                content: Some("hi".to_string()),
+                content: Some(ChatContent::Text("hi".to_string())),
                 tool_calls: None,
                 tool_call_id: None,
             }],
@@ -486,7 +532,7 @@ mod tests {
             model: "deepseek-flash".to_string(),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
-                content: Some("hi".to_string()),
+                content: Some(ChatContent::Text("hi".to_string())),
                 tool_calls: None,
                 tool_call_id: None,
             }],
