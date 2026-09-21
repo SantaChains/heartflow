@@ -24,7 +24,7 @@
     },
     {
       "title": "CLI Reference",
-      "purpose": "crates/cli 的子命令面(chat/prompt/search/config/doctor/init/models/system-prompt)、全局参数与 -v/--version、doctor 的 --fix/--ai、--resume 交互契约与退出码 0/1/2"
+      "purpose": "crates/cli 的子命令面(chat/prompt/search/config/doctor/init/models/system-prompt)、全局参数与 -v/--version、doctor 的 --fix/--ai、config export [config|theme|keymap|settings] 导出面、--resume 交互契约与退出码 0/1/2"
     },
     {
       "title": "REPL & Slash Commands",
@@ -32,7 +32,7 @@
     },
     {
       "title": "Configuration",
-      "purpose": "config.toml 优先级链、[provider]/[mcp.servers]/[theme] 结构、内置 deepseek/anthropic provider、密钥解析(env 优先)、热重载"
+      "purpose": "config.toml 优先级链、[provider]/[mcp.servers] 结构、theme/keymap/settings 三面 shell 配置(各自独立 toml、用户+项目两层逐项覆盖、config export 导出生效值)、内置 deepseek/anthropic provider、密钥解析(env 优先)、热重载"
     },
     {
       "title": "Context Engineering",

@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::compact::{
     compact_session_in_place, estimate_tokens_from, should_compact_with_estimate, truncate_chars,
-    CompactionConfig, CompactionResult,
+    CompactionConfig, CompactionResult, TokenCalibration,
 };
 use crate::permissions::{PermissionOutcome, PermissionPolicy, PermissionPrompter};
 use crate::schema::validate_tool_input;
@@ -58,10 +58,21 @@ pub enum AgentEvent {
 
 /// Live handle to one assistant message stream.
 ///
-/// Dropping the handle closes the channel; `cancel` aborts the producer task.
+/// The producer runs on a spawned task that ignores send errors, so dropping
+/// the receiver alone would leave it reading the network until the stream ends
+/// or the read timeout fires. `Drop` therefore aborts the task explicitly,
+/// making an early-dropped stream (a `!finished` return, a consumer that stops
+/// reading) leak-free across every transport; `cancel` aborts it sooner.
 pub struct TurnStream {
     rx: mpsc::Receiver<AgentEvent>,
     abort: AbortHandle,
+}
+
+impl Drop for TurnStream {
+    fn drop(&mut self) {
+        // Idempotent: an explicit `cancel` before the drop is harmless.
+        self.abort.abort();
+    }
 }
 
 impl TurnStream {
@@ -225,9 +236,11 @@ const REPLAY_MIN_STUB_CHARS: usize = 500;
 
 /// Project the durable transcript into the message list actually sent to the
 /// provider. Structure and ordering are preserved (each `tool_use` stays paired
-/// with its `tool_result`); only the *body* of a tool result older than the
-/// verbatim tail is replaced with a compact marker. The session keeps full
-/// output on disk; pinned messages are never rewritten.
+/// with its `tool_result`); only the *body* of a bulky block older than the
+/// verbatim tail is replaced with a compact marker — a large tool result, or an
+/// inline image attachment (folded to a text placeholder, since re-uploading a
+/// stale image every turn is the largest recurring context cost). The session
+/// keeps full output on disk; pinned messages are never rewritten.
 #[must_use]
 fn build_replay_messages(
     messages: &[ConversationMessage],
@@ -240,10 +253,12 @@ fn build_replay_messages(
         .map(|(index, message)| {
             if index >= verbatim_from
                 || message.pinned
-                || !message
-                    .blocks
-                    .iter()
-                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+                || !message.blocks.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::ToolResult { .. } | ContentBlock::Image { .. }
+                    )
+                })
             {
                 return message.clone();
             }
@@ -281,6 +296,19 @@ fn build_replay_messages(
                             is_error: *is_error,
                         }
                     }
+                    // Stale images are the largest per-turn re-upload cost: the
+                    // projection re-sends every surviving attachment on every
+                    // turn, and a provider discards pixels past its vision grid
+                    // anyway. Fold anything older than the verbatim tail to a
+                    // placeholder exactly like a bulky tool result — the on-disk
+                    // transcript keeps the real bytes, a pinned message is never
+                    // touched, and a recent attachment inside the tail survives.
+                    ContentBlock::Image { data, .. } => ContentBlock::Text {
+                        text: format!(
+                            "[earlier image attachment omitted from replay: {} KB base64; re-attach the file if it is still needed]",
+                            data.len() / 1024
+                        ),
+                    },
                     other => other.clone(),
                 })
                 .collect();
@@ -311,6 +339,11 @@ pub struct ConversationRuntime<C, T> {
     /// mutation); `compact` and `reset_for_task` replace `messages` wholesale
     /// and reset this to zero.
     token_prefix: Cell<(usize, usize)>,
+    /// Correction learned from provider-reported usage; see
+    /// [`TokenCalibration`]. Applied on top of `token_prefix`, never folded
+    /// into it — the cache must keep holding the raw heuristic sum, or every
+    /// observation would be fit against an already-corrected value.
+    token_calibration: RefCell<TokenCalibration>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -338,6 +371,7 @@ where
             usage_tracker,
             compaction: CompactionConfig::default(),
             token_prefix: Cell::new((0, 0)),
+            token_calibration: RefCell::new(TokenCalibration::default()),
         }
     }
 
@@ -460,6 +494,15 @@ where
 
             if let Some(value) = usage {
                 self.usage_tracker.record(value);
+                // Free ground truth for the estimator. The assistant reply is
+                // not appended yet, so `messages` still holds exactly what this
+                // request sent — the predicted figure and the provider's report
+                // describe the same prompt. The prediction is computed before
+                // the borrow: `observe` must never be fed a calibrated value.
+                let predicted = self.raw_estimated_tokens();
+                self.token_calibration
+                    .borrow_mut()
+                    .observe(predicted, value.context_input_tokens());
             }
 
             let pending_tool_uses = blocks
@@ -490,8 +533,9 @@ where
                 break;
             }
 
-            let allowed =
-                self.authorize_tools(&pending_tool_uses, &mut prompter, &mut tool_results, notify);
+            let allowed = self
+                .authorize_tools(&pending_tool_uses, &mut prompter, &mut tool_results, notify)
+                .await;
             let allowed = self.validate_tool_inputs(allowed, &mut tool_results, notify);
             if allowed.is_empty() {
                 continue;
@@ -585,7 +629,7 @@ where
         (blocks, usage, finished, cancelled, error)
     }
 
-    fn authorize_tools(
+    async fn authorize_tools(
         &mut self,
         pending_tool_uses: &[(String, String, String)],
         prompter: &mut Option<&mut dyn PermissionPrompter>,
@@ -601,8 +645,13 @@ where
                 Some(prompter) => {
                     self.permission_policy
                         .authorize(tool_name, input, Some(&mut **prompter))
+                        .await
                 }
-                None => self.permission_policy.authorize(tool_name, input, None),
+                None => {
+                    self.permission_policy
+                        .authorize(tool_name, input, None)
+                        .await
+                }
             };
             match outcome {
                 PermissionOutcome::Allow => {
@@ -838,11 +887,12 @@ where
         self.session.messages.iter().filter(|m| m.pinned).count()
     }
 
-    /// Amortized-O(1) token estimate: appends only re-score the new tail;
-    /// `compact` and `reset_for_task` reset the cached prefix, so the next
-    /// call re-scores the (much shorter) session once.
-    #[must_use]
-    pub fn estimated_tokens(&self) -> usize {
+    /// Amortized-O(1) *raw* token estimate: appends only re-score the new tail;
+    /// `compact` and `reset_for_task` reset the cached prefix, so the next call
+    /// re-scores the (much shorter) session once. Deliberately uncalibrated:
+    /// this is the value the cache stores and the input the calibration learns
+    /// from, so folding the factor in here would compound it every turn.
+    fn raw_estimated_tokens(&self) -> usize {
         let messages = &self.session.messages;
         let (prefix_len, prefix_sum) = self.token_prefix.get();
         let (from, base) = if prefix_len <= messages.len() {
@@ -853,6 +903,17 @@ where
         let total = estimate_tokens_from(messages, from, base);
         self.token_prefix.set((messages.len(), total));
         total
+    }
+
+    /// [`Self::raw_estimated_tokens`] corrected by what provider-reported usage
+    /// has taught this session about the heuristic's error. The compaction gate
+    /// and the status display use this; the error is systematic enough
+    /// (content-mix dependent) that a session's own history is the best
+    /// available predictor for its next prompt.
+    #[must_use]
+    pub fn estimated_tokens(&self) -> usize {
+        let raw = self.raw_estimated_tokens();
+        self.token_calibration.borrow().apply(raw)
     }
 
     /// Same gate as [`should_compact`], fed by the amortized estimate so the
@@ -980,9 +1041,36 @@ mod tests {
     use crate::redact::redact_session;
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::usage::TokenUsage;
+    use std::future::Future;
     use std::path::PathBuf;
+    use std::pin::Pin;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
+
+    /// A dropped `TurnStream` must abort its producer task. The driver ignores
+    /// send errors, so without the `Drop` abort an early-dropped stream would
+    /// leave the task reading the network until the read timeout fires. The
+    /// producer here never sends and never ends on its own, so `is_finished`
+    /// can only become `true` via the abort.
+    #[tokio::test]
+    async fn dropping_turn_stream_aborts_producer() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<AgentEvent>(1);
+        let handle = tokio::spawn(async move {
+            // Hold the sender open and idle; only an external abort ends this.
+            let _keep_open = tx;
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        });
+        {
+            let _stream = TurnStream::new(rx, handle.abort_handle());
+            // `_stream` drops at the end of this scope, which must abort.
+        }
+        // Yield so the runtime processes the abort before we assert.
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        assert!(
+            handle.is_finished(),
+            "producer task must be aborted when its TurnStream is dropped"
+        );
+    }
 
     fn noop_notify() -> impl FnMut(&AgentEvent) + Send {
         |_| {}
@@ -1042,9 +1130,14 @@ mod tests {
     struct PromptAllowOnce;
 
     impl PermissionPrompter for PromptAllowOnce {
-        fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
-            assert_eq!(request.tool_name, "add");
-            PermissionPromptDecision::Allow
+        fn decide<'a>(
+            &'a mut self,
+            request: &'a PermissionRequest,
+        ) -> Pin<Box<dyn Future<Output = PermissionPromptDecision> + 'a>> {
+            Box::pin(async move {
+                assert_eq!(request.tool_name, "add");
+                PermissionPromptDecision::Allow
+            })
         }
     }
 
@@ -1115,10 +1208,15 @@ mod tests {
     async fn records_denied_tool_results_when_prompt_rejects() {
         struct RejectPrompter;
         impl PermissionPrompter for RejectPrompter {
-            fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
-                PermissionPromptDecision::Deny {
-                    reason: "not now".to_string(),
-                }
+            fn decide<'a>(
+                &'a mut self,
+                _request: &'a PermissionRequest,
+            ) -> Pin<Box<dyn Future<Output = PermissionPromptDecision> + 'a>> {
+                Box::pin(async move {
+                    PermissionPromptDecision::Deny {
+                        reason: "not now".to_string(),
+                    }
+                })
             }
         }
 
@@ -1557,6 +1655,60 @@ mod tests {
         }
     }
 
+    /// The estimator must learn from provider-reported usage, and that learning
+    /// must reach `estimated_tokens` (what the compaction gate reads) while
+    /// leaving the cached raw sum alone.
+    #[tokio::test]
+    async fn calibrates_the_estimate_from_reported_usage() {
+        struct HeavyUsageClient;
+        impl ApiClient for HeavyUsageClient {
+            fn stream(&mut self, _request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+                Ok(TurnStream::from_events(vec![
+                    AgentEvent::TextDelta("ok".to_string()),
+                    AgentEvent::Usage(TokenUsage {
+                        input_tokens: 20_000,
+                        output_tokens: 5,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AgentEvent::MessageStop,
+                ]))
+            }
+        }
+
+        // The prompt must clear the calibration's minimum sample size, which is
+        // why the session is seeded instead of starting empty.
+        let mut session = Session::new();
+        session
+            .messages
+            .push(ConversationMessage::user_text("x".repeat(4_000)));
+        let mut runtime = ConversationRuntime::new(
+            session,
+            HeavyUsageClient,
+            PlanExecutor { pending: 0 },
+            PermissionPolicy::new(PermissionMode::Allow),
+            vec!["system".to_string()],
+        );
+
+        assert_eq!(
+            runtime.estimated_tokens(),
+            runtime.raw_estimated_tokens(),
+            "an uncalibrated runtime must behave exactly as before"
+        );
+
+        runtime
+            .run_turn("do it", None, &mut noop_notify(), &CancellationToken::new())
+            .await
+            .expect("turn should succeed");
+
+        assert_eq!(runtime.usage().current_turn_usage().input_tokens, 20_000);
+        let raw = runtime.raw_estimated_tokens();
+        // Seeded from the first residual, so the next prediction reproduces the
+        // provider's figure instead of re-deriving the ~20x it was missing.
+        assert_eq!(runtime.estimated_tokens(), 20_000);
+        assert!(runtime.estimated_tokens() > raw * 4);
+    }
+
     #[tokio::test]
     async fn continues_turn_while_plan_tasks_remain() {
         let mut runtime = ConversationRuntime::new(
@@ -1858,6 +2010,60 @@ mod tests {
             &messages[0].blocks[0],
             ContentBlock::ToolResult { output, .. } if output == &bulk
         ));
+    }
+
+    #[test]
+    fn replay_folds_old_image_attachments_but_keeps_recent_and_pinned() {
+        // A bulky base64 payload standing in for a real attachment.
+        let payload = "A".repeat(200 * 1024);
+        let image = |tag: &str| ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: format!("{tag}{payload}"),
+        };
+        let mut messages = vec![
+            // Old attachment: folds to a small text placeholder.
+            ConversationMessage::user_blocks(vec![image("old")]),
+            // Old but pinned attachment: survives verbatim.
+            ConversationMessage::user_blocks(vec![image("pin")]).with_pinned(true),
+        ];
+        // Pad past the verbatim tail so the two entries above fall out of it.
+        for i in 0..12 {
+            messages.push(ConversationMessage::user_text(format!("filler {i}")));
+        }
+        // A recent attachment (inside the tail) must stay verbatim.
+        messages.push(ConversationMessage::user_blocks(vec![image("new")]));
+
+        let replay = super::build_replay_messages(&messages, 12);
+
+        // The old image became a tiny marker, not a re-uploaded payload, and the
+        // block count is preserved (one image in, one text out).
+        assert_eq!(replay[0].blocks.len(), 1);
+        match &replay[0].blocks[0] {
+            ContentBlock::Text { text } => {
+                assert!(text.contains("image attachment omitted from replay"));
+                assert!(text.chars().count() < 200, "marker stays tiny: {text}");
+            }
+            other => panic!("expected a folded text marker, got {other:?}"),
+        }
+
+        // A pinned image survives byte-identical.
+        match &replay[1].blocks[0] {
+            ContentBlock::Image { data, .. } => {
+                assert_eq!(data, &format!("pin{payload}"), "pinned image survives");
+            }
+            other => panic!("expected the pinned image, got {other:?}"),
+        }
+
+        // A recent image (inside the tail) survives byte-identical.
+        match &replay[replay.len() - 1].blocks[0] {
+            ContentBlock::Image { data, .. } => {
+                assert_eq!(data, &format!("new{payload}"), "recent image survives");
+            }
+            other => panic!("expected the recent image, got {other:?}"),
+        }
+
+        // The durable transcript is never mutated by the projection.
+        assert!(matches!(&messages[0].blocks[0], ContentBlock::Image { .. }));
     }
 
     /// Records whether a mutating tool ever overlapped an in-flight read, and

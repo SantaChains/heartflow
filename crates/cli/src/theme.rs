@@ -19,11 +19,14 @@
 //! `#RRGGBB` string. Overrides are layered onto the built-in palette with the
 //! same field-by-field fault isolation as `config.toml` — a bad or missing file
 //! never blocks startup, a bad color is skipped with a warning — and the
-//! resolved theme is cached process-wide in [`Theme::current`].
+//! resolved theme is cached process-wide behind a lock in [`Theme::current`],
+//! which hands back a copy so a live edit can be swapped in without a restart
+//! and the effective palette can be re-serialized via [`Theme::to_toml_string`].
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{OnceLock, PoisonError, RwLock};
 
 use tracing::warn;
 
@@ -59,6 +62,13 @@ impl Rgb {
     pub const fn ratatui(self) -> ratatui::style::Color {
         ratatui::style::Color::Rgb(self.r, self.g, self.b)
     }
+
+    /// Render as a `#rrggbb` string, the inverse of [`parse_rgb`]; used to
+    /// export the effective palette back to `theme.toml`.
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
+    }
 }
 
 /// The coordinated semantic palette plus the fixed glyph/layout tokens.
@@ -67,9 +77,10 @@ impl Rgb {
 /// picked off a wheel, which is what keeps the set coherent: every warm tone is
 /// lacquer or leaf metal from Ran / Kagemusha / Rashomon, every cool tone is a
 /// glaze, moss or fog from Rashomon / Throne of Blood, and the neutrals are the
-/// hemp and mist that carry the frames. Two disciplines hold it together — one
-/// hue per role, and a deliberate lightness ladder (heading mid, strong bright,
-/// muted dim) so scanning order is readable before color is even noticed. The
+/// mist that carries the frames. Two disciplines hold it together — one hue per
+/// role, and a deliberate lightness ladder (heading mid, strong bright) so
+/// scanning order is readable before color is even noticed; `muted` is the one
+/// deliberate exception, sharing `strong`'s gold leaf instead of dimming. The
 /// single high-chroma accent is Third Son's ultramarine banner in Ran, the one
 /// cool event against a golden field; making it the prompt and spinner is what
 /// gives the REPL its signature. Body text stays uncolored so it inherits the
@@ -101,7 +112,7 @@ impl Default for Theme {
             link: Rgb::new(111, 191, 168),  // 青磁 celadon glaze
             quote: Rgb::new(138, 147, 163), // 蜘蛛巢城・雾 fog (Throne of Blood)
             accent: Rgb::new(85, 136, 238), // 乱・三郎的蓝旗 ultramarine banner (Ran)
-            muted: Rgb::new(125, 114, 105), // 麻布 hemp (deltas, secondary)
+            muted: Rgb::new(232, 180, 74),  // 金箔 gold leaf, shared with `strong`
             success: Rgb::new(143, 191, 106), // 苔 jade, shared with `inline_code`
             error: Rgb::new(225, 75, 99),   // 绯 rose-crimson (High and Low)
         }
@@ -163,8 +174,16 @@ impl Theme {
 
 /// Process-wide resolved theme, populated on the first [`Theme::current`] call
 /// and reused thereafter (terminal rendering happens on every frame, so the
-/// files are read once, not per line).
-static THEME: OnceLock<Theme> = OnceLock::new();
+/// files are read once, not per line). Behind an [`RwLock`] so a config watcher
+/// can swap in a freshly loaded palette mid-session; readers take a cheap
+/// shared lock and copy the small (`Copy`) value out.
+static THEME: OnceLock<RwLock<Theme>> = OnceLock::new();
+
+/// Bumped on every [`Theme::reload`] so a cached, theme-dependent projection
+/// (the TUI's rendered transcript) can tell a stale palette from the current
+/// one without diffing colors. Starts at 0; a cache keyed on the generation
+/// rebuilds exactly when the palette is swapped.
+static THEME_GEN: AtomicU64 = AtomicU64::new(0);
 
 impl Theme {
     /// Build the palette by layering user then project `theme.toml` overrides
@@ -181,14 +200,61 @@ impl Theme {
     }
 
     /// The active palette for this process: [`Theme::load`] of the on-disk
-    /// overrides, resolved once and cached. Returns a reference so hot render
-    /// paths read a pointer rather than rebuild the palette.
+    /// overrides, resolved once and cached. Returns by value (`Theme` is `Copy`,
+    /// ~30 bytes) so hot render paths read a stable snapshot and a mid-session
+    /// reload can swap the palette underneath them without a restart. A poisoned
+    /// lock (impossible here — `Theme` has no `Drop` and nothing panics while it
+    /// is held) is recovered rather than propagated, so rendering never aborts.
     #[must_use]
-    pub fn current() -> &'static Theme {
-        THEME.get_or_init(|| {
+    pub fn current() -> Theme {
+        let lock = THEME.get_or_init(|| {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            Theme::load(&cwd, &crate::home_dir())
-        })
+            RwLock::new(Theme::load(&cwd, &crate::home_dir()))
+        });
+        *lock.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Re-read the on-disk overrides and swap them into the process-wide
+    /// palette, so a live `theme.toml` edit takes effect at the next turn
+    /// without a restart. The blocking REPL's per-turn renderer and the TUI's
+    /// per-frame [`Theme::current`] both pick up the new value; poison-safe for
+    /// the same reason as `current`.
+    pub fn reload(cwd: &Path, home: &Path) {
+        let next = Theme::load(cwd, home);
+        let lock = THEME.get_or_init(|| RwLock::new(next));
+        *lock.write().unwrap_or_else(PoisonError::into_inner) = next;
+        THEME_GEN.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A monotonic counter that advances on every [`Theme::reload`]. Cache keys
+    /// fold it in so a palette swap invalidates theme-dependent projections.
+    #[must_use]
+    pub fn generation() -> u64 {
+        THEME_GEN.load(Ordering::Relaxed)
+    }
+
+    /// Serialize the effective palette as a `theme.toml` document (every role,
+    /// as `#rrggbb`), the inverse of [`Theme::load`]. Powers `hf config export
+    /// theme` so a user gets a fully-specified, editable starting point rather
+    /// than an empty file.
+    #[must_use]
+    pub fn to_toml_string(self) -> String {
+        let mut out = String::from("[theme]\n");
+        for (key, rgb) in [
+            ("heading", self.heading),
+            ("emphasis", self.emphasis),
+            ("strong", self.strong),
+            ("inline_code", self.inline_code),
+            ("link", self.link),
+            ("quote", self.quote),
+            ("accent", self.accent),
+            ("muted", self.muted),
+            ("success", self.success),
+            ("error", self.error),
+        ] {
+            out.push_str(&format!("{key} = \"{}\"\n", rgb.to_hex()));
+        }
+        out
     }
 }
 
@@ -279,7 +345,7 @@ impl ThemeSettings {
 }
 
 /// Theme file merge order mirrors `config.toml`: user then project (project wins).
-fn theme_file_paths(cwd: &Path, home: &Path) -> Vec<PathBuf> {
+pub(crate) fn theme_file_paths(cwd: &Path, home: &Path) -> Vec<PathBuf> {
     vec![
         home.join(".heartflow").join("theme.toml"),
         cwd.join(".heartflow").join("theme.toml"),
@@ -359,6 +425,20 @@ pub mod glyphs {
     pub const FAILED: &str = "✘";
     /// User-cancelled (neutral, non-alarming) state.
     pub const CANCELLED: &str = "◌";
+    /// Table grid, light box drawing: corners, tees, cross and the two edges.
+    /// Kept here so the grid is one typographic decision alongside the code
+    /// fence and rule marks above.
+    pub const TBL_TL: &str = "┌";
+    pub const TBL_TR: &str = "┐";
+    pub const TBL_BL: &str = "└";
+    pub const TBL_BR: &str = "┘";
+    pub const TBL_ML: &str = "├";
+    pub const TBL_MR: &str = "┤";
+    pub const TBL_TOP_T: &str = "┬";
+    pub const TBL_BOT_T: &str = "┴";
+    pub const TBL_CROSS: &str = "┼";
+    pub const TBL_H: &str = "─";
+    pub const TBL_V: &str = "│";
 }
 
 #[cfg(test)]
@@ -476,6 +556,25 @@ mod tests {
         let home = TempDir::new("broken-home");
         // A corrupt file degrades to the default layer rather than panicking.
         assert_eq!(Theme::load(project.path(), home.path()), Theme::default());
+    }
+
+    #[test]
+    fn hex_export_is_the_inverse_of_parse_rgb() {
+        let rgb = Rgb::new(0x0a, 0xbc, 0x1f);
+        assert_eq!(rgb.to_hex(), "#0abc1f");
+        assert_eq!(parse_rgb(&rgb.to_hex()), Some(rgb));
+    }
+
+    #[test]
+    fn exported_theme_round_trips_through_the_loader() {
+        // The export must re-load to the exact palette it came from, so
+        // `config export theme` yields a faithful, editable template.
+        let theme = Theme::default();
+        let exported = theme.to_toml_string();
+        let table = toml::from_str::<toml::Table>(&exported).expect("export emits valid TOML");
+        let mut reloaded = Theme::default();
+        ThemeSettings::from_table(&table, "export").apply_to(&mut reloaded);
+        assert_eq!(reloaded, theme);
     }
 
     /// A self-deleting temp dir holding a `.heartflow/theme.toml` for load tests.

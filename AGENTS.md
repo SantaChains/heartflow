@@ -42,7 +42,7 @@ CI 只有两条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/
 
 全局：`--provider NAME`、`--model MODEL`、`--version`（`-v`，`-V` 为可见短别名；内建版本 flag 已禁用）、`--resume[=PATH]`（`require_equals`，裸形式进选择器）、`--run CMD`（`requires = "resume"`）。
 
-子命令：`chat`、`prompt [TEXT...] [-q|--quiet] [--json]`、`search <QUERY...> [--limit N=20] [--json]`、`system-prompt [--cwd PATH] [--date YYYY-MM-DD]`、`config export [--output FILE]` / `config import FILE`、`doctor [--fix] [--ai]`、`init [--force]`、`models [--provider] [--model] [--balance]`。
+子命令：`chat`、`prompt [TEXT...] [-q|--quiet] [--json]`、`search <QUERY...> [--limit N=20] [--json]`、`system-prompt [--cwd PATH] [--date YYYY-MM-DD]`、`config export [SURFACE=config|theme|keymap|settings] [--output FILE]` / `config import FILE`、`doctor [--fix] [--ai]`、`init [--force]`、`models [--provider] [--model] [--balance]`。
 
 交互契约：无参数或 `hf chat` 进 REPL（唯一可弹确认的模式）；子命令永不阻塞等人。退出码 0 成功 / 1 运行时与 provider 错误 / 2 用法错误。
 
@@ -86,9 +86,15 @@ CI 只有两条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/
 
 `[mcp.servers.NAME]`：`command`、`args`、`env`、`url`、`headers`（值支持 `${VAR}` 展开）、`bearer_token_env`、`read_only`。`url` 与 `command` 二选一，两者皆缺则跳过并告警；`url` 存在即走 Streamable-HTTP/SSE（`crates/cli/src/config.rs:12-29`、`:55-110`）。
 
-`[theme]`：`heading`、`accent`、`muted`、`success`、`error`，可选 `emphasis`、`strong`、`inline_code`、`link`、`quote`。用户层 `~/.heartflow/theme.toml`、项目层 `.heartflow/theme.toml` 逐项覆盖（`crates/cli/src/theme.rs:284`）。
+`[theme]`：`heading`、`accent`、`muted`、`success`、`error`，可选 `emphasis`、`strong`、`inline_code`、`link`、`quote`；用户层 `~/.heartflow/theme.toml`、项目层 `.heartflow/theme.toml` 逐项覆盖（加载器 `crates/cli/src/theme.rs` 的 `theme_file_paths`）。
 
-配置优先级：CLI 参数 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量；同名字段逐项覆盖，REPL 每回合按 mtime 热重载。
+`[keymap]`：动作名 → 键串或键串数组（`submit`/`interrupt`/`escape`/`toggle_fold`/`scroll_up`/`scroll_down`）；空数组解绑（键回落编辑器），`ctrl`/`alt`/`super` 参与匹配、`shift` 忽略、字符大小写不敏感；同 theme 两层逐动作覆盖（`crates/cli/src/keymap.rs`）。
+
+`[settings]`：`scroll_step`（u16，默认 3）、`tool_inline_lines`（usize，默认 3）、`fold_thinking`（bool，默认 true）、`frame_budget_ms`（u64，默认 80，仅启动时读取）；同 theme 两层逐项覆盖（`crates/cli/src/settings.rs`）。
+
+`hf config export [SURFACE]`（`config` 默认 / `theme` / `keymap` / `settings`）导出该面生效值为可编辑模板，永不落密钥。
+
+配置优先级：CLI 参数 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量；同名字段逐项覆盖。`ConfigWatcher`（`crates/cli/src/config.rs`）每回合边界按 mtime 逐面探测 config/theme/keymap/settings 四面并热重载：`changed() -> ChangedSurfaces` 逐面上报，config 重建 runtime、theme 换入进程级调色板、keymap/settings 就地重载（改 theme 绝不触发 config 重载）。
 
 ### 运行时可写路径
 

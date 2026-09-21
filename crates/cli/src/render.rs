@@ -1,17 +1,12 @@
-use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
-use std::sync::OnceLock;
 
 use crossterm::cursor::{MoveToColumn, RestorePosition, SavePosition};
-use crossterm::style::{Color, Print, ResetColor, SetForegroundColor, Stylize};
+use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{execute, queue};
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
-use syntect::easy::HighlightLines;
-use syntect::highlighting::{Theme, ThemeSet};
-use syntect::parsing::SyntaxSet;
-use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
+use syntect::highlighting::Theme as SyntaxTheme;
 
+use crate::markdown;
 use crate::mascot::Mascot;
 use crate::theme::{glyphs, Theme as AppTheme};
 
@@ -51,6 +46,36 @@ impl ColorTheme {
         }
     }
 
+    /// Heading / code-fence accent.
+    #[must_use]
+    pub fn heading(&self) -> Color {
+        self.heading
+    }
+    /// Italic emphasis color.
+    #[must_use]
+    pub fn emphasis(&self) -> Color {
+        self.emphasis
+    }
+    /// Bold strong color.
+    #[must_use]
+    pub fn strong(&self) -> Color {
+        self.strong
+    }
+    /// Inline-code color.
+    #[must_use]
+    pub fn inline_code(&self) -> Color {
+        self.inline_code
+    }
+    /// Link / image color.
+    #[must_use]
+    pub fn link(&self) -> Color {
+        self.link
+    }
+    /// Block-quote bar and quoted-text color.
+    #[must_use]
+    pub fn quote(&self) -> Color {
+        self.quote
+    }
     /// Dimmed foreground for secondary/live text (deltas, running markers).
     #[must_use]
     pub fn muted(&self) -> Color {
@@ -60,7 +85,7 @@ impl ColorTheme {
 
 impl Default for ColorTheme {
     fn default() -> Self {
-        Self::from(AppTheme::current())
+        Self::from(&AppTheme::current())
     }
 }
 
@@ -155,55 +180,20 @@ impl Spinner {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct RenderState {
-    emphasis: usize,
-    strong: usize,
-    quote: usize,
-    list: usize,
-}
-
-impl RenderState {
-    fn style_text(&self, text: &str, theme: &ColorTheme) -> String {
-        if self.strong > 0 {
-            format!("{}", text.bold().with(theme.strong))
-        } else if self.emphasis > 0 {
-            format!("{}", text.italic().with(theme.emphasis))
-        } else if self.quote > 0 {
-            format!("{}", text.with(theme.quote))
-        } else {
-            text.to_string()
-        }
-    }
-}
-
-/// Process-wide syntax definitions, loaded once (~10ms) instead of per turn.
-fn global_syntax_set() -> &'static SyntaxSet {
-    static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
-    SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
-}
-
-/// Process-wide highlight theme, loaded once instead of per turn.
-fn global_theme() -> &'static Theme {
-    static THEME: OnceLock<Theme> = OnceLock::new();
-    THEME.get_or_init(|| {
-        ThemeSet::load_defaults()
-            .themes
-            .remove("base16-ocean.dark")
-            .unwrap_or_default()
-    })
-}
-
+/// The blocking REPL's streaming renderer: a thin front over the shared
+/// markdown IR ([`crate::markdown`]). It owns a snapshot of the palette
+/// ([`ColorTheme`]) and the syntect highlight theme so a turn renders in one
+/// consistent color family; markdown is parsed once and projected to ANSI.
 #[derive(Debug)]
 pub struct TerminalRenderer {
-    syntax_theme: &'static Theme,
+    syntax_theme: &'static SyntaxTheme,
     color_theme: ColorTheme,
 }
 
 impl Default for TerminalRenderer {
     fn default() -> Self {
         Self {
-            syntax_theme: global_theme(),
+            syntax_theme: markdown::global_syntax_theme(),
             color_theme: ColorTheme::default(),
         }
     }
@@ -220,207 +210,22 @@ impl TerminalRenderer {
         &self.color_theme
     }
 
+    /// Render markdown to crossterm ANSI. Parses into the shared thin IR then
+    /// projects; trailing whitespace is trimmed so a streamed message does not
+    /// push extra blank lines into the scroll region.
     #[must_use]
     pub fn render_markdown(&self, markdown: &str) -> String {
-        let mut output = String::new();
-        let mut state = RenderState::default();
-        let mut code_language = String::new();
-        let mut code_buffer = String::new();
-        let mut in_code_block = false;
-
-        for event in Parser::new_ext(markdown, Options::all()) {
-            self.render_event(
-                event,
-                &mut state,
-                &mut output,
-                &mut code_buffer,
-                &mut code_language,
-                &mut in_code_block,
-            );
-        }
-
-        output.trim_end().to_string()
-    }
-
-    fn render_event(
-        &self,
-        event: Event<'_>,
-        state: &mut RenderState,
-        output: &mut String,
-        code_buffer: &mut String,
-        code_language: &mut String,
-        in_code_block: &mut bool,
-    ) {
-        match event {
-            Event::Start(Tag::Heading { level, .. }) => self.start_heading(level as u8, output),
-            Event::End(TagEnd::Heading(..) | TagEnd::Paragraph) => output.push_str("\n\n"),
-            Event::Start(Tag::BlockQuote(..)) => self.start_quote(state, output),
-            Event::End(TagEnd::BlockQuote(..) | TagEnd::Item)
-            | Event::SoftBreak
-            | Event::HardBreak => output.push('\n'),
-            Event::Start(Tag::List(_)) => state.list += 1,
-            Event::End(TagEnd::List(..)) => {
-                state.list = state.list.saturating_sub(1);
-                output.push('\n');
-            }
-            Event::Start(Tag::Item) => Self::start_item(state, output),
-            Event::Start(Tag::CodeBlock(kind)) => {
-                *in_code_block = true;
-                *code_language = match kind {
-                    CodeBlockKind::Indented => String::from("text"),
-                    CodeBlockKind::Fenced(lang) => lang.to_string(),
-                };
-                code_buffer.clear();
-                self.start_code_block(code_language, output);
-            }
-            Event::End(TagEnd::CodeBlock) => {
-                self.finish_code_block(code_buffer, code_language, output);
-                *in_code_block = false;
-                code_language.clear();
-                code_buffer.clear();
-            }
-            Event::Start(Tag::Emphasis) => state.emphasis += 1,
-            Event::End(TagEnd::Emphasis) => state.emphasis = state.emphasis.saturating_sub(1),
-            Event::Start(Tag::Strong) => state.strong += 1,
-            Event::End(TagEnd::Strong) => state.strong = state.strong.saturating_sub(1),
-            Event::Code(code) => {
-                let _ = write!(
-                    output,
-                    "{}",
-                    format!("`{code}`").with(self.color_theme.inline_code)
-                );
-            }
-            Event::Rule => output.push_str(glyphs::RULE),
-            Event::Text(text) => {
-                self.push_text(text.as_ref(), state, output, code_buffer, *in_code_block);
-            }
-            Event::Html(html) | Event::InlineHtml(html) => output.push_str(&html),
-            Event::FootnoteReference(reference) => {
-                let _ = write!(output, "[{reference}]");
-            }
-            Event::TaskListMarker(done) => output.push_str(if done { "[x] " } else { "[ ] " }),
-            Event::InlineMath(math) | Event::DisplayMath(math) => output.push_str(&math),
-            Event::Start(Tag::Link { dest_url, .. }) => {
-                let _ = write!(
-                    output,
-                    "{}",
-                    format!("[{dest_url}]")
-                        .underlined()
-                        .with(self.color_theme.link)
-                );
-            }
-            Event::Start(Tag::Image { dest_url, .. }) => {
-                let _ = write!(
-                    output,
-                    "{}",
-                    format!("[image:{dest_url}]").with(self.color_theme.link)
-                );
-            }
-            Event::Start(
-                Tag::Paragraph
-                | Tag::Table(..)
-                | Tag::TableHead
-                | Tag::TableRow
-                | Tag::TableCell
-                | Tag::MetadataBlock(..)
-                | _,
-            )
-            | Event::End(
-                TagEnd::Link
-                | TagEnd::Image
-                | TagEnd::Table
-                | TagEnd::TableHead
-                | TagEnd::TableRow
-                | TagEnd::TableCell
-                | TagEnd::MetadataBlock(..)
-                | _,
-            ) => {}
-        }
-    }
-
-    fn start_heading(&self, level: u8, output: &mut String) {
-        output.push('\n');
-        let prefix = match level {
-            1 => "# ",
-            2 => "## ",
-            3 => "### ",
-            _ => "#### ",
-        };
-        let _ = write!(output, "{}", prefix.bold().with(self.color_theme.heading));
-    }
-
-    fn start_quote(&self, state: &mut RenderState, output: &mut String) {
-        state.quote += 1;
-        let _ = write!(output, "{}", glyphs::QUOTE_BAR.with(self.color_theme.quote));
-    }
-
-    fn start_item(state: &RenderState, output: &mut String) {
-        output.push_str(&"  ".repeat(state.list.saturating_sub(1)));
-        output.push_str(glyphs::BULLET);
-    }
-
-    fn start_code_block(&self, code_language: &str, output: &mut String) {
-        if !code_language.is_empty() {
-            let _ = writeln!(
-                output,
-                "{}",
-                format!("{}{code_language}", glyphs::CODE_OPEN).with(self.color_theme.heading)
-            );
-        }
-    }
-
-    fn finish_code_block(&self, code_buffer: &str, code_language: &str, output: &mut String) {
-        output.push_str(&self.highlight_code(code_buffer, code_language));
-        if !code_language.is_empty() {
-            let _ = write!(
-                output,
-                "{}",
-                glyphs::CODE_CLOSE.with(self.color_theme.heading)
-            );
-        }
-        output.push_str("\n\n");
-    }
-
-    fn push_text(
-        &self,
-        text: &str,
-        state: &RenderState,
-        output: &mut String,
-        code_buffer: &mut String,
-        in_code_block: bool,
-    ) {
-        if in_code_block {
-            code_buffer.push_str(text);
-        } else {
-            output.push_str(&state.style_text(text, &self.color_theme));
-        }
-    }
-
-    #[must_use]
-    pub fn highlight_code(&self, code: &str, language: &str) -> String {
-        let syntax_set = global_syntax_set();
-        let syntax = syntax_set
-            .find_syntax_by_token(language)
-            .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
-        let mut syntax_highlighter = HighlightLines::new(syntax, self.syntax_theme);
-        let mut colored_output = String::new();
-
-        for line in LinesWithEndings::from(code) {
-            match syntax_highlighter.highlight_line(line, syntax_set) {
-                Ok(ranges) => {
-                    colored_output.push_str(&as_24_bit_terminal_escaped(&ranges[..], false));
-                }
-                Err(_) => colored_output.push_str(line),
-            }
-        }
-
-        colored_output
+        let nodes = markdown::parse(markdown);
+        markdown::project_ansi(&nodes, &self.color_theme, self.syntax_theme)
+            .trim_end()
+            .to_string()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Spinner, TerminalRenderer};
+    use unicode_width::UnicodeWidthStr;
 
     fn strip_ansi(input: &str) -> String {
         let mut output = String::new();
@@ -482,5 +287,91 @@ mod tests {
 
         let output = String::from_utf8_lossy(&out);
         assert!(output.contains("Working"));
+    }
+
+    #[test]
+    fn renders_markdown_table_as_an_aligned_grid() {
+        let renderer = TerminalRenderer::new();
+        let out = renderer.render_markdown("| key | v |\n|-----|---|\n| alpha | 1 |\n| β | 22 |\n");
+        let plain = strip_ansi(&out);
+        // A full box grid is drawn.
+        assert!(plain.contains('┌') && plain.contains('┬') && plain.contains('┐'));
+        assert!(plain.contains('├') && plain.contains('┼') && plain.contains('┤'));
+        assert!(plain.contains('└') && plain.contains('┴') && plain.contains('┘'));
+        // Header and body cells survive.
+        assert!(plain.contains("key") && plain.contains("alpha") && plain.contains("22"));
+        // Columns align: every grid line has the same visible width (the CJK
+        // `β` cell is one column wide, so padding must account for it).
+        let grid_lines: Vec<usize> = plain
+            .lines()
+            .filter(|line| line.contains('│') || line.contains('─'))
+            .map(|line| line.width())
+            .collect();
+        assert!(
+            grid_lines.windows(2).all(|w| w[0] == w[1]),
+            "ragged grid: {grid_lines:?}"
+        );
+    }
+
+    #[test]
+    fn renders_link_as_an_osc8_hyperlink() {
+        let renderer = TerminalRenderer::new();
+        let out = renderer.render_markdown("see [the docs](https://example.com/x) now");
+        // OSC-8 open carries the URL; the label is the visible text; OSC-8 close
+        // terminates the link.
+        assert!(
+            out.contains("\u{1b}]8;;https://example.com/x\u{7}"),
+            "missing OSC-8 open: {out:?}"
+        );
+        assert!(out.contains("the docs"), "label text is shown");
+        assert!(out.contains("\u{1b}]8;;\u{7}"), "missing OSC-8 close");
+        // The bare URL is no longer dumped as visible `[url]` text.
+        assert!(!strip_ansi(&out).contains("[https://example.com/x]"));
+    }
+
+    // Plain-text goldens: these lock the newline/spacing layout the streaming
+    // renderer has always produced, so the IR refactor cannot silently shift the
+    // scroll-region output. Values are traced from the block/inline boundaries
+    // (heading open emits a leading newline and its close a blank line, a list
+    // item ends with one newline and the list another, a soft break is one
+    // newline, a quote bar prefixes the quoted run).
+    #[test]
+    fn heading_layout_is_preserved() {
+        let renderer = TerminalRenderer::new();
+        assert_eq!(
+            strip_ansi(&renderer.render_markdown("# Title")),
+            "\n# Title"
+        );
+        assert_eq!(
+            strip_ansi(&renderer.render_markdown("# H1\n\n## H2")),
+            "\n# H1\n\n\n## H2"
+        );
+    }
+
+    #[test]
+    fn tight_list_layout_is_preserved() {
+        let renderer = TerminalRenderer::new();
+        assert_eq!(
+            strip_ansi(&renderer.render_markdown("- a\n- b")),
+            "• a\n• b"
+        );
+    }
+
+    #[test]
+    fn soft_break_becomes_a_single_newline() {
+        let renderer = TerminalRenderer::new();
+        assert_eq!(
+            strip_ansi(&renderer.render_markdown("line one\nline two")),
+            "line one\nline two"
+        );
+    }
+
+    #[test]
+    fn blockquote_prefixes_the_bar_and_keeps_spacing() {
+        let renderer = TerminalRenderer::new();
+        assert_eq!(
+            strip_ansi(&renderer.render_markdown("> quoted\n\nafter")),
+            "│ quoted\n\n\nafter"
+        );
     }
 }

@@ -5,7 +5,7 @@ use serde::Deserialize;
 use tracing::debug;
 
 use crate::error::ApiError;
-use crate::retry::{build_http, is_retryable_status, RetryPolicy};
+use crate::retry::{build_http, is_retryable_status, parse_retry_after, RetryPolicy};
 use crate::sse::{anthropic_event, SseParser};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
 
@@ -222,6 +222,9 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         return Ok(response);
     }
 
+    // Capture `Retry-After` before the body is consumed: `text()` takes the
+    // whole response, headers included.
+    let retry_after = parse_retry_after(response.headers());
     let body = response.text().await.unwrap_or_else(|_| String::new());
     let parsed_error = serde_json::from_str::<AnthropicErrorEnvelope>(&body).ok();
     let retryable = is_retryable_status(status);
@@ -236,6 +239,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
             .map(|error| error.error.message.clone()),
         body,
         retryable,
+        retry_after,
     })
 }
 

@@ -9,6 +9,8 @@ use provider::config::{
 };
 use tracing::warn;
 
+use crate::{keymap::keymap_file_paths, settings::settings_file_paths, theme::theme_file_paths};
+
 /// One MCP server launch specification. A server is reached over stdio (spawn
 /// `command`) or Streamable-HTTP (`url` is set); the presence of `url` selects
 /// the transport so existing stdio entries load unchanged.
@@ -240,37 +242,102 @@ pub fn load_provider_selection(
     materialize(resolve_spec(provider_flag, model_flag, &settings)?)
 }
 
+/// One of the four on-disk configuration files heartflow layers user-then-project.
+/// A single enum names them all so `hf config export SURFACE` and the hot-reload
+/// [`ConfigWatcher`] stay in lockstep: adding a surface is one variant, not two
+/// parallel lists that can drift.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSurface {
+    /// Provider + MCP connection settings (`config.toml`).
+    Config,
+    /// Color palette (`theme.toml`).
+    Theme,
+    /// Key bindings (`keymap.toml`).
+    Keymap,
+    /// Shell behavior knobs (`settings.toml`).
+    Settings,
+}
+
+/// Per-surface change flags from one [`ConfigWatcher::changed`] poll. Callers
+/// reload only the surfaces that actually moved, so editing `theme.toml` never
+/// rebuilds the provider runtime and editing `config.toml` never disturbs the
+/// palette or key bindings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChangedSurfaces {
+    pub config: bool,
+    pub theme: bool,
+    pub keymap: bool,
+    pub settings: bool,
+}
+
+impl ChangedSurfaces {
+    /// True when at least one surface changed since the last poll.
+    #[must_use]
+    pub fn any(self) -> bool {
+        self.config || self.theme || self.keymap || self.settings
+    }
+}
+
 /// Detects on-disk config edits between REPL turns by comparing file mtimes.
 /// The REPL can only act on a change at a turn boundary, so lightweight mtime
 /// polling is used instead of a background watcher thread: same effect, no
 /// extra dependency, no thread. Absent files are tracked as `None` so creation
-/// is also detected.
+/// is also detected. One watcher spans every [`ConfigSurface`] (config, theme,
+/// keymap, settings — user and project layer each), tagging every path with its
+/// surface so `changed` reports them independently.
 #[derive(Debug, Clone)]
 pub struct ConfigWatcher {
-    paths: Vec<PathBuf>,
-    stamps: Vec<Option<SystemTime>>,
+    entries: Vec<(ConfigSurface, PathBuf, Option<SystemTime>)>,
 }
 
 impl ConfigWatcher {
     #[must_use]
     pub fn new(cwd: &Path, home: &Path) -> Self {
-        let paths = config_file_paths(cwd, home);
-        let stamps = paths
-            .iter()
-            .map(|path| modified_time(path))
-            .collect::<Vec<_>>();
-        Self { paths, stamps }
+        let mut watched: Vec<(ConfigSurface, PathBuf)> = config_file_paths(cwd, home)
+            .into_iter()
+            .map(|path| (ConfigSurface::Config, path))
+            .collect();
+        watched.extend(
+            theme_file_paths(cwd, home)
+                .into_iter()
+                .map(|path| (ConfigSurface::Theme, path)),
+        );
+        watched.extend(
+            keymap_file_paths(cwd, home)
+                .into_iter()
+                .map(|path| (ConfigSurface::Keymap, path)),
+        );
+        watched.extend(
+            settings_file_paths(cwd, home)
+                .into_iter()
+                .map(|path| (ConfigSurface::Settings, path)),
+        );
+        let entries = watched
+            .into_iter()
+            .map(|(surface, path)| {
+                let stamp = modified_time(&path);
+                (surface, path, stamp)
+            })
+            .collect();
+        Self { entries }
     }
 
-    /// Returns true when any watched file's mtime differs from the last
-    /// observation, refreshing the stored stamps as it goes.
-    pub fn changed(&mut self) -> bool {
-        let mut changed = false;
-        for (path, stamp) in self.paths.iter().zip(&mut self.stamps) {
+    /// Poll every watched file's mtime, returning which surfaces changed since
+    /// the last observation and refreshing the stored stamps as it goes. Only
+    /// the moved surfaces are flagged, so a caller can reload a palette edit
+    /// without paying for a provider/MCP rebuild.
+    pub fn changed(&mut self) -> ChangedSurfaces {
+        let mut changed = ChangedSurfaces::default();
+        for (surface, path, stamp) in &mut self.entries {
             let now = modified_time(path);
             if now != *stamp {
                 *stamp = now;
-                changed = true;
+                match surface {
+                    ConfigSurface::Config => changed.config = true,
+                    ConfigSurface::Theme => changed.theme = true,
+                    ConfigSurface::Keymap => changed.keymap = true,
+                    ConfigSurface::Settings => changed.settings = true,
+                }
             }
         }
         changed
@@ -415,11 +482,42 @@ mod tests {
         fs::write(&cfg, "[provider]\nmodel = \"a\"\n").expect("write cfg");
 
         let mut watcher = ConfigWatcher::new(&proj, &home);
-        assert!(!watcher.changed(), "no edit yet");
+        assert!(!watcher.changed().any(), "no edit yet");
         // Removal flips the mtime sentinel Some -> None regardless of clock
         // granularity, so the change is always observable.
         fs::remove_file(&cfg).expect("remove cfg");
-        assert!(watcher.changed(), "removal must be detected");
+        let changed = watcher.changed();
+        assert!(changed.config, "removal must be detected");
+        assert!(
+            !changed.theme && !changed.keymap && !changed.settings,
+            "only the config surface moved"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn watcher_reports_surfaces_independently() {
+        use super::ConfigWatcher;
+        let base = std::env::temp_dir().join(format!("hf-watch-surface-{}", std::process::id()));
+        let proj = base.join("proj");
+        let home = base.join("home");
+        let cfg_dir = home.join(".heartflow");
+        fs::create_dir_all(&cfg_dir).expect("create home cfg dir");
+        let theme = cfg_dir.join("theme.toml");
+        fs::write(&theme, "[theme]\n").expect("write theme");
+
+        let mut watcher = ConfigWatcher::new(&proj, &home);
+        assert!(!watcher.changed().any(), "baseline quiet");
+        // Editing only theme.toml flags theme and nothing else, so a palette
+        // change never triggers the provider/MCP rebuild reserved for config.
+        fs::remove_file(&theme).expect("remove theme");
+        let changed = watcher.changed();
+        assert!(changed.theme, "theme edit detected");
+        assert!(
+            !changed.config && !changed.keymap && !changed.settings,
+            "config/keymap/settings untouched"
+        );
 
         let _ = fs::remove_dir_all(&base);
     }

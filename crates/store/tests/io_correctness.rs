@@ -133,7 +133,7 @@ fn data_durably_survives_reopen() {
     } // store dropped, WAL checkpointed on close
     let store = Store::open(&path).expect("reopen");
     assert_eq!(load(&store, "dup"), original);
-    assert_eq!(store.schema_version().expect("version"), 2);
+    assert_eq!(store.schema_version().expect("version"), 3);
 }
 
 #[test]
@@ -145,7 +145,7 @@ fn migration_is_idempotent_across_reopens() {
         store
             .save_session("m", &meta(1), &[user("x")])
             .expect("save");
-        assert_eq!(store.schema_version().expect("v"), 2);
+        assert_eq!(store.schema_version().expect("v"), 3);
     }
     let store = Store::open(&path).expect("final open");
     assert_eq!(load(&store, "m").len(), 1, "re-save keeps one copy");
@@ -194,7 +194,22 @@ fn migrates_v1_database_and_preserves_pinned_flag() {
         .expect("create v1 schema");
     }
     let store = Store::open(&path).expect("open triggers migration");
-    assert_eq!(store.schema_version().expect("migrated"), 2);
+    assert_eq!(store.schema_version().expect("migrated"), 3);
+    // v3 drops `idx_messages_session`: `UNIQUE(session_row, seq)` already backs
+    // every query filtering on `session_row`, so the v1 database's copy must be
+    // gone after the upgrade rather than left behind for upgraded files.
+    {
+        let probe = rusqlite::Connection::open(&path).expect("probe open");
+        let leftover: i64 = probe
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_messages_session';",
+                [],
+                |row| row.get(0),
+            )
+            .expect("probe query");
+        assert_eq!(leftover, 0, "migration must drop the redundant index");
+    }
     let legacy = load(&store, "old");
     assert_eq!(legacy.len(), 1, "pre-existing row survives ALTER");
     assert!(!legacy[0].pinned, "old rows default to unpinned");

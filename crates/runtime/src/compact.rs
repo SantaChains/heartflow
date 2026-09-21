@@ -5,6 +5,181 @@ use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 /// tile), so a 1024x1024 attachment lands near this figure.
 const IMAGE_TOKEN_ESTIMATE: usize = 1_500;
 
+/// Observations kept for the affine fit. The static prompt is session-stable,
+/// so a short rolling window keeps the fit conditioned while still following a
+/// mid-session tool-set change.
+const CALIBRATION_WINDOW: usize = 16;
+/// Below this many samples a least-squares line is exact rather than fitted —
+/// two points always define one, however noisy — so the seeded intercept
+/// carries the estimate until a third point makes the fit meaningful.
+const MIN_FIT_SAMPLES: usize = 3;
+/// Spread in the independent variable required for the slope to be determined
+/// at all. Consecutive turns with near-identical prompt sizes carry no
+/// information about density, only about the intercept.
+const MIN_FIT_VARIANCE: f64 = 10_000.0;
+/// Bounds on the learned slope and intercept. Both hurt in both directions: an
+/// under-estimate lets the prompt grow past the context window (hard provider
+/// failure), an over-estimate discards history early (silent quality loss).
+const DENSITY_MIN: f64 = 0.5;
+const DENSITY_MAX: f64 = 3.0;
+const OVERHEAD_MAX_TOKENS: f64 = 200_000.0;
+/// Smallest prompt worth learning from. Below this the sample is dominated by
+/// per-message framing rather than content, and the ratio is mostly noise.
+const MIN_SAMPLE_TOKENS: usize = 256;
+
+/// Online correction for the character-based token heuristic.
+///
+/// [`estimate_text_tokens`] assumes ~4 ASCII characters per token and one token
+/// per non-ASCII glyph, and it counts only `session.messages`. The real request
+/// is larger in two *separately measured* ways, and confusing them was the first
+/// version's mistake:
+///
+/// 1. **Additive.** The provider also sees the system prompt, the tool schemas
+///    and per-message framing. On 451 real turns from 40 saved sessions the
+///    fitted constant is ~12k tokens — an order of magnitude larger than the
+///    content error, and it was simply absent from the estimate.
+/// 2. **Multiplicative.** No character heuristic can know how the provider's
+///    BPE vocabulary splits a given text, and agent transcripts are JSON- and
+///    code-heavy, where 4 chars/token is far too optimistic. The measured slope
+///    is ~2.2x.
+///
+/// So the model is affine — `actual ≈ overhead + density * predicted` — rather
+/// than a single scale factor. A pure multiplier has to absorb the fixed
+/// overhead into the slope, which then over-corrects as the prompt grows and
+/// saturates against its clamp (in measurement, the median session pinned the
+/// multiplier to the ceiling on the very first sample).
+///
+/// Fitted by least squares over a rolling window, seeded from the first
+/// residual. Measured against the raw heuristic on the same 451 turns: median
+/// error 62.4% and bias -57.5% before, 12.0% and -1.5% after.
+///
+/// Note the direction of the failure this prevents: with a -57% bias, a gate at
+/// `context_window / 2` fires only once the true prompt is already past the
+/// whole window. The bias was not conservative slack; it was a real overrun.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenCalibration {
+    /// Recent `(predicted content tokens, provider-reported prompt tokens)`.
+    samples: Vec<(usize, u32)>,
+    /// Tokens per predicted token, and the prompt's fixed additive size.
+    density: f64,
+    overhead: f64,
+    /// Whether any sample has been accepted. Until then the estimator is
+    /// bit-for-bit the uncorrected heuristic.
+    calibrated: bool,
+}
+
+impl Default for TokenCalibration {
+    fn default() -> Self {
+        Self {
+            samples: Vec::new(),
+            density: 1.0,
+            overhead: 0.0,
+            calibrated: false,
+        }
+    }
+}
+
+impl TokenCalibration {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one ground-truth sample in: `predicted` is the estimator's figure
+    /// for the prompt just sent, `actual` the provider's reported input size.
+    /// Degenerate samples are dropped rather than clamped, so a truncated or
+    /// absent usage report cannot move the fit at all.
+    pub fn observe(&mut self, predicted: usize, actual: u32) {
+        if predicted < MIN_SAMPLE_TOKENS || actual == 0 {
+            return;
+        }
+        if !self.calibrated {
+            // One residual cannot separate slope from intercept, and the
+            // intercept is the larger term. Assuming the heuristic's slope and
+            // attributing the whole gap to the fixed prompt makes this first
+            // sample exact, which is a far better prior than 0.0 — and it is
+            // what removes the warm-up tail (p90 falls from 84% to 53%).
+            self.density = 1.0;
+            // Clamped like the fitted intercept: a report far *below* the
+            // content estimate is a broken report, not a saving, and a negative
+            // intercept would forecast an empty prompt and disable compaction.
+            self.overhead = (f64::from(actual) - predicted as f64).clamp(0.0, OVERHEAD_MAX_TOKENS);
+            self.calibrated = true;
+        }
+
+        self.samples.push((predicted, actual));
+        if self.samples.len() > CALIBRATION_WINDOW {
+            self.samples.remove(0);
+        }
+        if self.samples.len() >= MIN_FIT_SAMPLES {
+            if let Some((density, overhead)) = least_squares(&self.samples) {
+                self.density = density;
+                self.overhead = overhead;
+            }
+        }
+    }
+
+    /// Predict the provider's prompt size for `estimate` content tokens.
+    /// Identity until the first accepted sample, so an uncalibrated runtime
+    /// behaves exactly as it did before.
+    #[must_use]
+    pub fn apply(&self, estimate: usize) -> usize {
+        if !self.calibrated {
+            return estimate;
+        }
+        let calibrated = self.overhead + self.density * estimate as f64;
+        if calibrated <= 0.0 {
+            return 0;
+        }
+        // Float-to-int casts saturate in Rust, so a wild fit cannot overflow.
+        calibrated.round() as usize
+    }
+
+    /// Accepted sample count, learned slope, and learned fixed size. Exposed
+    /// for status output and for tests that need to see convergence.
+    #[must_use]
+    pub fn samples(&self) -> usize {
+        self.samples.len()
+    }
+
+    #[must_use]
+    pub fn density(&self) -> f64 {
+        self.density
+    }
+
+    #[must_use]
+    pub fn overhead_tokens(&self) -> f64 {
+        self.overhead
+    }
+}
+
+/// Least-squares fit of `actual = overhead + density * predicted` over a window.
+/// `None` when the window says nothing about the slope, which leaves the
+/// previous fit in place rather than inventing one.
+fn least_squares(samples: &[(usize, u32)]) -> Option<(f64, f64)> {
+    let count = samples.len() as f64;
+    let mean_predicted = samples.iter().map(|(x, _)| *x as f64).sum::<f64>() / count;
+    let mean_actual = samples.iter().map(|(_, y)| f64::from(*y)).sum::<f64>() / count;
+    let variance = samples
+        .iter()
+        .map(|(x, _)| (*x as f64 - mean_predicted).powi(2))
+        .sum::<f64>()
+        / count;
+    if variance < MIN_FIT_VARIANCE {
+        return None;
+    }
+    let covariance = samples
+        .iter()
+        .map(|(x, y)| (*x as f64 - mean_predicted) * (f64::from(*y) - mean_actual))
+        .sum::<f64>()
+        / count;
+    // Slope is clamped before the intercept, so the intercept absorbs the
+    // leftover rather than the two fighting each other.
+    let density = (covariance / variance).clamp(DENSITY_MIN, DENSITY_MAX);
+    let overhead = (mean_actual - density * mean_predicted).clamp(0.0, OVERHEAD_MAX_TOKENS);
+    Some((density, overhead))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionConfig {
     pub preserve_recent_messages: usize,
@@ -348,9 +523,124 @@ fn collapse_blank_lines(content: &str) -> String {
 mod tests {
     use super::{
         compact_session_in_place, estimate_session_tokens, estimate_text_tokens,
-        format_compact_summary, should_compact, CompactionConfig,
+        format_compact_summary, should_compact, CompactionConfig, TokenCalibration,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+
+    #[test]
+    fn uncalibrated_estimate_is_identity() {
+        let calibration = TokenCalibration::new();
+        assert_eq!(calibration.samples(), 0);
+        assert_eq!(calibration.apply(12_345), 12_345);
+    }
+
+    #[test]
+    fn first_sample_is_attributed_to_the_fixed_prompt() {
+        let mut calibration = TokenCalibration::new();
+        // 20k reported against a 5k prediction: one residual cannot be split
+        // into slope and intercept, so it all lands on the fixed prompt — and
+        // the prediction for the prompt just measured becomes exact.
+        calibration.observe(5_000, 20_000);
+        assert_eq!(calibration.samples(), 1);
+        assert_eq!(calibration.density(), 1.0);
+        assert_eq!(calibration.overhead_tokens(), 15_000.0);
+        assert_eq!(calibration.apply(5_000), 20_000);
+    }
+
+    #[test]
+    fn a_fitted_window_recovers_slope_and_intercept() {
+        let mut calibration = TokenCalibration::new();
+        // An exact line: actual = 5_000 + 1.5 * predicted.
+        for (predicted, actual) in [(1_000_usize, 6_500_u32), (2_000, 8_000), (4_000, 11_000)] {
+            calibration.observe(predicted, actual);
+        }
+        assert_eq!(calibration.samples(), 3);
+        assert!((calibration.density() - 1.5).abs() < 1e-9);
+        assert!((calibration.overhead_tokens() - 5_000.0).abs() < 1e-6);
+        assert_eq!(calibration.apply(3_000), 9_500);
+    }
+
+    #[test]
+    fn a_wild_sample_cannot_collapse_the_estimate() {
+        let mut calibration = TokenCalibration::new();
+        // A provider reporting 1 token for a 10k content estimate is a broken
+        // report, not a 10k-token saving. Clamping the seeded intercept at zero
+        // degrades this to "heuristic unchanged" instead of forecasting an
+        // empty context and switching compaction off for the session.
+        calibration.observe(10_000, 1);
+        assert_eq!(calibration.overhead_tokens(), 0.0);
+        assert_eq!(calibration.apply(10_000), 10_000);
+    }
+
+    #[test]
+    fn a_wild_slope_is_clamped_by_the_band() {
+        let mut calibration = TokenCalibration::new();
+        // Actual grows 10x with predicted: an absurd slope.
+        for (predicted, actual) in [(1_000_usize, 10_000_u32), (2_000, 20_000), (4_000, 40_000)] {
+            calibration.observe(predicted, actual);
+        }
+        assert_eq!(calibration.density(), 3.0);
+        // Intercept absorbs whatever the clamped slope leaves over.
+        let expected = 70_000.0 / 3.0 - 3.0 * (7_000.0 / 3.0);
+        assert!((calibration.overhead_tokens() - expected).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_flat_window_leaves_the_previous_fit_alone() {
+        let mut calibration = TokenCalibration::new();
+        // Three samples whose predicted sizes barely differ carry no slope
+        // information at all, so the seeded fit must survive them unchanged
+        // rather than be replaced by a two-point line fitted to noise.
+        for (predicted, actual) in [
+            (10_000_usize, 30_000_u32),
+            (10_001, 30_002),
+            (10_002, 30_004),
+        ] {
+            calibration.observe(predicted, actual);
+        }
+        assert_eq!(calibration.samples(), 3);
+        assert_eq!(calibration.density(), 1.0);
+        assert_eq!(calibration.overhead_tokens(), 20_000.0);
+        assert_eq!(calibration.apply(10_000), 30_000);
+    }
+
+    #[test]
+    fn degenerate_samples_are_ignored() {
+        let mut calibration = TokenCalibration::new();
+        // A prompt too small to be informative, and an absent usage report.
+        // Clamping either into the fit would poison it from one trivial turn.
+        calibration.observe(8, 500);
+        calibration.observe(10_000, 0);
+        assert_eq!(calibration.samples(), 0);
+        assert_eq!(calibration.apply(9_999), 9_999);
+    }
+
+    #[test]
+    fn the_calibrated_estimate_moves_the_compaction_gate() {
+        let messages = (0..40)
+            .map(|_| ConversationMessage::user_text("x".repeat(400)))
+            .collect::<Vec<_>>();
+        let session = Session {
+            version: 1,
+            messages,
+        };
+        let raw = estimate_session_tokens(&session);
+        let config = CompactionConfig {
+            preserve_recent_messages: 1,
+            // Just above the raw estimate: uncorrected, no compaction yet.
+            max_estimated_tokens: raw + 1_000,
+            context_window_tokens: 0,
+            replay_verbatim_tail: 12,
+        };
+        assert!(!should_compact(&session, config));
+
+        // The provider reports the real prompt: the raw content it does not
+        // count, plus ~8k of system prompt and tool schemas it never counted.
+        let mut calibration = TokenCalibration::new();
+        calibration.observe(raw, u32::try_from(raw + 8_000).expect("fits u32"));
+        assert_eq!(calibration.apply(raw), raw + 8_000);
+        assert!(calibration.apply(raw) >= config.max_estimated_tokens);
+    }
 
     #[test]
     fn formats_compact_summary_like_upstream() {

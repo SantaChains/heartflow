@@ -5,7 +5,7 @@ use serde::Deserialize;
 use tracing::debug;
 
 use crate::error::ApiError;
-use crate::retry::{build_http, is_retryable_status, RetryPolicy};
+use crate::retry::{build_http, is_retryable_status, parse_retry_after, RetryPolicy};
 use crate::sse::{SseFrame, SseParser};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -115,6 +115,8 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     if status.is_success() {
         return Ok(response);
     }
+    // Capture `Retry-After` before the body is consumed.
+    let retry_after = parse_retry_after(response.headers());
     let body = response.text().await.unwrap_or_default();
     let message = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
@@ -130,6 +132,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         message,
         body,
         retryable: is_retryable_status(status),
+        retry_after,
     })
 }
 

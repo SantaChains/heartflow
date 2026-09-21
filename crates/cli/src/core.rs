@@ -6,6 +6,8 @@
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 
+use runtime::{ContentBlock, ConversationMessage, MessageRole};
+
 /// FIFO of user messages submitted while a turn is running.
 ///
 /// Semantics locked with the operator (Claude Code queue model): a queued
@@ -211,9 +213,71 @@ pub fn guide_log_line(role: &str, text: &str, budget: usize) -> String {
     format!("{role}: {head}{seam}{tail}")
 }
 
+/// The runtime-derived half of a guide draft: a compact work log and a one-line
+/// current state. Captured as a snapshot (never assembled live during a turn,
+/// when the runtime is borrowed by the turn future) so the ratatui Ctrl+G
+/// overlay can preview a full draft; `task` is supplied by the operator at
+/// confirm time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GuideContext {
+    pub work_log: String,
+    pub state: String,
+}
+
+/// Extract the work log + state from a transcript and a pending-task count: the
+/// last few human/assistant turns folded into high-density log lines, plus the
+/// ledger depth. Shared by the blocking `/guide` command and the ratatui overlay
+/// so the two assemble byte-identical drafts. Pure — reads the message slice,
+/// no I/O.
+#[must_use]
+pub fn guide_context(messages: &[ConversationMessage], pending_tasks: usize) -> GuideContext {
+    let mut work_log = String::new();
+    for message in messages.iter().rev().take(6).rev() {
+        let role = match message.role {
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            // System prompt and raw tool turns are noise for re-entry context;
+            // the guide summarizes the human/assistant thread only.
+            MessageRole::System | MessageRole::Tool => continue,
+        };
+        let text = message
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !text.trim().is_empty() {
+            work_log.push_str(&guide_log_line(role, &text, 160));
+            work_log.push('\n');
+        }
+    }
+    GuideContext {
+        work_log,
+        state: format!("{pending_tasks} pending tasks in the ledger"),
+    }
+}
+
+/// Assemble the full three-part draft from a snapshot context plus the
+/// operator's next task. The single sink for guide text, so the blocking command
+/// and the ratatui overlay never drift.
+#[must_use]
+pub fn guide_draft(context: &GuideContext, task: &str) -> String {
+    build_guide(GuideSections {
+        work_log: &context.work_log,
+        state: &context.state,
+        task,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_guide, FollowUpQueue, GuideSections, HeartModel};
+    use super::{
+        build_guide, guide_context, guide_draft, FollowUpQueue, GuideContext, GuideSections,
+        HeartModel,
+    };
 
     #[test]
     fn queue_preserves_order_and_drains_once() {
@@ -286,5 +350,24 @@ mod tests {
         assert!(long.starts_with("assistant: 字字字"));
         assert!(long.ends_with('字'), "tail must survive the fold");
         assert!(long.contains(" ... "));
+    }
+
+    #[test]
+    fn guide_draft_wraps_context_and_task_in_order() {
+        let context = GuideContext {
+            work_log: String::from("user: hi\n"),
+            state: String::from("2 pending tasks in the ledger"),
+        };
+        let draft = guide_draft(&context, "do next");
+        assert!(draft.contains("[guide: prior work]\nuser: hi"));
+        assert!(draft.contains("[guide: current state]\n2 pending tasks"));
+        assert!(draft.ends_with("[guide: next task]\ndo next"));
+    }
+
+    #[test]
+    fn guide_context_on_empty_transcript_reports_state_only() {
+        let context = guide_context(&[], 3);
+        assert!(context.work_log.is_empty());
+        assert_eq!(context.state, "3 pending tasks in the ledger");
     }
 }

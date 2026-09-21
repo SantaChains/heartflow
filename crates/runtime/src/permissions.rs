@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionMode {
@@ -20,7 +22,15 @@ pub enum PermissionPromptDecision {
 }
 
 pub trait PermissionPrompter: Send {
-    fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision;
+    /// Async so a full-screen UI can render a permission overlay and keep
+    /// pumping keys while the decision is pending. The future borrows `self`
+    /// and `request` for `'a`; it is intentionally not `Send` because the
+    /// consumer turn future is already non-`Send` (the runtime carries a
+    /// `Cell`), so requiring `Send` here would only add friction.
+    fn decide<'a>(
+        &'a mut self,
+        request: &'a PermissionRequest,
+    ) -> Pin<Box<dyn Future<Output = PermissionPromptDecision> + 'a>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,8 +80,7 @@ impl PermissionPolicy {
             .unwrap_or(self.default_mode)
     }
 
-    #[must_use]
-    pub fn authorize(
+    pub async fn authorize(
         &self,
         tool_name: &str,
         input: &str,
@@ -87,15 +96,20 @@ impl PermissionPolicy {
                     return PermissionOutcome::Allow;
                 }
                 match prompter.as_mut() {
-                    Some(prompter) => match prompter.decide(&PermissionRequest {
-                        tool_name: tool_name.to_string(),
-                        input: input.to_string(),
-                    }) {
-                        PermissionPromptDecision::Allow => PermissionOutcome::Allow,
-                        PermissionPromptDecision::Deny { reason } => {
-                            PermissionOutcome::Deny { reason }
+                    Some(prompter) => {
+                        match prompter
+                            .decide(&PermissionRequest {
+                                tool_name: tool_name.to_string(),
+                                input: input.to_string(),
+                            })
+                            .await
+                        {
+                            PermissionPromptDecision::Allow => PermissionOutcome::Allow,
+                            PermissionPromptDecision::Deny { reason } => {
+                                PermissionOutcome::Deny { reason }
+                            }
                         }
-                    },
+                    }
                     None => PermissionOutcome::Deny {
                         reason: format!("tool '{tool_name}' requires interactive approval"),
                     },
@@ -111,23 +125,35 @@ mod tests {
         PermissionMode, PermissionOutcome, PermissionPolicy, PermissionPromptDecision,
         PermissionPrompter, PermissionRequest,
     };
+    use std::future::Future;
+    use std::pin::Pin;
 
     struct AllowPrompter;
 
     impl PermissionPrompter for AllowPrompter {
-        fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
-            assert_eq!(request.tool_name, "bash");
-            PermissionPromptDecision::Allow
+        fn decide<'a>(
+            &'a mut self,
+            request: &'a PermissionRequest,
+        ) -> Pin<Box<dyn Future<Output = PermissionPromptDecision> + 'a>> {
+            Box::pin(async move {
+                assert_eq!(request.tool_name, "bash");
+                PermissionPromptDecision::Allow
+            })
         }
     }
 
     struct DenyPrompter;
 
     impl PermissionPrompter for DenyPrompter {
-        fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
-            PermissionPromptDecision::Deny {
-                reason: "user rejected".to_string(),
-            }
+        fn decide<'a>(
+            &'a mut self,
+            _request: &'a PermissionRequest,
+        ) -> Pin<Box<dyn Future<Output = PermissionPromptDecision> + 'a>> {
+            Box::pin(async move {
+                PermissionPromptDecision::Deny {
+                    reason: "user rejected".to_string(),
+                }
+            })
         }
     }
 
@@ -139,42 +165,44 @@ mod tests {
         true
     }
 
-    #[test]
-    fn uses_tool_specific_overrides() {
+    #[tokio::test]
+    async fn uses_tool_specific_overrides() {
         let policy = PermissionPolicy::new(PermissionMode::Deny)
             .with_tool_mode("bash", PermissionMode::Prompt);
 
-        let outcome = policy.authorize("bash", "echo hi", Some(&mut AllowPrompter));
+        let outcome = policy
+            .authorize("bash", "echo hi", Some(&mut AllowPrompter))
+            .await;
         assert_eq!(outcome, PermissionOutcome::Allow);
         assert!(matches!(
-            policy.authorize("edit", "x", None),
+            policy.authorize("edit", "x", None).await,
             PermissionOutcome::Deny { .. }
         ));
     }
 
-    #[test]
-    fn allow_mode_permits_every_tool_without_a_prompter() {
+    #[tokio::test]
+    async fn allow_mode_permits_every_tool_without_a_prompter() {
         let policy = PermissionPolicy::new(PermissionMode::Allow);
         assert_eq!(
-            policy.authorize("bash", "anything", None),
+            policy.authorize("bash", "anything", None).await,
             PermissionOutcome::Allow
         );
         assert_eq!(
-            policy.authorize("unknown_tool", "", None),
+            policy.authorize("unknown_tool", "", None).await,
             PermissionOutcome::Allow
         );
     }
 
-    #[test]
-    fn deny_default_overridden_to_allow_for_one_tool() {
+    #[tokio::test]
+    async fn deny_default_overridden_to_allow_for_one_tool() {
         let policy = PermissionPolicy::new(PermissionMode::Deny)
             .with_tool_mode("read", PermissionMode::Allow);
         assert_eq!(
-            policy.authorize("read", "x", None),
+            policy.authorize("read", "x", None).await,
             PermissionOutcome::Allow
         );
         assert!(matches!(
-            policy.authorize("write", "x", None),
+            policy.authorize("write", "x", None).await,
             PermissionOutcome::Deny { reason } if reason.contains("write")
         ));
     }
@@ -187,59 +215,63 @@ mod tests {
         assert_eq!(policy.mode_for("edit"), PermissionMode::Prompt);
     }
 
-    #[test]
-    fn prompt_without_gate_uses_prompter() {
+    #[tokio::test]
+    async fn prompt_without_gate_uses_prompter() {
         let policy = PermissionPolicy::new(PermissionMode::Allow)
             .with_tool_mode("bash", PermissionMode::Prompt);
         assert_eq!(
-            policy.authorize("bash", "echo", Some(&mut AllowPrompter)),
+            policy
+                .authorize("bash", "echo", Some(&mut AllowPrompter))
+                .await,
             PermissionOutcome::Allow
         );
         assert!(matches!(
-            policy.authorize("bash", "echo", Some(&mut DenyPrompter)),
+            policy.authorize("bash", "echo", Some(&mut DenyPrompter)).await,
             PermissionOutcome::Deny { reason } if reason == "user rejected"
         ));
         assert!(matches!(
-            policy.authorize("bash", "echo", None),
+            policy.authorize("bash", "echo", None).await,
             PermissionOutcome::Deny { reason } if reason.contains("interactive")
         ));
     }
 
-    #[test]
-    fn prompt_gate_auto_allows_safe_and_prompts_dangerous() {
+    #[tokio::test]
+    async fn prompt_gate_auto_allows_safe_and_prompts_dangerous() {
         let policy = PermissionPolicy::new(PermissionMode::Allow)
             .with_tool_mode("bash", PermissionMode::Prompt)
             .with_prompt_gate(gate_flags_only_rm);
         // Routine command: gate says no confirmation needed, so it runs unattended.
         assert_eq!(
-            policy.authorize("bash", "ls -la", None),
+            policy.authorize("bash", "ls -la", None).await,
             PermissionOutcome::Allow
         );
         // Dangerous command: gate demands confirmation; no prompter means we must deny.
         assert!(matches!(
-            policy.authorize("bash", "rm file", None),
+            policy.authorize("bash", "rm file", None).await,
             PermissionOutcome::Deny { .. }
         ));
         // Dangerous command with an approving prompter is allowed.
         assert_eq!(
-            policy.authorize("bash", "rm file", Some(&mut AllowPrompter)),
+            policy
+                .authorize("bash", "rm file", Some(&mut AllowPrompter))
+                .await,
             PermissionOutcome::Allow
         );
     }
 
-    #[test]
-    fn gate_is_ignored_outside_prompt_mode() {
+    #[tokio::test]
+    async fn gate_is_ignored_outside_prompt_mode() {
         let policy =
             PermissionPolicy::new(PermissionMode::Allow).with_prompt_gate(gate_flags_everything);
         assert_eq!(
-            policy.authorize("bash", "rm -rf /", None),
+            policy.authorize("bash", "rm -rf /", None).await,
             PermissionOutcome::Allow,
             "Allow mode must not consult the gate"
         );
         let policy =
             PermissionPolicy::new(PermissionMode::Deny).with_prompt_gate(gate_flags_everything);
         assert!(matches!(
-            policy.authorize("bash", "ls", None),
+            policy.authorize("bash", "ls", None).await,
             PermissionOutcome::Deny { .. }
         ));
     }

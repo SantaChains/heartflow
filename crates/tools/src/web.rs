@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Read;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -78,9 +78,12 @@ pub fn web_fetch(input: &WebFetchInput) -> Result<WebFetchReport, WebError> {
         .map(|path| load_cookie_jar(path))
         .unwrap_or_default();
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let is_secure = url.scheme() == "https";
+    let request_path = url.path();
+    let now_secs = unix_now();
 
     let mut request = client.get(url.clone());
-    if let Some(header) = build_cookie_header(&jar, &host) {
+    if let Some(header) = build_cookie_header(&jar, &host, request_path, is_secure, now_secs) {
         request = request.header(reqwest::header::COOKIE, header);
     }
     let response = request
@@ -137,7 +140,7 @@ pub fn web_fetch(input: &WebFetchInput) -> Result<WebFetchReport, WebError> {
     }
 
     if let (Some(path), Some(final_host)) = (jar_path.as_deref(), final_url.host_str()) {
-        store_set_cookies(&mut jar, &set_cookies, final_host);
+        store_set_cookies(&mut jar, &set_cookies, final_host, unix_now());
         save_cookie_jar(path, &jar);
     }
 
@@ -151,11 +154,83 @@ pub fn web_fetch(input: &WebFetchInput) -> Result<WebFetchReport, WebError> {
     })
 }
 
-/// Persistent name->value cookies keyed by host scope. Deliberately minimal: it
-/// ignores `Path`/`Secure`/`Expires` attributes and only scopes by `Domain` (or
-/// the response host), which covers login/session replay for the built-in
-/// `web_fetch` without pulling a cookie crate into the offline dependency set.
-type CookieJar = BTreeMap<String, BTreeMap<String, String>>;
+/// Persistent cookies keyed by host scope, each entry remembering the security
+/// and lifetime attributes the server set: `Secure` (replay only over https),
+/// `Path` (prefix match on a `/` boundary), and `Max-Age` folded to an absolute
+/// Unix expiry. `Expires` HTTP-dates are intentionally not parsed and fail open
+/// as session cookies, matching `retry.rs`'s refusal to hand-roll date math.
+/// Scoping by `Domain` (or the response host) covers login/session replay for
+/// the built-in `web_fetch` without pulling a cookie crate into the deps.
+type CookieJar = BTreeMap<String, BTreeMap<String, StoredCookie>>;
+
+/// One stored cookie: its value plus the attributes that gate replay.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct StoredCookie {
+    value: String,
+    /// `Secure`: only send back over an https request.
+    #[serde(default)]
+    secure: bool,
+    /// Absolute expiry in Unix seconds, folded from `Max-Age`. `None` is a
+    /// session cookie; a timestamp at or before now means "drop on replay".
+    #[serde(default)]
+    expires: Option<i64>,
+    /// `Path` attribute; `None` matches any path.
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// Backward-compatible deserialization: jars written before these attributes
+/// existed stored a bare string value. Accept both shapes so an old cookie file
+/// upgrades in place instead of being discarded.
+impl<'de> Deserialize<'de> for StoredCookie {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Legacy(String),
+            Full {
+                value: String,
+                #[serde(default)]
+                secure: bool,
+                #[serde(default)]
+                expires: Option<i64>,
+                #[serde(default)]
+                path: Option<String>,
+            },
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Legacy(value) => StoredCookie {
+                value,
+                secure: false,
+                expires: None,
+                path: None,
+            },
+            Repr::Full {
+                value,
+                secure,
+                expires,
+                path,
+            } => StoredCookie {
+                value,
+                secure,
+                expires,
+                path,
+            },
+        })
+    }
+}
+
+/// Current Unix time in seconds, saturating to a sane bound rather than
+/// panicking on a clock before the epoch.
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
 
 /// Jar file path when cookie persistence is enabled via `HEARTFLOW_COOKIE_JAR`.
 fn cookie_jar_path() -> Option<PathBuf> {
@@ -181,44 +256,121 @@ fn host_matches(scope: &str, host: &str) -> bool {
     host == scope || host.ends_with(&format!(".{scope}"))
 }
 
-/// Build a `Cookie` header from every jar entry whose scope applies to `host`.
-fn build_cookie_header(jar: &CookieJar, host: &str) -> Option<String> {
+/// Build a `Cookie` header from every jar entry whose scope applies to `host`,
+/// filtered by the request's security and path context and by expiry: a `Secure`
+/// cookie is withheld over plain http, an expired one is dropped, and a cookie
+/// scoped to a `Path` is sent only when the request path matches.
+fn build_cookie_header(
+    jar: &CookieJar,
+    host: &str,
+    request_path: &str,
+    is_secure: bool,
+    now_secs: i64,
+) -> Option<String> {
     let mut pairs = Vec::new();
     for (scope, cookies) in jar {
-        if host_matches(scope, host) {
-            pairs.extend(
-                cookies
-                    .iter()
-                    .map(|(name, value)| format!("{name}={value}")),
-            );
+        if !host_matches(scope, host) {
+            continue;
+        }
+        for (name, cookie) in cookies {
+            if cookie.secure && !is_secure {
+                continue;
+            }
+            if cookie.expires.is_some_and(|expires| now_secs >= expires) {
+                continue;
+            }
+            if cookie
+                .path
+                .as_deref()
+                .is_some_and(|path| !path_matches(path, request_path))
+            {
+                continue;
+            }
+            pairs.push(format!("{name}={}", cookie.value));
         }
     }
     (!pairs.is_empty()).then(|| pairs.join("; "))
 }
 
-/// Split a `Set-Cookie` value into (name, value, optional Domain attribute).
-fn parse_set_cookie(raw: &str) -> Option<(String, String, Option<String>)> {
+/// RFC 6265 path matching: `cookie_path` applies when it equals the request
+/// path or is a prefix ending at a `/` boundary, so `/foo` covers `/foo` and
+/// `/foo/bar` but never `/foobar`.
+fn path_matches(cookie_path: &str, request_path: &str) -> bool {
+    let cookie_path = if cookie_path.is_empty() {
+        "/"
+    } else {
+        cookie_path
+    };
+    if cookie_path == request_path {
+        return true;
+    }
+    if !request_path.starts_with(cookie_path) {
+        return false;
+    }
+    cookie_path.ends_with('/') || request_path[cookie_path.len()..].starts_with('/')
+}
+
+/// Split a `Set-Cookie` value into (name, optional Domain attribute, stored
+/// cookie). `Max-Age` (delta seconds) is folded into an absolute Unix expiry
+/// against `now_secs`; `Secure` and `Path` are captured. `Expires` HTTP-dates
+/// are intentionally not parsed (see `StoredCookie`).
+fn parse_set_cookie(raw: &str, now_secs: i64) -> Option<(String, Option<String>, StoredCookie)> {
     let mut segments = raw.split(';');
     let (name, value) = segments.next()?.split_once('=')?;
     let name = name.trim();
     if name.is_empty() {
         return None;
     }
-    let domain = segments.find_map(|attr| {
-        let (key, val) = attr.split_once('=')?;
-        key.trim()
-            .eq_ignore_ascii_case("domain")
-            .then(|| val.trim().to_string())
-    });
-    Some((name.to_string(), value.trim().to_string(), domain))
+    let mut domain = None;
+    let mut path = None;
+    let mut secure = false;
+    let mut expires = None;
+    for attr in segments {
+        let val_start = attr.find('=');
+        let key = match val_start {
+            Some(idx) => attr[..idx].trim(),
+            None => attr.trim(),
+        };
+        if key.eq_ignore_ascii_case("secure") {
+            secure = true;
+            continue;
+        }
+        let Some(val) = val_start.map(|idx| attr[idx + 1..].trim()) else {
+            continue;
+        };
+        if key.eq_ignore_ascii_case("domain") {
+            domain = Some(val.to_string());
+        } else if key.eq_ignore_ascii_case("path") && !val.is_empty() {
+            path = Some(val.to_string());
+        } else if key.eq_ignore_ascii_case("max-age") {
+            if let Ok(secs) = val.parse::<i64>() {
+                expires = Some(now_secs.saturating_add(secs));
+            }
+        }
+    }
+    Some((
+        name.to_string(),
+        domain,
+        StoredCookie {
+            value: value.trim().to_string(),
+            secure,
+            expires,
+            path,
+        },
+    ))
 }
 
 /// Merge captured `Set-Cookie` headers into `jar`, scoping each by its `Domain`
 /// attribute (leading dot stripped) or the response host when absent.
-fn store_set_cookies(jar: &mut CookieJar, set_cookies: &[String], response_host: &str) {
+fn store_set_cookies(
+    jar: &mut CookieJar,
+    set_cookies: &[String],
+    response_host: &str,
+    now_secs: i64,
+) {
     let response_host = response_host.to_ascii_lowercase();
     for raw in set_cookies {
-        let Some((name, value, domain)) = parse_set_cookie(raw) else {
+        let Some((name, domain, cookie)) = parse_set_cookie(raw, now_secs) else {
             continue;
         };
         let scope = domain.map_or_else(
@@ -228,7 +380,7 @@ fn store_set_cookies(jar: &mut CookieJar, set_cookies: &[String], response_host:
         if scope.is_empty() {
             continue;
         }
-        jar.entry(scope).or_default().insert(name, value);
+        jar.entry(scope).or_default().insert(name, cookie);
     }
 }
 
@@ -807,7 +959,7 @@ mod tests {
         attr, build_cookie_header, collapse_whitespace, decode_ddg_redirect, decode_entity,
         decode_html_text, ensure_public, extract_title, host_matches, html_to_markdown,
         html_to_text, is_blocked_ip, load_cookie_jar, parse_duckduckgo, parse_set_cookie,
-        save_cookie_jar, store_set_cookies, CookieJar,
+        path_matches, save_cookie_jar, store_set_cookies, CookieJar,
     };
     use std::net::IpAddr;
 
@@ -885,13 +1037,23 @@ mod tests {
 
     #[test]
     fn parses_set_cookie_with_attributes() {
-        let (name, value, domain) =
-            parse_set_cookie("session=abc123; Path=/; Domain=.Example.com; Secure")
+        let (name, domain, cookie) =
+            parse_set_cookie("session=abc123; Path=/; Domain=.Example.com; Secure", 0)
                 .expect("valid cookie");
         assert_eq!(name, "session");
-        assert_eq!(value, "abc123");
+        assert_eq!(cookie.value, "abc123");
         assert_eq!(domain.as_deref(), Some(".Example.com"));
-        assert!(parse_set_cookie("=novalue; Path=/").is_none());
+        assert!(cookie.secure, "Secure flag captured");
+        assert_eq!(cookie.path.as_deref(), Some("/"));
+        assert!(parse_set_cookie("=novalue; Path=/", 0).is_none());
+    }
+
+    #[test]
+    fn max_age_folds_to_absolute_expiry() {
+        let (_, _, cookie) = parse_set_cookie("a=1; Max-Age=60", 1_000).expect("valid");
+        assert_eq!(cookie.expires, Some(1_060));
+        let (_, _, session) = parse_set_cookie("b=2", 1_000).expect("valid");
+        assert!(session.expires.is_none(), "no Max-Age is a session cookie");
     }
 
     #[test]
@@ -899,6 +1061,15 @@ mod tests {
         assert!(host_matches("example.com", "example.com"));
         assert!(host_matches("example.com", "www.example.com"));
         assert!(!host_matches("example.com", "evilexample.com"));
+    }
+
+    #[test]
+    fn path_matches_slash_boundary() {
+        assert!(path_matches("/foo", "/foo"));
+        assert!(path_matches("/foo", "/foo/bar"));
+        assert!(path_matches("/foo/", "/foo/bar"));
+        assert!(!path_matches("/foo", "/foobar"));
+        assert!(path_matches("/", "/anything"));
     }
 
     #[test]
@@ -911,25 +1082,92 @@ mod tests {
                 "t=2".to_string(), // no Domain -> scoped to the response host
             ],
             "www.example.com",
+            0,
         );
         assert_eq!(
             jar.get("example.com")
                 .and_then(|c| c.get("sid"))
-                .map(String::as_str),
+                .map(|cookie| cookie.value.as_str()),
             Some("1")
         );
         assert_eq!(
             jar.get("www.example.com")
                 .and_then(|c| c.get("t"))
-                .map(String::as_str),
+                .map(|cookie| cookie.value.as_str()),
             Some("2")
         );
-        let header = build_cookie_header(&jar, "shop.example.com").expect("header");
+        let header = build_cookie_header(&jar, "shop.example.com", "/", true, 0).expect("header");
         assert!(header.contains("sid=1"));
         assert!(
             !header.contains("t=2"),
             "host-specific cookie must not leak to a sibling subdomain"
         );
+    }
+
+    #[test]
+    fn secure_cookie_withheld_over_plain_http() {
+        let mut jar = CookieJar::new();
+        store_set_cookies(&mut jar, &["tok=s; Secure".to_string()], "example.com", 0);
+        assert_eq!(
+            build_cookie_header(&jar, "example.com", "/", false, 0),
+            None,
+            "a Secure cookie must not replay over http"
+        );
+        let header = build_cookie_header(&jar, "example.com", "/", true, 0).expect("https header");
+        assert!(header.contains("tok=s"));
+    }
+
+    #[test]
+    fn expired_cookie_is_dropped_on_replay() {
+        let mut jar = CookieJar::new();
+        store_set_cookies(
+            &mut jar,
+            &["a=1; Max-Age=60".to_string()],
+            "example.com",
+            1_000,
+        );
+        assert!(build_cookie_header(&jar, "example.com", "/", true, 1_030)
+            .expect("still fresh")
+            .contains("a=1"));
+        assert_eq!(
+            build_cookie_header(&jar, "example.com", "/", true, 1_060),
+            None,
+            "a cookie at or past its expiry is not replayed"
+        );
+    }
+
+    #[test]
+    fn path_attribute_gates_replay() {
+        let mut jar = CookieJar::new();
+        store_set_cookies(&mut jar, &["p=1; Path=/api".to_string()], "example.com", 0);
+        assert!(build_cookie_header(&jar, "example.com", "/api", true, 0)
+            .expect("/api")
+            .contains("p=1"));
+        assert!(build_cookie_header(&jar, "example.com", "/api/v1", true, 0)
+            .expect("/api/v1")
+            .contains("p=1"));
+        assert_eq!(
+            build_cookie_header(&jar, "example.com", "/apifoo", true, 0),
+            None,
+            "/api must not match /apifoo"
+        );
+        assert_eq!(build_cookie_header(&jar, "example.com", "/", true, 0), None);
+    }
+
+    #[test]
+    fn legacy_bare_string_cookie_upgrades_on_load() {
+        // A jar written before attributes existed stored bare string values; it
+        // must still deserialize, upgrading each entry to a session cookie.
+        let legacy = r#"{"example.com":{"sid":"old"}}"#;
+        let jar: CookieJar = serde_json::from_str(legacy).expect("legacy jar parses");
+        let cookie = jar
+            .get("example.com")
+            .and_then(|c| c.get("sid"))
+            .expect("sid");
+        assert_eq!(cookie.value, "old");
+        assert!(!cookie.secure);
+        assert!(cookie.expires.is_none());
+        assert!(cookie.path.is_none());
     }
 
     #[test]
@@ -940,6 +1178,7 @@ mod tests {
             &mut jar,
             &["sid=1; Domain=example.com".to_string()],
             "example.com",
+            0,
         );
         save_cookie_jar(&path, &jar);
         assert_eq!(load_cookie_jar(&path), jar);

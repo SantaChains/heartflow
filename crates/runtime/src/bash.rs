@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::io;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -32,6 +33,14 @@ pub struct BashCommandOutput {
     pub is_image: Option<bool>,
     #[serde(rename = "backgroundTaskId")]
     pub background_task_id: Option<String>,
+    /// Sidecar JSON recording the task's terminal state (`running`, then
+    /// `exited` + exit code). The log answers "what has it printed"; this
+    /// answers "is it done, and why" without polling the log and guessing.
+    #[serde(
+        rename = "backgroundStatusPath",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub background_status_path: Option<String>,
     #[serde(rename = "backgroundedByUser")]
     pub backgrounded_by_user: Option<bool>,
     #[serde(rename = "assistantAutoBackgrounded")]
@@ -117,10 +126,21 @@ fn spawn_background(
     for arg in args {
         spawn.arg(arg);
     }
+    // Same hygiene as the foreground path: no inherited credentials, no
+    // console window. Background tasks are the ones most likely to outlive the
+    // invocation, so a leaked key here is the longest-lived.
+    if !input.dangerously_disable_sandbox.unwrap_or(false) {
+        scrub_credential_env(&mut spawn);
+    }
+    hide_console_window(&mut spawn);
     // The log file must be openable before spawn (both output streams point
     // at it), so it gets a unique pre-generated name; the PID is returned as
     // the task id and the log path as `raw_output_path`.
     let (log_file, log_path) = tempfile_log()?;
+    // The background directory is a bounded cache, not a record: sweep our own
+    // stale artifacts on the next spawn so a long-lived install does not
+    // accumulate them. Only `bg-`-named entries are candidates.
+    prune_background_logs(&background_log_dir(), &log_path, BACKGROUND_LOG_RETENTION);
 
     let child = spawn
         .arg(wrapped)
@@ -134,32 +154,70 @@ fn spawn_background(
         .spawn()?;
 
     let pid = child.id();
-    // Unix keeps the child as a zombie until reaped; a detached reaper thread
-    // collects it (Windows has no zombies and reaps on handle close).
-    #[cfg(unix)]
-    {
-        let mut reaper = child;
-        std::thread::spawn(move || {
-            let _ = reaper.wait();
-        });
-    }
-    #[cfg(not(unix))]
-    drop(child);
+    let status_path = background_status_path(&log_path);
+    // Snapshot `running` *before* the reaper starts, so the reaper's terminal
+    // write is always last and cannot be clobbered by this one.
+    write_background_status(
+        &status_path,
+        &BackgroundTaskStatus {
+            pid,
+            state: BackgroundTaskState::Running,
+            exit_code: None,
+            success: None,
+        },
+    );
+    // One detached reaper for both platforms. Unix needs it to avoid zombies;
+    // Windows needs it to *observe* the exit code — its handles reap on close,
+    // so dropping the child (as before) would leave the code forever unknown,
+    // which is exactly the gap the sidecar closes.
+    let reaper_status_path = status_path.clone();
+    let mut reaper = child;
+    std::thread::spawn(move || {
+        let collected = reaper.wait();
+        let (exit_code, success) = match collected {
+            Ok(status) => (status.code(), Some(status.success())),
+            Err(_) => (None, None),
+        };
+        write_background_status(
+            &reaper_status_path,
+            &BackgroundTaskStatus {
+                pid,
+                state: BackgroundTaskState::Exited,
+                exit_code,
+                success,
+            },
+        );
+    });
 
-    Ok(background_output(input, pid, &log_path.to_string_lossy()))
+    Ok(background_output(
+        input,
+        pid,
+        &log_path.to_string_lossy(),
+        &status_path,
+    ))
 }
 
-fn background_output(input: &BashCommandInput, pid: u32, log_path: &str) -> BashCommandOutput {
+fn background_output(
+    input: &BashCommandInput,
+    pid: u32,
+    log_path: &str,
+    status_path: &Path,
+) -> BashCommandOutput {
+    let status_path = status_path.to_string_lossy();
     BashCommandOutput {
         stdout: format!(
             "background task started: pid {pid}, log at {log_path} \
-             (read it later with read_file; stop with `kill`/`Stop-Process -Id {pid}`)"
+             (read progress with read_file; check completion at {status_path} — \
+             once it reads `\"state\":\"exited\"` the exit code is in the same \
+             file, so no log polling is needed; stop with `kill`/\
+             `Stop-Process -Id {pid}`)"
         ),
         stderr: String::new(),
         raw_output_path: Some(log_path.to_string()),
         interrupted: false,
         is_image: None,
         background_task_id: Some(pid.to_string()),
+        background_status_path: Some(status_path.into_owned()),
         backgrounded_by_user: Some(false),
         assistant_auto_backgrounded: Some(false),
         dangerously_disable_sandbox: input.dangerously_disable_sandbox,
@@ -171,10 +229,94 @@ fn background_output(input: &BashCommandInput, pid: u32, log_path: &str) -> Bash
     }
 }
 
+/// Terminal state of a background task, written to its sidecar file. `Running`
+/// is the snapshot taken at spawn; the reaper overwrites it with `Exited` (and
+/// the exit code) the moment the process is collected.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundTaskState {
+    Running,
+    Exited,
+}
+
+/// The sidecar payload. Deliberately small: one `read_file` answers "finished
+/// yet, and with what status", which the log alone cannot answer without
+/// polling and guessing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackgroundTaskStatus {
+    pub pid: u32,
+    pub state: BackgroundTaskState,
+    /// Present only once `state` is `Exited` (a signal-killed process may still
+    /// have no numeric code, in which case only `success` is meaningful).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
+}
+
+/// The shared directory holding background logs and their status sidecars.
+/// Namespaced under the OS temp dir so a crash never leaves junk in the repo.
+fn background_log_dir() -> std::path::PathBuf {
+    env::temp_dir().join("heartflow-bg")
+}
+
+/// `bg-<…>.log` -> `bg-<…>.status.json`, so the sidecar travels with its log
+/// and a single naming rule covers both.
+fn background_status_path(log_path: &Path) -> std::path::PathBuf {
+    log_path.with_extension("status.json")
+}
+
+/// Best-effort status write: an unwritable sidecar must never fail the tool
+/// call — the log and the pid alone already keep the task usable.
+fn write_background_status(path: &Path, status: &BackgroundTaskStatus) {
+    if let Ok(json) = serde_json::to_string(status) {
+        let _ = fs::write(path, json);
+    }
+}
+
+/// Background artifacts are a cache, not a record: logs older than this are
+/// swept on the next spawn so a long-lived install does not accumulate them.
+const BACKGROUND_LOG_RETENTION: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+
+/// Remove our own stale background artifacts from `dir`, keeping `keep` (the
+/// log just created) unconditionally. Only entries named with our `bg-` prefix
+/// are candidates — anything else in the directory belongs to someone else and
+/// is left alone. Every step is best-effort: an unreadable entry simply
+/// survives rather than failing the spawn.
+fn prune_background_logs(dir: &Path, keep: &Path, max_age: Duration) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep {
+            continue;
+        }
+        let is_ours = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("bg-"));
+        if !is_ours {
+            continue;
+        }
+        // A missing or future-dated mtime yields `false`, i.e. the file
+        // survives — the conservative direction.
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= max_age);
+        if stale {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
 /// A unique, pre-opened log file in the shared background-log directory;
 /// returned with its path because `File` alone does not expose it.
 fn tempfile_log() -> io::Result<(std::fs::File, std::path::PathBuf)> {
-    let dir = env::temp_dir().join("heartflow-bg");
+    let dir = background_log_dir();
     fs::create_dir_all(&dir)?;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -194,6 +336,104 @@ fn tempfile_log() -> io::Result<(std::fs::File, std::path::PathBuf)> {
     Err(io::Error::other("could not create a background log file"))
 }
 
+/// Variable-name shapes that carry credentials. A shell child spawned by the
+/// agent is for builds, tests and inspection; it has no legitimate need for the
+/// agent's own provider keys, yet it inherits them by default. `printenv`, or
+/// any tool that echoes its environment, then lifts a live key into the
+/// transcript — which gets persisted to the session store and resent to the
+/// provider on every later turn.
+///
+/// Matching is by name *shape* rather than by a value registry because
+/// `runtime` sits below `provider` and cannot see the resolved `api_key_env`,
+/// and the CLI-side literal registry (`redact.rs`) is applied only at save
+/// time. Name matching is the one layer that can act before the child starts.
+///
+/// `_KEY` alone is deliberately absent: it would sweep benign variables
+/// (`SSH_KEY`, `GPG_KEY`) that are identifiers rather than secrets.
+const CREDENTIAL_ENV_SUFFIXES: &[&str] = &[
+    "_API_KEY",
+    "_APIKEY",
+    "_ACCESS_KEY_ID",
+    "_ACCESS_KEY",
+    "_SECRET_KEY",
+    "_SECRET",
+    "_TOKEN",
+    "_PASSWORD",
+    "_PASSWD",
+    "_CREDENTIALS",
+    "_CREDENTIAL",
+];
+
+/// Whether an environment variable name looks like it holds a credential.
+/// Windows environment blocks are case-insensitive, so matching is too.
+fn is_credential_env_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    CREDENTIAL_ENV_SUFFIXES
+        .iter()
+        .any(|suffix| upper.ends_with(suffix))
+        || matches!(
+            upper.as_str(),
+            "TOKEN" | "API_KEY" | "APIKEY" | "SECRET" | "PASSWORD"
+        )
+}
+
+/// Remove every credential-bearing variable from a child's environment,
+/// inherited from the agent's own process. Absent variables are a no-op, so
+/// this is unconditional over whatever the host happens to export.
+fn scrub_credential_env(command: &mut Command) {
+    for (name, _) in env::vars_os() {
+        if name.to_str().is_some_and(is_credential_env_name) {
+            command.env_remove(name);
+        }
+    }
+}
+
+/// `CREATE_NO_WINDOW`: a console child gets no console of its own. Without it,
+/// every `bash` call launched from a console-less parent (GUI host, detached
+/// service) allocates a window that flashes on screen and steals focus.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Suppress the child's console window. A no-op off Windows so both spawn
+/// paths can call it unconditionally.
+#[cfg(windows)]
+fn hide_console_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt as _;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_console_window(_command: &mut Command) {}
+
+/// Terminate a timed-out shell *together with its descendants*.
+///
+/// `kill_on_drop` only reaches the direct child: a `pwsh -Command` that started
+/// `cargo`/`npm` leaves those grandchildren running after the timeout path
+/// returns, holding build locks and CPU. The containment primitive for this on
+/// Windows is a Job Object, but creating one requires `unsafe` and the
+/// workspace forbids it (`unsafe_code = "forbid"`, which a local `#[allow]`
+/// cannot lift). `taskkill /T` is the safe-Rust equivalent; it is a sweep at
+/// the timeout instant rather than a fence, which is enough here because the
+/// parent is still alive when it runs.
+#[cfg(windows)]
+fn kill_process_tree(pid: u32) {
+    use std::os::windows::process::CommandExt as _;
+    let _ = Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+}
+
+/// Off Windows there is no safe-Rust, group-preserving equivalent: the child
+/// intentionally shares the terminal's process group so `Ctrl+C` reaches it,
+/// and re-grouping it would silently break interrupt delivery. So only the
+/// direct child is reaped there, exactly as before.
+#[cfg(not(windows))]
+fn kill_process_tree(_pid: u32) {}
+
 async fn execute_bash_async(
     input: BashCommandInput,
     wrapped: String,
@@ -206,6 +446,14 @@ async fn execute_bash_async(
     command.arg(&wrapped);
     // A timed-out or dropped future must not leave an orphaned child running.
     command.kill_on_drop(true);
+    // Credentials stay out of the child's environment, and no console window
+    // flashes when the agent itself has no console. An explicit sandbox opt-out
+    // is also the opt-out from scrubbing: a workflow that genuinely needs the
+    // variable (e.g. `gh pr create` with `GITHUB_TOKEN`) stays reachable.
+    if !input.dangerously_disable_sandbox.unwrap_or(false) {
+        scrub_credential_env(command.as_std_mut());
+    }
+    hide_console_window(command.as_std_mut());
 
     let timeout_ms = input
         .timeout
@@ -220,6 +468,10 @@ async fn execute_bash_async(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    // Captured before the join! future borrows `child`: on timeout that future
+    // is only *dropped*, and dropping a borrow does not drop the child, so the
+    // parent is still alive when the tree sweep below needs its descendants.
+    let child_pid = child.id();
     // Boxed once: the join! state machine plus Child exceed clippy's
     // large-future threshold and poll() never inspects them anyway.
     let collected = timeout(
@@ -244,6 +496,11 @@ async fn execute_bash_async(
     let (output, interrupted) = match collected {
         Ok(triple) => (triple, false),
         Err(_) => {
+            // Sweep the whole tree before `child` is dropped: kill_on_drop
+            // reaps only the shell, leaving anything it spawned behind.
+            if let Some(pid) = child_pid {
+                kill_process_tree(pid);
+            }
             return Ok(BashCommandOutput {
                 stdout: String::new(),
                 stderr: format!("Command exceeded timeout of {timeout_ms} ms"),
@@ -251,6 +508,7 @@ async fn execute_bash_async(
                 interrupted: true,
                 is_image: None,
                 background_task_id: None,
+                background_status_path: None,
                 backgrounded_by_user: None,
                 assistant_auto_backgrounded: None,
                 dangerously_disable_sandbox: input.dangerously_disable_sandbox,
@@ -280,6 +538,7 @@ async fn execute_bash_async(
         interrupted,
         is_image: None,
         background_task_id: None,
+        background_status_path: None,
         backgrounded_by_user: None,
         assistant_auto_backgrounded: None,
         dangerously_disable_sandbox: input.dangerously_disable_sandbox,
@@ -451,9 +710,177 @@ pub fn is_dangerous_command(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::time::{Duration, Instant};
 
-    use super::{execute_bash, is_dangerous_command, resolve_shell, BashCommandInput};
+    use super::{
+        execute_bash, is_credential_env_name, is_dangerous_command, resolve_shell, BashCommandInput,
+    };
+
+    #[test]
+    fn classifies_credential_env_names() {
+        // Shapes that must be scrubbed.
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "MY_PASSWORD",
+            "OPENAI_APIKEY",
+            "TOKEN",
+            "openai_api_key",
+        ] {
+            assert!(is_credential_env_name(name), "{name} should be scrubbed");
+        }
+        // Ordinary variables, including the key-shaped identifiers the suffix
+        // list deliberately does not catch. Losing any of these would break
+        // real commands (PATH lookup, shell selection, editor fallbacks).
+        for name in [
+            "PATH",
+            "HOME",
+            "USERPROFILE",
+            "SSH_KEY",
+            "GPG_KEY",
+            "NODE_OPTIONS",
+            "HEARTFLOW_SHELL",
+            "HEARTFLOW_COOKIE_JAR",
+            "EDITOR",
+            "KEYBOARD_LAYOUT",
+        ] {
+            assert!(!is_credential_env_name(name), "{name} must survive");
+        }
+    }
+
+    #[test]
+    fn child_environment_lacks_inherited_credentials() {
+        const NAME: &str = "HF_TEST_SCRUB_API_KEY";
+        // SAFETY-adjacent caveat: this mutates the test process environment,
+        // which is global. The name is unique to this test and only ever adds a
+        // credential-shaped variable, so a concurrent child can at worst have
+        // one extra variable scrubbed.
+        env::set_var(NAME, "sk-must-not-reach-the-child");
+        let command = if cfg!(windows) {
+            format!(r#"Write-Output "value=[$env:{NAME}]""#)
+        } else {
+            format!(r#"printf 'value=[%s]' "${{{NAME}:-}}""#)
+        };
+        let output = execute_bash(BashCommandInput {
+            command,
+            timeout: Some(10_000),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(false),
+        })
+        .expect("shell command should execute");
+        env::remove_var(NAME);
+
+        assert!(
+            output.stdout.contains("value=[]"),
+            "credential reached the child: {:?}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("sk-must-not-reach-the-child"),
+            "credential value leaked into stdout"
+        );
+    }
+
+    #[test]
+    fn scrub_opt_out_keeps_the_variable() {
+        // The sandbox opt-out doubles as the scrubbing opt-out, so a workflow
+        // that genuinely needs the variable must still see it.
+        const NAME: &str = "HF_TEST_KEEP_API_KEY";
+        env::set_var(NAME, "kept-on-purpose");
+        let command = if cfg!(windows) {
+            format!(r#"Write-Output "value=[$env:{NAME}]""#)
+        } else {
+            format!(r#"printf 'value=[%s]' "${{{NAME}:-}}""#)
+        };
+        let output = execute_bash(BashCommandInput {
+            command,
+            timeout: Some(10_000),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(true),
+        })
+        .expect("shell command should execute");
+        env::remove_var(NAME);
+
+        assert!(
+            output.stdout.contains("value=[kept-on-purpose]"),
+            "opt-out did not preserve the variable: {:?}",
+            output.stdout
+        );
+    }
+
+    /// The timeout path must reap the shell's descendants, not just the shell.
+    /// `kill_on_drop` alone reaches only the direct child, so a regression back
+    /// to it would leave this `ping` running and the assertion below catches it.
+    #[cfg(windows)]
+    #[test]
+    fn timeout_sweeps_descendants() {
+        let marker = env::temp_dir().join(format!(
+            "hf-sweep-{}.pid",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let _ = std::fs::remove_file(&marker);
+        // The descendant outlives the shell's own timeout, so only an explicit
+        // tree sweep can stop it. Its pid is recorded first because the timeout
+        // branch returns no stdout to read it from.
+        let script = format!(
+            "$p = Start-Process -FilePath ping -ArgumentList '-n','20','127.0.0.1' \
+             -PassThru -WindowStyle Hidden; Set-Content -LiteralPath '{}' -Value $p.Id; \
+             Start-Sleep -Seconds 30",
+            marker.display()
+        );
+        let output = execute_bash(BashCommandInput {
+            command: script,
+            timeout: Some(6_000),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(false),
+        })
+        .expect("the timeout path should still return an output");
+        assert!(output.interrupted, "expected the timeout branch to fire");
+
+        let pid: u32 = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "descendant pid was never recorded at {} — the shell did not get \
+                     far enough to start one",
+                    marker.display()
+                )
+            });
+        let _ = std::fs::remove_file(&marker);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if !process_alive(pid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        panic!("descendant {pid} survived the timeout sweep");
+    }
+
+    /// Liveness by pid has no safe std equivalent, so `tasklist` stands in.
+    #[cfg(windows)]
+    fn process_alive(pid: u32) -> bool {
+        use std::os::windows::process::CommandExt as _;
+        let probed = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .creation_flags(super::CREATE_NO_WINDOW)
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()))
+            .unwrap_or(false);
+        probed
+    }
 
     #[test]
     fn bounded_reads_capture_head_and_count_tail() {
@@ -491,7 +918,11 @@ mod tests {
         let output = execute_bash(BashCommandInput {
             // ~2 MB of stdout: beyond the 512 KB capture cap.
             command: String::from("1..200000 | ForEach-Object { 'A' * 12 }"),
-            timeout: Some(30_000),
+            // Generous on purpose: a PowerShell cold start pushing ~2.4 MB
+            // through the pipeline can exceed 30s when the whole workspace
+            // suite runs in parallel, which would kill the shell before the
+            // truncation note is emitted and flake the assertion below.
+            timeout: Some(180_000),
             description: None,
             run_in_background: Some(false),
             dangerously_disable_sandbox: Some(false),
@@ -575,6 +1006,12 @@ mod tests {
         let task_id = output.background_task_id.expect("pid as task id");
         assert_ne!(task_id, "");
         let log_path = output.raw_output_path.expect("log path");
+        // The sidecar path ships with every background result, so completion
+        // becomes a single read instead of a log poll.
+        assert!(
+            output.background_status_path.is_some(),
+            "a background task must advertise its status sidecar"
+        );
         // The shell cold start can exceed a second on a loaded machine; poll
         // for the marker instead of sleeping a fixed amount.
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -587,6 +1024,77 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         panic!("log never contained the marker; content: {log:?}");
+    }
+
+    /// The gap this closes: before, a background task's outcome was only
+    /// inferable by polling the log. The sidecar must reach `exited` and carry
+    /// the real exit code, or the whole entry is decorative.
+    #[test]
+    fn background_status_sidecar_reports_exit_code() {
+        let output = execute_bash(BashCommandInput {
+            command: String::from("exit 7"),
+            timeout: None,
+            description: None,
+            run_in_background: Some(true),
+            dangerously_disable_sandbox: Some(false),
+        })
+        .expect("background spawn should succeed");
+
+        let status_path = output.background_status_path.expect("status sidecar path");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let parsed = std::fs::read_to_string(&status_path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<super::BackgroundTaskStatus>(&text).ok());
+            if let Some(status) = parsed {
+                if status.state == super::BackgroundTaskState::Exited {
+                    assert_eq!(status.exit_code, Some(7), "exit code not propagated");
+                    assert_eq!(status.success, Some(false));
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "status sidecar never reached `exited`: {:?}",
+                std::fs::read_to_string(&status_path)
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let _ = std::fs::remove_file(&status_path);
+        if let Some(log) = output.raw_output_path {
+            let _ = std::fs::remove_file(log);
+        }
+    }
+
+    /// The retention sweep must be narrow: our own `bg-` artifacts go, anything
+    /// else in the directory stays. A zero retention makes every non-`keep`
+    /// artifact eligible, exercising the selection rule without faking mtimes.
+    #[test]
+    fn prunes_stale_background_artifacts_but_keeps_fresh_and_foreign_files() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = env::temp_dir().join(format!("hf-prune-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let keep = dir.join("bg-current.log");
+        let stale_log = dir.join("bg-old.log");
+        let stale_status = dir.join("bg-old.status.json");
+        let foreign = dir.join("user-notes.txt");
+        for path in [&keep, &stale_log, &stale_status, &foreign] {
+            std::fs::write(path, "x").unwrap();
+        }
+
+        super::prune_background_logs(&dir, &keep, Duration::ZERO);
+
+        assert!(keep.exists(), "the log just created must survive");
+        assert!(!stale_log.exists(), "a stale log should be swept");
+        assert!(!stale_status.exists(), "its sidecar should go with it");
+        assert!(
+            foreign.exists(),
+            "files we did not name must be left untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

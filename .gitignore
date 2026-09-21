@@ -25,3 +25,7 @@ error.md
 
 *.log
 .prompt-dump.txt
+
+.workbuddy/
+openmemory copy.md
+*.bak

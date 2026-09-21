@@ -27,7 +27,7 @@ pub use search::{choose_method, fts_match_phrase, like_escape, TRIGRAM_MIN};
 
 /// Schema version tracked via `PRAGMA user_version` (no meta table needed).
 /// Version 2 adds the `pinned` column so compaction pins survive resume.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// One row from the aggregate token-usage query (all `SUM`s are nullable).
 type UsageRow = (
@@ -535,16 +535,25 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
              pinned INTEGER NOT NULL DEFAULT 0,
              UNIQUE(session_row, seq)
          );
-         CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_row);
+         DROP INDEX IF EXISTS idx_messages_session;
          CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
              search_text,
              tokenize='trigram'
          );",
     )?;
+    // `UNIQUE(session_row, seq)` already materialises an index whose leftmost
+    // column is `session_row`, so the separate single-column index v2 created
+    // on the same column was pure write amplification: `DELETE FROM messages
+    // WHERE session_row = ?`, `SELECT COUNT(*) … WHERE session_row = ?` and
+    // `… WHERE session_row = ? ORDER BY seq` all resolve through the UNIQUE
+    // index. v3 drops it (and never recreates it on a fresh database).
+    //
     // Databases created before the pin feature already have `messages` without
     // the `pinned` column, so `CREATE TABLE IF NOT EXISTS` was a no-op there.
-    // A fresh (version 0) database already got the column above.
-    if version >= 1 {
+    // A fresh (version 0) database got the column from the CREATE above, and a
+    // v2 database already has it, so only the v1 upgrade still needs the ALTER
+    // — `>= 1` would now try to re-add it and fail on a v2 file.
+    if version == 1 {
         conn.execute_batch("ALTER TABLE messages ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;")?;
     }
     conn.execute_batch(&format!(
@@ -579,6 +588,25 @@ mod tests {
         assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
         assert_eq!(store.integrity_check().expect("check ran"), Integrity::Ok);
         assert_eq!(store.quick_check().expect("check ran"), Integrity::Ok);
+    }
+
+    /// v3 drops the single-column index on `messages(session_row)`: the
+    /// `UNIQUE(session_row, seq)` constraint already backs every query that
+    /// filters on `session_row`, so the extra B-tree only cost write
+    /// amplification and cache. A fresh database must never recreate it.
+    #[test]
+    fn redundant_session_index_is_not_created() {
+        let store = Store::open_in_memory().expect("open");
+        let conn = store.conn.lock().expect("lock");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_messages_session';",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query");
+        assert_eq!(count, 0, "idx_messages_session must not exist at v3");
     }
 
     #[test]

@@ -1,9 +1,21 @@
 mod config;
 mod core;
+mod doctor;
 mod editor;
+mod interact;
+mod keymap;
+mod markdown;
 mod mascot;
+mod permissions;
+mod plan;
 mod render;
+mod settings;
+mod shell;
+mod storage;
 mod theme;
+mod tool_exec;
+mod tui;
+mod turn;
 mod viewport_term;
 
 // mimalloc serves the hot allocation streams (serde_json parsing on every
@@ -18,33 +30,69 @@ use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use api::OpenAiClient;
-use clap::{ArgAction, Args, Parser, Subcommand};
+use clap::Parser;
 use crossterm::style::Stylize;
-use inquire::{Confirm, MultiSelect, Select, Text};
-use mcp::{HttpTransport, McpClient, McpTool, StdioTransport, Transport};
+use inquire::{Confirm, Select};
 use runtime::{
-    execute_bash, is_dangerous_command, load_system_prompt, normalize_tool_schema, redact_messages,
-    redact_session, truncate_chars, AgentEvent, BashCommandInput, CompactionConfig, ContentBlock,
-    ConversationMessage, ConversationRuntime, MessageRole, PermissionMode, PermissionPolicy,
-    PermissionPromptDecision, PermissionPrompter, PermissionRequest, Session, TokenUsage,
-    ToolError, ToolExecutor, ToolSpec,
+    execute_bash, is_dangerous_command, load_system_prompt, truncate_chars, AgentEvent,
+    BashCommandInput, CompactionConfig, ContentBlock, ConversationRuntime, MessageRole, Session,
+    TokenUsage, ToolSpec,
 };
-use store::{role_str, Integrity, SearchHit, SearchMethod, SessionMeta, Store, StoreError};
+use store::{role_str, SearchHit, SearchMethod, Store};
 use tokio_util::sync::CancellationToken;
-use tools::{task_id, todo_tool_spec, TodoLedger};
 
-use config::{load_merged_mcp, load_provider_selection, ConfigWatcher, McpServerConfig};
-use core::{build_guide, guide_log_line, GuideSections, HeartModel};
+use config::{load_merged_mcp, load_provider_selection, ConfigWatcher};
+use core::{guide_context, guide_draft, HeartModel};
 use provider::{
-    config_file_paths, load_merged_settings, AnthropicStreamClient, ProviderProtocol,
-    ProviderSelection, ProviderSettings, TransportClient, CONFIG_VERSION,
+    load_merged_settings, AnthropicStreamClient, ProviderProtocol, ProviderSelection,
+    ProviderSettings, TransportClient, CONFIG_VERSION,
 };
-use render::{ColorTheme, Spinner, TerminalRenderer};
+use render::TerminalRenderer;
+// Persistence subsystem (Phase 1 thinning): re-exported crate-wide so existing
+// call sites (`home_dir`, `SessionShared`, `save_session_async`, ...) and
+// `crate::`/`super::` paths in sibling modules and tests keep resolving. The
+// wildcard is deliberate: some items are used only by the test build, so an
+// explicit list would trip `unused_imports` in the non-test compilation.
+#[allow(clippy::wildcard_imports)]
+pub(crate) use storage::*;
+// CLI argument surface (Phase 1 thinning): `run` parses `Cli` and dispatches on
+// `Action`/`ConfigAction`; the clap subcommand types stay private to `shell`.
+pub(crate) use shell::{Action, Cli, ConfigAction, ConfigSurface};
+// Interactive terminal primitives (cli-thinning): the blocking REPL's
+// permission prompter and `ask_user` question flow, re-exported crate-wide so
+// `main.rs` call sites and `super::` test paths keep resolving.
+#[allow(clippy::wildcard_imports)]
+pub(crate) use interact::*;
+// Tool routing + MCP connection glue (cli-thinning): `NativeToolExecutor`,
+// `AgentToolExecutor`, `McpToolset` and the connect helpers, re-exported so the
+// `AgentRuntime` alias, `build_runtime*` and `super::` test paths keep
+// resolving.
+#[allow(clippy::wildcard_imports)]
+pub(crate) use tool_exec::*;
+// Permission policy resolution (cli-thinning): the mode -> policy mapping, the
+// prompt gates and the hard-gate `BlockPrompter`, re-exported so `main.rs`
+// dispatch sites and `super::` test paths keep resolving.
+#[allow(clippy::wildcard_imports)]
+pub(crate) use permissions::*;
+// Plan mode + Hermes task loop (cli-thinning): the plan-document helpers, the
+// fresh-context task orchestrator and the reflection tail, re-exported so the
+// `/plan` dispatch sites and `super::` test paths keep resolving.
+#[allow(clippy::wildcard_imports)]
+pub(crate) use plan::*;
+// Interactive turn rendering + driving (cli-thinning): `TurnRenderer`,
+// `TurnOutcome` and `run_turn_interactive`, re-exported so the REPL, `plan.rs`,
+// `doctor` and `super::` test paths keep resolving.
+#[allow(clippy::wildcard_imports)]
+pub(crate) use turn::*;
+// `hf doctor` diagnostics (cli-thinning): the health checks, FAQ and `--ai`
+// repair turn, re-exported so the `run` dispatch site and `super::` test paths
+// keep resolving.
+#[allow(clippy::wildcard_imports)]
+pub(crate) use doctor::*;
 
 /// Fallback date only when the system clock reads before the Unix epoch; the
 /// live value comes from `current_date()` so the prompt never hardcodes a date.
@@ -90,21 +138,14 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
-/// Set by `/restart` to ask `main` to re-exec this binary after the REPL exits.
-static RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
-
 /// Cap on chained automatic restarts, guarding against a crash-restart loop.
 const MAX_RESTART_DEPTH: usize = 5;
 
 /// Tool results longer than this are folded in the terminal; the full text is
-/// kept in `EXPANDABLE` for `/expand`. Chosen to fit a typical screen.
-const FOLD_TOOL_OUTPUT_LINES: usize = 40;
+/// kept in the session state for `/expand`. Chosen to fit a typical screen.
+pub(crate) const FOLD_TOOL_OUTPUT_LINES: usize = 40;
 
-/// Full text of tool outputs folded during rendering, indexed for `/expand`.
-/// The REPL renders on a single thread, so a mutex is only for `'static` access.
-static EXPANDABLE: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-type AgentRuntime = ConversationRuntime<TransportClient, AgentToolExecutor>;
+pub(crate) type AgentRuntime = ConversationRuntime<TransportClient, AgentToolExecutor>;
 
 fn main() {
     init_logging();
@@ -118,14 +159,16 @@ fn main() {
             process::exit(1);
         }
     };
-    if let Err(error) = runtime.block_on(run()) {
-        eprintln!("{error}");
-        process::exit(1);
-    }
-    // `/restart` was confirmed in the REPL: re-exec a fresh process (picking up a
-    // replaced binary and a full config/MCP reload) and exit with its status.
-    if RESTART_REQUESTED.load(Ordering::SeqCst) {
-        perform_restart();
+    // `run` reports whether `/restart` was confirmed in the REPL: re-exec a
+    // fresh process (picking up a replaced binary and a full config/MCP reload)
+    // and exit with its status.
+    match runtime.block_on(run()) {
+        Ok(true) => perform_restart(),
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            process::exit(1);
+        }
     }
 }
 
@@ -192,8 +235,12 @@ fn init_logging() {
         .try_init();
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+async fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    // One conversation's mutable state (persistence, mirror, folded-output
+    // stash); instance-scoped so a future parallel section owns its own.
+    let state = new_session_state();
+    let mut restart = false;
     match cli.into_action()? {
         Action::PrintSystemPrompt { cwd, date } => print_system_prompt(cwd, date),
         Action::ResumeSession {
@@ -209,21 +256,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(command) = command {
                 // One-shot slash command run against the saved session, then exit.
                 resume_session(&session_path, &command);
-                return Ok(());
+                return Ok(false);
             }
             // No --run: reopen the interactive REPL with the conversation restored.
             let session = load_saved_session(&session_path)
                 .map_err(|error| format!("failed to restore session: {error}"))?;
             // Continue this transcript in place: adopt its id so later
             // turns overwrite the same file and update the same row.
-            adopt_session_path(&session_path);
+            adopt_session_path(&state, &session_path);
             let selection = resolve_selection(provider.as_deref(), model.as_deref())?;
             println!(
                 "Restored session from {} ({} messages).",
                 session_path.display(),
                 session.messages.len()
             );
-            run_repl(selection, session).await?;
+            restart = run_repl(&state, selection, session).await?;
         }
         Action::Prompt {
             instruction,
@@ -238,6 +285,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let selection = resolve_selection(provider.as_deref(), model.as_deref())?;
             let mut runtime = build_runtime(
+                &state,
                 Session::new(),
                 selection,
                 false,
@@ -245,14 +293,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             if quiet || json {
                 let (text, usage) = run_turn_capture(&mut runtime, &prompt).await?;
-                let saved = save_session_async(runtime.session()).await.ok();
+                let saved = save_session_async(&state, runtime.session()).await.ok();
                 if json {
                     println!("{}", turn_json(&text, usage.as_ref(), saved.as_deref()));
                 } else {
                     println!("{text}");
                 }
             } else {
-                run_turn_interactive(&mut runtime, &prompt, None).await?;
+                run_turn_interactive(&state, &mut runtime, &prompt, None).await?;
             }
         }
         Action::Search { query, limit, json } => run_search(&query, limit, json)?,
@@ -265,16 +313,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     process::exit(1);
                 }
             };
-            run_repl(selection, Session::new()).await?;
+            restart = run_repl(&state, selection, Session::new()).await?;
         }
         Action::Config { action } => match action {
-            ConfigAction::Export { output } => export_config(output)?,
+            ConfigAction::Export { surface, output } => export_config(surface, output)?,
             ConfigAction::Import { path } => import_config(&path)?,
         },
         Action::Doctor { fix, ai } => {
             let problems = run_doctor(fix)?;
             if ai {
-                doctor_ai_repair(&problems).await?;
+                doctor_ai_repair(&state, &problems).await?;
             }
         }
         Action::Init { force } => {
@@ -287,10 +335,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             balance,
         } => run_models(provider, model, balance).await?,
     }
-    Ok(())
+    Ok(restart)
 }
 
-fn resolve_selection(
+pub(crate) fn resolve_selection(
     provider: Option<&str>,
     model: Option<&str>,
 ) -> Result<ProviderSelection, String> {
@@ -298,13 +346,28 @@ fn resolve_selection(
     load_provider_selection(&cwd, &home_dir(), provider, model)
 }
 
-/// Export the merged file-level config (no CLI flags, no secret values).
-fn export_config(output: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+/// Export one merged config surface (no CLI flags, no secret values). `config`
+/// is the provider + MCP connection file; `theme`/`keymap`/`settings` are the
+/// shell's look/feel/behavior files. Each emits its fully-resolved effective
+/// values, so the result is a ready-to-edit template rather than a partial file.
+fn export_config(
+    surface: ConfigSurface,
+    output: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let mut settings = load_merged_settings(&cwd, &home_dir());
-    settings.version = Some(CONFIG_VERSION);
-    let mut text = settings.to_toml_string();
-    text.push_str(&load_merged_mcp(&cwd, &home_dir()).to_toml_string());
+    let home = home_dir();
+    let text = match surface {
+        ConfigSurface::Config => {
+            let mut provider = load_merged_settings(&cwd, &home);
+            provider.version = Some(CONFIG_VERSION);
+            let mut text = provider.to_toml_string();
+            text.push_str(&load_merged_mcp(&cwd, &home).to_toml_string());
+            text
+        }
+        ConfigSurface::Theme => theme::Theme::load(&cwd, &home).to_toml_string(),
+        ConfigSurface::Keymap => keymap::Keymap::load(&cwd, &home).to_toml_string(),
+        ConfigSurface::Settings => settings::Settings::load(&cwd, &home).to_toml_string(),
+    };
     match output {
         Some(path) => {
             if let Some(parent) = path.parent() {
@@ -342,7 +405,7 @@ fn import_config(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn backup_existing(target: &Path) -> std::io::Result<()> {
+pub(crate) fn backup_existing(target: &Path) -> std::io::Result<()> {
     if !target.exists() {
         return Ok(());
     }
@@ -357,527 +420,6 @@ fn backup_existing(target: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Diagnose config, directories, and provider resolution. `--fix` applies safe
-/// repairs: create missing directories and move an unparseable config aside
-/// (backed up, never deleted). Returns the human-readable list of problems found
-/// so `--ai` can hand them to the built-in assistant for repair advice.
-fn run_doctor(fix: bool) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
-    let home = home_dir();
-    let mut problems: Vec<String> = Vec::new();
-    println!("heartflow doctor{}", if fix { " (fix mode)" } else { "" });
-
-    // Every config layer must be absent or valid TOML.
-    for path in config_file_paths(&cwd, &home) {
-        match fs::read_to_string(&path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                println!("  ok   {} (absent)", path.display());
-            }
-            Err(error) => {
-                let message = format!("{} is unreadable: {error}", path.display());
-                println!("  fail {message}");
-                problems.push(message);
-            }
-            Ok(contents) => match toml::from_str::<toml::Table>(&contents) {
-                Ok(_) => println!("  ok   {}", path.display()),
-                Err(error) => {
-                    let message = format!("{} is not valid TOML: {error}", path.display());
-                    println!("  fail {message}");
-                    problems.push(message);
-                    if fix {
-                        match backup_existing(&path) {
-                            Ok(()) => println!("       moved it aside as a .bak backup"),
-                            Err(error) => println!("       could not back it up: {error}"),
-                        }
-                    }
-                }
-            },
-        }
-    }
-
-    // Working directories must exist and be usable.
-    for dir in [home.join(".heartflow"), sessions_dir()] {
-        match ensure_dir(&dir, fix) {
-            DirState::Ok => println!("  ok   {} (directory)", dir.display()),
-            DirState::Created => println!("  fix  created {}", dir.display()),
-            DirState::Missing => {
-                let message = format!("{} is missing", dir.display());
-                println!("  fail {message}");
-                problems.push(message);
-            }
-            DirState::NotDirectory => {
-                let message = format!("{} exists but is not a directory", dir.display());
-                println!("  fail {message}");
-                problems.push(message);
-            }
-        }
-    }
-
-    // Resolve the provider end-to-end (surfaces a missing api-key env var, etc.).
-    match load_provider_selection(&cwd, &home, None, None) {
-        Ok(selection) => println!("  ok   provider resolves (model={})", selection.model()),
-        Err(error) => {
-            let message = format!("provider: {error}");
-            println!("  fail {message}");
-            problems.push(message);
-        }
-    }
-
-    // The derived history database, if present, must be structurally sound.
-    check_history_store(&mut problems);
-
-    let count = problems.len();
-    if count == 0 {
-        println!("no problems found");
-    } else if fix {
-        println!("{count} problem(s) reported; verify the repairs above");
-    } else {
-        println!("{count} problem(s): rerun with --fix to apply safe repairs");
-    }
-    print_common_issues();
-    Ok(problems)
-}
-
-/// Above this size `hf doctor` falls back to `SQLite`'s cheaper `quick_check` so
-/// the diagnostic stays prompt; below it the full `integrity_check` runs because
-/// the scan is cheap and maximally thorough (index-vs-row cross-checks included).
-const QUICK_CHECK_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Verify the derived history database is not corrupted. Read-only: it never
-/// mutates data. The JSON transcripts stay authoritative, so a corrupt database
-/// is reported with the rebuild path rather than silently patched.
-fn check_history_store(problems: &mut Vec<String>) {
-    let path = store_path();
-    if !path.exists() {
-        println!("  ok   history database absent (created on first save)");
-        return;
-    }
-    let size = fs::metadata(&path).map_or(0, |meta| meta.len());
-    let quick = size > QUICK_CHECK_THRESHOLD_BYTES;
-    let mode = if quick {
-        "quick_check"
-    } else {
-        "integrity_check"
-    };
-    match Store::open_read_only(&path).and_then(|store| {
-        if quick {
-            store.quick_check()
-        } else {
-            store.integrity_check()
-        }
-    }) {
-        Ok(Integrity::Ok) => {
-            println!("  ok   history database is sound ({mode}, {size} bytes)");
-        }
-        Ok(Integrity::Corrupt {
-            problems: found,
-            truncated,
-        }) => {
-            let suffix = if truncated {
-                ", further errors suppressed"
-            } else {
-                ""
-            };
-            let first = found.first().map_or("unknown", String::as_str);
-            let message = format!(
-                "history database is corrupt: {} issue(s){suffix}; first: {first}",
-                found.len()
-            );
-            println!("  fail {message}");
-            println!("       JSON transcripts under ~/.heartflow/sessions stay authoritative;");
-            println!(
-                "       delete {} to rebuild the search index from future saves",
-                path.display()
-            );
-            problems.push(message);
-        }
-        Err(error) => {
-            let message = format!("history database could not be checked: {error}");
-            println!("  fail {message}");
-            problems.push(message);
-        }
-    }
-}
-
-/// Built-in "常见问题 + 处理清单". These mirror the real failure modes this CLI
-/// can hit (provider key/base URL, shell resolution, config precedence, encoding,
-/// session dir), so users can self-remediate issues doctor cannot fix automatically.
-fn print_common_issues() {
-    const FAQ: [(&str, &str, &str); 7] = [
-        (
-            "provider: api key missing",
-            "the key env var named by the provider config is unset",
-            "set that env var (or point config to a key already present); rerun doctor",
-        ),
-        (
-            "request fails / wrong endpoint",
-            "base_url is missing the version segment (needs /v1) or points at the wrong host",
-            "config: provider base_url must include the version path, e.g. https://api.deepseek.com/v1",
-        ),
-        (
-            "bash tool cannot run a shell",
-            "neither pwsh, powershell nor sh is on PATH for the current mode",
-            "install PowerShell 7 (pwsh) or ensure sh is available on PATH",
-        ),
-        (
-            "config edits seem ignored",
-            "a higher-precedence layer overrides the file you changed",
-            "project .heartflow/ wins over user ~/.heartflow/; edit the layer that wins",
-        ),
-        (
-            "garbled / non-UTF-8 output",
-            "legacy console code page or a stray BOM in a saved file",
-            "use a UTF-8 terminal; reading already strips BOM and normalizes drive paths",
-        ),
-        (
-            "session not saved",
-            "sessions directory missing or not writable",
-            "rerun `hf doctor --fix` to recreate the sessions directory",
-        ),
-        (
-            "history database is corrupt",
-            "the derived ~/.heartflow/heartflow.db was damaged (torn write, disk fault, tampering)",
-            "JSON transcripts are authoritative: delete heartflow.db and it rebuilds on the next save (search covers future turns)",
-        ),
-    ];
-    println!("\ncommon issues and fixes:");
-    for (symptom, cause, fix_hint) in FAQ {
-        println!("  - {symptom}");
-        println!("      cause: {cause}");
-        println!("      fix:   {fix_hint}");
-    }
-}
-
-/// Build the repair-advice prompt handed to the built-in assistant. Empty when
-/// there is nothing to diagnose.
-#[must_use]
-fn doctor_repair_prompt(problems: &[String]) -> String {
-    if problems.is_empty() {
-        return String::new();
-    }
-    let mut prompt = String::from(
-        "The heartflow `doctor` diagnostics reported the problems below. As a terse support \n\
-         engineer, give concrete, ordered repair steps for each (exact commands, config keys, \n\
-         and environment variables). Advice only.\n\nProblems:\n",
-    );
-    for problem in problems {
-        prompt.push_str("- ");
-        prompt.push_str(problem);
-        prompt.push('\n');
-    }
-    prompt
-}
-
-/// Hand doctor's findings to the built-in assistant for repair advice. Degrades
-/// gracefully when no provider is configured (the common offline case).
-async fn doctor_ai_repair(problems: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    if problems.is_empty() {
-        println!("\nno problems to diagnose; skipping AI repair.");
-        return Ok(());
-    }
-    let selection = match resolve_selection(None, None) {
-        Ok(selection) => selection,
-        Err(error) => {
-            println!("\nAI repair needs a working provider, but none resolved: {error}");
-            println!("configure a provider or set its API key, then rerun `hf doctor --ai`.");
-            return Ok(());
-        }
-    };
-    // read-only + non-interactive prompter: the assistant can only advise, never write.
-    let mut runtime = match build_runtime(Session::new(), selection, false, "read-only") {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            println!("\nAI repair could not start a session: {error}");
-            return Ok(());
-        }
-    };
-    println!(
-        "\nasking the built-in assistant to analyze {} problem(s)...\n",
-        problems.len()
-    );
-    run_turn_interactive(&mut runtime, &doctor_repair_prompt(problems), None).await?;
-    Ok(())
-}
-
-enum DirState {
-    Ok,
-    Created,
-    Missing,
-    NotDirectory,
-}
-
-fn ensure_dir(dir: &Path, fix: bool) -> DirState {
-    match dir.metadata() {
-        Ok(metadata) if metadata.is_dir() => DirState::Ok,
-        Ok(_) => DirState::NotDirectory,
-        Err(_) => {
-            if fix && fs::create_dir_all(dir).is_ok() {
-                DirState::Created
-            } else {
-                DirState::Missing
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ConfigAction {
-    Export { output: Option<PathBuf> },
-    Import { path: PathBuf },
-}
-
-/// Normalized action produced from the parsed CLI surface.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Action {
-    PrintSystemPrompt {
-        cwd: PathBuf,
-        date: String,
-    },
-    ResumeSession {
-        session_path: Option<PathBuf>,
-        command: Option<String>,
-        provider: Option<String>,
-        model: Option<String>,
-    },
-    Prompt {
-        instruction: String,
-        provider: Option<String>,
-        model: Option<String>,
-        quiet: bool,
-        json: bool,
-    },
-    Search {
-        query: String,
-        limit: i64,
-        json: bool,
-    },
-    Repl {
-        provider: Option<String>,
-        model: Option<String>,
-    },
-    Config {
-        action: ConfigAction,
-    },
-    Doctor {
-        fix: bool,
-        ai: bool,
-    },
-    Init {
-        force: bool,
-    },
-    Models {
-        provider: Option<String>,
-        model: Option<String>,
-        balance: bool,
-    },
-}
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "hf",
-    version,
-    disable_version_flag = true,
-    about = "heartflow terminal AI agent\n\nWith no subcommand (or `hf chat`) hf starts the interactive REPL; every subcommand is non-interactive and pipe-friendly."
-)]
-#[command(subcommand_precedence_over_arg = true)]
-#[command(
-    after_help = "INTERACTION CONTRACT\n  Interactive:  no args or `hf chat` opens the REPL (this is the only mode that can prompt for confirmation).\n  Resume:       `hf --resume[=PATH] [--run \"/cmd\"]` reopens a saved session (PATH omitted = interactive picker; value form uses `=`).\n  Non-interactive: subcommands (prompt/search/...) never block on a human. Because there is no tty to answer a confirmation, `prompt` runs tools under the permission mode from HEARTFLOW_PERMISSION_MODE, defaulting to `full` (auto-allow). Set HEARTFLOW_PERMISSION_MODE=read-only for an unattended, read-only pipe.\n\nEXIT CODES\n  0  success\n  1  runtime/provider error (stream, config resolution, failed turn)\n  2  usage error (bad arguments; emitted by the argument parser)"
-)]
-struct Cli {
-    /// Provider name (deepseek, anthropic, or a [provider] table entry).
-    #[arg(long, global = true)]
-    provider: Option<String>,
-    /// Model override for the selected provider.
-    #[arg(long, global = true)]
-    model: Option<String>,
-    /// Print version information. Accepts the conventional `-V` and the
-    /// shorthand `-v` (as in node/npm); the built-in flag is disabled so this
-    /// one owns both spellings.
-    #[arg(short = 'v', visible_short_alias = 'V', long = "version", action = ArgAction::Version)]
-    version: (),
-    /// Resume a saved session; `--resume` alone picks interactively, `--resume=PATH`
-    /// opens a specific file. The value must use `=` so a bare `--resume` never
-    /// swallows a following subcommand token.
-    #[arg(long, num_args = 0..=1, require_equals = true, value_name = "PATH")]
-    // Two-level Option is the clap idiom for a tri-state flag: absent, bare
-    // `--resume`, or `--resume=PATH`. An enum would fight the derive macros.
-    #[allow(clippy::option_option)]
-    resume: Option<Option<PathBuf>>,
-    /// Slash command to run right after resuming (requires --resume).
-    #[arg(long, value_name = "CMD", requires = "resume")]
-    run: Option<String>,
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(Subcommand, Debug)]
-enum Command {
-    /// Start the interactive REPL (same as running `hf` with no subcommand).
-    Chat,
-    /// Send one prompt and stream the response. When stdin is piped it is read
-    /// as extra context, so `git diff | hf prompt "review this"` composes.
-    Prompt {
-        /// Prompt text (instruction). If omitted, the prompt is read from stdin.
-        text: Vec<String>,
-        /// Print only the assistant's answer (no spinner/usage/save lines).
-        #[arg(long, short)]
-        quiet: bool,
-        /// Emit a JSON object `{text, usage, session_id}` instead of prose.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Search saved conversation history (non-interactive, pipe-friendly).
-    Search {
-        /// Query text.
-        query: Vec<String>,
-        /// Maximum number of hits to return.
-        #[arg(long, default_value_t = 20)]
-        limit: i64,
-        /// Emit a JSON array instead of one line per hit.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Print the assembled system prompt.
-    SystemPrompt(SystemPromptArgs),
-    /// Manage configuration (export/import).
-    Config(ConfigArgs),
-    /// Diagnose configuration, directories, and provider resolution.
-    Doctor(DoctorArgs),
-    /// Scaffold a starting AGENTS.md instruction file in the current directory.
-    Init(InitArgs),
-    /// Self-bootstrap a provider: list models and report the context window.
-    /// Pass `--balance` to also query the account balance (uses quota).
-    /// Needs an explicit provider, e.g. `hf --provider deepseek models`.
-    Models(ModelsArgs),
-}
-
-#[derive(Args, Debug)]
-struct SystemPromptArgs {
-    /// Working directory the prompt should describe.
-    #[arg(long)]
-    cwd: Option<PathBuf>,
-    /// Date to embed (YYYY-MM-DD).
-    #[arg(long)]
-    date: Option<String>,
-}
-
-#[derive(Args, Debug)]
-struct ConfigArgs {
-    #[command(subcommand)]
-    action: ConfigCommand,
-}
-
-#[derive(Args, Debug)]
-struct DoctorArgs {
-    /// Apply safe repairs: create missing directories, move unparseable config aside.
-    #[arg(long)]
-    fix: bool,
-    /// Ask the built-in AI to analyze any problems found and suggest repairs.
-    #[arg(long)]
-    ai: bool,
-}
-
-#[derive(Args, Debug)]
-struct InitArgs {
-    /// Overwrite an existing AGENTS.md instead of leaving it untouched.
-    #[arg(long)]
-    force: bool,
-}
-
-#[derive(Args, Debug)]
-struct ModelsArgs {
-    /// Query the account balance (`DeepSeek`). Off by default because the
-    /// balance endpoint counts against API quota; model listing is free.
-    #[arg(long)]
-    balance: bool,
-}
-
-#[derive(Subcommand, Debug)]
-enum ConfigCommand {
-    /// Export the merged config (without secrets).
-    Export {
-        /// Output file; prints to stdout when omitted.
-        #[arg(long)]
-        output: Option<PathBuf>,
-    },
-    /// Import a config file into the user layer.
-    Import {
-        /// Path to a config file.
-        path: PathBuf,
-    },
-}
-
-impl Cli {
-    /// Fold the parsed surface into a single `Action`, applying defaults.
-    fn into_action(self) -> Result<Action, String> {
-        let Cli {
-            provider,
-            model,
-            resume,
-            run,
-            command,
-            version: (),
-        } = self;
-        if let Some(session_path) = resume {
-            if command.is_some() {
-                return Err("--resume cannot be combined with a subcommand".to_string());
-            }
-            return Ok(Action::ResumeSession {
-                // `Some(None)` == bare `--resume` -> interactive picker.
-                session_path,
-                command: run,
-                provider,
-                model,
-            });
-        }
-        match command {
-            None | Some(Command::Chat) => Ok(Action::Repl { provider, model }),
-            Some(Command::Prompt { text, quiet, json }) => Ok(Action::Prompt {
-                instruction: text.join(" "),
-                provider,
-                model,
-                quiet,
-                json,
-            }),
-            Some(Command::Search { query, limit, json }) => {
-                let joined = query.join(" ");
-                if joined.trim().is_empty() {
-                    return Err("search requires a query string".to_string());
-                }
-                Ok(Action::Search {
-                    query: joined,
-                    limit,
-                    json,
-                })
-            }
-            Some(Command::SystemPrompt(args)) => {
-                let cwd = match args.cwd {
-                    Some(path) => path,
-                    None => env::current_dir().map_err(|error| error.to_string())?,
-                };
-                let date = args.date.unwrap_or_else(current_date);
-                Ok(Action::PrintSystemPrompt { cwd, date })
-            }
-            Some(Command::Config(cfg)) => Ok(Action::Config {
-                action: match cfg.action {
-                    ConfigCommand::Export { output } => ConfigAction::Export { output },
-                    ConfigCommand::Import { path } => ConfigAction::Import { path },
-                },
-            }),
-            Some(Command::Doctor(args)) => Ok(Action::Doctor {
-                fix: args.fix,
-                ai: args.ai,
-            }),
-            Some(Command::Init(args)) => Ok(Action::Init { force: args.force }),
-            Some(Command::Models(args)) => Ok(Action::Models {
-                provider,
-                model,
-                balance: args.balance,
-            }),
-        }
-    }
-}
-
 /// A slash token that matched no known command: suggest the closest one instead
 /// of forwarding the typo to the model as a turn.
 fn report_unknown_command(input: &str) {
@@ -890,20 +432,21 @@ fn report_unknown_command(input: &str) {
 /// Reset the live session to a fresh runtime, dropping planning state. Extracted
 /// so `/clear` stays a one-token arm and `run_repl` remains under the line cap.
 fn handle_clear_command(
+    state: &SessionShared,
     selection: &ProviderSelection,
     mode: &str,
     runtime: &mut AgentRuntime,
     planning: &mut bool,
     plan_path: &mut Option<PathBuf>,
 ) {
-    match build_runtime(Session::new(), selection.clone(), true, mode) {
+    match build_runtime(state, Session::new(), selection.clone(), true, mode) {
         Ok(fresh) => {
             *runtime = fresh;
             *planning = false;
             *plan_path = None;
             // A cleared session is a new conversation: give it a fresh file and
             // history row instead of appending onto the one just wiped.
-            rotate_session_id();
+            rotate_session_id(state);
             println!("session cleared.");
         }
         Err(error) => println!("failed to reset session: {error}"),
@@ -1124,7 +667,7 @@ fn resume_session(session_path: &Path, command: &str) {
     println!("{}", result.message);
 }
 
-fn stdin_is_terminal() -> bool {
+pub(crate) fn stdin_is_terminal() -> bool {
     io::stdin().is_terminal()
 }
 
@@ -1170,378 +713,76 @@ fn pick_session() -> Result<PathBuf, String> {
         .ok_or_else(|| format!("selection out of range: {index}"))
 }
 
-fn home_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
-}
-
-fn sessions_dir() -> PathBuf {
-    home_dir().join(".heartflow").join("sessions")
-}
-
-/// System-level `SQLite` history database (searchable mirror of saved sessions).
-fn store_path() -> PathBuf {
-    home_dir().join(".heartflow").join("heartflow.db")
-}
-
-fn unix_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or_default()
-}
-
-fn unix_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_millis())
-        .unwrap_or_default()
-}
-
-/// Restore a saved session: the snapshot file plus any append-only segment
-/// beside it. A segment that cannot be placed on the snapshot never fails the
-/// restore — the snapshot is complete on its own — so it is dropped with a note
-/// on stderr. See `Session::load_with_segment`.
-fn load_saved_session(path: &Path) -> Result<Session, String> {
-    let (session, segment) = Session::load_with_segment(path).map_err(|error| error.to_string())?;
-    if let Some(warning) = segment.warning() {
-        eprintln!("{}: {warning}", path.display());
-    }
-    Ok(session)
-}
-
-fn save_session(session: &Session) -> io::Result<PathBuf> {
-    let dir = sessions_dir();
-    fs::create_dir_all(&dir)?;
-    // Never persist a live credential: scrub the transcript that reaches disk
-    // (both the authoritative JSON and the SQLite mirror) on a clone, so the
-    // in-memory session that talks to the provider is left verbatim.
-    let secrets = registered_secrets();
-    let redacted = redact_for_save(session, &secrets);
-    // One file per conversation, keyed by the stable id (see current_session_id):
-    // each turn overwrites it via the atomic temp+rename in `save_to_path`, so a
-    // crash keeps the last complete snapshot rather than a truncated tail.
-    let path = dir.join(format!("{}.json", current_session_id()));
-    redacted
-        .save_to_path(&path)
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    // Best-effort mirror into the searchable store; the JSON file stays
-    // authoritative, so a store failure must never fail the save.
-    mirror_to_store(&path, &redacted);
-    Ok(path)
-}
-
-/// Async wrapper around [`save_session`]: the whole chain (regex scrub,
-/// multi-MB serialize, file rename, `SQLite` mirror) is blocking work, so it
-/// runs on the blocking pool instead of stalling a reactor worker mid-turn.
-async fn save_session_async(session: &Session) -> io::Result<PathBuf> {
-    let session = session.clone();
-    tokio::task::spawn_blocking(move || save_session(&session))
-        .await
-        .map_err(|error| io::Error::other(error.to_string()))?
-}
-
-/// Per-process redaction cache: the redacted prefix of the current transcript,
-/// so each save scrubs only the newly added messages instead of re-running the
-/// four structural regexes over the whole (multi-MB) transcript every turn.
-///
-/// A single hf run is one conversation, so the tracker needs no id: it is
-/// invalidated whenever the cached prefix stops being a trustworthy base —
-/// a compaction shortened the transcript, or a pin toggle / task-context reset
-/// mutated rows in place (`note_mirror_rewrite` forces both caches, whose
-/// invalidation sources are identical). Credentials registered at runtime build
-/// time always predate the messages that follow, so extending the prefix with
-/// the current literal set stays sound.
-struct SaveTracker {
-    last_len: usize,
-    force_full: bool,
-    redacted: Session,
-}
-
-impl SaveTracker {
-    /// Whether this save may extend the cached redacted prefix. Sound only when
-    /// the transcript strictly grows past an already-scrubbed base and no
-    /// in-place rewrite was forced.
-    #[must_use]
-    fn can_extend(&self, len: usize) -> bool {
-        !self.force_full && self.last_len > 0 && len > self.last_len
-    }
-}
-
-static SAVE_CACHE: Mutex<Option<SaveTracker>> = Mutex::new(None);
-
-/// Scrub the transcript for persistence, extending the cached redacted prefix
-/// when possible. The clone handed back is what reaches disk and the mirror;
-/// the tracker keeps its own authoritative copy so a failed save simply leaves
-/// the cache intact and the next save redoes the same extension.
-fn redact_for_save(session: &Session, secrets: &[String]) -> Session {
-    let len = session.messages.len();
-    if let Ok(mut guard) = SAVE_CACHE.lock() {
-        if let Some(tracker) = guard.as_mut() {
-            if tracker.can_extend(len) {
-                // Scrub only the new tail: the cached prefix was already
-                // scrubbed, and credentials registered at runtime build time
-                // always predate the messages that follow.
-                tracker.redacted.messages.extend(redact_messages(
-                    &session.messages[tracker.last_len..],
-                    secrets,
-                ));
-                tracker.last_len = len;
-                return tracker.redacted.clone();
-            }
-        }
-        let redacted = redact_session(session, secrets);
-        *guard = Some(SaveTracker {
-            last_len: len,
-            force_full: false,
-            redacted: redacted.clone(),
-        });
-        return redacted;
-    }
-    // Poisoned lock: the always-correct full scrub.
-    redact_session(session, secrets)
-}
-
-/// Credential literals learned this run (the resolved API key / auth token).
-/// Registered when a runtime is built and replayed against every saved
-/// transcript so a key that matches no structural redaction pattern is still
-/// scrubbed before it reaches disk. De-duplicated; a redeployed provider just
-/// re-registers its (identical) value.
-static SECRETS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-fn register_secret(value: &str) {
-    let value = value.trim();
-    // Mirrors redact_text's floor: a shorter string is ordinary text.
-    if value.len() < 4 {
-        return;
-    }
-    if let Ok(mut guard) = SECRETS.lock() {
-        if !guard.iter().any(|existing| existing == value) {
-            guard.push(value.to_string());
-        }
-    }
-}
-
-fn registered_secrets() -> Vec<String> {
-    SECRETS
-        .lock()
-        .map(|guard| guard.clone())
-        .unwrap_or_default()
-}
-
-/// Process-lifetime read-write handle to the history store, opened on the first
-/// write. Reusing one connection across turns avoids re-running the pragmas and
-/// migration on every save; WAL still lets other processes read/search safely.
-static SHARED_STORE: OnceLock<Option<Store>> = OnceLock::new();
-
-fn shared_store() -> Option<&'static Store> {
-    SHARED_STORE
-        .get_or_init(|| {
-            let path = store_path();
-            if let Some(parent) = path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            Store::open(&path).ok()
-        })
-        .as_ref()
-}
-
-fn mirror_to_store(json_path: &Path, session: &Session) {
-    let now = unix_secs();
-    let meta = SessionMeta {
-        created_at: now,
-        updated_at: now,
-        source_path: Some(json_path.display().to_string()),
-        provider: None,
-        model: None,
-    };
-    // Store unavailable (e.g. unwritable home): the JSON file is authoritative,
-    // so a mirror failure is logged and never blocks the save.
-    let Some(store) = shared_store() else {
-        return;
-    };
-    let Ok(mut guard) = MIRROR.lock() else {
-        return;
-    };
-    let tracker = guard.get_or_insert_with(|| MirrorTracker {
-        id: current_session_id(),
-        last_len: 0,
-        force_full: true,
-    });
-
-    // Append is only sound when the transcript is a strict extension of the last
-    // mirrored prefix; a shrink (compaction) or forced rewrite (pin/task reset)
-    // falls through to the full rewrite, which is always correct.
-    let len = session.messages.len();
-    let can_append = tracker.can_append(len);
-    let result = if can_append {
-        store.append_messages(
-            &tracker.id,
-            &meta,
-            tracker.last_len,
-            &session.messages[tracker.last_len..],
-            tracker.last_len,
-        )
-    } else {
-        store.save_session(&tracker.id, &meta, &session.messages)
-    };
-
-    match result {
-        Ok(()) => {
-            tracker.last_len = len;
-            tracker.force_full = false;
-        }
-        // The stored base moved under us (another process rewrote it, or the DB
-        // was rebuilt): recover once with a full rewrite, which cannot drift.
-        Err(StoreError::Drift { .. }) => {
-            if store
-                .save_session(&tracker.id, &meta, &session.messages)
-                .is_ok()
-            {
-                tracker.last_len = len;
-                tracker.force_full = false;
-            } else {
-                tracing::debug!("history store mirror fallback failed");
-            }
-        }
-        Err(error) => tracing::debug!("history store mirror failed: {error}"),
-    }
-}
-
-/// Per-process mirror bookkeeping so the `SQLite` history is written incrementally
-/// instead of re-dumping the whole transcript every turn.
-///
-/// The JSON transcript stays authoritative and keeps its per-save file naming;
-/// this governs only the *mirror*. A single stable `id` represents the current
-/// conversation inside the history DB, so search returns one row per
-/// conversation rather than a snapshot per turn. `last_len` is how many messages
-/// are already mirrored under `id`; `force_full` marks that the stored prefix is
-/// no longer a trustworthy base (an in-place pin toggle, a compaction, or a
-/// task-context reset changed/shortened already-mirrored rows), so the next
-/// write must be a full rewrite rather than a tail append.
-struct MirrorTracker {
-    id: String,
-    last_len: usize,
-    force_full: bool,
-}
-
-impl MirrorTracker {
-    /// Whether this turn's mirror may be an incremental append onto the existing
-    /// base. Sound only when the transcript strictly extends the last mirrored
-    /// prefix: no rewrite was forced (pin/compaction/task-reset), at least one
-    /// row is already stored (otherwise there is no base to extend), and the
-    /// session did not shrink (a shorter transcript means earlier rows changed).
-    /// When false, the caller performs a full `save_session` rewrite.
-    #[must_use]
-    fn can_append(&self, len: usize) -> bool {
-        !self.force_full && self.last_len > 0 && len >= self.last_len
-    }
-}
-
-static MIRROR: Mutex<Option<MirrorTracker>> = Mutex::new(None);
-
-/// Force the next mirror to fully rewrite. Called after any operation that
-/// mutates already-mirrored rows without necessarily growing the transcript.
-fn note_mirror_rewrite() {
-    if let Ok(mut guard) = MIRROR.lock() {
-        if let Some(tracker) = guard.as_mut() {
-            tracker.force_full = true;
-        }
-    }
-    // The JSON snapshot's redaction cache shares every invalidation source
-    // (pin toggle / compaction / task reset change rows in place), so it is
-    // forced here rather than threading a second note call through each site.
-    if let Ok(mut guard) = SAVE_CACHE.lock() {
-        if let Some(tracker) = guard.as_mut() {
-            tracker.force_full = true;
-        }
-    }
-}
-
-/// Stable on-disk identity of the conversation this process persists. A single
-/// `hf` run is one conversation, so `save_session` keeps writing the SAME file
-/// (`sessions/<id>.json`) instead of minting a fresh timestamped snapshot every
-/// turn. The old per-turn naming fragmented one conversation across N files and
-/// re-dumped the whole transcript each turn; one atomic snapshot per
-/// conversation is durable and keeps `/sessions` at one row each. The id is a
-/// start timestamp so listings stay newest-first; it is adopted when a run
-/// resumes/opens a transcript and rotated on `/clear`.
-static SESSION_ID: Mutex<Option<String>> = Mutex::new(None);
-
-/// A fresh conversation id: start millis then PID, unique across concurrent
-/// `hf` processes sharing the history DB and sortable by recency.
-fn new_session_id() -> String {
-    format!("{}-{}", unix_millis(), std::process::id())
-}
-
-/// The active conversation id, minted on first use. A poisoned lock falls back
-/// to a fresh id rather than blocking persistence.
-fn current_session_id() -> String {
-    match SESSION_ID.lock() {
-        Ok(mut guard) => guard.get_or_insert_with(new_session_id).clone(),
-        Err(_) => new_session_id(),
-    }
-}
-
-/// Rebind persistence to `id`: point future saves at that conversation and drop
-/// the mirror tracker so the next write re-initializes (full, not append) under
-/// the same id, keeping the JSON file and the `SQLite` row keyed identically.
-fn rebind_conversation(id: String) {
-    if let Ok(mut guard) = SESSION_ID.lock() {
-        *guard = Some(id);
-    }
-    if let Ok(mut guard) = MIRROR.lock() {
-        *guard = None;
-    }
-}
-
-/// Start a brand-new conversation (after `/clear`): a fresh id for both the
-/// transcript file and the history mirror.
-fn rotate_session_id() {
-    rebind_conversation(new_session_id());
-}
-
-/// Adopt the conversation persisted at `path` (resume / `/open`): continuing it
-/// overwrites the same file and updates the same history row instead of
-/// branching into a new one.
-fn adopt_session_path(path: &Path) {
-    let id = path
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or_else(new_session_id);
-    rebind_conversation(id);
-}
-
-fn list_sessions() -> Vec<PathBuf> {
-    let mut entries: Vec<PathBuf> = fs::read_dir(sessions_dir())
-        .into_iter()
-        .flatten()
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-        })
-        .collect();
-    entries.sort_by_key(|path| {
-        std::cmp::Reverse(
-            fs::metadata(path)
-                .and_then(|metadata| metadata.modified())
-                .ok(),
-        )
-    });
-    entries
-}
-
 async fn run_repl(
+    state: &SessionShared,
     selection: ProviderSelection,
     session: Session,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
+    // Phase 2 dual-backend gate: `HEARTFLOW_TUI=1` opts into the full-screen
+    // ratatui carrier layer; unset keeps the default blocking-line REPL, which
+    // stays the proven fallback while the carrier shell is built out. The TUI
+    // owns its own runtime and drives turns on an actor task, so the gate
+    // consumes `session`/`selection` and returns early (no restart). The move
+    // is flow-sensitive: the diverging branch leaves the fall-through path
+    // below still owning them.
+    if env::var("HEARTFLOW_TUI").is_ok_and(|v| v == "1") {
+        let tui_mode = default_permission_mode(true);
+        // Connect every MCP server once and share the toolset across sections:
+        // N sections then cost one set of server processes, not N. `McpClient`
+        // serializes requests per connection, so the shared handle is correct
+        // even once sections run turns concurrently.
+        let cwd = env::current_dir()?;
+        let mcp = Arc::new(connect_mcp_servers(&cwd, &home_dir()));
+        let runtime = build_runtime_with_mcp(
+            state,
+            session,
+            selection.clone(),
+            true,
+            &tui_mode,
+            mcp.clone(),
+        )?;
+        // Header context for the shell: every section shares this selection, so
+        // model/cwd/context-window are captured once here, before `selection`
+        // moves into the section factory below. The cwd is home-shortened so the
+        // header stays compact on deep trees.
+        let home = home_dir();
+        let cwd_display = match cwd.strip_prefix(&home) {
+            Ok(rest) if rest.as_os_str().is_empty() => String::from("~"),
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => cwd.display().to_string(),
+        };
+        let chrome = tui::Chrome {
+            model: selection.model().to_string(),
+            cwd: cwd_display,
+            context_window: resolve_context_window(&selection),
+        };
+        // Factory for each additional section: a fresh state handle (its own
+        // session id + redaction cache) plus a runtime over a new empty session
+        // sharing the one MCP toolset, so sections never share conversation
+        // data or a save path. It owns the cloned selection/mode/mcp, so it
+        // borrows nothing from this scope.
+        let mode = tui_mode;
+        let make_section =
+            move || -> Result<(SessionShared, AgentRuntime), Box<dyn std::error::Error>> {
+                let section_state = new_session_state();
+                let section_runtime = build_runtime_with_mcp(
+                    &section_state,
+                    Session::new(),
+                    selection.clone(),
+                    true,
+                    &mode,
+                    mcp.clone(),
+                )?;
+                Ok((section_state, section_runtime))
+            };
+        tui::run_shell(state, runtime, make_section, chrome).await?;
+        return Ok(false);
+    }
     let mut selection = selection;
     let mut mode = default_permission_mode(true);
     let cwd = env::current_dir()?;
     let mut watcher = ConfigWatcher::new(&cwd, &home_dir());
-    let mut runtime = build_runtime(session, selection.clone(), true, &mode)?;
+    let mut runtime = build_runtime(state, session, selection.clone(), true, &mode)?;
     let mut prompter = CliPermissionPrompter::new();
     // Planning runs on the *same* runtime (policy swapped in place) so the todo
     // ledger and conversation survive the plan -> execute handoff. `plan_path`
@@ -1555,11 +796,15 @@ async fn run_repl(
     // empty until P4-c wires keyboard polling; the injection point below is
     // already the final one.
     let mut model = HeartModel::new();
-    mascot::draw_banner(theme::Theme::current(), &mut io::stdout())?;
+    // `/restart` confirmation unwinds the loop and reports upward so `main`
+    // re-execs a fresh process; a plain quit leaves this false.
+    let mut restart = false;
+    mascot::draw_banner(&theme::Theme::current(), &mut io::stdout())?;
     print_repl_preamble();
 
     loop {
         deliver_queued_injection(
+            state,
             &mut runtime,
             &mut model,
             planning,
@@ -1571,18 +816,26 @@ async fn run_repl(
         // session and print the resume command just like `/exit`, so the
         // conversation is never silently dropped on the EOF path.
         let Some(line) = editor.read_line()? else {
-            exit_with_resume_hint(&runtime).await;
+            exit_with_resume_hint(state, &runtime).await;
             break;
         };
-        // Config edited on disk since the last turn: re-resolve the provider and
-        // rebuild the runtime, keeping the conversation and current mode.
-        if watcher.changed() {
-            reload_config(&cwd, &mut selection, &mut runtime, &mode);
+        // Config edited on disk since the last turn: reload each changed surface
+        // through its own path. Provider config re-resolves and rebuilds the
+        // runtime (keeping the conversation and current mode); a theme edit just
+        // swaps the global palette, which the next turn's renderer picks up.
+        // keymap/settings drive the TUI only, so the blocking REPL ignores them.
+        let changed = watcher.changed();
+        if changed.config {
+            reload_config(state, &cwd, &mut selection, &mut runtime, &mode);
             planning = false;
+        }
+        if changed.theme {
+            theme::Theme::reload(&cwd, &home_dir());
         }
         let trimmed = line.trim();
         let control = if trimmed.starts_with('/') {
             dispatch_slash_command(
+                state,
                 trimmed,
                 &mut runtime,
                 &mut selection,
@@ -1595,7 +848,7 @@ async fn run_repl(
             )
             .await?
         } else if trimmed.starts_with('!') {
-            handle_bang_command(trimmed).await;
+            handle_bang_command(state, trimmed).await;
             LoopControl::Continue
         } else {
             // Running turns cannot be submitted through the blocking line
@@ -1607,27 +860,34 @@ async fn run_repl(
                 }
             } else {
                 let outcome = if planning {
-                    run_turn_interactive(&mut runtime, trimmed, Some(&mut BlockPrompter)).await?
+                    run_turn_interactive(state, &mut runtime, trimmed, Some(&mut BlockPrompter))
+                        .await?
                 } else {
-                    run_turn_interactive(&mut runtime, trimmed, Some(&mut prompter)).await?
+                    run_turn_interactive(state, &mut runtime, trimmed, Some(&mut prompter)).await?
                 };
                 editor.note_turn(outcome.ok);
             }
-            maybe_auto_compact(&mut runtime);
+            maybe_auto_compact(state, &mut runtime);
             LoopControl::Continue
         };
         match control {
             LoopControl::Continue => {}
             LoopControl::Exit => break,
+            LoopControl::Restart => {
+                restart = true;
+                break;
+            }
         }
     }
-    Ok(())
+    Ok(restart)
 }
 
 /// What the REPL loop should do after one input line is fully handled.
 enum LoopControl {
     Continue,
     Exit,
+    /// `/restart` confirmed: unwind the REPL and ask `main` to re-exec.
+    Restart,
 }
 
 /// Banner lines printed once before the loop starts.
@@ -1641,8 +901,8 @@ fn print_repl_preamble() {
 
 /// `/save` from the REPL: persist the live session and report the path or the
 /// failure inline (a failed save is a status message, never an abort).
-async fn save_and_report(runtime: &AgentRuntime) {
-    match save_session_async(runtime.session()).await {
+async fn save_and_report(state: &SessionShared, runtime: &AgentRuntime) {
+    match save_session_async(state, runtime.session()).await {
         Ok(path) => println!("session saved -> {}", path.display()),
         Err(error) => println!("failed to save session: {error}"),
     }
@@ -1653,6 +913,7 @@ async fn save_and_report(runtime: &AgentRuntime) {
 /// after the turn). A refused/failed injection is re-queued by the caller, so
 /// nothing is lost.
 async fn deliver_queued_injection(
+    state: &SessionShared,
     runtime: &mut AgentRuntime,
     model: &mut HeartModel,
     planning: bool,
@@ -1664,14 +925,14 @@ async fn deliver_queued_injection(
     };
     model.begin_turn();
     let delivery = if planning {
-        run_turn_interactive(runtime, &injection, Some(&mut BlockPrompter)).await
+        run_turn_interactive(state, runtime, &injection, Some(&mut BlockPrompter)).await
     } else {
-        run_turn_interactive(runtime, &injection, Some(prompter)).await
+        run_turn_interactive(state, runtime, &injection, Some(prompter)).await
     };
     model.end_turn();
     match delivery {
         Ok(outcome) => {
-            maybe_auto_compact(runtime);
+            maybe_auto_compact(state, runtime);
             editor.note_turn(outcome.ok);
         }
         Err(error) => {
@@ -1687,6 +948,7 @@ async fn deliver_queued_injection(
 /// state pieces as separate `&mut`s instead of a bundled struct.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_slash_command(
+    state: &SessionShared,
     trimmed: &str,
     runtime: &mut AgentRuntime,
     selection: &mut ProviderSelection,
@@ -1701,7 +963,7 @@ async fn dispatch_slash_command(
     // `Ok` once so each arm stays one statement shorter.
     Ok(match trimmed {
         "/exit" | "/quit" => {
-            exit_with_resume_hint(runtime).await;
+            exit_with_resume_hint(state, runtime).await;
             LoopControl::Exit
         }
         "/help" => {
@@ -1713,11 +975,11 @@ async fn dispatch_slash_command(
             LoopControl::Continue
         }
         "/save" => {
-            save_and_report(runtime).await;
+            save_and_report(state, runtime).await;
             LoopControl::Continue
         }
         "/clear" => {
-            handle_clear_command(selection, mode, runtime, planning, plan_path);
+            handle_clear_command(state, selection, mode, runtime, planning, plan_path);
             LoopControl::Continue
         }
         "/sessions" => {
@@ -1725,7 +987,7 @@ async fn dispatch_slash_command(
             LoopControl::Continue
         }
         _ if trimmed == "/open" || trimmed.starts_with("/open ") => {
-            handle_open_command(trimmed, selection, mode, runtime);
+            handle_open_command(state, trimmed, selection, mode, runtime);
             LoopControl::Continue
         }
         _ if trimmed == "/remember" || trimmed.starts_with("/remember ") => {
@@ -1733,11 +995,11 @@ async fn dispatch_slash_command(
             LoopControl::Continue
         }
         "/compact" => {
-            force_compact(runtime);
+            force_compact(state, runtime);
             LoopControl::Continue
         }
         "/pin" => {
-            handle_pin_command(runtime);
+            handle_pin_command(state, runtime);
             LoopControl::Continue
         }
         "/mcp" => {
@@ -1746,8 +1008,7 @@ async fn dispatch_slash_command(
         }
         "/restart" => {
             if confirm_restart() {
-                RESTART_REQUESTED.store(true, Ordering::SeqCst);
-                LoopControl::Exit
+                LoopControl::Restart
             } else {
                 println!("restart cancelled.");
                 LoopControl::Continue
@@ -1758,7 +1019,7 @@ async fn dispatch_slash_command(
             LoopControl::Continue
         }
         _ if trimmed == "/expand" || trimmed.starts_with("/expand ") => {
-            handle_expand_command(trimmed);
+            handle_expand_command(state, trimmed);
             LoopControl::Continue
         }
         _ if trimmed == "/queue" || trimmed.starts_with("/queue ") => {
@@ -1777,17 +1038,20 @@ async fn dispatch_slash_command(
             LoopControl::Continue
         }
         _ if trimmed == "/mode" || trimmed.starts_with("/mode ") => {
-            handle_mode_command(trimmed, mode, selection, runtime);
+            handle_mode_command(state, trimmed, mode, selection, runtime);
             *planning = false;
             LoopControl::Continue
         }
         _ if trimmed == "/model" || trimmed.starts_with("/model ") => {
-            handle_model_command(trimmed, selection, runtime, mode);
+            handle_model_command(state, trimmed, selection, runtime, mode);
             *planning = false;
             LoopControl::Continue
         }
         _ if trimmed == "/plan" || trimmed.starts_with("/plan ") => {
-            handle_plan_command(trimmed, planning, plan_path, cwd, mode, runtime, prompter).await?;
+            handle_plan_command(
+                state, trimmed, planning, plan_path, cwd, mode, runtime, prompter,
+            )
+            .await?;
             LoopControl::Continue
         }
         _ => {
@@ -1835,39 +1099,13 @@ fn handle_guide_command(input: &str, runtime: &AgentRuntime) {
         println!("usage: /guide <下一步任务描述>");
         return;
     }
-    let messages = &runtime.session().messages;
-    let mut work_log = String::new();
-    for message in messages.iter().rev().take(6).rev() {
-        let role = match message.role {
-            MessageRole::User => "user",
-            MessageRole::Assistant => "assistant",
-            // System prompt and raw tool turns are noise for re-entry context;
-            // the guide summarizes the human/assistant thread only.
-            MessageRole::System | MessageRole::Tool => continue,
-        };
-        let text = message
-            .blocks
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        if !text.trim().is_empty() {
-            work_log.push_str(&guide_log_line(role, &text, 160));
-            work_log.push('\n');
-        }
-    }
-    let state = format!(
-        "{} pending tasks in the ledger",
-        runtime.executor().todo_ledger().pending_tasks()
+    // Assembly lives in `core` so the ratatui Ctrl+G overlay builds the exact
+    // same draft; this command only prints it.
+    let context = guide_context(
+        &runtime.session().messages,
+        runtime.executor().todo_ledger().pending_tasks(),
     );
-    let draft = build_guide(GuideSections {
-        work_log: &work_log,
-        state: &state,
-        task,
-    });
+    let draft = guide_draft(&context, task);
     println!("guide draft (edit and resend, or paste into the next message):\n");
     println!("{draft}\n");
 }
@@ -1876,7 +1114,7 @@ fn handle_guide_command(input: &str, runtime: &AgentRuntime) {
 /// model uses (pwsh on Windows, UTF-8 wrapped), with no model round-trip.
 /// Dangerous commands are confirmed first; output is folded like tool output
 /// and stays reachable via `/expand`.
-async fn handle_bang_command(input: &str) {
+async fn handle_bang_command(state: &SessionShared, input: &str) {
     let command = input.trim().strip_prefix('!').unwrap_or("").trim();
     if command.is_empty() {
         println!("usage: !<shell command>   e.g. !git status");
@@ -1924,7 +1162,7 @@ async fn handle_bang_command(input: &str) {
     if body.trim().is_empty() {
         println!("{}", "(no output)".dark_grey());
     } else {
-        let markdown = fold_tool_output("shell", &body, FOLD_TOOL_OUTPUT_LINES);
+        let markdown = fold_tool_output(state, "shell", &body, FOLD_TOOL_OUTPUT_LINES);
         println!("{}", TerminalRenderer::new().render_markdown(&markdown));
     }
     if output.interrupted {
@@ -1950,8 +1188,8 @@ fn print_sessions_listing() {
 
 /// Save the live session on the way out and print the exact command to resume
 /// this section later, so `/exit` leaves a clear path back to the conversation.
-async fn exit_with_resume_hint(runtime: &AgentRuntime) {
-    match save_session_async(runtime.session()).await {
+async fn exit_with_resume_hint(state: &SessionShared, runtime: &AgentRuntime) {
+    match save_session_async(state, runtime.session()).await {
         Ok(path) => {
             println!("session saved -> {}", path.display());
             println!("to resume this section: hf --resume=\"{}\"", path.display());
@@ -1965,6 +1203,7 @@ async fn exit_with_resume_hint(runtime: &AgentRuntime) {
 /// swapping the in-place conversation without restarting the process. The
 /// connected MCP servers and provider are reconstructed by `build_runtime`.
 fn handle_open_command(
+    state: &SessionShared,
     input: &str,
     selection: &ProviderSelection,
     mode: &str,
@@ -1990,12 +1229,12 @@ fn handle_open_command(
     }
     let path = &sessions[index - 1];
     match load_saved_session(path) {
-        Ok(session) => match build_runtime(session, selection.clone(), true, mode) {
+        Ok(session) => match build_runtime(state, session, selection.clone(), true, mode) {
             Ok(fresh) => {
                 *runtime = fresh;
                 // Own this transcript's identity so subsequent turns keep
                 // writing the same file and history row.
-                adopt_session_path(path);
+                adopt_session_path(state, path);
                 println!("opened session {index}: {}", path.display());
             }
             Err(error) => println!("failed to start runtime for session {index}: {error}"),
@@ -2067,6 +1306,7 @@ fn confirm_restart() -> bool {
 const KNOWN_DEEPSEEK_MODELS: &[&str] = &["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"];
 
 fn handle_model_command(
+    state: &SessionShared,
     input: &str,
     selection: &mut ProviderSelection,
     runtime: &mut AgentRuntime,
@@ -2085,7 +1325,7 @@ fn handle_model_command(
 
     let mut next = selection.clone();
     next.set_model(requested);
-    match build_runtime(runtime.session().clone(), next.clone(), true, mode) {
+    match build_runtime(state, runtime.session().clone(), next.clone(), true, mode) {
         Ok(rebuilt) => {
             *runtime = rebuilt;
             *selection = next;
@@ -2101,13 +1341,15 @@ const KNOWN_PERMISSION_MODES: &[&str] = &["read-only", "workspace-write", "full"
 /// Re-read config from disk and rebuild the runtime in place, preserving the
 /// live conversation and permission mode. Used for between-turn hot reload.
 fn reload_config(
+    state: &SessionShared,
     cwd: &Path,
     selection: &mut ProviderSelection,
     runtime: &mut AgentRuntime,
     mode: &str,
 ) {
     match load_provider_selection(cwd, &home_dir(), None, None) {
-        Ok(next) => match build_runtime(runtime.session().clone(), next.clone(), true, mode) {
+        Ok(next) => match build_runtime(state, runtime.session().clone(), next.clone(), true, mode)
+        {
             Ok(rebuilt) => {
                 *runtime = rebuilt;
                 *selection = next;
@@ -2187,14 +1429,14 @@ fn compaction_config(selection: &ProviderSelection) -> CompactionConfig {
 /// half the window after the last in-loop check, so re-evaluate once the turn
 /// ends. Reuses the runtime's own policy so the window and preserve count stay
 /// identical to the in-turn check.
-fn maybe_auto_compact(runtime: &mut AgentRuntime) {
+fn maybe_auto_compact(state: &SessionShared, runtime: &mut AgentRuntime) {
     let config = runtime.compaction();
     if config.context_window_tokens == 0 {
         return;
     }
     if runtime.should_compact(config) {
         let result = runtime.compact(config);
-        note_mirror_rewrite();
+        note_mirror_rewrite(state);
         println!(
             "auto-compacted {} older messages into a summary (context pressure).",
             result.removed_message_count
@@ -2206,7 +1448,7 @@ fn maybe_auto_compact(runtime: &mut AgentRuntime) {
 /// and absolute thresholds so the auto gates can't skip it, while still keeping
 /// the recent-message count the active policy preserves. Reports when the
 /// session is still too short to have anything to compact.
-fn force_compact(runtime: &mut AgentRuntime) {
+fn force_compact(state: &SessionShared, runtime: &mut AgentRuntime) {
     let config = CompactionConfig {
         preserve_recent_messages: runtime.compaction().preserve_recent_messages,
         max_estimated_tokens: 0,
@@ -2217,7 +1459,7 @@ fn force_compact(runtime: &mut AgentRuntime) {
     if result.removed_message_count == 0 {
         println!("nothing to compact: session is within the preserve window.");
     } else {
-        note_mirror_rewrite();
+        note_mirror_rewrite(state);
         println!(
             "Compacted {} messages into a resumable summary.",
             result.removed_message_count
@@ -2229,12 +1471,12 @@ fn force_compact(runtime: &mut AgentRuntime) {
 /// assistant/user turn. A pinned message survives every compaction verbatim
 /// instead of being folded into the summary, so key constraints or decisions
 /// stay in context. Reports the new state and how many messages are pinned.
-fn handle_pin_command(runtime: &mut AgentRuntime) {
+fn handle_pin_command(state: &SessionShared, runtime: &mut AgentRuntime) {
     match runtime.toggle_pin_latest() {
         Some(pinned) => {
             // Pinning flips a flag on an already-mirrored row without changing
             // the transcript length, so the mirror must be fully rewritten.
-            note_mirror_rewrite();
+            note_mirror_rewrite(state);
             if pinned {
                 println!(
                     "pinned the last message - it will survive compaction ({} pinned total).",
@@ -2255,6 +1497,7 @@ fn handle_pin_command(runtime: &mut AgentRuntime) {
 /// conversation. `read-only` reads and plans without writing (plan mode),
 /// `workspace-write` (default) asks before `bash`, `full` auto-approves all.
 fn handle_mode_command(
+    state: &SessionShared,
     input: &str,
     mode: &mut String,
     selection: &ProviderSelection,
@@ -2283,6 +1526,7 @@ fn handle_mode_command(
         return;
     }
     match build_runtime(
+        state,
         runtime.session().clone(),
         selection.clone(),
         true,
@@ -2301,7 +1545,9 @@ fn handle_mode_command(
 /// to a hard-gated policy (only the plan document is writable) instead of
 /// rebuilding it, so the todo ledger and conversation survive the transition
 /// into execution.
+#[allow(clippy::too_many_arguments)]
 async fn handle_plan_command(
+    state: &SessionShared,
     input: &str,
     planning: &mut bool,
     plan_path: &mut Option<PathBuf>,
@@ -2339,8 +1585,8 @@ async fn handle_plan_command(
             }
         }
         "end" => end_planning(planning, mode, runtime),
-        "approve" => approve_plan(planning, plan_path, mode, runtime, prompter).await?,
-        goal => start_planning(goal, planning, plan_path, cwd, runtime).await?,
+        "approve" => approve_plan(state, planning, plan_path, mode, runtime, prompter).await?,
+        goal => start_planning(state, goal, planning, plan_path, cwd, runtime).await?,
     }
     Ok(())
 }
@@ -2348,6 +1594,7 @@ async fn handle_plan_command(
 /// Begin a planning session: reserve the plan document, engage the gated
 /// policy, and run the first research-and-plan turn under `BlockPrompter`.
 async fn start_planning(
+    state: &SessionShared,
     goal: &str,
     planning: &mut bool,
     plan_path: &mut Option<PathBuf>,
@@ -2366,7 +1613,13 @@ async fn start_planning(
     set_runtime_mode_policy(runtime, "plan");
     println!("planning mode ON - writes are blocked except the plan document.");
     println!("plan file: {}", path.display());
-    run_turn_interactive(runtime, &plan_brief(goal, &path), Some(&mut BlockPrompter)).await?;
+    run_turn_interactive(
+        state,
+        runtime,
+        &plan_brief(goal, &path),
+        Some(&mut BlockPrompter),
+    )
+    .await?;
     println!();
     println!("Refine by typing notes (still planning), then `/plan approve` to execute or `/plan end` to stop.");
     Ok(())
@@ -2386,6 +1639,7 @@ fn end_planning(planning: &mut bool, mode: &str, runtime: &mut AgentRuntime) {
 /// Approve the plan: parse its checkboxes, seed the todo ledger deterministically,
 /// restore the execution policy, and run the first execution turn.
 async fn approve_plan(
+    state: &SessionShared,
     planning: &mut bool,
     plan_path: &mut Option<PathBuf>,
     mode: &str,
@@ -2444,6 +1698,7 @@ async fn approve_plan(
     let mut memory: Vec<String> = Vec::new();
     let mut escalation = InteractiveEscalation;
     let status = run_task_loop(
+        state,
         runtime,
         &path,
         &tasks,
@@ -2525,17 +1780,25 @@ fn print_repl_help() {
 }
 
 /// Render a tool result, folding outputs longer than `fold_lines` to a head
-/// preview. The full text is stashed in `EXPANDABLE` and reachable via
+/// preview. The full text is stashed in the session state and reachable via
 /// `/expand <id>`; short results render whole.
-fn fold_tool_output(name: &str, output: &str, fold_lines: usize) -> String {
+pub(crate) fn fold_tool_output(
+    state: &SessionShared,
+    name: &str,
+    output: &str,
+    fold_lines: usize,
+) -> String {
     let lines: Vec<&str> = output.lines().collect();
     if lines.len() <= fold_lines {
         return format!("### Tool `{name}`\n\n```text\n{output}\n```\n");
     }
-    let id = {
-        let mut log = EXPANDABLE.lock().expect("expandable log poisoned");
-        log.push(output.to_string());
-        log.len()
+    let id = match state.lock() {
+        Ok(mut guard) => {
+            guard.expandable.push(output.to_string());
+            guard.expandable.len()
+        }
+        // Poisoned state: render the whole output rather than lose it.
+        Err(_) => return format!("### Tool `{name}`\n\n```text\n{output}\n```\n"),
     };
     let head = lines[..fold_lines].join("\n");
     format!(
@@ -2545,9 +1808,12 @@ fn fold_tool_output(name: &str, output: &str, fold_lines: usize) -> String {
 }
 
 /// Handle `/expand [ID]`: reprint a folded tool output (default: the latest).
-fn handle_expand_command(input: &str) {
-    let log = EXPANDABLE.lock().expect("expandable log poisoned");
-    if log.is_empty() {
+fn handle_expand_command(state: &SessionShared, input: &str) {
+    let Ok(log) = state.lock() else {
+        println!("nothing to expand yet.");
+        return;
+    };
+    if log.expandable.is_empty() {
         println!("nothing to expand yet.");
         return;
     }
@@ -2557,15 +1823,18 @@ fn handle_expand_command(input: &str) {
         .filter(|arg| !arg.is_empty());
     let index = match requested {
         Some(arg) => match arg.parse::<usize>() {
-            Ok(n) if (1..=log.len()).contains(&n) => n - 1,
+            Ok(n) if (1..=log.expandable.len()).contains(&n) => n - 1,
             _ => {
-                println!("no folded output #{arg} (valid: 1..{}).", log.len());
+                println!(
+                    "no folded output #{arg} (valid: 1..{}).",
+                    log.expandable.len()
+                );
                 return;
             }
         },
-        None => log.len() - 1,
+        None => log.expandable.len() - 1,
     };
-    println!("{}", log[index]);
+    println!("{}", log.expandable[index]);
 }
 
 /// Search saved conversation history (the `SQLite` store) for a text query.
@@ -2677,7 +1946,7 @@ fn mention_paths(text: &str) -> Vec<&str> {
 /// a supported image into an attachment. The text is kept verbatim so the model
 /// can still tell which file each image came from; an unreadable attachment is
 /// reported and skipped instead of failing the turn.
-fn expand_attachments(text: &str) -> Vec<ContentBlock> {
+pub(crate) fn expand_attachments(text: &str) -> Vec<ContentBlock> {
     let mut blocks = vec![ContentBlock::Text {
         text: text.to_string(),
     }];
@@ -2829,260 +2098,32 @@ fn print_mcp_status(runtime: &AgentRuntime) {
     }
 }
 
-/// Terminal-side rendering state for one interactive turn.
-struct TurnRenderer {
-    spinner: Spinner,
-    theme: ColorTheme,
-    renderer: TerminalRenderer,
-    spinner_active: bool,
-    saw_text: bool,
-    last_usage: Option<TokenUsage>,
-    /// Accumulated assistant text for the current message segment; rendered
-    /// as finished markdown on `MessageStop`.
-    assistant_text: String,
-}
-
-impl TurnRenderer {
-    fn new() -> Self {
-        let renderer = TerminalRenderer::new();
-        let theme = *renderer.color_theme();
-        Self {
-            spinner: Spinner::new(),
-            theme,
-            renderer,
-            spinner_active: true,
-            saw_text: false,
-            last_usage: None,
-            assistant_text: String::new(),
-        }
-    }
-
-    fn render(&mut self, event: &AgentEvent) {
-        let mut out = io::stdout();
-        match event {
-            AgentEvent::TextDelta(delta) => {
-                if self.spinner_active {
-                    self.spinner.finish("Response", &self.theme, &mut out).ok();
-                    self.spinner_active = false;
-                }
-                self.saw_text = true;
-                self.assistant_text.push_str(delta.as_ref());
-                print!("{}", delta.as_str().with(self.theme.muted()));
-                out.flush().ok();
-            }
-            AgentEvent::ThinkingDelta(delta) => {
-                print!("{}", delta.as_str().with(self.theme.muted()).italic());
-                io::stdout().flush().ok();
-            }
-            AgentEvent::ToolUse { name, .. } => {
-                if self.spinner_active {
-                    self.spinner
-                        .tick(&format!("Running `{name}`"), &self.theme, &mut out)
-                        .ok();
-                } else {
-                    println!("{}", format!("· running `{name}`").with(self.theme.muted()));
-                }
-            }
-            AgentEvent::ToolResult {
-                name,
-                output,
-                is_error,
-                ..
-            } => {
-                let label = if *is_error {
-                    format!("`{name}` failed")
-                } else {
-                    format!("`{name}` done")
-                };
-                if self.spinner_active {
-                    self.spinner.finish(&label, &self.theme, &mut out).ok();
-                    self.spinner_active = false;
-                } else {
-                    println!("{}", format!("· {label}").with(self.theme.muted()));
-                }
-                let markdown = fold_tool_output(name, output, FOLD_TOOL_OUTPUT_LINES);
-                writeln!(out, "{}", self.renderer.render_markdown(&markdown)).ok();
-                out.flush().ok();
-            }
-            AgentEvent::Usage(usage) => {
-                self.last_usage = Some(*usage);
-            }
-            AgentEvent::MessageStop => {
-                if !self.assistant_text.is_empty() {
-                    writeln!(out).ok();
-                    writeln!(
-                        out,
-                        "{}",
-                        self.renderer.render_markdown(&self.assistant_text)
-                    )
-                    .ok();
-                    self.assistant_text.clear();
-                    out.flush().ok();
-                }
-            }
-            AgentEvent::Truncated(reason) => {
-                if self.spinner_active {
-                    self.spinner.finish("Truncated", &self.theme, &mut out).ok();
-                    self.spinner_active = false;
-                }
-                writeln!(
-                    out,
-                    "{}",
-                    format!("· response truncated by the provider ({reason})")
-                        .with(self.theme.muted())
-                )
-                .ok();
-                out.flush().ok();
-            }
-            AgentEvent::Error(_) => {}
-        }
-    }
-}
-
-/// Deterministic signals the task-loop verifier needs from one interactive
-/// turn: whether the runtime errored, how many tool results came back as
-/// errors, and a short tail of the assistant's final message for memory.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TurnOutcome {
-    ok: bool,
-    tool_errors: usize,
-    conclusion: Option<String>,
-}
-
-/// Count tool results flagged as errors across a turn's transcript entries.
-fn count_tool_errors(results: &[ConversationMessage]) -> usize {
-    results
-        .iter()
-        .flat_map(|message| &message.blocks)
-        .filter(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. }))
-        .count()
-}
-
-/// The assistant's final text, truncated for a high-density memory line.
-fn last_assistant_conclusion(messages: &[ConversationMessage]) -> Option<String> {
-    let text = messages
-        .iter()
-        .rev()
-        .find(|message| message.role == MessageRole::Assistant)
-        .map(|message| {
-            message
-                .blocks
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .map(|joined| joined.trim().to_string())
-        .filter(|joined| !joined.is_empty())?;
-    Some(truncate_chars(&text, 240))
-}
-
-/// Run one interactive turn: stream events to the terminal, abort on Ctrl+C,
-/// and auto-save the session afterwards.
-///
-/// Returns a [`TurnOutcome`] the task loop verifies against; the failure is
-/// rendered here so callers can keep running.
-async fn run_turn_interactive(
-    runtime: &mut AgentRuntime,
-    input_text: &str,
-    prompter: Option<&mut dyn PermissionPrompter>,
-) -> io::Result<TurnOutcome> {
-    let cancel = CancellationToken::new();
-    let listener = tokio::spawn({
-        let cancel = cancel.clone();
-        async move {
-            let _ = tokio::signal::ctrl_c().await;
-            cancel.cancel();
-        }
-    });
-
-    let mut turn = TurnRenderer::new();
-    let mut stdout = io::stdout();
-    turn.spinner.tick("Thinking", &turn.theme, &mut stdout)?;
-
-    let mut notify = |event: &AgentEvent| turn.render(event);
-    let result = runtime
-        .run_turn_with_blocks(
-            expand_attachments(input_text),
-            prompter,
-            &mut notify,
-            &cancel,
-        )
-        .await;
-    listener.abort();
-
-    let outcome = match result {
-        Ok(summary) => {
-            if turn.saw_text {
-                writeln!(stdout)?;
-            } else {
-                turn.spinner.finish("Done", &turn.theme, &mut stdout)?;
-            }
-            TurnOutcome {
-                ok: true,
-                tool_errors: count_tool_errors(&summary.tool_results),
-                conclusion: last_assistant_conclusion(&summary.assistant_messages),
-            }
-        }
-        Err(error) => {
-            let interrupted = error.to_string().contains("cancelled");
-            if turn.spinner_active {
-                if interrupted {
-                    turn.spinner
-                        .cancel("Interrupted", &turn.theme, &mut stdout)?;
-                } else {
-                    turn.spinner.fail("Turn failed", &turn.theme, &mut stdout)?;
-                }
-            } else {
-                writeln!(stdout)?;
-            }
-            if interrupted {
-                println!(
-                    "{}",
-                    "turn interrupted; the transcript stays consistent - give the next instruction or /exit to quit"
-                        .dark_grey()
-                );
-            } else {
-                println!("{}", format!("✘ {error}").red());
-            }
-            if let Ok(path) = save_session_async(runtime.session()).await {
-                println!(
-                    "{}",
-                    format!("· session saved to {}", path.display()).dark_grey()
-                );
-            }
-            return Ok(TurnOutcome {
-                ok: false,
-                tool_errors: 0,
-                conclusion: None,
-            });
-        }
-    };
-
-    if let Some(usage) = turn.last_usage {
-        println!(
-            "{}",
-            format!(
-                "[in {} / out {} / cache read {}]",
-                usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens
-            )
-            .dark_grey()
-        );
-    }
-    if let Ok(path) = save_session_async(runtime.session()).await {
-        println!("{}", format!("· saved {}", path.display()).dark_grey());
-    }
-    Ok(outcome)
-}
-
-fn build_runtime(
+pub(crate) fn build_runtime(
+    state: &SessionShared,
     session: Session,
     selection: ProviderSelection,
     interactive: bool,
     mode: &str,
+) -> Result<AgentRuntime, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    // Single-runtime paths own their MCP connections; the multi-section shell
+    // connects once and shares one toolset via `build_runtime_with_mcp`.
+    let mcp = Arc::new(connect_mcp_servers(&cwd, &home_dir()));
+    build_runtime_with_mcp(state, session, selection, interactive, mode, mcp)
+}
+
+/// Assemble a runtime over an already-connected, shared MCP toolset. The
+/// multi-section shell connects every server once and hands the same `Arc` to
+/// each section, so N sections cost one set of MCP server processes rather than
+/// N. `McpClient` serializes requests per connection (internal mutex), so the
+/// shared handle stays correct even once sections run turns concurrently.
+fn build_runtime_with_mcp(
+    state: &SessionShared,
+    session: Session,
+    selection: ProviderSelection,
+    interactive: bool,
+    mode: &str,
+    mcp: Arc<McpToolset>,
 ) -> Result<AgentRuntime, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let (os_name, os_version) = os_platform();
@@ -3094,13 +2135,13 @@ fn build_runtime(
     match &selection {
         ProviderSelection::Env { .. } => {
             if let Ok(key) = env::var("ANTHROPIC_API_KEY") {
-                register_secret(&key);
+                register_secret(state, &key);
             }
         }
         ProviderSelection::Profile(profile) => {
-            register_secret(&profile.api_key);
+            register_secret(state, &profile.api_key);
             if let Some(token) = &profile.auth_token {
-                register_secret(token);
+                register_secret(state, token);
             }
         }
     }
@@ -3110,7 +2151,6 @@ fn build_runtime(
         }
         ProviderSelection::Profile(profile) => TransportClient::from_profile(&profile, true),
     };
-    let mcp = connect_mcp_servers(&cwd, &home_dir());
     let mcp_read_only = mcp.read_only_tool_names();
     let questioner: Option<Arc<dyn UserQuestioner>> =
         interactive.then(|| Arc::new(InteractiveQuestioner) as Arc<dyn UserQuestioner>);
@@ -3122,1194 +2162,6 @@ fn build_runtime(
         system_prompt,
     )
     .with_compaction(compaction))
-}
-
-/// Terminal-backed permission prompt. `allow_all` latches for the rest of
-/// the session once the user answers "all".
-struct CliPermissionPrompter {
-    allow_all: bool,
-}
-
-impl CliPermissionPrompter {
-    fn new() -> Self {
-        Self { allow_all: false }
-    }
-}
-
-impl PermissionPrompter for CliPermissionPrompter {
-    fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
-        if self.allow_all {
-            return PermissionPromptDecision::Allow;
-        }
-        let deny = || PermissionPromptDecision::Deny {
-            reason: "user denied the tool call".to_string(),
-        };
-        let preview: String = request.input.chars().take(200).collect();
-        let mut stdout = io::stdout();
-        let _ = writeln!(stdout, "\npermission requested: {}", request.tool_name);
-        let _ = writeln!(stdout, "  {preview}");
-
-        if stdin_is_terminal() {
-            let options = vec![
-                "Allow once".to_string(),
-                "Allow all for this session".to_string(),
-                "Deny".to_string(),
-            ];
-            let chosen = Select::new(&format!("Allow `{}`?", request.tool_name), options).prompt();
-            return match chosen.as_deref() {
-                Ok("Allow once") => PermissionPromptDecision::Allow,
-                Ok("Allow all for this session") => {
-                    self.allow_all = true;
-                    PermissionPromptDecision::Allow
-                }
-                _ => deny(),
-            };
-        }
-
-        // Non-interactive fallback: single-line y/a/n read over a plain stream.
-        let _ = write!(stdout, "allow? [y]es / [a]ll / [n]o: ");
-        let _ = stdout.flush();
-        let mut line = String::new();
-        if io::stdin().read_line(&mut line).is_err() {
-            return PermissionPromptDecision::Deny {
-                reason: "stdin unavailable".to_string(),
-            };
-        }
-        match line.trim().to_ascii_lowercase().as_str() {
-            "y" | "yes" => PermissionPromptDecision::Allow,
-            "a" | "all" => {
-                self.allow_all = true;
-                PermissionPromptDecision::Allow
-            }
-            _ => deny(),
-        }
-    }
-}
-
-/// One option rendered by the `ask_user` tool.
-struct QuestionOption {
-    label: String,
-    description: Option<String>,
-}
-
-/// Terminal-backed question flow for the `ask_user` tool.
-trait UserQuestioner: Send + Sync {
-    fn ask(
-        &self,
-        question: &str,
-        options: &[QuestionOption],
-        multi: bool,
-    ) -> Result<String, String>;
-}
-
-struct InteractiveQuestioner;
-
-impl UserQuestioner for InteractiveQuestioner {
-    fn ask(
-        &self,
-        question: &str,
-        options: &[QuestionOption],
-        multi: bool,
-    ) -> Result<String, String> {
-        let answers = if stdin_is_terminal() {
-            Self::ask_inquire(question, options, multi)?
-        } else {
-            Self::ask_manual(question, options, multi)?
-        };
-        serde_json::to_string(&serde_json::json!({ "answers": answers }))
-            .map_err(|error| error.to_string())
-    }
-}
-
-impl InteractiveQuestioner {
-    /// Interactive path backed by `inquire` list/text prompts. A trailing
-    /// sentinel lets the user reject the offered options and type freely.
-    fn ask_inquire(
-        question: &str,
-        options: &[QuestionOption],
-        multi: bool,
-    ) -> Result<Vec<String>, String> {
-        const CUSTOM: &str = "Type your own answer";
-        let cancelled = || "answer cancelled".to_string();
-        let prompt_custom = || Text::new("Your answer").prompt().map_err(|_| cancelled());
-
-        if options.is_empty() {
-            let text = Text::new(question).prompt().map_err(|_| cancelled())?;
-            return Ok(vec![text]);
-        }
-
-        let labels: Vec<String> = options
-            .iter()
-            .map(|option| match &option.description {
-                Some(desc) => format!("{} - {}", option.label, desc),
-                None => option.label.clone(),
-            })
-            .collect();
-        let label_at = |display: &str| {
-            labels
-                .iter()
-                .position(|label| label == display)
-                .and_then(|index| options.get(index))
-                .map_or_else(|| display.to_string(), |option| option.label.clone())
-        };
-
-        if multi {
-            let mut choices = labels.clone();
-            choices.push(CUSTOM.to_string());
-            let picked = MultiSelect::new(question, choices)
-                .prompt()
-                .map_err(|_| cancelled())?;
-            let mut answers = Vec::new();
-            for choice in &picked {
-                if choice == CUSTOM {
-                    answers.push(prompt_custom()?);
-                } else {
-                    answers.push(label_at(choice));
-                }
-            }
-            if answers.is_empty() {
-                return Err("no option selected".to_string());
-            }
-            Ok(answers)
-        } else {
-            let mut choices = labels.clone();
-            choices.push(CUSTOM.to_string());
-            let picked = Select::new(question, choices)
-                .prompt()
-                .map_err(|_| cancelled())?;
-            if picked == CUSTOM {
-                return Ok(vec![prompt_custom()?]);
-            }
-            Ok(vec![label_at(&picked)])
-        }
-    }
-
-    /// Non-interactive fallback: numbered selection or free text on a plain
-    /// stream, preserved for piped input and automated runs.
-    fn ask_manual(
-        question: &str,
-        options: &[QuestionOption],
-        multi: bool,
-    ) -> Result<Vec<String>, String> {
-        let mut stdout = io::stdout();
-        let _ = writeln!(stdout);
-        let _ = writeln!(stdout, "? {question}");
-        for (index, option) in options.iter().enumerate() {
-            match &option.description {
-                Some(text) => {
-                    let _ = writeln!(stdout, "  {}) {} - {text}", index + 1, option.label);
-                }
-                None => {
-                    let _ = writeln!(stdout, "  {}) {}", index + 1, option.label);
-                }
-            }
-        }
-        if multi {
-            let _ = write!(
-                stdout,
-                "select numbers (comma-separated), or type your own answer: "
-            );
-        } else {
-            let _ = write!(
-                stdout,
-                "select a number, press Enter for 1, or type your own answer: "
-            );
-        }
-        stdout.flush().map_err(|error| error.to_string())?;
-
-        let mut line = String::new();
-        io::stdin()
-            .read_line(&mut line)
-            .map_err(|error| error.to_string())?;
-        let answer = line.trim();
-        if answer.is_empty() {
-            return Ok(vec![options
-                .first()
-                .map(|option| option.label.clone())
-                .ok_or("no options offered; type an answer")?]);
-        }
-        if looks_like_selection(answer) && !options.is_empty() {
-            let indices: Vec<usize> = answer
-                .split(',')
-                .filter(|token| !token.trim().is_empty())
-                .map(|token| token.trim().parse::<usize>())
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| "invalid selection".to_string())?;
-            return Ok(indices
-                .into_iter()
-                .map(|index| {
-                    options
-                        .get(index.wrapping_sub(1))
-                        .map_or_else(|| index.to_string(), |option| option.label.clone())
-                })
-                .collect());
-        }
-        Ok(vec![answer.to_string()])
-    }
-}
-
-fn looks_like_selection(answer: &str) -> bool {
-    !answer.is_empty()
-        && answer
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == ',' || c == ' ')
-}
-
-struct NativeToolExecutor {
-    todo: Arc<TodoLedger>,
-    questioner: Option<Arc<dyn UserQuestioner>>,
-}
-
-impl NativeToolExecutor {
-    fn new(questioner: Option<Arc<dyn UserQuestioner>>) -> Self {
-        Self {
-            todo: Arc::new(TodoLedger::new()),
-            questioner,
-        }
-    }
-
-    fn run_ask_user(&self, input: &str) -> Result<String, ToolError> {
-        let questioner = self.questioner.as_ref().ok_or_else(|| {
-            ToolError::new("ask_user requires an interactive session".to_string())
-        })?;
-        let value: serde_json::Value = serde_json::from_str(input)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let question = value
-            .get("question")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| ToolError::new("ask_user needs a question".to_string()))?;
-        let options: Vec<QuestionOption> = value
-            .get("options")
-            .and_then(serde_json::Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|item| QuestionOption {
-                        label: item
-                            .get("label")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        description: item
-                            .get("description")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let multi = value
-            .get("multi")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        questioner
-            .ask(question, &options, multi)
-            .map_err(ToolError::new)
-    }
-}
-
-impl ToolExecutor for NativeToolExecutor {
-    fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
-        if tool_name == "todo_write" {
-            return self.todo.write(input).map_err(ToolError::new);
-        }
-        if tool_name == "ask_user" {
-            return self.run_ask_user(input);
-        }
-        let value = serde_json::from_str(input)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        tools::execute_tool(tool_name, &value).map_err(ToolError::new)
-    }
-
-    fn specs(&self) -> Vec<ToolSpec> {
-        let mut specs = tools::mvp_tool_specs()
-            .into_iter()
-            .map(|spec| ToolSpec {
-                name: spec.name.to_string(),
-                description: spec.description.to_string(),
-                input_schema: spec.input_schema,
-            })
-            .collect::<Vec<_>>();
-        for spec in [
-            todo_tool_spec(),
-            tools::ask_user_tool_spec(),
-            tools::verify_graphics_tool_spec(),
-            tools::web_fetch_tool_spec(),
-            tools::web_search_tool_spec(),
-            tools::generate_image_tool_spec(),
-            // Document search needs the external rga binary; advertise the
-            // tool only when it exists so the model never sees a dead entry.
-        ]
-        .into_iter()
-        .chain(if runtime::rga_available() {
-            vec![tools::search_documents_tool_spec()]
-        } else {
-            Vec::new()
-        }) {
-            specs.push(ToolSpec {
-                name: spec.name.to_string(),
-                description: spec.description.to_string(),
-                input_schema: spec.input_schema,
-            });
-        }
-        specs
-    }
-
-    fn pending_tasks(&self) -> usize {
-        self.todo.pending_tasks()
-    }
-
-    fn is_concurrent_safe(&self, tool_name: &str) -> bool {
-        // Pure reads, searches and a network fetch mutate no workspace state, so
-        // several may overlap. bash and write/edit/patch/generate_image touch the
-        // workspace, todo_write mutates the shared ledger, and ask_user needs the
-        // terminal; each must run alone.
-        matches!(
-            tool_name,
-            "read_file"
-                | "glob_search"
-                | "grep_search"
-                | "search_files"
-                | "search_documents"
-                | "verify_graphics"
-                | "web_fetch"
-                | "web_search"
-        )
-    }
-
-    fn seed_plan(&self, input: &str) -> Result<String, ToolError> {
-        self.todo.write(input).map_err(ToolError::new)
-    }
-}
-
-/// One connected MCP server with its advertised tools.
-struct McpServerTools {
-    name: String,
-    client: McpClient,
-    tools: Vec<McpTool>,
-    /// `[mcp.servers.NAME] read_only = true`: force every tool here to be
-    /// treated as read-only, overriding the server's own annotations.
-    config_read_only: bool,
-}
-
-/// MCP tool namespace: every tool is exposed as `mcp__<server>__<tool>` so
-/// native tools keep precedence and names stay collision-free.
-struct McpToolset {
-    servers: Vec<McpServerTools>,
-}
-
-impl McpToolset {
-    /// Namespaced names of every MCP tool that is safe to expose in
-    /// `read-only`/`plan` modes: those the server annotates `readOnlyHint`, plus
-    /// every tool of a server the config marks `read_only`.
-    fn read_only_tool_names(&self) -> Vec<String> {
-        self.servers
-            .iter()
-            .flat_map(|server| server.tools.iter().map(move |tool| (server, tool)))
-            .filter(|(server, tool)| server.config_read_only || tool.read_only)
-            .map(|(server, tool)| format!("mcp__{}__{}", server.name, tool.name))
-            .collect()
-    }
-}
-
-/// Routes tool calls between the native tools and connected MCP servers.
-struct AgentToolExecutor {
-    native: NativeToolExecutor,
-    mcp: McpToolset,
-}
-
-impl AgentToolExecutor {
-    fn new(mcp: McpToolset, questioner: Option<Arc<dyn UserQuestioner>>) -> Self {
-        Self {
-            native: NativeToolExecutor::new(questioner),
-            mcp,
-        }
-    }
-
-    /// Shared handle to the plan ledger. The task-loop orchestrator reads this
-    /// to verify completion without going through the model.
-    fn todo_ledger(&self) -> Arc<TodoLedger> {
-        Arc::clone(&self.native.todo)
-    }
-
-    /// Namespaced read-only MCP tool names, so a rebuilt permission policy can
-    /// keep them usable under `read-only`/`plan` after a mode switch.
-    fn mcp_read_only_names(&self) -> Vec<String> {
-        self.mcp.read_only_tool_names()
-    }
-
-    fn call_mcp(&self, route: &str, input: &str) -> Result<String, ToolError> {
-        let (server_name, tool_name) = route
-            .split_once("__")
-            .ok_or_else(|| ToolError::new(format!("malformed mcp tool name: mcp__{route}")))?;
-        let server = self
-            .mcp
-            .servers
-            .iter()
-            .find(|server| server.name == server_name)
-            .ok_or_else(|| ToolError::new(format!("unknown mcp server: {server_name}")))?;
-        let arguments = serde_json::from_str(input)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let result = server
-            .client
-            .call_tool(tool_name, &arguments)
-            .map_err(|error| ToolError::new(error.to_string()))?;
-        if result.is_error {
-            Err(ToolError::new(result.text))
-        } else {
-            Ok(result.text)
-        }
-    }
-}
-
-impl ToolExecutor for AgentToolExecutor {
-    fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
-        if let Some(route) = tool_name.strip_prefix("mcp__") {
-            return self.call_mcp(route, input);
-        }
-        self.native.execute(tool_name, input)
-    }
-
-    fn pending_tasks(&self) -> usize {
-        self.native.pending_tasks()
-    }
-
-    fn seed_plan(&self, input: &str) -> Result<String, ToolError> {
-        self.native.seed_plan(input)
-    }
-
-    fn is_concurrent_safe(&self, tool_name: &str) -> bool {
-        if tool_name.starts_with("mcp__") {
-            // A namespaced MCP tool overlaps only when it (or its server) is
-            // annotated read-only; mutating tools run alone. Reuses the same
-            // read-only set the permission policy relies on.
-            self.mcp
-                .read_only_tool_names()
-                .iter()
-                .any(|name| name == tool_name)
-        } else {
-            self.native.is_concurrent_safe(tool_name)
-        }
-    }
-
-    fn specs(&self) -> Vec<ToolSpec> {
-        let mut specs = self.native.specs();
-        for server in &self.mcp.servers {
-            for tool in &server.tools {
-                let mut input_schema = tool.input_schema.clone();
-                normalize_tool_schema(&mut input_schema);
-                specs.push(ToolSpec {
-                    name: format!("mcp__{}__{}", server.name, tool.name),
-                    description: format!("[mcp:{}] {}", server.name, tool.description),
-                    input_schema,
-                });
-            }
-        }
-        specs
-    }
-}
-
-/// Connect every configured MCP server; failures isolate to one server and
-/// never block startup.
-fn connect_mcp_servers(cwd: &Path, home: &Path) -> McpToolset {
-    let settings = load_merged_mcp(cwd, home);
-    let mut servers = Vec::new();
-    for (name, config) in settings.servers {
-        match connect_mcp_server(&name, &config) {
-            Ok(handle) => {
-                tracing::debug!(server = %name, tools = handle.tools.len(), "mcp server connected");
-                servers.push(handle);
-            }
-            Err(error) => {
-                tracing::warn!(server = %name, error = %error, "mcp server failed; skipped");
-            }
-        }
-    }
-    McpToolset { servers }
-}
-
-fn connect_mcp_server(name: &str, config: &McpServerConfig) -> Result<McpServerTools, String> {
-    // The handshake (`initialize` + `tools/list`) is idempotent, so it is safe
-    // to retry with backoff on a transient failure. Tool *calls* are not
-    // retried here: they can mutate state, so a failure is surfaced to the
-    // model, which decides whether to try again.
-    const MAX_ATTEMPTS: u32 = 3;
-    let mut last_error = String::from("mcp server connection failed");
-    for attempt in 0..MAX_ATTEMPTS {
-        if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(200 * u64::from(attempt)));
-        }
-        match try_connect_mcp(name, config) {
-            Ok(server) => return Ok(server),
-            Err(error) => last_error = error,
-        }
-    }
-    Err(last_error)
-}
-
-fn try_connect_mcp(name: &str, config: &McpServerConfig) -> Result<McpServerTools, String> {
-    let transport = build_mcp_transport(config)?;
-    let client = McpClient::connect(transport).map_err(|error| error.to_string())?;
-    let tools = client.list_tools().map_err(|error| error.to_string())?;
-    Ok(McpServerTools {
-        name: name.to_string(),
-        client,
-        tools,
-        config_read_only: config.read_only,
-    })
-}
-
-/// Pick the transport from the config: an `url` selects Streamable-HTTP, else
-/// spawn the stdio `command`. HTTP header values may reference `${VAR}`.
-fn build_mcp_transport(config: &McpServerConfig) -> Result<Box<dyn Transport>, String> {
-    if let Some(url) = &config.url {
-        let headers = config
-            .headers
-            .iter()
-            .map(|(key, value)| (key.clone(), expand_env_vars(value)))
-            .collect();
-        let bearer = config
-            .bearer_token_env
-            .as_ref()
-            .and_then(|var| env::var(var).ok())
-            .filter(|token| !token.is_empty());
-        HttpTransport::new(url.clone(), headers, bearer)
-            .map(|transport| Box::new(transport) as Box<dyn Transport>)
-            .map_err(|error| error.to_string())
-    } else {
-        StdioTransport::spawn(&config.command, &config.args, &config.env)
-            .map(|transport| Box::new(transport) as Box<dyn Transport>)
-            .map_err(|error| error.to_string())
-    }
-}
-
-/// Substitute every `${NAME}` in `value` with the environment variable, using
-/// an empty string when it is unset (so a missing secret yields an empty
-/// header rather than a literal placeholder).
-fn expand_env_vars(value: &str) -> String {
-    let mut out = String::new();
-    let mut rest = value;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        if let Some(end) = after.find('}') {
-            let name = &after[..end];
-            out.push_str(&env::var(name).unwrap_or_default());
-            rest = &after[end + 1..];
-        } else {
-            out.push_str("${");
-            rest = after;
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-/// Default permission mode: from `HEARTFLOW_PERMISSION_MODE`, else
-/// `workspace-write` when interactive and `full` for one-shot runs.
-fn default_permission_mode(interactive: bool) -> String {
-    env::var("HEARTFLOW_PERMISSION_MODE").unwrap_or_else(|_| {
-        if interactive {
-            "workspace-write".to_string()
-        } else {
-            "full".to_string()
-        }
-    })
-}
-
-/// Permission resolution: `read-only` allows pure readers, `full`/`auto` run
-/// everything without asking, and the default `workspace-write` runs routine
-/// commands but confirms only high-blast-radius ones (a `bash` command is
-/// auto-allowed unless it looks destructive; `web_fetch` always confirms).
-///
-/// `mcp_read_only` names (from `McpToolset::read_only_tool_names`) are added to
-/// the Allow set for the two Deny-default modes, so read-only MCP tools stay
-/// usable in `read-only`/`plan` without opening up write-capable ones.
-fn permission_policy_for_mode(mode: &str, mcp_read_only: &[String]) -> PermissionPolicy {
-    let base = match mode {
-        "read-only" => PermissionPolicy::new(PermissionMode::Deny)
-            .with_tool_mode("read_file", PermissionMode::Allow)
-            .with_tool_mode("glob_search", PermissionMode::Allow)
-            .with_tool_mode("grep_search", PermissionMode::Allow)
-            .with_tool_mode("search_files", PermissionMode::Allow)
-            .with_tool_mode("search_documents", PermissionMode::Allow)
-            .with_tool_mode("todo_write", PermissionMode::Allow)
-            .with_tool_mode("verify_graphics", PermissionMode::Allow)
-            .with_tool_mode("ask_user", PermissionMode::Allow),
-        "full" | "auto" => PermissionPolicy::new(PermissionMode::Allow),
-        // Planning: read/research freely, but the only mutation allowed is the
-        // plan document itself. Writers route to `Prompt`; the gate auto-allows
-        // `.heartflow/plans/*.md` and every other write hits `BlockPrompter`
-        // (a hard gate). `bash` and everything else fall to the `Deny` default.
-        "plan" => PermissionPolicy::new(PermissionMode::Deny)
-            .with_tool_mode("read_file", PermissionMode::Allow)
-            .with_tool_mode("glob_search", PermissionMode::Allow)
-            .with_tool_mode("grep_search", PermissionMode::Allow)
-            .with_tool_mode("search_files", PermissionMode::Allow)
-            .with_tool_mode("search_documents", PermissionMode::Allow)
-            .with_tool_mode("web_fetch", PermissionMode::Allow)
-            .with_tool_mode("web_search", PermissionMode::Allow)
-            .with_tool_mode("todo_write", PermissionMode::Allow)
-            .with_tool_mode("verify_graphics", PermissionMode::Allow)
-            .with_tool_mode("ask_user", PermissionMode::Allow)
-            .with_tool_mode("write_file", PermissionMode::Prompt)
-            .with_tool_mode("edit_file", PermissionMode::Prompt)
-            .with_tool_mode("apply_patch", PermissionMode::Prompt)
-            .with_prompt_gate(plan_gate),
-        _ => PermissionPolicy::new(PermissionMode::Allow)
-            .with_tool_mode("bash", PermissionMode::Prompt)
-            // Network egress leaves the sandbox; ask like a dangerous command does.
-            .with_tool_mode("web_fetch", PermissionMode::Prompt)
-            .with_tool_mode("web_search", PermissionMode::Prompt)
-            .with_tool_mode("generate_image", PermissionMode::Prompt)
-            .with_prompt_gate(confirm_only_when_risky),
-    };
-    // The Deny-default modes must still reach read-only MCP tools; Allow modes
-    // already permit them, so adding them again is a harmless no-op there.
-    match mode {
-        "read-only" | "plan" => mcp_read_only.iter().fold(base, |policy, name| {
-            policy.with_tool_mode(name.clone(), PermissionMode::Allow)
-        }),
-        _ => base,
-    }
-}
-
-/// Swap a live runtime to `mode`, preserving the connected servers' read-only
-/// MCP tools. The read-only names are computed before the mutable borrow so the
-/// executor can be inspected while the policy is replaced.
-fn set_runtime_mode_policy(runtime: &mut AgentRuntime, mode: &str) {
-    let mcp_read_only = runtime.executor().mcp_read_only_names();
-    runtime.set_permission_policy(permission_policy_for_mode(mode, &mcp_read_only));
-}
-
-/// Prompt gate for `workspace-write`: `bash` needs confirmation only when the
-/// command looks destructive; every other `Prompt`-mode tool always confirms.
-fn confirm_only_when_risky(tool_name: &str, input: &str) -> bool {
-    if tool_name != "bash" {
-        return true;
-    }
-    runtime::is_dangerous_command(&input_str_field(input, "command"))
-}
-
-/// Read a top-level string field from a tool's JSON input, falling back to the
-/// raw input when it is not structured JSON (the model sometimes sends plain
-/// text). Shared by the planning gate so path checks mirror the bash checks.
-fn input_str_field(input: &str, key: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(input)
-        .ok()
-        .and_then(|value| {
-            value
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| input.to_string())
-}
-
-/// Prompt gate for `plan` mode. Returns `true` when confirmation is required
-/// (which `BlockPrompter` then refuses). Only writes to a plan document under
-/// `.heartflow/plans/*.md` are auto-allowed and therefore return `false`.
-fn plan_gate(_tool_name: &str, input: &str) -> bool {
-    !is_plan_doc_input(input)
-}
-
-/// Whether a write targets a planning document: a `.md` under `.heartflow/plans/`.
-fn is_plan_doc_input(input: &str) -> bool {
-    let path = input_str_field(input, "path")
-        .replace('\\', "/")
-        .to_lowercase();
-    path.contains(".heartflow/plans/")
-        && std::path::Path::new(&path)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-}
-
-/// Prompter used while planning: any action the plan policy routed to `Prompt`
-/// (a write outside the plan document) is refused outright, which is what turns
-/// the policy into a hard gate. Plan-document writes never reach here because
-/// `plan_gate` auto-allows them.
-struct BlockPrompter;
-
-impl PermissionPrompter for BlockPrompter {
-    fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
-        PermissionPromptDecision::Deny {
-            reason: format!(
-                "planning mode: `{}` is blocked. Only the plan document under .heartflow/plans/ may be written; get approval with `/plan approve` before making real changes.",
-                request.tool_name
-            ),
-        }
-    }
-}
-
-/// Create `.heartflow/plans/` under `cwd` and reserve a unique plan path for
-/// `goal`. The CLI owns the exact path so the model writes where we can find it.
-fn plan_file_path(cwd: &Path, goal: &str) -> Result<PathBuf, String> {
-    let dir = cwd.join(".heartflow").join("plans");
-    fs::create_dir_all(&dir).map_err(|error| format!("{}: {error}", dir.display()))?;
-    let stamp = unix_secs();
-    let slug: String = goal
-        .to_lowercase()
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .take(24)
-        .collect();
-    let slug = if slug.is_empty() { "plan" } else { &slug };
-    Ok(dir.join(format!("{stamp}-{slug}.md")))
-}
-
-/// The kickoff message for a planning turn: states the goal and the single file
-/// the model is allowed to write, plus the checkbox format the seeder parses.
-fn plan_brief(goal: &str, plan_path: &Path) -> String {
-    format!(
-        "PLAN MODE: investigate and plan, make no real changes yet.\n\
-         Objective: {goal}\n\
-         Explore the repository as needed (read/search/fetch), then write ONE implementation plan to exactly this file: {path}\n\
-         The plan must contain a `## Tasks` section whose items are markdown checkboxes, one per task, using the literal form `- [ ] description` (mark done items `- [x]`). These checkboxes become the tracked task list verbatim, so keep each one a concrete, verifiable step.\n\
-         Also include `## Goal` and `## Verification` (how success is proven).",
-        path = plan_path.display()
-    )
-}
-
-/// Parse the checkbox tasks from a plan document. `- [ ]` becomes pending and
-/// `- [x]`/`- [X]` completed; every other line is ignored. This is the
-/// deterministic bridge from the approved plan to the todo ledger.
-fn parse_plan_tasks(markdown: &str) -> Vec<(String, &'static str)> {
-    let mut tasks = Vec::new();
-    for line in markdown.lines() {
-        let trimmed = line.trim_start();
-        let after_bullet = match trimmed
-            .strip_prefix('-')
-            .or_else(|| trimmed.strip_prefix('*'))
-        {
-            Some(rest) => rest.trim_start(),
-            None => continue,
-        };
-        let (status, content) = if let Some(content) = after_bullet.strip_prefix("[ ]") {
-            ("pending", content)
-        } else if let Some(content) = after_bullet
-            .strip_prefix("[x]")
-            .or_else(|| after_bullet.strip_prefix("[X]"))
-        {
-            ("completed", content)
-        } else {
-            continue;
-        };
-        let content = content.trim().to_string();
-        if !content.is_empty() {
-            tasks.push((content, status));
-        }
-    }
-    tasks
-}
-
-/// Build the `todo_write`-shaped JSON used to seed the ledger from a plan.
-/// Each task carries a stable positional id so the task-loop orchestrator can
-/// track it across the plan document, the ledger, and its reflection record.
-fn plan_seed_json(tasks: &[(String, &'static str)]) -> String {
-    let items: Vec<serde_json::Value> = tasks
-        .iter()
-        .enumerate()
-        .map(|(index, (content, status))| {
-            serde_json::json!({
-                "id": task_id(index),
-                "content": content,
-                "status": status,
-            })
-        })
-        .collect();
-    serde_json::json!({ "todos": items }).to_string()
-}
-
-/// The result of running the whole plan task loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TaskLoopStatus {
-    Completed,
-    Aborted,
-}
-
-/// Max automated attempts per task before the operator is asked.
-const MAX_TASK_ATTEMPTS: usize = 3;
-
-/// The escalation the operator chooses after a task exhausts its attempts.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Escalation {
-    Retry,
-    Skip,
-    Abort,
-    Reword(String),
-}
-
-/// Decides what to do when a task fails every attempt. Kept behind a trait so
-/// the loop can be driven by a stub in tests and by the terminal otherwise.
-trait EscalationHandler {
-    fn handle(&mut self, task_id: &str, task_content: &str) -> Escalation;
-}
-
-struct InteractiveEscalation;
-
-impl EscalationHandler for InteractiveEscalation {
-    fn handle(&mut self, id: &str, content: &str) -> Escalation {
-        let choices = vec![
-            "Try again (fresh attempts)".to_string(),
-            "Skip this task".to_string(),
-            "Reword the task".to_string(),
-            "Abort the plan".to_string(),
-        ];
-        let prompt = format!("[{id}] {content:?} failed after {MAX_TASK_ATTEMPTS} attempts. Next?");
-        match Select::new(&prompt, choices).prompt() {
-            Ok(choice) if choice.starts_with("Try again") => Escalation::Retry,
-            Ok(choice) if choice.starts_with("Skip") => Escalation::Skip,
-            Ok(choice) if choice.starts_with("Reword") => {
-                match Text::new("New task description").prompt() {
-                    Ok(text) if !text.trim().is_empty() => {
-                        Escalation::Reword(text.trim().to_string())
-                    }
-                    _ => Escalation::Skip,
-                }
-            }
-            // Any terminal/cancel condition or unknown pick stops the loop safely.
-            _ => Escalation::Abort,
-        }
-    }
-}
-
-/// Pre-compaction kickoff note per attempt: first try is clean, the second
-/// retries verbatim, the third demands a fundamentally different approach.
-#[must_use]
-fn attempt_note(attempt: usize) -> &'static str {
-    match attempt {
-        0 | 1 => "",
-        2 => "PREVIOUS ATTEMPT FAILED. Retry the same approach once; the failure may be transient.\n",
-        _ => "ALL PRIOR ATTEMPTS FAILED. Change strategy: pursue a fundamentally different approach.\n",
-    }
-}
-
-/// Seed JSON for a single focused task, keeping its stable plan id so the
-/// ledger, plan checkbox, and reflection line all refer to the same task.
-#[must_use]
-fn task_seed_json(id: &str, content: &str) -> String {
-    serde_json::json!({
-        "todos": [{ "id": id, "content": content, "status": "in_progress" }]
-    })
-    .to_string()
-}
-
-/// Kickoff user message for one task on a given attempt.
-#[must_use]
-fn task_kickoff(id: &str, content: &str, attempt: usize) -> String {
-    format!(
-        "TASK [{id}]: {content}\n{note}Do only this task now. Your todo list holds just this one item: finish it, verify it against the plan's ## Verification, then mark it `completed` with `todo_write` - the loop cannot advance until you do. Report the concrete result.",
-        note = attempt_note(attempt)
-    )
-}
-
-/// Fresh-context seeds for a task: prior tasks' high-density conclusions, so
-/// knowledge carries forward while the raw transcript does not.
-#[must_use]
-fn build_task_seeds(memory: &[String]) -> Vec<ConversationMessage> {
-    if memory.is_empty() {
-        return Vec::new();
-    }
-    let joined = memory.join("\n");
-    vec![ConversationMessage::user_text(format!(
-        "CONCLUSIONS FROM EARLIER TASKS IN THIS PLAN (already done, do not redo them):\n{joined}"
-    ))]
-}
-
-/// A one-line memory entry recording a finished task's outcome.
-#[must_use]
-fn task_memory_note(id: &str, content: &str, outcome: &TurnOutcome) -> String {
-    let detail = outcome.conclusion.as_deref().unwrap_or("(no text summary)");
-    format!("[{id}] {content} -> {detail}")
-}
-
-/// Flip the `target_index`-th plan checkbox to checked, mirroring the
-/// `parse_plan_tasks` order. Idempotent when already `[x]`.
-fn mark_plan_task_done(path: &Path, target_index: usize) -> io::Result<()> {
-    let text = fs::read_to_string(path)?;
-    let mut seen = 0usize;
-    let mut lines: Vec<String> = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        let is_checkbox = trimmed
-            .strip_prefix('-')
-            .or_else(|| trimmed.strip_prefix('*'))
-            .is_some_and(|rest| {
-                let inner = rest.trim_start();
-                inner.starts_with("[ ]") || inner.starts_with("[x]") || inner.starts_with("[X]")
-            });
-        if is_checkbox {
-            if seen == target_index {
-                lines.push(line.replacen("[ ]", "[x]", 1));
-            } else {
-                lines.push(line.to_string());
-            }
-            seen += 1;
-            continue;
-        }
-        lines.push(line.to_string());
-    }
-    let mut result = lines.join("\n");
-    if text.ends_with('\n') {
-        result.push('\n');
-    }
-    fs::write(path, result)
-}
-
-/// Coordinates for one pending plan task inside the task loop.
-struct TaskContext<'a> {
-    plan_path: &'a Path,
-    index: usize,
-    id: String,
-    content: String,
-}
-
-/// Hermes-style task loop: run every pending plan task in order, each from a
-/// fresh context, verify it deterministically, and escalate on failure.
-async fn run_task_loop(
-    runtime: &mut AgentRuntime,
-    plan_path: &Path,
-    tasks: &[(String, &'static str)],
-    prompter: &mut CliPermissionPrompter,
-    escalation: &mut dyn EscalationHandler,
-    memory: &mut Vec<String>,
-) -> io::Result<TaskLoopStatus> {
-    for (index, (content, initial_status)) in tasks.iter().enumerate() {
-        if *initial_status == "completed" {
-            continue;
-        }
-        let task = TaskContext {
-            plan_path,
-            index,
-            id: task_id(index),
-            content: content.clone(),
-        };
-        if run_one_task(runtime, task, prompter, escalation, memory).await?
-            == TaskLoopStatus::Aborted
-        {
-            return Ok(TaskLoopStatus::Aborted);
-        }
-    }
-    Ok(TaskLoopStatus::Completed)
-}
-
-/// Drive one task through its attempt ladder and, on repeated failure, the
-/// operator escalation. `Completed` covers both done and skipped.
-async fn run_one_task(
-    runtime: &mut AgentRuntime,
-    mut task: TaskContext<'_>,
-    prompter: &mut CliPermissionPrompter,
-    escalation: &mut dyn EscalationHandler,
-    memory: &mut Vec<String>,
-) -> io::Result<TaskLoopStatus> {
-    let ledger = runtime.executor().todo_ledger();
-    loop {
-        for attempt in 1..=MAX_TASK_ATTEMPTS {
-            println!(
-                "\n=== [{}] {} (attempt {}/{}) ===",
-                task.id, task.content, attempt, MAX_TASK_ATTEMPTS
-            );
-            if let Err(error) = runtime.seed_plan(&task_seed_json(&task.id, &task.content)) {
-                println!("failed to seed task into the ledger: {error}");
-                return Ok(TaskLoopStatus::Completed);
-            }
-            runtime.reset_for_task(build_task_seeds(memory));
-            // A fresh task context replaces the transcript wholesale, so the
-            // prior mirror rows are no longer a valid append base.
-            note_mirror_rewrite();
-            let outcome = run_turn_interactive(
-                runtime,
-                &task_kickoff(&task.id, &task.content, attempt),
-                Some(prompter),
-            )
-            .await?;
-            // Deterministic verify (no judge): turn succeeded, no tool errors,
-            // and the model marked the single focused task completed.
-            if outcome.ok && outcome.tool_errors == 0 && ledger.pending_tasks() == 0 {
-                if let Err(error) = mark_plan_task_done(task.plan_path, task.index) {
-                    println!("(note) could not update the plan checkbox: {error}");
-                }
-                memory.push(task_memory_note(&task.id, &task.content, &outcome));
-                println!("[{}] done.", task.id);
-                return Ok(TaskLoopStatus::Completed);
-            }
-            println!(
-                "[{}] not verified (turn ok: {}, tool errors: {}, pending: {}).",
-                task.id,
-                outcome.ok,
-                outcome.tool_errors,
-                ledger.pending_tasks()
-            );
-        }
-        // The match is the loop's tail: Retry/Reword fall through to a fresh
-        // attempt ladder, Skip/Abort exit.
-        match escalation.handle(&task.id, &task.content) {
-            Escalation::Retry => {}
-            Escalation::Skip => {
-                memory.push(format!(
-                    "[{}] {} -> SKIPPED after {} failed attempts",
-                    task.id, task.content, MAX_TASK_ATTEMPTS
-                ));
-                println!("[{}] skipped.", task.id);
-                return Ok(TaskLoopStatus::Completed);
-            }
-            Escalation::Reword(new_content) => task.content = new_content,
-            Escalation::Abort => {
-                println!("[{}] aborting the remaining tasks.", task.id);
-                return Ok(TaskLoopStatus::Aborted);
-            }
-        }
-    }
-}
-
-/// Directory holding plan reflection documents (sibling of the plans dir).
-fn reflections_dir(cwd: &Path) -> PathBuf {
-    cwd.join(".heartflow").join("reflections")
-}
-
-/// Extract the plan's `## Goal` text for the reflection header; falls back to
-/// the supplied name when the plan has no goal section.
-#[must_use]
-fn extract_plan_goal(markdown: &str, fallback: &str) -> String {
-    let mut in_goal = false;
-    for line in markdown.lines() {
-        let trimmed = line.trim();
-        if trimmed.eq_ignore_ascii_case("## goal") {
-            in_goal = true;
-            continue;
-        }
-        if in_goal {
-            if trimmed.starts_with('#') {
-                break;
-            }
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
-        }
-    }
-    fallback.to_string()
-}
-
-/// Build the reflection document body. Pure so it can be tested without a
-/// model: lists every task with its final status plus the conclusion the loop
-/// captured, and the aggregated token usage.
-#[must_use]
-fn build_reflection_doc(
-    stamp: &str,
-    plan_path: &Path,
-    goal: &str,
-    tasks: &[(String, &'static str)],
-    memory: &[String],
-    usage: &TokenUsage,
-) -> String {
-    let mut lines = vec![
-        String::from("# heartflow reflection"),
-        String::new(),
-        format!("- generated: {stamp}"),
-        format!("- plan: {}", plan_path.display()),
-        format!("- goal: {goal}"),
-        format!(
-            "- usage: in {} / out {} / cache read {} / total {}",
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.cache_read_input_tokens,
-            usage.total_tokens()
-        ),
-        String::new(),
-        String::from("## Tasks"),
-    ];
-    for (index, (content, status)) in tasks.iter().enumerate() {
-        let id = task_id(index);
-        let verdict = if *status == "completed" {
-            "completed"
-        } else {
-            "not completed"
-        };
-        lines.push(format!("- [{id}] {content} - {verdict}"));
-        if let Some(note) = memory
-            .iter()
-            .find(|note| note.starts_with(&format!("[{id}] ")))
-        {
-            lines.push(format!("  - {note}"));
-        }
-    }
-    let mut doc = lines.join("\n");
-    doc.push('\n');
-    doc
-}
-
-/// Persist a plan reflection document, creating the reflections directory.
-fn write_reflection(
-    cwd: &Path,
-    plan_path: &Path,
-    tasks: &[(String, &'static str)],
-    memory: &[String],
-    usage: &TokenUsage,
-    goal: &str,
-) -> io::Result<PathBuf> {
-    let dir = reflections_dir(cwd);
-    fs::create_dir_all(&dir)?;
-    let stamp = unix_millis();
-    let path = dir.join(format!("{stamp}.md"));
-    let doc = build_reflection_doc(
-        &format!("{stamp}ms since epoch (UTC)"),
-        plan_path,
-        goal,
-        tasks,
-        memory,
-        usage,
-    );
-    fs::write(&path, doc)?;
-    Ok(path)
-}
-
-/// Turn a plan goal into a filesystem-safe skill slug.
-#[must_use]
-fn skill_slug(goal: &str) -> String {
-    let mut out = String::new();
-    let mut prev_dash = false;
-    for ch in goal.to_lowercase().chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch);
-            prev_dash = false;
-        } else if !prev_dash && !out.is_empty() {
-            out.push('-');
-            prev_dash = true;
-        }
-    }
-    let trimmed: String = out.trim_matches('-').chars().take(40).collect();
-    if trimmed.is_empty() {
-        String::from("plan-reflection")
-    } else {
-        trimmed
-    }
-}
-
-/// Optionally distill a reusable skill from a reflection. Never auto-writes:
-/// it only creates `.agent/skills/<slug>/SKILL.md` when there is non-trivial
-/// experience AND `confirm` returns true. `confirm` is injected so the write
-/// path can be exercised without a terminal.
-fn maybe_sink_skill(
-    cwd: &Path,
-    goal: &str,
-    reflection: &Path,
-    has_experience: bool,
-    confirm: &mut dyn FnMut() -> bool,
-) -> io::Result<Option<PathBuf>> {
-    if !has_experience || !confirm() {
-        return Ok(None);
-    }
-    let slug = skill_slug(goal);
-    let dir = cwd.join(".agent").join("skills").join(&slug);
-    fs::create_dir_all(&dir)?;
-    let path = dir.join("SKILL.md");
-    let safe_goal = goal.replace('"', "'");
-    let body = format!(
-        "---\nname: {slug}\ndescription: \"Workflow learned from the '{safe_goal}' plan\"\n---\n\n# {safe_goal}\n\nReusable workflow distilled by heartflow after completing this plan. See the full reflection at {} for the per-task record.\n",
-        reflection.display()
-    );
-    fs::write(&path, body)?;
-    Ok(Some(path))
 }
 
 #[cfg(test)]
@@ -4367,15 +2219,16 @@ mod tests {
 
     #[test]
     fn secret_registry_dedups_and_ignores_short_values() {
-        use super::{register_secret, registered_secrets};
-        let before = registered_secrets();
+        use super::{new_session_state, register_secret, registered_secrets};
+        let state = new_session_state();
+        let before = registered_secrets(&state);
         // A <4-char value is ordinary text and must never be registered.
-        register_secret("ab");
-        assert_eq!(registered_secrets().len(), before.len());
+        register_secret(&state, "ab");
+        assert_eq!(registered_secrets(&state).len(), before.len());
         // Repeated registration of the same credential collapses to one entry.
-        register_secret("sk-supersecret-value-xyz");
-        register_secret("sk-supersecret-value-xyz");
-        let after = registered_secrets();
+        register_secret(&state, "sk-supersecret-value-xyz");
+        register_secret(&state, "sk-supersecret-value-xyz");
+        let after = registered_secrets(&state);
         assert_eq!(
             after
                 .iter()
@@ -4388,23 +2241,25 @@ mod tests {
 
     #[test]
     fn session_identity_adopts_a_transcript_and_rotates_to_a_new_id() {
-        use super::{adopt_session_path, current_session_id, rotate_session_id};
+        use super::{adopt_session_path, current_session_id, new_session_state, rotate_session_id};
         use std::path::Path;
+        let state = new_session_state();
         // Adopting a transcript rebinds persistence to its file stem, so a
         // resumed conversation keeps writing the same file and history row.
-        adopt_session_path(Path::new("/x/sessions/123-45.json"));
-        assert_eq!(current_session_id(), "123-45");
+        adopt_session_path(&state, Path::new("/x/sessions/123-45.json"));
+        assert_eq!(current_session_id(&state), "123-45");
         // Rotating (after /clear) mints a fresh, non-empty, different id.
-        let before = current_session_id();
-        rotate_session_id();
-        let after = current_session_id();
+        let before = current_session_id(&state);
+        rotate_session_id(&state);
+        let after = current_session_id(&state);
         assert!(!after.is_empty(), "a fresh id is never empty");
         assert_ne!(before, after, "rotate must start a new conversation id");
     }
 
     #[test]
     fn native_read_only_tools_are_the_only_concurrent_safe_ones() {
-        use super::{NativeToolExecutor, ToolExecutor};
+        use super::NativeToolExecutor;
+        use runtime::ToolExecutor;
         let exec = NativeToolExecutor::new(None);
         // Pure reads/searches/fetches may overlap.
         for tool in [
@@ -4520,30 +2375,36 @@ mod tests {
         );
     }
 
-    #[test]
-    fn workspace_write_confirms_only_dangerous_bash() {
+    #[tokio::test]
+    async fn workspace_write_confirms_only_dangerous_bash() {
         use super::permission_policy_for_mode;
         use runtime::PermissionOutcome;
         let write = permission_policy_for_mode("workspace-write", &[]);
         // Routine command auto-runs without prompting (no prompter needed).
         assert!(matches!(
-            write.authorize("bash", r#"{"command":"ls -la"}"#, None),
+            write
+                .authorize("bash", r#"{"command":"ls -la"}"#, None)
+                .await,
             PermissionOutcome::Allow
         ));
         // Destructive command falls through to interactive approval.
         assert!(matches!(
-            write.authorize("bash", r#"{"command":"rm -rf /"}"#, None),
+            write
+                .authorize("bash", r#"{"command":"rm -rf /"}"#, None)
+                .await,
             PermissionOutcome::Deny { .. }
         ));
         // web_fetch always confirms.
         assert!(matches!(
-            write.authorize("web_fetch", r#"{"url":"https://x"}"#, None),
+            write
+                .authorize("web_fetch", r#"{"url":"https://x"}"#, None)
+                .await,
             PermissionOutcome::Deny { .. }
         ));
     }
 
-    #[test]
-    fn plan_mode_gates_writes_to_the_plan_document() {
+    #[tokio::test]
+    async fn plan_mode_gates_writes_to_the_plan_document() {
         use super::{permission_policy_for_mode, BlockPrompter};
         use runtime::{PermissionMode, PermissionOutcome};
         let plan = permission_policy_for_mode("plan", &[]);
@@ -4558,7 +2419,8 @@ mod tests {
                 "write_file",
                 r#"{"path":".heartflow/plans/1-add-auth.md","content":"x"}"#,
                 None
-            ),
+            )
+            .await,
             PermissionOutcome::Allow
         );
         // Windows separators still resolve to a plan document.
@@ -4567,7 +2429,8 @@ mod tests {
                 "edit_file",
                 r#"{"path":".heartflow\\plans\\plan.md"}"#,
                 None
-            ),
+            )
+            .await,
             PermissionOutcome::Allow
         );
         // Any other write reaches BlockPrompter and is refused (the hard gate).
@@ -4576,12 +2439,14 @@ mod tests {
                 "write_file",
                 r#"{"path":"src/main.rs","content":"x"}"#,
                 Some(&mut BlockPrompter)
-            ),
+            )
+            .await,
             PermissionOutcome::Deny { .. }
         ));
         // Non-plan writes with no prompter cannot silently proceed.
         assert!(matches!(
-            plan.authorize("write_file", r#"{"path":"README.md"}"#, None),
+            plan.authorize("write_file", r#"{"path":"README.md"}"#, None)
+                .await,
             PermissionOutcome::Deny { .. }
         ));
     }
@@ -4809,8 +2674,9 @@ mod tests {
 
     #[test]
     fn folds_long_tool_output_and_keeps_short() {
-        use super::fold_tool_output;
-        let short = fold_tool_output("bash", "one\ntwo", 40);
+        use super::{fold_tool_output, new_session_state};
+        let state = new_session_state();
+        let short = fold_tool_output(&state, "bash", "one\ntwo", 40);
         assert!(short.contains("one\ntwo"));
         assert!(!short.contains("/expand"), "short output must not fold");
 
@@ -4818,7 +2684,7 @@ mod tests {
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let folded = fold_tool_output("read_file", &long, 40);
+        let folded = fold_tool_output(&state, "read_file", &long, 40);
         assert!(folded.contains("line 0") && folded.contains("line 39"));
         assert!(!folded.contains("line 49"), "tail must be folded away");
         assert!(folded.contains("/expand"), "fold must advertise /expand");
@@ -5093,14 +2959,47 @@ mod tests {
         assert_eq!(
             action(&["hf", "config", "export"]),
             Action::Config {
-                action: super::ConfigAction::Export { output: None },
+                action: super::ConfigAction::Export {
+                    surface: super::ConfigSurface::Config,
+                    output: None,
+                },
             }
         );
         assert_eq!(
             action(&["hf", "config", "export", "--output=out.toml"]),
             Action::Config {
                 action: super::ConfigAction::Export {
+                    surface: super::ConfigSurface::Config,
                     output: Some(PathBuf::from("out.toml")),
+                },
+            }
+        );
+        // The SURFACE positional selects which file to emit; it composes with
+        // --output and defaults to `config` when omitted (asserted above).
+        assert_eq!(
+            action(&["hf", "config", "export", "theme"]),
+            Action::Config {
+                action: super::ConfigAction::Export {
+                    surface: super::ConfigSurface::Theme,
+                    output: None,
+                },
+            }
+        );
+        assert_eq!(
+            action(&["hf", "config", "export", "keymap", "--output=km.toml"]),
+            Action::Config {
+                action: super::ConfigAction::Export {
+                    surface: super::ConfigSurface::Keymap,
+                    output: Some(PathBuf::from("km.toml")),
+                },
+            }
+        );
+        assert_eq!(
+            action(&["hf", "config", "export", "settings"]),
+            Action::Config {
+                action: super::ConfigAction::Export {
+                    surface: super::ConfigSurface::Settings,
+                    output: None,
                 },
             }
         );

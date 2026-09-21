@@ -8,7 +8,7 @@ hf prompt --json TEXT                             输出 {text, usage, session_i
 echo TEXT | hf prompt "指令"                       stdin 作为上下文与指令拼接（Unix 管道）
 hf search QUERY [--limit N] [--json]              跨会话全文检索历史（非交互，可管道）
 hf --resume[=SESSION.json] [--run /compact]       恢复会话（省略 PATH 进选择器），--run 恢复后立即执行 slash 命令
-hf config export [--output FILE]                  导出配置（不含密钥）
+hf config export [SURFACE] [--output FILE]        导出某一面配置（不含密钥）；SURFACE=config（默认）|theme|keymap|settings
 hf config import FILE                             导入配置（自动备份 .bak）
 hf doctor [--fix] [--ai]                          诊断环境（含历史库完整性）；--fix 应用安全修复，--ai 请内置模型给修复建议
 hf init [--force]                                 在当前目录生成 AGENTS.md 指令骨架（已存在不动，--force 覆盖）

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs;
@@ -228,7 +229,7 @@ fn read_file_once(
             ),
         ));
     }
-    let raw_content = fs::read_to_string(&absolute_path)?;
+    let raw_content = read_text_lossy(&absolute_path)?;
     let content = strip_bom(&raw_content);
     let lines: Vec<&str> = content.lines().collect();
     let start_index = offset.unwrap_or(0).min(lines.len());
@@ -248,6 +249,34 @@ fn read_file_once(
             total_lines: lines.len(),
         },
     })
+}
+
+/// Read a file as text, degrading through charset detection instead of failing
+/// outright. `fs::read_to_string` alone rejects every byte sequence that is not
+/// UTF-8, which on a zh-CN Windows box means GBK logs and UTF-16 output from
+/// `PowerShell` redirection are not merely mis-decoded but wholly unreadable.
+fn read_text_lossy(path: &Path) -> io::Result<String> {
+    Ok(decode_text(&fs::read(path)?))
+}
+
+/// Decode bytes to text. A byte-order mark is honoured first (authoritative,
+/// and `chardetng`'s statistical guess is unreliable for the short UTF-16 files
+/// Windows tools emit), then valid UTF-8 is returned unchanged; only genuinely
+/// non-UTF-8 input is sniffed and decoded through the detected legacy encoding,
+/// so CJK content survives rather than collapsing into replacement characters
+/// under a lossy UTF-8 pass. Mirrors `bash::decode_output`.
+fn decode_text(bytes: &[u8]) -> String {
+    if let Some((encoding, bom_len)) = encoding_rs::Encoding::for_bom(bytes) {
+        return encoding.decode(&bytes[bom_len..]).0.into_owned();
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_string();
+    }
+    let mut detector = chardetng::EncodingDetector::new();
+    detector.feed(bytes, true);
+    // `allow_utf8: false` is deliberate: the bytes are known non-UTF-8 here, so
+    // forcing a legacy candidate avoids re-emitting the same bytes lossily.
+    detector.guess(None, false).decode(bytes).0.into_owned()
 }
 
 pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
@@ -417,14 +446,36 @@ pub fn apply_patch(changes: &[PatchChange]) -> io::Result<ApplyPatchOutput> {
         };
     }
 
-    // Everything validated: now write, in first-seen order.
+    // Everything validated: now write, in first-seen order. Validation above is
+    // what makes the batch atomic against *bad input*; this loop is what makes
+    // it atomic against *bad timing*. Without a journal, an I/O failure partway
+    // through leaves the caller holding an error it cannot act on — the files it
+    // had already changed still hold their new content, so the `old_string`
+    // values it would retry with no longer exist. Roll the batch back so the
+    // failure returns the workspace to the state the caller still believes in.
     let mut results = Vec::with_capacity(order.len());
+    let mut written: Vec<&PathBuf> = Vec::with_capacity(order.len());
     for absolute_path in &order {
         let prepared = &by_path[absolute_path];
         if let Some(parent) = prepared.absolute_path.parent() {
-            fs::create_dir_all(parent)?;
+            if let Err(error) = fs::create_dir_all(parent) {
+                return Err(write_failure(
+                    error,
+                    &prepared.absolute_path,
+                    &written,
+                    &by_path,
+                ));
+            }
         }
-        write_text_atomic(&prepared.absolute_path, &prepared.content)?;
+        if let Err(error) = write_text_atomic(&prepared.absolute_path, &prepared.content) {
+            return Err(write_failure(
+                error,
+                &prepared.absolute_path,
+                &written,
+                &by_path,
+            ));
+        }
+        written.push(absolute_path);
         let (kind, structured_patch) = match &prepared.original {
             Some(original) => (
                 String::from("update"),
@@ -444,6 +495,53 @@ pub fn apply_patch(changes: &[PatchChange]) -> io::Result<ApplyPatchOutput> {
         files_changed,
         results,
     })
+}
+
+/// Undo a half-applied batch and describe the outcome.
+///
+/// Restoration is best-effort, but its own failures are surfaced rather than
+/// swallowed: the caller retries based on this message, so silently dropping a
+/// failed restore would turn the report into a lie and reintroduce exactly the
+/// ambiguity the rollback exists to remove.
+fn write_failure(
+    error: io::Error,
+    failed_path: &Path,
+    written: &[&PathBuf],
+    by_path: &HashMap<PathBuf, PreparedFile>,
+) -> io::Error {
+    let mut restore_errors = Vec::new();
+    for path in written.iter().rev() {
+        let prepared = &by_path[*path];
+        let restore = match &prepared.original {
+            Some(original) => write_text_atomic(path, original),
+            // The file did not exist before this batch, so its creation is the
+            // thing to undo. A concurrent delete is fine — the goal is absence.
+            None => fs::remove_file(path).or_else(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }),
+        };
+        if let Err(error) = restore {
+            restore_errors.push(format!("{}: {error}", path.display()));
+        }
+    }
+
+    let mut message = format!(
+        "write failed for {}: {error}; rolled back {} previously written file(s), \
+         so the batch left nothing on disk",
+        failed_path.display(),
+        written.len()
+    );
+    if !restore_errors.is_empty() {
+        message.push_str(&format!(
+            "; rollback failures: {}",
+            restore_errors.join(", ")
+        ));
+    }
+    io::Error::new(error.kind(), message)
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
@@ -587,21 +685,9 @@ fn collect_single_glob(full: &str) -> io::Result<Vec<std::path::PathBuf>> {
         )
         .build()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-    let mut matches = Vec::new();
-    for entry in ignore::WalkBuilder::new(&root)
-        .hidden(false)
-        .build()
-        .flatten()
-    {
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-        let relative = entry.path().strip_prefix(&root).unwrap_or(entry.path());
-        if glob_set.is_match(relative) {
-            matches.push(entry.into_path());
-        }
-    }
-    Ok(matches)
+    Ok(collect_glob_matches(&root, |relative, _| {
+        glob_set.is_match(relative)
+    }))
 }
 
 /// Several patterns in one crawl: relative globs match entries under the
@@ -631,21 +717,9 @@ fn collect_multi_glob<I: IntoIterator<Item = String>>(
     let absolute_set = absolute_globs
         .build()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-    let mut matches = Vec::new();
-    for entry in ignore::WalkBuilder::new(base_dir)
-        .hidden(false)
-        .build()
-        .flatten()
-    {
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-        let relative = entry.path().strip_prefix(base_dir).unwrap_or(entry.path());
-        if relative_set.is_match(relative) || absolute_set.is_match(entry.path()) {
-            matches.push(entry.into_path());
-        }
-    }
-    Ok(matches)
+    Ok(collect_glob_matches(base_dir, |relative, absolute| {
+        relative_set.is_match(relative) || absolute_set.is_match(absolute)
+    }))
 }
 
 /// Non-interactive fuzzy file finder — the machine-friendly answer to `fzf`.
@@ -886,6 +960,20 @@ fn scan_file(
         });
     }
 
+    // `files_with_matches` (the default) only reports *how many* lines match,
+    // never *which* ones, so it counts in one pass and allocates nothing per
+    // match. Only `content` mode needs the indices, because those address the
+    // per-match context windows below.
+    if output_mode != "content" {
+        let line_matches = text.lines().filter(|line| regex.is_match(line)).count();
+        return (line_matches > 0).then(|| FileScan {
+            path: path.to_path_buf(),
+            count: 0,
+            line_matches,
+            content_lines: Vec::new(),
+        });
+    }
+
     let matched_lines: Vec<usize> = text
         .lines()
         .enumerate()
@@ -953,6 +1041,45 @@ fn build_search_walker(base_path: &Path) -> ignore::WalkParallel {
                     .is_some_and(|name| SKIP_DIRS.contains(&name))
         });
     builder.build_parallel()
+}
+
+/// Walk `root` in parallel and collect every *file* the predicate accepts,
+/// handing it both the path relative to `root` (for relative globs) and the
+/// full path (for absolute ones).
+///
+/// Shares the grep crawler deliberately: `.gitignore` / `.ignore` handling, the
+/// `SKIP_DIRS` prune, and the visited-file budget now behave identically across
+/// every search tool. The glob path previously ran its own serial `WalkBuilder`,
+/// which is how the two configurations drifted apart — and why a query against
+/// a build tree could stall where grep would have pruned it.
+fn collect_glob_matches<F>(root: &Path, accept: F) -> Vec<PathBuf>
+where
+    F: Fn(&Path, &Path) -> bool + Send + Sync,
+{
+    let matches = Mutex::new(Vec::<PathBuf>::new());
+    let seen = AtomicUsize::new(0);
+    build_search_walker(root).run(|| {
+        Box::new(|entry: Result<ignore::DirEntry, ignore::Error>| {
+            let Ok(entry) = entry else {
+                return WalkState::Continue; // one unreadable entry never kills the walk
+            };
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                return WalkState::Continue;
+            }
+            if seen.fetch_add(1, Ordering::Relaxed) >= MAX_SEARCH_FILES {
+                return WalkState::Quit;
+            }
+            let path = entry.path();
+            let relative = path.strip_prefix(root).unwrap_or(path);
+            if accept(relative, path) {
+                if let Ok(mut sink) = matches.lock() {
+                    sink.push(path.to_path_buf());
+                }
+            }
+            WalkState::Continue
+        })
+    });
+    matches.into_inner().unwrap_or_default()
 }
 
 fn collect_search_files(base_path: &Path) -> Vec<PathBuf> {
@@ -1048,7 +1175,18 @@ fn nearest_snippet(content: &str, old_string: &str) -> Option<String> {
         return None;
     }
 
-    let window_at = |start: usize| lines[start..start + span].join("\n");
+    // A single-line needle is the overwhelmingly common case, and there the
+    // window *is* the line — borrowing it avoids one `String` allocation per
+    // candidate, up to `MAX_WINDOWS` of them before any ranking happens.
+    // Multi-line needles still materialise the joined window; the algorithm is
+    // unchanged, only the allocation count.
+    let window_at = |start: usize| -> Cow<'_, str> {
+        if span == 1 {
+            Cow::Borrowed(lines[start])
+        } else {
+            Cow::Owned(lines[start..start + span].join("\n"))
+        }
+    };
     let mut coarse: Vec<(usize, f64)> = (0..=lines.len() - span)
         .map(|start| (start, strsim::jaro_winkler(needle, &window_at(start))))
         .collect();
@@ -1068,7 +1206,7 @@ fn nearest_snippet(content: &str, old_string: &str) -> Option<String> {
     if similarity < MIN_SIMILARITY {
         return None;
     }
-    let mut snippet = window_at(start);
+    let mut snippet = window_at(start).into_owned();
     if snippet.len() > 500 {
         snippet.truncate(500);
         snippet.push_str("...");
@@ -1383,6 +1521,128 @@ mod tests {
     }
 
     #[test]
+    fn apply_patch_rolls_back_when_a_later_write_fails() {
+        let dir = temp_path("patch-rollback");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let first = dir.join("first.txt");
+        write_file(first.to_string_lossy().as_ref(), "hello world").expect("write first");
+
+        // A plain *file* sitting where the second change needs a directory:
+        // `create_dir_all` fails only after `first.txt` has been rewritten, so
+        // the batch reaches the write loop and dies halfway through it.
+        let blocker = dir.join("blocked");
+        write_file(blocker.to_string_lossy().as_ref(), "not a directory").expect("write blocker");
+        let second = blocker.join("nested.txt");
+
+        let error = apply_patch(&[
+            PatchChange {
+                path: first.to_string_lossy().into_owned(),
+                old_string: "world".to_string(),
+                new_string: "there".to_string(),
+                replace_all: false,
+            },
+            PatchChange {
+                path: second.to_string_lossy().into_owned(),
+                old_string: String::new(),
+                new_string: "created".to_string(),
+                replace_all: false,
+            },
+        ])
+        .expect_err("the second write must fail");
+
+        assert!(
+            error.to_string().contains("rolled back"),
+            "error should report the rollback: {error}"
+        );
+        // The batch must be a no-op from the caller's point of view: the first
+        // file's pre-batch content is back, so its `old_string` still exists and
+        // a retry remains valid.
+        assert_eq!(
+            read_file(first.to_string_lossy().as_ref(), None, None)
+                .expect("read first")
+                .file
+                .content,
+            "hello world"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_patch_rollback_deletes_files_the_batch_created() {
+        let dir = temp_path("patch-rollback-create");
+        std::fs::create_dir_all(&dir).expect("dir");
+
+        // Nothing exists yet, so the rollback has to *remove* rather than
+        // restore — a create-then-fail batch must not leave a stray file behind.
+        let created = dir.join("brand-new.txt");
+        let blocker = dir.join("blocked");
+        write_file(blocker.to_string_lossy().as_ref(), "not a directory").expect("write blocker");
+
+        let error = apply_patch(&[
+            PatchChange {
+                path: created.to_string_lossy().into_owned(),
+                old_string: String::new(),
+                new_string: "should not survive".to_string(),
+                replace_all: false,
+            },
+            PatchChange {
+                path: blocker.join("nested.txt").to_string_lossy().into_owned(),
+                old_string: String::new(),
+                new_string: "created".to_string(),
+                replace_all: false,
+            },
+        ])
+        .expect_err("the second write must fail");
+
+        assert!(
+            error.to_string().contains("rolled back"),
+            "error should report the rollback: {error}"
+        );
+        assert!(
+            !created.exists(),
+            "a rolled-back creation must not leave a file on disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_file_decodes_non_utf8_instead_of_failing() {
+        // UTF-16LE with a BOM is what `PowerShell > file` redirection writes on
+        // Windows. The BOM makes the decode exact rather than statistical.
+        let utf16 = temp_path("utf16.txt");
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in "你好 world".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(&utf16, &bytes).expect("write utf16");
+        assert_eq!(
+            read_file(utf16.to_string_lossy().as_ref(), None, None)
+                .expect("utf16 read should succeed")
+                .file
+                .content,
+            "你好 world"
+        );
+
+        // GBK has no BOM, so the charset detector has to earn its keep. Before
+        // the fallback existed this read failed outright with InvalidData.
+        let gbk = temp_path("gbk.txt");
+        let (encoded, _, _) = encoding_rs::GBK.encode("中文日志内容测试");
+        std::fs::write(&gbk, &encoded).expect("write gbk");
+        assert_eq!(
+            read_file(gbk.to_string_lossy().as_ref(), None, None)
+                .expect("gbk read should succeed")
+                .file
+                .content,
+            "中文日志内容测试"
+        );
+
+        let _ = std::fs::remove_file(&utf16);
+        let _ = std::fs::remove_file(&gbk);
+    }
+
+    #[test]
     fn apply_patch_aborts_without_writing_on_missing_string() {
         let dir = temp_path("patch-abort");
         std::fs::create_dir_all(&dir).expect("dir");
@@ -1537,6 +1797,38 @@ mod tests {
         })
         .expect("grep should succeed");
         assert!(grep_output.content.unwrap_or_default().contains("hello"));
+    }
+
+    #[test]
+    fn glob_skips_build_cache_directories() {
+        let dir = temp_path("glob-skip");
+        let cache = dir.join("target").join("debug");
+        std::fs::create_dir_all(&cache).expect("cache dir should be created");
+        write_file(
+            cache.join("artifact.rs").to_string_lossy().as_ref(),
+            "compiled",
+        )
+        .expect("cache file write should succeed");
+        let source = dir.join("src");
+        std::fs::create_dir_all(&source).expect("src dir should be created");
+        write_file(source.join("main.rs").to_string_lossy().as_ref(), "source")
+            .expect("source file write should succeed");
+
+        let dir_string = dir.to_string_lossy().into_owned();
+        let output = glob_search(&["**/*.rs".to_string()], Some(dir_string.as_str()))
+            .expect("glob should succeed");
+
+        let listing = output.filenames.join("\n");
+        assert!(
+            listing.contains("main.rs"),
+            "source file must be found: {listing}"
+        );
+        assert!(
+            !listing.contains("artifact.rs"),
+            "glob now shares the grep crawler, so build caches are pruned: {listing}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

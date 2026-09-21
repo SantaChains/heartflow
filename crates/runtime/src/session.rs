@@ -176,7 +176,7 @@ impl Session {
             let _ = fs::remove_file(&temp);
             return Err(error.into());
         }
-        match fs::rename(&temp, path) {
+        match rename_with_transient_retry(&temp, path) {
             Ok(()) => Ok(()),
             Err(error) => {
                 let _ = fs::remove_file(&temp);
@@ -259,6 +259,37 @@ impl Session {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { version, messages })
     }
+}
+
+/// Retry a couple of milliseconds-wide `rename` window.
+///
+/// On Windows a real-time AV scanner can open the freshly written sibling temp
+/// file for a few milliseconds after `fs::write` returns, which makes an
+/// otherwise-atomic rename fail with `ACCESS_DENIED` outright — the transcript
+/// write then dies for a reason no caller can act on. Three attempts over
+/// ~100 ms clear that window. Only `PermissionDenied` is retried: any other
+/// error kind is a real failure and is returned on the first attempt.
+fn rename_with_transient_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    const ATTEMPTS: usize = 3;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 0..ATTEMPTS {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let retryable = error.kind() == std::io::ErrorKind::PermissionDenied;
+                last = Some(error);
+                if !retryable {
+                    break;
+                }
+                if attempt + 1 < ATTEMPTS {
+                    std::thread::sleep(BACKOFF);
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("rename was never attempted")))
 }
 
 impl Default for Session {
@@ -484,6 +515,37 @@ mod tests {
             .expect("system time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("runtime-{tag}-{nanos}.json"))
+    }
+
+    /// Only `PermissionDenied` is retried. A destination directory that does
+    /// not exist is `NotFound` — a real error — so it must fail on the first
+    /// attempt and leave the source in place for the caller to clean up.
+    #[test]
+    fn rename_does_not_retry_real_errors() {
+        let dir = std::env::temp_dir().join(format!("runtime-rename-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let from = dir.join("from.txt");
+        std::fs::write(&from, "payload").expect("write");
+        let missing = dir.join("no-such-dir").join("to.txt");
+
+        let error = super::rename_with_transient_retry(&from, &missing).expect_err("must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(from.exists(), "failed rename must not consume the source");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_moves_the_file_on_the_first_attempt() {
+        let dir = std::env::temp_dir().join(format!("runtime-rename-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let from = dir.join("from.txt");
+        let to = dir.join("to.txt");
+        std::fs::write(&from, "payload").expect("write");
+
+        super::rename_with_transient_retry(&from, &to).expect("rename");
+        assert!(!from.exists());
+        assert_eq!(std::fs::read_to_string(&to).expect("read"), "payload");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

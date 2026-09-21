@@ -15,6 +15,9 @@ pub enum ApiError {
         message: Option<String>,
         body: String,
         retryable: bool,
+        /// Server-requested wait (`Retry-After`) parsed from the response, when
+        /// present. `None` means the retry policy should use its own backoff.
+        retry_after: Option<Duration>,
     },
     RetriesExhausted {
         attempts: u32,
@@ -40,6 +43,20 @@ impl ApiError {
             | Self::Json(_)
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. } => false,
+        }
+    }
+
+    /// The delay the server asked us to wait before retrying (`Retry-After`),
+    /// if the failing response carried one. Rate limiters and gateways emit
+    /// this, and honouring it beats guessing with a local exponential backoff:
+    /// retrying earlier burns quota and earns another 429, waiting blindly
+    /// wastes a turn. `None` falls back to the policy's own schedule.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Api { retry_after, .. } => *retry_after,
+            Self::RetriesExhausted { last_error, .. } => last_error.retry_after(),
+            _ => None,
         }
     }
 }

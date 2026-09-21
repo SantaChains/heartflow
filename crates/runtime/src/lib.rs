@@ -18,7 +18,7 @@ pub use compact::estimate_tokens_from;
 pub use compact::{
     compact_session_in_place, estimate_session_tokens, format_compact_summary,
     get_compact_continuation_message, should_compact, truncate_chars, CompactionConfig,
-    CompactionResult,
+    CompactionResult, TokenCalibration,
 };
 pub use config::{
     ConfigEntry, ConfigError, ConfigLoader, ConfigSource, RuntimeConfig,

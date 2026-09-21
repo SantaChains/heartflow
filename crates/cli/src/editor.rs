@@ -154,14 +154,25 @@ pub fn echo_lines(text: &str) -> Vec<String> {
 /// Persistent REPL history: an in-memory list backed by an append-only file so a
 /// bad write can never wipe existing entries. Navigation is a cursor over the
 /// list; the cursor resting past the end means "the draft you are typing".
+/// Shared by the blocking REPL and the full-screen shell (both point it at
+/// `~/.heartflow/history.txt`), so recall works identically on either surface.
 #[derive(Debug)]
-struct History {
+pub(crate) struct History {
     entries: Vec<String>,
     cursor: usize,
 }
 
 impl History {
-    fn load(path: &Path) -> Self {
+    /// An empty, in-memory-only history (no backing file). Used where disk I/O
+    /// must stay off (hermetic test construction) until a real path is set.
+    pub(crate) fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            cursor: 0,
+        }
+    }
+
+    pub(crate) fn load(path: &Path) -> Self {
         let entries = std::fs::read_to_string(path)
             .map(|raw| decode_history(&raw, HISTORY_MAX))
             .unwrap_or_default();
@@ -171,7 +182,7 @@ impl History {
 
     /// Move to an older entry; returns it for the caller to load into the
     /// buffer. Clamps at the oldest entry.
-    fn prev(&mut self) -> Option<&str> {
+    pub(crate) fn prev(&mut self) -> Option<&str> {
         if self.entries.is_empty() {
             return None;
         }
@@ -183,7 +194,7 @@ impl History {
 
     /// Move to a newer entry; `None` once past the end means back to the empty
     /// draft the user was typing.
-    fn next(&mut self) -> Option<&str> {
+    pub(crate) fn next(&mut self) -> Option<&str> {
         if self.cursor >= self.entries.len() {
             return None;
         }
@@ -196,17 +207,20 @@ impl History {
     }
 
     /// Record a submitted line: appended to the file (escaped onto one physical
-    /// line) and pushed in memory, capped at `HISTORY_MAX`.
-    fn push(&mut self, path: &Path, text: &str) {
+    /// line) and pushed in memory, capped at `HISTORY_MAX`. An empty `path`
+    /// means in-memory only (hermetic construction), so no file is touched.
+    pub(crate) fn push(&mut self, path: &Path, text: &str) {
         let trimmed = text.trim_end();
         if trimmed.is_empty() || self.entries.last().is_some_and(|last| last == trimmed) {
             self.reset_cursor();
             return;
         }
-        if let Err(error) = append_history_line(path, trimmed) {
-            // A history write failure must never break the session; the entry
-            // still lives in memory for this run.
-            tracing::warn!("history append failed: {error}");
+        if !path.as_os_str().is_empty() {
+            if let Err(error) = append_history_line(path, trimmed) {
+                // A history write failure must never break the session; the entry
+                // still lives in memory for this run.
+                tracing::warn!("history append failed: {error}");
+            }
         }
         self.entries.push(trimmed.to_string());
         if self.entries.len() > HISTORY_MAX {
@@ -613,7 +627,7 @@ fn draw_frame(
     .render(gutter, buf);
     textarea.render(editor, buf);
     if show_mascot {
-        let fg = mascot.badge_color(theme).ratatui();
+        let fg = mascot.badge_color(&theme).ratatui();
         let badge_x = size.x + size.width.saturating_sub(badge_width);
         for (row, line) in badge_rows.iter().enumerate() {
             if row >= usize::from(VIEWPORT_ROWS) {
@@ -638,7 +652,7 @@ fn draw_frame(
     )))
     .render(hint_area, buf);
 
-    render_menu(buf, size, completions, completion_idx, theme);
+    render_menu(buf, size, completions, completion_idx, &theme);
 
     // Park the real terminal cursor on the input cell (the IME anchor).
     let (cursor_row, cursor_col) = textarea.cursor();
@@ -892,7 +906,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::assert_is_empty)]
     fn completions_match_prefix_and_ignore_args() {
         assert!(completion_candidates("/comp").contains(&"/compact"));
         assert!(completion_candidates("/que").contains(&"/queue"));

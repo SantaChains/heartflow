@@ -16,6 +16,19 @@ impl TokenUsage {
             + self.cache_creation_input_tokens
             + self.cache_read_input_tokens
     }
+
+    /// Size of the prompt the provider actually charged for. `input_tokens`
+    /// alone excludes everything served from the prompt cache, so all three
+    /// input counters must be summed before comparing against a context-window
+    /// budget — otherwise a well-cached session looks arbitrarily small.
+    /// Distinct from [`total_tokens`], which is billing-oriented and adds the
+    /// model's output as well.
+    #[must_use]
+    pub fn context_input_tokens(self) -> u32 {
+        self.input_tokens
+            .saturating_add(self.cache_creation_input_tokens)
+            .saturating_add(self.cache_read_input_tokens)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -71,6 +84,21 @@ impl UsageTracker {
 mod tests {
     use super::{TokenUsage, UsageTracker};
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+
+    #[test]
+    fn context_input_counts_cached_tokens() {
+        // A fully cached resend: `input_tokens` collapses to 0 while the real
+        // prompt is entirely present in `cache_read`. Summing only
+        // `input_tokens` would report an empty context.
+        let usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 42,
+            cache_creation_input_tokens: 300,
+            cache_read_input_tokens: 12_000,
+        };
+        assert_eq!(usage.context_input_tokens(), 12_300);
+        assert_eq!(usage.total_tokens(), 12_342);
+    }
 
     #[test]
     fn tracks_true_cumulative_usage() {

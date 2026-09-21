@@ -27,7 +27,7 @@ Rust 实现的终端 AI agent。二进制命令 `hf`，在 REPL 中通过流式�
 - 自迭代记忆：`~/.heartflow/MEMORY.md`（或项目 `.heartflow/MEMORY.md`）作为跨会话的坑/决策/偏好记录，以极小 token（截断 4KB）注入系统提示词的 Memory 段；`/remember` 手动追加（去重），任务环遇硬坑（多次尝试失败被跳过）自动记录（非向量嵌入）
 - Unix 管道组合：stdin 被管道时读入为上下文，`git diff | hf prompt "评审这次改动"`；`--quiet` 只输出答案、`--json` 输出结构化结果，方便脚本串联
 - 外部 CLI 工具按需感知：系统提示词只广播主机上确已安装的非交互文本过滤器（jq/yq/gron/jc/rg/fd/tree/tokei/hyperfine/difft/xsv/gh），并约定首次使用前先 `<tool> --help` 学当前 flag 而非臆测；交互式/装饰性 TTY 工具（fzf、git-delta、less）归人类终端，不进 agent 提示（其能力已由原生 search_files 模糊检索与 apply_patch/真实 diff 覆盖）
-- 配置热重载：REPL 每回合边界按 mtime 探测配置变更，自动重建 provider 并保留会话（零依赖轮询）
+- 配置热重载：REPL 每回合边界按 mtime 探测 config/theme/keymap/settings 四面变更——config 自动重建 provider 并保留会话，theme/keymap/settings 就地生效（零依赖轮询，逐面上报，改 theme 不触发 config 重载）
 - 自检自愈：`hf doctor [--fix]` 校验配置解析、目录可写、provider 与密钥，并对历史库跑 `PRAGMA integrity_check`（库体过大时自动降级 `quick_check`）；`--fix` 建缺失目录、坏配置备份移开
 - 权限模型：read-only / workspace-write / full 三档，REPL 内 `/mode` 热切换（`auto` 归一为 full；`HEARTFLOW_PERMISSION_MODE` 另接受 `plan`，其硬门禁只允许写 `.heartflow/plans/*.md`），工具级覆盖；/plan 规划模式（硬门禁：仅可写 `.heartflow/plans/*.md`，其余写/bash 一律拒绝），审批后进入 Hermes 任务环逐任务新鲜上下文执行，收尾把复盘写入 `.heartflow/reflections/`（可选沉淀为 `.agent/skills`）；read-only 与 plan 两档自动放行标注为只读的 MCP 工具（`readOnlyHint`/`read_only`），让远程只读 MCP 在受限模式下亦可用
 - 健壮性：connect/read 双超时、子进程 kill_on_drop、UTF-8 全链路（BOM 剥除、PowerShell 编码前缀，非 UTF-8 字节经 `chardetng` 嗅探 + `encoding_rs` 解码 GBK 等遗留码页、不再 lossy 碎字、CJK 宽度对齐）、工具输出 32K 截断、缓存目录剪枝；工具入参执行前用 `jsonschema` crate 做完整 JSON-Schema 校验（draft 全能力；空/布尔/无法编译的 schema 一律放行，绝不误拦合法调用），转发给 provider 前对（MCP）schema 做规整（object 补 `properties`、array 补 `items`、单元素 `type` 联合折叠），MCP 握手（initialize+tools/list）失败按 200/400ms 退避重试 3 次（幂等），工具调用本身不自动重试（非幂等危险）交由模型层决策
@@ -43,7 +43,7 @@ scoop bucket add heartflow https://github.com/SantaChains/heartflow
 scoop install heartflow
 ```
 
-**cargo(crates.io)**
+**cargo([crates.io](https://crates.io/crates/heartflow))**
 
 ```bash
 cargo install heartflow
@@ -94,7 +94,7 @@ hf prompt --json TEXT                             输出 {text, usage, session_i
 echo TEXT | hf prompt "指令"                       stdin 作为上下文与指令拼接（Unix 管道）
 hf search QUERY [--limit N] [--json]              跨会话全文检索历史（非交互，可管道）
 hf --resume[=SESSION.json] [--run /compact]       恢复会话（省略 PATH 进选择器），--run 恢复后立即执行 slash 命令
-hf config export [--output FILE]                  导出配置（不含密钥）
+hf config export [SURFACE] [--output FILE]        导出某一面配置（不含密钥）；SURFACE=config（默认）|theme|keymap|settings
 hf config import FILE                             导入配置（自动备份 .bak）
 hf doctor [--fix] [--ai]                          诊断环境（含历史库完整性）；--fix 应用安全修复，--ai 请内置模型给修复建议
 hf init [--force]                                 在当前目录生成 AGENTS.md 指令骨架（已存在不动，--force 覆盖）
@@ -147,7 +147,7 @@ hf search 中文笔记 --json | jq -r '.[].snippet'   # ≥ 3 码点走 FTS5 tri
 
 优先级从高到低：CLI 参数 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量。同名字段逐项覆盖，坏字段跳过并告警，单条配置不阻断启动。
 
-REPL 运行期间编辑并保存任一 `config.toml`，下一回合会自动热重载（保留当前会话与权限模式）。环境异常可用 `hf doctor` 诊断，`hf doctor --fix` 应用安全修复。
+REPL 运行期间编辑并保存 `config.toml` / `theme.toml` / `keymap.toml` / `settings.toml` 任一，下一回合边界会自动热重载（`config` 重建 provider 并保留当前会话与权限模式，`theme`/`keymap`/`settings` 就地生效）。环境异常可用 `hf doctor` 诊断，`hf doctor --fix` 应用安全修复。
 
 ```toml
 version = 1
@@ -181,16 +181,47 @@ read_only = true                       # 声明该 server 工具均只读：read
 
 ### 终端配色（theme.toml）
 
-配色以单一主题源为基准（Tokyo Night 冷色系，流式渲染与输入框共用同一色族），可按语义角色覆盖。文件位于 `~/.heartflow/theme.toml`（用户）与 `.heartflow/theme.toml`（项目，逐项胜出），与 `config.toml` 同优先级链。每个值取 `#RRGGBB`，坏值跳过并告警、绝不阻断启动；缺省沿用内置色板。改后重启生效（首次渲染时解析并进程级缓存）。
+配色以单一主题源为基准（内置色板取自黑泽明电影的实物取色，一角色一色相、暖冷协调，流式渲染与输入框共用同一色族），可按语义角色覆盖。文件位于 `~/.heartflow/theme.toml`（用户）与 `.heartflow/theme.toml`（项目，逐项胜出），与 `config.toml` 同优先级链。每个值取 `#RRGGBB`，坏值跳过并告警、绝不阻断启动；缺省沿用内置色板。改后于下一回合边界热重载生效（进程级缓存，中途换入无需重启）。`hf config export theme` 导出当前生效的完整色板作为可编辑模板。
 
 ```toml
 [theme]
-heading = "#2ac3de"      # Markdown 标题
-accent = "#7aa2f7"       # 提示符 / 活动 spinner / 补全高亮
-muted = "#78829f"        # 次要文本（增量、空闲提示）
-success = "#9ece6a"      # 完成
-error = "#f7768e"        # 失败
+heading = "#e4613c"      # Markdown 标题（朱漆）
+accent = "#5588ee"       # 提示符 / 活动 spinner / 补全高亮（群青）
+muted = "#e8b44a"        # 次要文本（增量、空闲提示，金箔）
+success = "#8fbf6a"      # 完成（苔）
+error = "#e14b63"        # 失败（绯）
 # 其余可选：emphasis / strong / inline_code / link / quote
+```
+
+### 键位（keymap.toml）
+
+全屏 shell 的按键绑定以语义动作（而非物理键）为中心，可在磁盘上重映射。文件位于 `~/.heartflow/keymap.toml`（用户）与 `.heartflow/keymap.toml`（项目，逐动作胜出）。每个动作映射到一个键串（`"ctrl+c"`）或键串数组；空数组 `[]` 解绑该动作（按键回落到输入编辑器）。修饰键 `ctrl`/`alt`/`super` 参与匹配，`shift` 被忽略（大写字母是否带 shift 因终端而异，故字符大小写不敏感）；未知动作或非法键串跳过并告警，绝不阻断启动。改后于下一回合边界热重载生效。`hf config export keymap` 导出当前生效绑定作为模板。
+
+```toml
+[keymap]
+submit = "enter"                # 提交输入（回合运行中则排队）
+interrupt = "ctrl+c"            # 取消运行中的回合（双击）/ 空闲时退出
+escape = "esc"                  # 关闭浮层 / 空闲时退出
+toggle_fold = "tab"             # 折叠/展开最近一条过程项（思考或工具输出）
+scroll_up = "pageup"            # 向上滚动转录
+scroll_down = "pagedown"        # 向下滚动转录
+guide = "ctrl+g"                # 打开引导浮层，预览零 token 的下一步任务草稿并发送（回合运行中则排队）
+next_section = "ctrl+pagedown"  # 切换到下一个会话分区（标签页）；回合运行中不可切换
+prev_section = "ctrl+pageup"    # 切换到上一个会话分区（标签页）
+new_section = "ctrl+t"          # 新建一个独立会话分区（自带运行时、会话文件与队列）
+help = "f1"                     # 打开/关闭按键参考浮层（列出每个动作的当前绑定键与说明，只读，回合运行中亦可查阅）
+```
+
+### Shell 行为（settings.toml）
+
+若干此前为编译期常量的 shell 行为旋钮，可免重编调校。文件位于 `~/.heartflow/settings.toml`（用户）与 `.heartflow/settings.toml`（项目，逐项胜出）。每个字段可选，缺省复现内置行为；类型错或越界的值跳过并告警，绝不阻断启动。改后于下一回合边界热重载生效（`frame_budget_ms` 例外，仅启动时读取）。`hf config export settings` 导出当前生效值作为模板。
+
+```toml
+[settings]
+scroll_step = 3          # 每次 PageUp/PageDown 滚动的行数
+tool_inline_lines = 3    # 工具输出行数 ≤ 此值时默认展开，否则折叠为单行标记（0 = 全部折叠）
+fold_thinking = true     # 流式思考是否默认折叠（过程而非产出，故默认折叠）
+frame_budget_ms = 80     # 重绘节流窗口（毫秒）；启动时读取，会话中改动下次运行生效
 ```
 
 ### 终端伴侣（mascot）
