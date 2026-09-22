@@ -22,6 +22,9 @@
 //! [`Node::CodeBlock`] note for why the token colors were removed). Tables are
 //! drawn as a light box grid whose column widths are measured in terminal cells,
 //! so CJK cell text stays aligned with ASCII.
+//!
+//! The parser is built on a deliberate subset rather than `Options::all()`;
+//! see [`RENDERED_OPTIONS`] for which grammars are in and why the rest are out.
 
 use std::fmt::Write as FmtWrite;
 
@@ -84,15 +87,9 @@ pub enum Node {
     Image {
         url: String,
     },
-    FootnoteRef {
-        label: String,
-    },
+    /// A task-list checkbox, projected as `[x]` / `[ ]`.
     TaskMarker {
         done: bool,
-    },
-    /// Inline or display math, emitted verbatim.
-    Math {
-        text: String,
     },
     /// Raw HTML passthrough.
     Html {
@@ -162,10 +159,39 @@ impl TableBuilder {
     }
 }
 
+/// The markdown subset this renderer implements — deliberately *not*
+/// `Options::all()`.
+///
+/// `Options::all()` turns on fifteen switches, and ten of them produce events
+/// the IR has no node for: we paid parse cost for syntax we then threw away.
+/// Strikethrough, YAML and `+++` metadata blocks, definition lists,
+/// superscript, subscript, wikilinks, GFM blockquote alerts and heading
+/// attributes all parsed into nothing.
+///
+/// Two more of the fifteen were not merely wasted — they silently rewrote the
+/// text we print:
+///
+/// - `ENABLE_SMART_PUNCTUATION` replaces ASCII in prose: `--` becomes an en dash
+///   and `---` an em dash, `...` an ellipsis, `"`/`'` curly quotes. For an agent
+///   whose job is to tell you `cargo build --release`, republishing that as
+///   `–release` is a **wrong instruction**, not a typographic nicety. (Inside a
+///   code span or fence it never applied, which is why it went unnoticed.)
+/// - `ENABLE_MATH` reads `$…$` as inline math and prints the body without its
+///   delimiters, so ordinary prose with prices can quietly lose its `$`.
+///
+/// What remains is the subset a terminal coding agent actually draws: CommonMark
+/// core (headings, paragraphs, emphasis, lists, block quotes, code, links,
+/// images, rules, HTML passthrough) plus tables and task-list markers. Everything
+/// else is passed through as literal text — the honest rendering, since the
+/// reader then sees the syntax instead of a silently wrong interpretation of it.
+const RENDERED_OPTIONS: Options = Options::ENABLE_TABLES.union(Options::ENABLE_TASKLISTS);
+
 /// Parse `markdown` into the thin IR. One walk; both projections read the result.
 #[must_use]
 pub fn parse(markdown: &str) -> Vec<Node> {
-    let mut nodes: Vec<Node> = Vec::new();
+    // Node count tracks event count closely (one node per block boundary and per
+    // text run), so a rough guess still removes most of the growth reallocations.
+    let mut nodes: Vec<Node> = Vec::with_capacity(markdown.len() / 16 + 8);
     let mut emphasis = 0usize;
     let mut strong = 0usize;
     let mut in_code_block = false;
@@ -173,7 +199,7 @@ pub fn parse(markdown: &str) -> Vec<Node> {
     let mut code_language = String::new();
     let mut table: Option<TableBuilder> = None;
 
-    for event in Parser::new_ext(markdown, Options::all()) {
+    for event in Parser::new_ext(markdown, RENDERED_OPTIONS) {
         // True while the parser is inside a table cell: text/code are diverted
         // into the builder so column widths can be measured before drawing.
         let in_cell = table.as_ref().is_some_and(|b| b.in_cell);
@@ -243,13 +269,9 @@ pub fn parse(markdown: &str) -> Vec<Node> {
             Event::Html(html) | Event::InlineHtml(html) => nodes.push(Node::Html {
                 text: html.to_string(),
             }),
-            Event::FootnoteReference(reference) => nodes.push(Node::FootnoteRef {
-                label: reference.to_string(),
-            }),
             Event::TaskListMarker(done) => nodes.push(Node::TaskMarker { done }),
-            Event::InlineMath(math) | Event::DisplayMath(math) => nodes.push(Node::Math {
-                text: math.to_string(),
-            }),
+            // Footnotes and math need no arm: `RENDERED_OPTIONS` leaves both
+            // grammars off, so the parser emits their syntax as ordinary text.
             // OSC-8 hyperlink: the label renders underlined in the link color
             // between the two markers. Inside a table cell the markers are
             // dropped (cell text is plain), mirroring the streaming renderer.
@@ -313,7 +335,9 @@ pub fn parse(markdown: &str) -> Vec<Node> {
 /// user has chosen apply unchanged.
 #[must_use]
 pub fn project_ansi(nodes: &[Node], theme: &ColorTheme) -> String {
-    let mut out = String::new();
+    // One text run per node, so the node count is a decent size proxy: guessing
+    // low would cost a few growth copies, guessing high wastes memory.
+    let mut out = String::with_capacity(nodes.len() * 24);
     let mut link_depth = 0usize;
     let mut list_depth = 0usize;
     let mut quote_active = false;
@@ -348,13 +372,7 @@ pub fn project_ansi(nodes: &[Node], theme: &ColorTheme) -> String {
                 out.push_str(glyphs::BULLET);
             }
             Node::Text { text, style } => {
-                out.push_str(&style_text(
-                    text,
-                    *style,
-                    link_depth > 0,
-                    quote_active,
-                    theme,
-                ));
+                write_styled(&mut out, text, *style, link_depth > 0, quote_active, theme);
             }
             Node::InlineCode { text } => {
                 let _ = write!(out, "{}", format!("`{text}`").with(theme.inline_code()));
@@ -372,13 +390,10 @@ pub fn project_ansi(nodes: &[Node], theme: &ColorTheme) -> String {
             Node::Image { url } => {
                 let _ = write!(out, "{}", format!("[image:{url}]").with(theme.link()));
             }
-            Node::FootnoteRef { label } => {
-                let _ = write!(out, "[{label}]");
-            }
             Node::TaskMarker { done } => {
                 out.push_str(if *done { "[x] " } else { "[ ] " });
             }
-            Node::Math { text } | Node::Html { text } => out.push_str(text),
+            Node::Html { text } => out.push_str(text),
             Node::Rule => out.push_str(glyphs::RULE),
             Node::CodeBlock { language, code } => {
                 if !language.is_empty() {
@@ -401,26 +416,32 @@ pub fn project_ansi(nodes: &[Node], theme: &ColorTheme) -> String {
     out
 }
 
-/// Resolve one text run's ANSI styling. Priority mirrors the historical
-/// renderer: an active link wins, then strong, then emphasis, then the (sticky)
-/// quote color, then plain.
-fn style_text(
+/// Append one text run to the ANSI buffer with its resolved styling. Priority
+/// mirrors the historical renderer: an active link wins, then strong, then
+/// emphasis, then the (sticky) quote color, then plain.
+///
+/// Writes straight into `out` rather than returning a `String`: the common case
+/// is a plain run that needs no styling at all, and a returned `String` meant
+/// allocating (and then copying) one per text run — the most frequent node in
+/// any document.
+fn write_styled(
+    out: &mut String,
     text: &str,
     style: TextStyle,
     in_link: bool,
     quote_active: bool,
     theme: &ColorTheme,
-) -> String {
+) {
     if in_link {
-        format!("{}", text.underlined().with(theme.link()))
+        let _ = write!(out, "{}", text.underlined().with(theme.link()));
     } else if style.strong {
-        format!("{}", text.bold().with(theme.strong()))
+        let _ = write!(out, "{}", text.bold().with(theme.strong()));
     } else if style.emphasis {
-        format!("{}", text.italic().with(theme.emphasis()))
+        let _ = write!(out, "{}", text.italic().with(theme.emphasis()));
     } else if quote_active {
-        format!("{}", text.with(theme.quote()))
+        let _ = write!(out, "{}", text.with(theme.quote()));
     } else {
-        text.to_string()
+        out.push_str(text);
     }
 }
 
@@ -501,7 +522,7 @@ impl RtProjector {
             .add_modifier(Modifier::UNDERLINED)
     }
 
-    /// Resolve a text run's style with the same priority as [`style_text`]:
+    /// Resolve a text run's style with the same priority as [`write_styled`]:
     /// link > strong > emphasis > (sticky) quote > plain.
     fn text_style(&self, style: TextStyle) -> RtStyle {
         if self.link_depth > 0 {
@@ -569,11 +590,10 @@ impl RtProjector {
                 let styled = self.link_style();
                 self.span(format!("[image:{url}]"), styled);
             }
-            Node::FootnoteRef { label } => self.span(format!("[{label}]"), RtStyle::default()),
             Node::TaskMarker { done } => {
                 self.span(if *done { "[x] " } else { "[ ] " }, RtStyle::default());
             }
-            Node::Math { text } | Node::Html { text } => {
+            Node::Html { text } => {
                 self.span(text.clone(), RtStyle::default());
             }
             Node::Rule => {
@@ -971,6 +991,49 @@ mod tests {
             }
         }
         output
+    }
+
+    /// Command flags must survive prose. `ENABLE_SMART_PUNCTUATION` (part of
+    /// `Options::all()`) rewrote `--` to an en dash and `...` to an ellipsis, so
+    /// an agent telling you to run `cargo build --release` published
+    /// `–release`, which does not run. Code spans were never affected, which is
+    /// why the defect hid in plain sentences.
+    #[test]
+    fn prose_keeps_ascii_punctuation() {
+        let plain =
+            |markdown: &str| strip_ansi(&project_ansi(&parse(markdown), &ColorTheme::default()));
+        assert_eq!(
+            plain("run cargo build --release").trim(),
+            "run cargo build --release"
+        );
+        // `--`/`---`/`...` are the three substitutions the option made.
+        assert_eq!(plain("a -- b --- c ... d").trim(), "a -- b --- c ... d");
+    }
+
+    /// The parser runs on the subset this renderer draws, so syntax outside it
+    /// reaches the reader as literal text rather than being dropped or
+    /// reinterpreted. Pins the families `Options::all()` used to enable.
+    #[test]
+    fn syntax_outside_the_rendered_subset_stays_literal() {
+        let plain =
+            |markdown: &str| strip_ansi(&project_ansi(&parse(markdown), &ColorTheme::default()));
+        assert_eq!(plain("~~gone~~").trim(), "~~gone~~", "strikethrough");
+        assert_eq!(plain("[^1]").trim(), "[^1]", "footnotes");
+        assert_eq!(plain("$x^2$").trim(), "$x^2$", "math");
+        assert_eq!(
+            plain("# Title {#id}").trim(),
+            "# Title {#id}",
+            "heading attributes"
+        );
+        // Losing `$` to a bogus math span would be worse than showing it raw.
+        assert_eq!(plain("costs $5 to $9").trim(), "costs $5 to $9");
+
+        // What *is* in the subset still renders.
+        assert_eq!(plain("- [ ] todo").trim(), "• [ ] todo", "task list");
+        assert!(
+            plain("| a | b |\n|---|---|\n| 1 | 2 |").contains(glyphs::TBL_TL),
+            "tables"
+        );
     }
 
     /// A table projects to a light box grid: a top rule, the bolded header row,

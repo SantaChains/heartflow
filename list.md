@@ -203,6 +203,10 @@
 | 71 | `Set-Cookie` 的 `Domain` 未做 domain-match 校验 | 落地 | 3 | 4 | 4 | `tools/src/web.rs:396-399`：`domain.map_or(response_host, \|d\| d.trim_start_matches('.').to_ascii_lowercase())`——`Domain` 属性被**原样采信**。于是 `evil.com` 的响应可写 `Domain=example.com`，jar 把它存到 `example.com` 名下，之后**每次抓取 example.com 都会带上它**（cookie 注入 / 会话固定） | RFC 6265 §5.3 第 6 步：`Domain` 必须是请求 host 的 domain-match，否则**整条 cookie 丢弃**。也可顺带拒 `Domain` 为公共后缀者。修法纯函数、可离线测（`store_set_cookies` 已是纯函数，`web.rs:385`），单独成条是因为判据需对照 RFC 逐条落 |
 | 72 | URL userinfo 与真实主机不一致 | 落地 | 2 | 2 | 5 | `web.rs:409` `ensure_public` 取 `url.host_str()`——**判 SSRF 用的是正确主机**，这一层没问题；问题在展示：`https://api.github.com@evil.com/x` 的 `host_str()` 是 `evil.com`，但字符串读起来像 GitHub。reqwest 不把 userinfo 当凭据发，故不是凭据泄漏，而是**误导读模型** | 修法：`ensure_public` 或 `web_fetch` 入口拒收带 userinfo 的 URL（消息说明「URL 里不能带用户名/密码」）。低严重度，但成本极小、可离线测 |
 | 73 | 表格列宽不按终端宽度封顶 | 落地 | 3 | 3 | 3 | `markdown.rs` 的 `render_table` / `render_table_ratatui` 都按「各列自然最大宽度」铺框线，**无上限**。列多或单元格是长句时，框线宽度会超过终端宽度：ANSI 侧被终端硬折（框线错位），TUI 侧被 `Paragraph` 折行（网格破相） | 难点在设计而非实现：`project_ratatui` 刻意**每次刷出只投影一次**并把 `Line<'static>'` 存进转录（热帧路径零分配），而表格宽度恰恰依赖当时的 frame 宽度——两者冲突。三条路：① 取一个保守常数封顶（确定、无需重投影）；② 只对 `Node::Table` 在绘制时按真实宽度重投影（其余行仍走缓存）；③ 投影时读一次终端尺寸（REPL 侧可得，TUI 侧需把尺寸传进来）。**且必须给「超宽单元格怎么截」定规则**（省略号截断 vs 折行成多行单元格），折行会让单行网格变多行，是更大的改动。故先入清单，不盲改 |
+| 74 | REPL 流式「双写」：原始流 + 格式化副本 | 落地 | 2 | 3 | 3 | `turn.rs:70-78` 把 `TextDelta` 原样 muted 打印并累积；`turn.rs:117-128` 在 `MessageStop` 又 `writeln!` 一份 `render_markdown(&assistant_text)`，两者之间**没有任何回退或清行**（`turn.rs` 全文无 `MoveToPreviousLine`/`Clear`）→ 同一条回复会打印两遍（先是 md 源码，再是格式化版） | 修法取舍：① **行数记账 + 光标上移重画**（即 `.bak:441` 的 T1，效果最好；须处理「原始流已滚出屏幕就无法回退」的降级分支）；② 流式阶段不再打印原始 md，改印进度指示，结束时打印一次（零风险，代价是失去逐字流式观感）。**属流式路径，按仓库纪律「改流式必须端到端冒烟」，而本仓只有 `HEARTFLOW_CASSETTE=record:` 才能产出回放夹具、当前尚无已录制夹具** → 先立项，等夹具或真机 |
+| 75 | TUI 流式尾部每帧 clone | 落地 | 3 | 2 | 4 | `tui.rs:1340-1341` `tail.push(Line::from(Span::raw(app.assistant_buf.clone())))`——tail 每帧重建（注释自陈 `rebuilt every frame`），于是流式期间**每帧复制整个不断增长的缓冲**，累计 O(n²) 字节拷贝（不涉及解析）；同段另有 `thinking_buf.clone()`（`:1335-1338`） | 修法二选一：① 把 `tail: Vec<Line<'static>>` 放宽为借用 `&'a str`（需让 `cache ⧺ tail` 的类型统合，`Line<'static>` 靠协变降到 `Line<'a>`）；② 给 tail 设显示上界，只渲染末尾 N 字符（改动约 3 行，顺带界定内存）。**须真机 TUI 验证**（alt-screen 与帧循环无法离线断言） |
+| 76 | 队列：多队列 + 「注入在飞回合 / 开启下一个任务」两种语义 | 落地 | 3 | 4 | 2 | `core.rs:19-22` 单 FIFO（`DEFAULT_QUEUE_LIMIT = 32` 在 `:26`）；`drain_injection` `:87-94` 把整队**合并成一条**；drain 点 `main.rs:933`（REPL）与 `tui.rs:2048-2050`（TUI，drain 后 `push_back` 作为**下一个回合**） | 「默认等上一个完成再开下一个」已具备；缺**多队列**与**注入在飞回合**。**前置是 #77 的 Phase 1**（否则无从注入）。默认语义取 `Next`（`.bak:428` 明确「默认是等上个任务完成，开启后一个」）。详见「队列模式 / 新会话」小节 |
+| 77 | 运行中切换 section（SessionActor 化的最小形态） | 落地 | 3 | 4 | 1 | `tui.rs:449-453` 守卫直接回 `finish or cancel the turn before switching sections`；回合是 `run_one_turn(...).await` **内联**在 `while` 循环（`tui.rs:1786-1804`），回合期间循环不转；`tui.rs:1784-1789` 注释自陈该不变量为 `a live turn guards nav` | 改法：每 section 的回合 spawn 成 task，循环只做「轮询键盘 / `select!` 收 `Msg` / 重绘」，section 状态存 `JoinHandle` + 一条**入站** `mpsc::Sender`（出站已有 `msg_tx`）。**最大风险是所有权**：`run_one_turn` 借 `&mut runtime`，spawn 要求 `'static` → runtime 须移入 task 或 `Arc<Mutex<_>>`；取消语义一并从 `take_cancel()` 换成 `CancellationToken`（`tokio-util` 已在依赖里）。`.bak:781` 已预言此路。详见「队列模式 / 新会话」小节 |
 
 ---
 
@@ -581,6 +585,56 @@ cli 拆薄已把交互面分成默认 REPL 与 `HEARTFLOW_TUI=1` 可选全屏载
 
 **门禁**：`fmt --check` 0；`clippy --workspace --all-targets -- -D clippy::all` 0（中途抓到一次 `derivable_impls`：`TerminalRenderer` 少了一个字段后 `Default` 可直接 derive，已改）；`cargo test --workspace` **585 passed / 0 failed**；panic 预算 `debt=0 justified=7`。
 
+### 实施（2026-09-22 三续）——md 渲染收窄到「基本能力」
+
+（不编批次号。）
+
+用户口径：**「优化 md 渲染，只要基本能力，可以用库和自研，占用最少优先，性能好」**。
+
+**选型：继续用 `pulldown-cmark`，不改自研。** 依据是仓库自己的纪律（`openmemory.md.bak:194`「需求开发前，先找官方成熟可靠的方案，其次找开源成熟的方案，避免后期多次改造」）——`pulldown-cmark` 是 mdBook/rustdoc 在用的 CommonMark 实现，无 C 依赖。自研一个「基本 markdown」能省掉一个依赖，但要重吃边界（围栏嵌套、列表松紧、引用内代码块、转义），与「最小改动不回归」冲突。**所以本轮的「占用最少」不是砍依赖，而是砍「解析了却用不到的能力」**：
+
+| 项 | 改动 | 依据 |
+|---|---|---|
+| 解析选项 | `Options::all()` → `RENDERED_OPTIONS = ENABLE_TABLES ∪ ENABLE_TASKLISTS` | 15 个开关里有 10 个产出的事件 IR 根本没有节点：删除线、YAML/`+++` 元数据块、定义列表、上下标、wikilink、GFM 引用告警、标题属性——**每个块/每处行内都白解析一遍再扔掉** |
+| **智能标点** | 关闭 `ENABLE_SMART_PUNCTUATION` | 它把正文里 `--` 改成 en dash、`---` 改成 em dash、`...` 改成省略号、直引号改弯引号。对「要告诉你运行什么命令」的 agent，把 `cargo build --release` 印成 `cargo build –release` 是**一条错的指令**，不是排版美化。代码块与行内代码不受影响，所以这个缺陷一直只藏在普通句子里 |
+| **数学** | 关闭 `ENABLE_MATH`，删除 `Node::Math` | `$…$` 被判为行内数学并**丢掉定界符**，于是 `costs $5 to $9` 这类带价格的正文会莫名少 `$` |
+| 脚注 | 关闭 `ENABLE_FOOTNOTES`，删除 `Node::FootnoteRef` | 非基本能力；关闭后 `[^1]` 原样显示，信息不丢（比「解析成 `[1]` 却丢掉定义块」更诚实） |
+| 分配 | `Vec::with_capacity` / `String::with_capacity`，`style_text` → `write_styled` | 后者原来「先返回 `String` 再 `push_str`」：**最常见的节点类型每处多一次分配加一次拷贝**。改成直接写入缓冲区后，纯文本路径零分配 |
+
+IR 因此少了两个变体（`Math` / `FootnoteRef`），模块文档改为显式说明「实现的是子集，子集外的语法原样透出」——读者看到原始语法，好过看到一个被静默曲解的结果。新增两条测试钉住行为：`prose_keeps_ascii_punctuation`（`--release` 逐字存活、`--`/`---`/`...` 都不被替换）、`syntax_outside_the_rendered_subset_stays_literal`（删除线/脚注/数学/标题属性原样，任务列表与表格仍渲染）。
+
+**门禁**：`fmt --check` 0；`clippy --workspace --all-targets -- -D clippy::all` 0；`cargo test --workspace` **587 passed / 0 failed**（cli 219）；panic 预算 `debt=0 justified=7`。
+
+### 队列模式 / 新会话：现状核实与方案（**待确认后实施**）
+
+同一轮并行核实了 `.bak` 里那两条要求（`openmemory.md.bak` L180 / L414-420 / L428 / L445 / L781）在代码里的真实状态。**结论：R1 已完成；R2 部分完成；R3/R4 缺的其实是同一件事。**
+
+| 要求 | 现状 | 证据（已逐行核对） |
+|---|---|---|
+| R1 RUNNING 时回车静默入队 + 显示计数 | **已完成（TUI）** | `tui.rs:557-570` 入队并写 `n follow-up(s) queued · merged after this turn`；状态栏 `tui.rs:1425-1431` 渲染 `[{queued} queued]`；测试 `tui.rs:2250-2308`。REPL 做不到——阻塞式行编辑器在回合内根本不读键盘 |
+| R2 多队列 + drain 区分「注入当前回合 / 开启下一个任务」 | **部分完成** | 单 FIFO `core.rs:19-22`（上限 32，`core.rs:26`）；`drain_injection` `core.rs:87-94` 把整队**合并成一条**。两个 drain 点：`main.rs:933`（REPL）与 `tui.rs:2048-2050`（TUI，drain 后 `push_back` 作为**下一个回合**）。所以「默认等上一个完成再开下一个」已具备，**缺多队列、缺「注入在飞回合」** |
+| R3 运行中切到另一个 section | **缺失** | 守卫 `tui.rs:449-453` 直接回「finish or cancel the turn before switching sections」；导航只在空闲分支处理；因为回合是 `run_one_turn(...).await` **内联**在 `while` 循环里（`tui.rs:1786-1804`），回合期间循环不转 |
+| R4 每 section 独立 runtime+队列+JSONL、MCP 单连接、切换不 abort | **部分完成** | 独立 runtime/队列/JSONL 与共享 MCP 已具备（`main.rs:737/767-779`、`tui.rs:233/1109-1169`、`storage.rs:104/119`）；**缺「运行中切换且不 abort」**，与 R3 同源 |
+
+**关键发现（比逐条差距更重要）**：`tui.rs:1784-1789` 的注释把当前设计的不变量写明了——
+
+> `a submit is drained and run before any key (including a section switch) is processed, and a live turn guards nav, so active is stable from here`
+
+也就是说，「运行中不许切 section」不是偷懒，而是**内联 await 的必然代价**。R2 的「注入在飞回合」与 R3/R4 的「切走不 abort」**共用同一个前置**：**在飞的回合必须能被事件循环够到，而不是被它 await 住**。`.bak:781` 其实已经预言了这一点（「SessionActor 化的本质就是 AppState 多实例化加每实例独立 runtime 与队列」）。
+
+**方案（三阶段，严格串行，Phase 1 是 2 与 3 的共同前置）**
+
+1. **把回合从事件循环里摘出来**。每个 section 的回合改成 spawn 一个 task；循环只做「轮询键盘 / `select!` 收 `Msg` / 重绘」。section 状态里存 (a) 回合的 `JoinHandle`、(b) 一条**入站**通道 `mpsc::Sender<String>`（出站已有 `msg_tx`）。不需要 actor 框架，这就是「per-section actor」的最小形态。
+   - 风险：`run_one_turn` 现在直接借 `&mut runtime`，spawn 要求 `'static` → runtime 需移入 task 或 `Arc<Mutex<_>>`。**这是本次最大的所有权改动。**
+   - 取消语义要一起处理：现有双按 Ctrl+C 走 `take_cancel()`，spawn 后应换成 `CancellationToken`（`tokio-util` 已在依赖里）。
+   - 验收：A 区跑长回合时切到 B 区，A 区状态栏仍标运行中（`*` 标记已有，`tui.rs:1193-1213`），切回 A 能看到回合仍在推进，全程不 abort。
+2. **R2 多队列 + 两种语义**。`FollowUpQueue` 扩成具名多队列（保留默认队列与现有 API）；`drain_injection`（注入，Phase 1 后才能真正注入在飞回合）与新增 `pop_next_task`（开启下一个回合）分成两条路径；用显式 `queue_mode: Inject | Next` 表达，**默认 `Next`**（= `.bak` 要求的「默认等上个任务完成，开启后一个」）；状态栏扩成 `[N queued · next]` / `[N queued · inject]`。
+3. **R4 运行中切换 + 新会话**。放宽 `tui.rs:449-453` 的守卫为「运行中允许切换、只是不允许关闭运行中的 section」。TUI 里「新会话」已等于 Ctrl+T 新建 section（`tui.rs:1858-1884` + `main.rs:767-779`），REPL 侧仍是 `/clear`（`main.rs:463-483`）。
+   - **必须一并定死的隐患**：多 section 并发写同一 JSONL 目前无防护。若每 section 各自持有独立 `session_id`/文件则无冲突，但两个 section 打开**同一个**会话文件会互相覆盖 → 计划里写死「一个会话文件最多被一个 section 持有」，并在 `adopt_session_path`（`storage.rs:393-400`）处加校验。
+   - 待定：REPL 是否也要「边跑边切」。它是阻塞行编辑器，要做到必须把 REPL 也改成非阻塞轮询——建议**不做**，只把队列语义（`Inject`/`Next`）给 REPL。
+
+**不做（`.bak` 自己标了二期）**：steering 模式、常驻后台 section。
+
 ---
 
 ## 附：按底层度分层视图
@@ -588,9 +642,9 @@ cli 拆薄已把交互面分成默认 REPL 与 `HEARTFLOW_TUI=1` 可选全屏载
 | 层 | 含义 | 条目 |
 |---|---|---|
 | L1 硬件层 | CPU 缓存、SIMD、多核、存储介质 | 8, 14 |
-| L2 OS 原语层 | 系统调用、内存映射、文件系统、进程、字节编码 | 1, 6, 7, 16, 22, 32, 33, 41, 43, 47, 59, 61, 64, 68, 69 |
+| L2 OS 原语层 | 系统调用、内存映射、文件系统、进程、字节编码 | 1, 6, 7, 16, 22, 32, 33, 41, 43, 47, 59, 61, 64, 68, 69, 74, 75 |
 | L3 数据结构与算法范式层 | 索引结构、编码、哈希、合并、字符串匹配 | 2, 3, 4, 9, 10, 11, 12, 13, 17, 18, 19, 20, 21, 23, 25, 26, 27, 38, 39, 51 |
-| L4 策略与调度层 | 代价估算、缓存目录、任务编排、网络协议语义、schema 装配、审计、形式化验证 | 5, 15, 24, 28, 29, 30, 31, 34, 35, 36, 37, 40, 42, 44, 45, 46, 48, 49, 50, 52, 53, 54, 55, 56, 57, 58, 60, 62, 63, 65, 66, 67, 70, 71, 72, 73 |
+| L4 策略与调度层 | 代价估算、缓存目录、任务编排、网络协议语义、schema 装配、审计、形式化验证 | 5, 15, 24, 28, 29, 30, 31, 34, 35, 36, 37, 40, 42, 44, 45, 46, 48, 49, 50, 52, 53, 54, 55, 56, 57, 58, 60, 62, 63, 65, 66, 67, 70, 71, 72, 73, 76, 77 |
 
 ---
 
