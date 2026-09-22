@@ -16,18 +16,19 @@
 //! Parsing once and projecting twice is the point: the two terminal backends
 //! share one document model and one [`crate::theme::Theme`] palette, so they can
 //! no longer drift the way two independent walkers did.
+//!
+//! A fenced code block is emitted **without** syntax highlighting, so every
+//! colored glyph in a transcript is derived from the app theme (see the
+//! [`Node::CodeBlock`] note for why the token colors were removed). Tables are
+//! drawn as a light box grid whose column widths are measured in terminal cells,
+//! so CJK cell text stays aligned with ASCII.
 
 use std::fmt::Write as FmtWrite;
-use std::sync::OnceLock;
 
 use crossterm::style::{Color, Stylize};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
-use ratatui::style::{Color as RtColor, Modifier, Style as RtStyle};
+use ratatui::style::{Modifier, Style as RtStyle};
 use ratatui::text::{Line, Span};
-use syntect::easy::HighlightLines;
-use syntect::highlighting::{Theme as SyntaxTheme, ThemeSet};
-use syntect::parsing::SyntaxSet;
-use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
 use unicode_width::UnicodeWidthStr;
 
 use crate::render::ColorTheme;
@@ -101,8 +102,16 @@ pub enum Node {
     HardBreak,
     Rule,
     /// A fenced or indented code block. `language` is empty for a bare fence and
-    /// `"text"` for an indented block; `code` is the raw body (highlighting is a
-    /// projection concern).
+    /// `"text"` for an indented block; `code` is the raw body.
+    ///
+    /// The body is deliberately **not** syntax-highlighted. Token coloring came
+    /// from a fixed third-party palette (`base16-ocean.dark`) that no theme in
+    /// this app can override, so a code block was the one region of the
+    /// transcript whose colors did not follow [`crate::theme`] — wrong on a
+    /// light terminal and unreachable from a custom palette. The block is drawn
+    /// in the terminal's own foreground instead, which is correct under every
+    /// theme by construction. The fence marks and language label stay, because
+    /// those are structure, not color.
     CodeBlock {
         language: String,
         code: String,
@@ -298,8 +307,12 @@ pub fn parse(markdown: &str) -> Vec<Node> {
 /// renderer. Style priority matches the historical single-pass renderer exactly
 /// (link > strong > emphasis > quote), and the quote color, once entered, is
 /// retained for the rest of the document to keep the byte output unchanged.
+///
+/// Every escape this emits derives from `theme`; a code block body is passed
+/// through verbatim, so the terminal's own foreground and any color scheme the
+/// user has chosen apply unchanged.
 #[must_use]
-pub fn project_ansi(nodes: &[Node], theme: &ColorTheme, syntax_theme: &SyntaxTheme) -> String {
+pub fn project_ansi(nodes: &[Node], theme: &ColorTheme) -> String {
     let mut out = String::new();
     let mut link_depth = 0usize;
     let mut list_depth = 0usize;
@@ -375,7 +388,8 @@ pub fn project_ansi(nodes: &[Node], theme: &ColorTheme, syntax_theme: &SyntaxThe
                         format!("{}{language}", glyphs::CODE_OPEN).with(theme.heading())
                     );
                 }
-                out.push_str(&highlight_code(code, language, syntax_theme));
+                // Verbatim: no token colors, no escape at all. See `Node::CodeBlock`.
+                out.push_str(code);
                 if !language.is_empty() {
                     let _ = write!(out, "{}", glyphs::CODE_CLOSE.with(theme.heading()));
                 }
@@ -415,8 +429,8 @@ fn style_text(
 /// terminal backends render the same document model through the same
 /// [`AppTheme`] palette roles and cannot drift. Where the ANSI projector emits a
 /// flat string, this emits one [`Line`] per row: an ANSI `\n` becomes a line
-/// break, inline styles become [`Span`]s, and a fenced block is highlighted by
-/// mapping syntect's foreground colors onto ratatui RGB.
+/// break, inline styles become [`Span`]s, and a fenced block becomes unstyled
+/// rows (no syntax highlighting, matching [`project_ansi`]).
 ///
 /// Heading *text* stays plain with only the `#`-marker colored, mirroring
 /// [`project_ansi`] exactly, so a future "prettier heading" change is made once
@@ -425,7 +439,7 @@ fn style_text(
 /// and each redraw re-borrows it, keeping the hot frame path allocation-free.
 #[must_use]
 pub fn project_ratatui(nodes: &[Node], theme: &AppTheme) -> Vec<Line<'static>> {
-    let mut projector = RtProjector::new(*theme, global_syntax_theme());
+    let mut projector = RtProjector::new(*theme);
     for node in nodes {
         projector.emit(node);
     }
@@ -437,7 +451,6 @@ pub fn project_ratatui(nodes: &[Node], theme: &AppTheme) -> Vec<Line<'static>> {
 /// resolve styles identically.
 struct RtProjector {
     theme: AppTheme,
-    syntax_theme: &'static SyntaxTheme,
     lines: Vec<Line<'static>>,
     cur: Vec<Span<'static>>,
     link_depth: usize,
@@ -446,10 +459,9 @@ struct RtProjector {
 }
 
 impl RtProjector {
-    fn new(theme: AppTheme, syntax_theme: &'static SyntaxTheme) -> Self {
+    fn new(theme: AppTheme) -> Self {
         Self {
             theme,
-            syntax_theme,
             lines: Vec::new(),
             cur: Vec::new(),
             link_depth: 0,
@@ -582,8 +594,14 @@ impl RtProjector {
         if !self.cur.is_empty() {
             self.newline();
         }
-        self.lines
-            .extend(highlight_code_ratatui(code, language, self.syntax_theme));
+        // Unstyled rows: the terminal's own foreground, same as `project_ansi`.
+        // `lines()` (not `LinesWithEndings`) so no trailing `\r` survives on a
+        // CRLF-encoded block; a trailing newline in `code` would otherwise add a
+        // phantom blank row.
+        self.lines.extend(
+            code.lines()
+                .map(|line| Line::from(Span::raw(line.to_string()))),
+        );
         if !language.is_empty() {
             let head = self.heading_style();
             self.span(glyphs::CODE_CLOSE, head);
@@ -615,50 +633,6 @@ impl RtProjector {
         }
         self.lines
     }
-}
-
-/// Highlight a code block into ratatui [`Line`]s (one per source line). Past
-/// [`MAX_SYNTECT_BYTES`] the body is emitted verbatim, bounding the render-path
-/// cost exactly as the ANSI [`highlight_code`] does.
-fn highlight_code_ratatui(
-    code: &str,
-    language: &str,
-    syntax_theme: &SyntaxTheme,
-) -> Vec<Line<'static>> {
-    if code.len() > MAX_SYNTECT_BYTES {
-        return code
-            .lines()
-            .map(|line| Line::from(Span::raw(line.to_string())))
-            .collect();
-    }
-    let syntax_set = global_syntax_set();
-    let syntax = syntax_set
-        .find_syntax_by_token(language)
-        .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
-    let mut highlighter = HighlightLines::new(syntax, syntax_theme);
-    let mut lines = Vec::new();
-    for line in LinesWithEndings::from(code) {
-        let mut spans = Vec::new();
-        match highlighter.highlight_line(line, syntax_set) {
-            Ok(ranges) => {
-                for (style, text) in ranges {
-                    let text = text.trim_end_matches(['\n', '\r']);
-                    if !text.is_empty() {
-                        spans.push(Span::styled(text.to_string(), syntect_to_ratatui(&style)));
-                    }
-                }
-            }
-            Err(_) => spans.push(Span::raw(line.trim_end_matches(['\n', '\r']).to_string())),
-        }
-        lines.push(Line::from(spans));
-    }
-    lines
-}
-
-/// Map a syntect foreground color onto a ratatui RGB style.
-fn syntect_to_ratatui(style: &syntect::highlighting::Style) -> RtStyle {
-    let fg = style.foreground;
-    RtStyle::default().fg(RtColor::Rgb(fg.r, fg.g, fg.b))
 }
 
 /// Draw collected table rows as a light box grid of ratatui [`Line`]s — the
@@ -754,52 +728,6 @@ fn table_row_ratatui(
         spans.push(Span::styled(glyphs::TBL_V, border));
     }
     Line::from(spans)
-}
-
-/// Upper bound on the code-block size syntect will highlight. Highlighting is a
-/// regex tokenizer run on the render path, so an oversized block is emitted raw
-/// instead of risking a frame stall (the non-blocking guard for A4). Tunable; a
-/// future `[settings]` key may override it.
-pub const MAX_SYNTECT_BYTES: usize = 32 * 1024;
-
-/// Process-wide syntax definitions, loaded once (~10ms) instead of per turn.
-pub fn global_syntax_set() -> &'static SyntaxSet {
-    static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
-    SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
-}
-
-/// Process-wide highlight theme, loaded once instead of per turn.
-pub fn global_syntax_theme() -> &'static SyntaxTheme {
-    static THEME: OnceLock<SyntaxTheme> = OnceLock::new();
-    THEME.get_or_init(|| {
-        ThemeSet::load_defaults()
-            .themes
-            .remove("base16-ocean.dark")
-            .unwrap_or_default()
-    })
-}
-
-/// Highlight `code` as `language` into 24-bit ANSI. Past [`MAX_SYNTECT_BYTES`]
-/// the body is returned verbatim so a pathological block cannot stall the
-/// render loop; an unknown language falls back to plain text.
-#[must_use]
-pub fn highlight_code(code: &str, language: &str, syntax_theme: &SyntaxTheme) -> String {
-    if code.len() > MAX_SYNTECT_BYTES {
-        return code.to_string();
-    }
-    let syntax_set = global_syntax_set();
-    let syntax = syntax_set
-        .find_syntax_by_token(language)
-        .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
-    let mut highlighter = HighlightLines::new(syntax, syntax_theme);
-    let mut colored = String::new();
-    for line in LinesWithEndings::from(code) {
-        match highlighter.highlight_line(line, syntax_set) {
-            Ok(ranges) => colored.push_str(&as_24_bit_terminal_escaped(&ranges[..], false)),
-            Err(_) => colored.push_str(line),
-        }
-    }
-    colored
 }
 
 /// Draw collected table rows as a light box grid. Column widths are the max
@@ -898,12 +826,11 @@ fn table_row(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        global_syntax_theme, highlight_code, parse, project_ratatui, AppTheme, Node, TextStyle,
-        MAX_SYNTECT_BYTES,
-    };
+    use super::{parse, project_ansi, project_ratatui, AppTheme, ColorTheme, Node, TextStyle};
+    use crate::theme::glyphs;
     use ratatui::style::Modifier;
     use ratatui::text::Line;
+    use unicode_width::UnicodeWidthStr as _;
 
     /// The visible text of a projected row (spans concatenated), so tests assert
     /// layout without coupling to palette RGB.
@@ -985,17 +912,138 @@ mod tests {
         );
     }
 
-    /// Beyond the cap the body comes back verbatim (no syntect ANSI), bounding
-    /// the render-path cost; a small block is still highlighted.
+    /// A code block body carries **no** color: the only escape the ANSI
+    /// projection may emit for it is none at all, so the terminal's own
+    /// foreground applies. The fence marks still bracket it, so the block stays
+    /// visually distinct from prose.
     #[test]
-    fn oversized_code_blocks_skip_highlighting() {
-        let syntax_theme = global_syntax_theme();
-        let huge = "x".repeat(MAX_SYNTECT_BYTES + 1);
-        assert_eq!(highlight_code(&huge, "rust", syntax_theme), huge);
-        let small = highlight_code("fn main() { let x = 1; }", "rust", syntax_theme);
+    fn code_blocks_are_not_highlighted() {
+        let ansi = project_ansi(&parse("```rust\nfn main() {}\n```"), &ColorTheme::default());
+        let body = ansi
+            .lines()
+            .find(|line| line.contains("fn main"))
+            .expect("the code body is rendered");
+        assert_eq!(
+            body, "fn main() {}",
+            "the body row must be verbatim, with no ANSI escape around it"
+        );
+
+        // The ratatui side: an unstyled span, not a colored one.
+        let lines = project_ratatui(&parse("```rust\nfn main() {}\n```"), &AppTheme::default());
+        let body = lines
+            .iter()
+            .find(|line| line_text(line).contains("fn main"))
+            .expect("the code body is rendered");
+        assert_eq!(body.spans.len(), 1, "one span, so no token splits");
+        assert_eq!(
+            body.spans[0].style,
+            ratatui::style::Style::default(),
+            "the body span must be unstyled"
+        );
+    }
+
+    /// A code block whose body is empty must not emit a phantom row: the
+    /// trailing newline of a fenced block is not a source line.
+    #[test]
+    fn a_bare_fence_leaves_no_blank_code_row() {
+        let lines = project_ratatui(&parse("```\n```"), &AppTheme::default());
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert!(
-            small.contains('\u{1b}'),
-            "small block should carry syntect ANSI"
+            texts.is_empty(),
+            "an empty block renders nothing: {texts:?}"
+        );
+    }
+
+    /// Drop CSI escapes, so a test can read the grid a terminal would show.
+    fn strip_ansi(input: &str) -> String {
+        let mut output = String::new();
+        let mut chars = input.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                output.push(ch);
+            }
+        }
+        output
+    }
+
+    /// A table projects to a light box grid: a top rule, the bolded header row,
+    /// a mid rule, the body row, and a bottom rule. Both backends are asserted,
+    /// since they must agree on the layout.
+    #[test]
+    fn projects_a_table_to_a_light_box_grid() {
+        let markdown = "| key | value |\n|-----|-------|\n| a | 1 |\n";
+        let expected = [
+            "┌─────┬───────┐",
+            "│ key │ value │",
+            "├─────┼───────┤",
+            "│ a   │ 1     │",
+            "└─────┴───────┘",
+        ];
+
+        let lines = project_ratatui(&parse(markdown), &AppTheme::default());
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let grid: Vec<&str> = texts
+            .iter()
+            .map(String::as_str)
+            .filter(|text| {
+                [
+                    glyphs::TBL_TL,
+                    glyphs::TBL_ML,
+                    glyphs::TBL_BL,
+                    glyphs::TBL_V,
+                ]
+                .iter()
+                .any(|lead| text.starts_with(*lead))
+            })
+            .collect();
+        assert_eq!(grid, expected, "ratatui grid: {texts:?}");
+
+        // The header row is the only bolded one.
+        let header = lines
+            .iter()
+            .find(|line| line_text(line).contains("key"))
+            .expect("header row");
+        assert!(
+            header
+                .spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::BOLD)),
+            "the header row is bolded"
+        );
+
+        // The ANSI projector draws the same five rows.
+        let ansi = strip_ansi(&project_ansi(&parse(markdown), &ColorTheme::default()));
+        for row in expected {
+            assert!(ansi.contains(row), "ANSI projection is missing `{row}`");
+        }
+    }
+
+    /// Column widths are measured in terminal cells, not `char`s: a CJK header
+    /// is two glyphs but four cells, and getting that wrong makes every rule
+    /// shorter than the rows it brackets. Asserting *equal display width across
+    /// every row and rule* is what discriminates the two measurements — a
+    /// char-count implementation produces an 11-cell rule above a 13-cell row.
+    #[test]
+    fn table_columns_are_measured_in_display_cells() {
+        let markdown = "| 名称 | 值 |\n|------|----|\n| ab | 1 |\n";
+        let lines = project_ratatui(&parse(markdown), &AppTheme::default());
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+
+        assert_eq!(texts[0], "┌──────┬────┐", "col 0 is 4 cells, col 1 is 2");
+        assert_eq!(texts[1], "│ 名称 │ 值 │");
+        assert_eq!(texts[3], "│ ab   │ 1  │");
+
+        let widths: Vec<usize> = texts.iter().map(|text| text.width()).collect();
+        assert!(
+            widths.windows(2).all(|pair| pair[0] == pair[1]),
+            "every row must align with the rules: {texts:?} -> {widths:?}"
         );
     }
 

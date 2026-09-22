@@ -4,7 +4,6 @@ use crossterm::cursor::{MoveToColumn, RestorePosition, SavePosition};
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{execute, queue};
-use syntect::highlighting::Theme as SyntaxTheme;
 
 use crate::markdown;
 use crate::mascot::Mascot;
@@ -182,21 +181,13 @@ impl Spinner {
 
 /// The blocking REPL's streaming renderer: a thin front over the shared
 /// markdown IR ([`crate::markdown`]). It owns a snapshot of the palette
-/// ([`ColorTheme`]) and the syntect highlight theme so a turn renders in one
-/// consistent color family; markdown is parsed once and projected to ANSI.
-#[derive(Debug)]
+/// ([`ColorTheme`]); markdown is parsed once and projected to ANSI. There is no
+/// second palette to keep in step — a code block is drawn in the terminal's own
+/// foreground — so every color this renderer can emit comes from
+/// [`AppTheme`].
+#[derive(Debug, Default)]
 pub struct TerminalRenderer {
-    syntax_theme: &'static SyntaxTheme,
     color_theme: ColorTheme,
-}
-
-impl Default for TerminalRenderer {
-    fn default() -> Self {
-        Self {
-            syntax_theme: markdown::global_syntax_theme(),
-            color_theme: ColorTheme::default(),
-        }
-    }
 }
 
 impl TerminalRenderer {
@@ -216,7 +207,7 @@ impl TerminalRenderer {
     #[must_use]
     pub fn render_markdown(&self, markdown: &str) -> String {
         let nodes = markdown::parse(markdown);
-        markdown::project_ansi(&nodes, &self.color_theme, self.syntax_theme)
+        markdown::project_ansi(&nodes, &self.color_theme)
             .trim_end()
             .to_string()
     }
@@ -261,15 +252,28 @@ mod tests {
         assert!(markdown_output.contains('\u{1b}'));
     }
 
+    /// A fenced block keeps its frame and language label, but the body is
+    /// verbatim: no token colors from a palette the app cannot control, so the
+    /// terminal's own foreground (and a light color scheme) reads correctly.
     #[test]
-    fn highlights_fenced_code_blocks() {
+    fn code_block_bodies_carry_no_color() {
         let terminal_renderer = TerminalRenderer::new();
         let markdown_output =
             terminal_renderer.render_markdown("```rust\nfn hi() { println!(\"hi\"); }\n```");
         let plain_text = strip_ansi(&markdown_output);
 
-        assert!(plain_text.contains("╭─ rust"));
-        assert!(plain_text.contains("fn hi"));
+        // Structure survives: the frame and its language label.
+        assert!(plain_text.contains("╭─ rust"), "{plain_text}");
+        assert!(plain_text.contains("╰─"), "{plain_text}");
+
+        // The body row is reproduced exactly, with no escape on it at all.
+        let body = markdown_output
+            .lines()
+            .find(|line| line.contains("fn hi"))
+            .expect("the code body is rendered");
+        assert_eq!(body, "fn hi() { println!(\"hi\"); }");
+
+        // The rest of the document is still theme-colored.
         assert!(markdown_output.contains('\u{1b}'));
     }
 

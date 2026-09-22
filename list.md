@@ -169,7 +169,7 @@
 | 37 | 回合级 catch_unwind + 终端恢复 panic hook | **部分已具备** | 3 | 4 | 4 | panic hook 已做：`tui.rs:1610-1615` `take_hook`+`set_hook`，panic 时 `disable_raw_mode`+`LeaveAlternateScreen` 后再转原 hook——终端不卡在 raw/alt-screen。**回合级 `catch_unwind`→报 Error 回合→继续 未做**（全仓 grep 无 `catch_unwind`） | 终端恢复面已闭合；剩余「捕获后不杀 REPL、继续下一回合」需真机验证交互行为，延后 |
 | 38 | CJK bigram 影子列（FTS 短词） | **已具备（LIKE 回退）** | 3 | 4 | 3 | `store/src/search.rs:47 choose_method`：<3 码点走 `LIKE`，≥3 走 FTS trigram；`:80` 注释「so short Chinese terms still match」 | 中文两字查询已由 LIKE 回退正确覆盖（无空结果）。bigram 影子列只是 MB 级历史上的**性能**优化，非正确性缺口，不做 |
 | 39 | redact 触发字节预筛 | 落地 | 3 | 2 | 5 | `redact.rs` 每次 save 全量 Text ×4 regex 扫描 | 先 memchr 触发字节(`:` `/` `@` `s` `g` `A`)短路；诚实注：regex 自带前缀预筛，实测后再定 |
-| 40 | syntect bincode dump 预编译 | 落地 | 2 | 3 | 4 | render.rs 的 syntect 从目录加载(.pack plist 解析) | `dump_to_binary` 加载快 10–100×，或首帧后异步预热 |
+| 40 | syntect bincode dump 预编译 | **不做（依赖已移除）** | 2 | 3 | 4 | 原落点：render.rs 的 syntect 从目录加载 `.pack` plist。**2026-09-22 起 syntect 已整体退场**（代码块不再做语法高亮，见下方「实施（2026-09-22 续）」），`SyntaxSet`/`HighlightLines`/`ThemeSet` 与 `MAX_SYNTECT_BYTES` 全部删除，`crates/cli/Cargo.toml` 的 `syntect = "5"` 已去掉，`Cargo.lock` 中 `syntect`/`onig`/`onig_sys` 计数归零 | 本条因此**失去对象**：没有语法集可预编译。附带收益是少一条 C 依赖（`onig_sys` 由 cc 构建）与一次性 ~10ms 的语法集加载 |
 | 41 | DEC 2026 同步输出 | **已实施** | 2 | 3 | 5 | `tui.rs:1634 draw_synced`：`queue!(BeginSynchronizedUpdate)` → `terminal.draw` → `queue!(EndSynchronizedUpdate)` → `flush`；两处生产 draw 站点（event_loop / run_one_turn）改走它。ratatui 0.29 `CrosstermBackend` 不自发该序列（已核） | helper 对 writer 泛型故字节序列可单测：`draw_synced_brackets_the_frame_with_dec_2026` 断言 `\e[?2026h` 在 `\e[?2026l` 之前。不支持 DEC 2026 的终端忽略该对转义（安全 no-op）|
 | 42 | 图片入站降采样 + 同图去重 | **已具备（降采样）+ #58（去重意图）** | 2 | 3 | 4 | `image.rs:96 shrink_to_vision_grid`：长边 >1568px 的 png/jpeg 用 Lanczos3 缩到 `VISION_MAX_EDGE=1568` + JPEG q85，保留原图/重编码中更小者，含 EXIF 方向纠正；gif/webp 透传（可能带动画）。「同图去重」真实形态＝陈旧图不再每回合重传 | 降采样已完整落地（比清单设想的 q80 更高）；重传成本由 #58 的 replay 折叠消除。同轮内重复附件是唯一可去重面，价值边际 |
 | 43 | 原子写 rename 的 AV 瞬时锁重试 | 落地 | 2 | 3 | 5 | `session.rs save_to_path` temp+rename | Defender 实时扫描可令 rename 瞬时 ACCESS_DENIED；3 次 ×50ms |
@@ -202,6 +202,7 @@
 | 70 | 内置预置静默覆盖显式 `[provider] protocol` | 落地 | 3 | 4 | 5 | `provider/src/config.rs:391-395`：`builtin.map_or_else(|| settings.protocol.unwrap_or(Anthropic), \|p\| p.protocol)`——只要 provider 名命中了内置预置，用户**显式写的** `[provider] protocol` 就被**静默忽略**。违反「显式配置优先」原则，且失败形态是「请求用错协议、报一个与配置无关的错」 | 修法二选一：让显式值优先并 warn，或保持预置优先但 warn 出「你的 protocol 被忽略了」。需读完整装配链（`base_url`/`api_key_env`/`model` 三处同构回落）再定，避免只改一处造成不一致 |
 | 71 | `Set-Cookie` 的 `Domain` 未做 domain-match 校验 | 落地 | 3 | 4 | 4 | `tools/src/web.rs:396-399`：`domain.map_or(response_host, \|d\| d.trim_start_matches('.').to_ascii_lowercase())`——`Domain` 属性被**原样采信**。于是 `evil.com` 的响应可写 `Domain=example.com`，jar 把它存到 `example.com` 名下，之后**每次抓取 example.com 都会带上它**（cookie 注入 / 会话固定） | RFC 6265 §5.3 第 6 步：`Domain` 必须是请求 host 的 domain-match，否则**整条 cookie 丢弃**。也可顺带拒 `Domain` 为公共后缀者。修法纯函数、可离线测（`store_set_cookies` 已是纯函数，`web.rs:385`），单独成条是因为判据需对照 RFC 逐条落 |
 | 72 | URL userinfo 与真实主机不一致 | 落地 | 2 | 2 | 5 | `web.rs:409` `ensure_public` 取 `url.host_str()`——**判 SSRF 用的是正确主机**，这一层没问题；问题在展示：`https://api.github.com@evil.com/x` 的 `host_str()` 是 `evil.com`，但字符串读起来像 GitHub。reqwest 不把 userinfo 当凭据发，故不是凭据泄漏，而是**误导读模型** | 修法：`ensure_public` 或 `web_fetch` 入口拒收带 userinfo 的 URL（消息说明「URL 里不能带用户名/密码」）。低严重度，但成本极小、可离线测 |
+| 73 | 表格列宽不按终端宽度封顶 | 落地 | 3 | 3 | 3 | `markdown.rs` 的 `render_table` / `render_table_ratatui` 都按「各列自然最大宽度」铺框线，**无上限**。列多或单元格是长句时，框线宽度会超过终端宽度：ANSI 侧被终端硬折（框线错位），TUI 侧被 `Paragraph` 折行（网格破相） | 难点在设计而非实现：`project_ratatui` 刻意**每次刷出只投影一次**并把 `Line<'static>'` 存进转录（热帧路径零分配），而表格宽度恰恰依赖当时的 frame 宽度——两者冲突。三条路：① 取一个保守常数封顶（确定、无需重投影）；② 只对 `Node::Table` 在绘制时按真实宽度重投影（其余行仍走缓存）；③ 投影时读一次终端尺寸（REPL 侧可得，TUI 侧需把尺寸传进来）。**且必须给「超宽单元格怎么截」定规则**（省略号截断 vs 折行成多行单元格），折行会让单行网格变多行，是更大的改动。故先入清单，不盲改 |
 
 ---
 
@@ -554,6 +555,32 @@ cli 拆薄已把交互面分成默认 REPL 与 `HEARTFLOW_TUI=1` 可选全屏载
 - 原「已具备」栏的「curl 式 redirect 上限 + **每跳** SSRF 复查」是误记。`limited(5)` 由 reqwest 内部跟随，只有**终点** `response.url()` 过 `ensure_public`（`web.rs:93-97`）；中间跳的请求**已经发出**。终点复查确实阻断了「把内网响应体交给模型」，但中间跳的盲 SSRF 副作用没拦。已改注并立为 #67。
 - 另核出两条**证据在手但离线不可证**的新缺陷，立为 #70（`config.rs:391-395` 内置预置静默覆盖显式 `[provider] protocol`）与 #71（`web.rs:396-399` `Set-Cookie` 的 `Domain` 属性**未做 domain-match 校验**，即 `evil.com` 可写 `Domain=example.com`，随后把该 cookie 重放到 example.com——RFC 6265 §5.3 第 6 步要求拒绝）。
 
+### 实施（2026-09-22 续）——代码块高亮整体退场 + 表格渲染补测
+
+（不编批次号，理由同上一节。）
+
+**一、代码块不再做语法高亮，syntect 随之整体移除。**
+
+起因是配色一致性的一个硬缺陷：代码块的高亮色来自 `base16-ocean.dark`（`markdown.rs` 里 `ThemeSet::load_defaults().themes.remove(...)`），这是一个**第三方固定调色板**，`theme::Theme` 无论如何配都改不动它。结果是**转录里唯一一块不跟随主题的区域就是代码块**——浅色终端上配色错位，自定义调色板也够不着。改完之后，一个转录里能被上色的每个字形都源自 `theme::Theme`（或它派生的 `ColorTheme`），「浅色主题下也可读」变成构造上的性质，而不是运气。
+
+保留的是结构：`╭─ rust` / `╰─` 围栏与语言标签照旧（那是结构不是颜色）。落在 `markdown.rs`：`project_ansi` 的 `CodeBlock` 臂改为 `out.push_str(code)`；`RtProjector::code_block` 改为逐行 `Span::raw`（用 `lines()` 而非 `LinesWithEndings`，顺带保证 CRLF 块不残留 `\r`、且 `code` 末尾的换行不会多出一行幽灵空行）。
+
+因此删除：`highlight_code` / `highlight_code_ratatui` / `syntect_to_ratatui` / `global_syntax_set` / `global_syntax_theme` / `MAX_SYNTECT_BYTES`，`Projector::syntax_theme` 字段，`project_ansi` 的第三个参数，`TerminalRenderer::syntax_theme` 字段，以及 `crates/cli/Cargo.toml` 的 `syntect = "5"`。**`Cargo.lock` 中 `syntect`/`onig`/`onig_sys` 计数归零**——其中 `onig_sys` 是 `cc` 构建的 C 库，删掉即少一条本地工具链依赖。这也让 **#40 失去对象**（没有语法集可 bincode 预编译）。
+
+**二、表格渲染补测（表格此前已实现，只是没有任何投影层测试）。**
+
+解析期把 `Event::Start(Tag::Table)` 到 `TagEnd::Table` 之间的行/单元格收进 `TableBuilder`，结束时落成**单个** `Node::Table { rows }`（单元格剥成纯文本，故列宽可先量后画）。两个投影器各有一套绘制：`render_table`（ANSI）与 `render_table_ratatui`，都是「`┌─┬─┐` 顶规 + 粗体表头 + 中规 + 数据行 + 底规」，列宽取该列最大**显示宽度**（`UnicodeWidthStr`，CJK 按 2 格算）。
+
+新增两条投影层用例（此前只有解析层的 `collects_a_table_into_plain_rows`）：
+- `projects_a_table_to_a_light_box_grid`：断言 ratatui 侧五行网格逐字符正确、表头行是唯一带 `BOLD` 的行，并断言 **ANSI 侧渲染出同样五行**（先剥 CSI 转义再比）。这是「两个后端不许漂移」这条设计约束第一次被测试真正抓住——此前只有 ANSI/ratatui 各自的行文本被断言过。
+- `table_columns_are_measured_in_display_cells`：用 `| 名称 | 值 |` / `| ab | 1 |` 断言**每一行与每一条规的显示宽度都相等**。这条断言的判别力在于：若列宽按 `chars` 数算，`名称` 会被当成 2 格，顶规变成 11 格而数据行仍是 13 格 —— 于是「相等」这一条才会失败。（原先的写法把 `名称` 放在宽度不足的列里，测不出区别。）
+
+另修正两处与本次改动直接冲突的旧测试：`highlights_fenced_code_blocks`（断言代码块带转义）→ `code_block_bodies_carry_no_color`（断言主体行**逐字等于源码、且不含任何转义**，同时围栏仍在）；`oversized_code_blocks_skip_highlighting` 随 `highlight_code` 一并删除。
+
+**本批未做**：表格列宽不按终端宽度封顶 → 立为 **#73**（原因与三条候选路径见该条备注）。
+
+**门禁**：`fmt --check` 0；`clippy --workspace --all-targets -- -D clippy::all` 0（中途抓到一次 `derivable_impls`：`TerminalRenderer` 少了一个字段后 `Default` 可直接 derive，已改）；`cargo test --workspace` **585 passed / 0 failed**；panic 预算 `debt=0 justified=7`。
+
 ---
 
 ## 附：按底层度分层视图
@@ -563,7 +590,7 @@ cli 拆薄已把交互面分成默认 REPL 与 `HEARTFLOW_TUI=1` 可选全屏载
 | L1 硬件层 | CPU 缓存、SIMD、多核、存储介质 | 8, 14 |
 | L2 OS 原语层 | 系统调用、内存映射、文件系统、进程、字节编码 | 1, 6, 7, 16, 22, 32, 33, 41, 43, 47, 59, 61, 64, 68, 69 |
 | L3 数据结构与算法范式层 | 索引结构、编码、哈希、合并、字符串匹配 | 2, 3, 4, 9, 10, 11, 12, 13, 17, 18, 19, 20, 21, 23, 25, 26, 27, 38, 39, 51 |
-| L4 策略与调度层 | 代价估算、缓存目录、任务编排、网络协议语义、schema 装配、审计、形式化验证 | 5, 15, 24, 28, 29, 30, 31, 34, 35, 36, 37, 40, 42, 44, 45, 46, 48, 49, 50, 52, 53, 54, 55, 56, 57, 58, 60, 62, 63, 65, 66, 67, 70, 71, 72 |
+| L4 策略与调度层 | 代价估算、缓存目录、任务编排、网络协议语义、schema 装配、审计、形式化验证 | 5, 15, 24, 28, 29, 30, 31, 34, 35, 36, 37, 40, 42, 44, 45, 46, 48, 49, 50, 52, 53, 54, 55, 56, 57, 58, 60, 62, 63, 65, 66, 67, 70, 71, 72, 73 |
 
 ---
 
