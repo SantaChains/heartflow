@@ -3,6 +3,7 @@
 ```text
 hf [--provider NAME] [--model MODEL]              进入交互 REPL（等价 hf chat）
 hf [--provider NAME] [--model MODEL] prompt TEXT  单次提问，流式输出
+hf -p TEXT                                        prompt 的短写法（等价 hf prompt TEXT，stdin 语义相同）
 hf prompt -q|--quiet TEXT                         只打印答案（去掉进度/用量行，脚本友好）
 hf prompt --json TEXT                             输出 {text, usage, session_id} 结构化 JSON
 echo TEXT | hf prompt "指令"                       stdin 作为上下文与指令拼接（Unix 管道）
@@ -17,12 +18,13 @@ hf system-prompt [--cwd PATH] [--date YYYY-MM-DD] 打印系统提示词
 hf -v | -V | --version                            打印版本号
 ```
 
-`hf prompt` 的 TEXT 省略时从 stdin 读提示词；`hf search` 的 `--limit` 默认 20。
+`hf -p` 是 `hf prompt` 的短写法，参数与 stdin 语义完全一致。`hf prompt` 的 TEXT 省略时从 stdin 读提示词；`hf search` 的 `--limit` 默认 20。
 
 ## 交互契约与退出码
 
 - **交互式**：无参数或 `hf chat` 打开 REPL（唯一能弹确认的模式）。
 - **恢复**：`hf --resume[=PATH] [--run "/cmd"]` 重开已存会话（省略 PATH 进选择器；值形式必须用 `=`）。
+- **单次**：`hf -p "TEXT"` 是 `hf prompt "TEXT"` 的短写法（参数、stdin 语义完全一致）。
 - **非交互**：子命令（prompt/search/…）绝不阻塞等人。因无 tty 应答确认，`prompt` 在 `HEARTFLOW_PERMISSION_MODE` 的权限模式下跑工具，默认 `full`（自动放行）；无人值守只读管道设 `HEARTFLOW_PERMISSION_MODE=read-only`。
 
 | 退出码 | 含义 |

@@ -17,14 +17,22 @@ use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 use crate::usage::{TokenUsage, UsageTracker};
 
 /// Provider-agnostic tool advertisement sent alongside each request.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Serializable so a recorded request can be written to disk verbatim (see the
+/// provider cassette): replay compares the recorded request against the live
+/// one, which turns prompt/tool assembly drift into a test failure rather than
+/// a silent divergence.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Serializable for the same reason as [`ToolSpec`]: a cassette stores the whole
+/// request so replay can detect that the prompt the loop now builds differs from
+/// the one that was recorded.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ApiRequest {
     pub system_prompt: Vec<String>,
     pub messages: Vec<ConversationMessage>,
@@ -32,7 +40,11 @@ pub struct ApiRequest {
 }
 
 /// Events that flow from a provider stream and the agent loop to the UI layer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable so a provider stream can be recorded to disk and replayed
+/// offline (`TurnStream::from_events` is the replay half). This is what makes a
+/// real turn reproducible without a network or a provider key.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AgentEvent {
     TextDelta(String),
     ThinkingDelta(String),

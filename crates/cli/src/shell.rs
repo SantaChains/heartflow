@@ -81,7 +81,7 @@ pub(crate) enum Action {
 )]
 #[command(subcommand_precedence_over_arg = true)]
 #[command(
-    after_help = "INTERACTION CONTRACT\n  Interactive:  no args or `hf chat` opens the REPL (this is the only mode that can prompt for confirmation).\n  Resume:       `hf --resume[=PATH] [--run \"/cmd\"]` reopens a saved session (PATH omitted = most recent session; value form uses `=`).\n  Non-interactive: subcommands (prompt/search/...) never block on a human. Because there is no tty to answer a confirmation, `prompt` runs tools under the permission mode from HEARTFLOW_PERMISSION_MODE, defaulting to `full` (auto-allow). Set HEARTFLOW_PERMISSION_MODE=read-only for an unattended, read-only pipe.\n\nEXIT CODES\n  0  success\n  1  runtime/provider error (stream, config resolution, failed turn)\n  2  usage error (bad arguments; emitted by the argument parser)"
+    after_help = "INTERACTION CONTRACT\n  Interactive:  no args or `hf chat` opens the REPL (this is the only mode that can prompt for confirmation).\n  Resume:       `hf --resume[=PATH] [--run \"/cmd\"]` reopens a saved session (PATH omitted = most recent session; value form uses `=`).\n  One-shot:     `hf -p \"TEXT\"` is the short spelling of `hf prompt \"TEXT\"` (same args, stdin still read as extra context).\n  Non-interactive: subcommands (prompt/search/...) never block on a human. Because there is no tty to answer a confirmation, `prompt` runs tools under the permission mode from HEARTFLOW_PERMISSION_MODE, defaulting to `full` (auto-allow). Set HEARTFLOW_PERMISSION_MODE=read-only for an unattended, read-only pipe.\n\nEXIT CODES\n  0  success\n  1  runtime/provider error (stream, config resolution, failed turn)\n  2  usage error (bad arguments; emitted by the argument parser)"
 )]
 pub(crate) struct Cli {
     /// Provider name (deepseek, anthropic, or a [provider] table entry).
@@ -121,6 +121,9 @@ pub(crate) enum Command {
     Chat,
     /// Send one prompt and stream the response. When stdin is piped it is read
     /// as extra context, so `git diff | hf prompt "review this"` composes.
+    /// `-p` is the short spelling of this subcommand, so
+    /// `git diff | hf -p "review this"` is equivalent.
+    #[command(short_flag = 'p')]
     Prompt {
         /// Prompt text (instruction). If omitted, the prompt is read from stdin.
         text: Vec<String>,

@@ -90,6 +90,7 @@ hf --provider deepseek
 ```text
 hf [--provider NAME] [--model MODEL]              进入交互 REPL（等价 hf chat）
 hf [--provider NAME] [--model MODEL] prompt TEXT  单次提问，流式输出
+hf -p TEXT                                        prompt 的短写法（等价 hf prompt TEXT，stdin 语义相同）
 hf prompt -q|--quiet TEXT                         只打印答案（去掉进度/用量行，脚本友好）
 hf prompt --json TEXT                             输出 {text, usage, session_id} 结构化 JSON
 echo TEXT | hf prompt "指令"                       stdin 作为上下文与指令拼接（Unix 管道）
@@ -104,7 +105,7 @@ hf system-prompt [--cwd PATH] [--date YYYY-MM-DD] 打印系统提示词
 hf -v | -V | --version                            打印版本号
 ```
 
-`hf prompt` 的 TEXT 省略时从 stdin 读提示词；退出码 0 成功、1 运行时或 provider 错误、2 用法错误。
+`hf -p` 是 `hf prompt` 的短写法，参数与 stdin 语义完全一致。`hf prompt` 的 TEXT 省略时从 stdin 读提示词；退出码 0 成功、1 运行时或 provider 错误、2 用法错误。
 
 ## REPL 命令
 
@@ -132,6 +133,7 @@ hf 遵循 Unix 过滤工具约定：当 stdin 被管道或重定向（非交互�
 
 ```bash
 git diff HEAD | hf prompt --quiet "评审这次改动，只列风险点"
+git diff HEAD | hf -p "评审这次改动，只列风险点"   # -p 是 prompt 的短写法，同一个过滤器
 hf prompt --json "用三句话总结上面这段日志" | jq -r .text
 hf search 中文笔记 --json | jq -r '.[].snippet'   # ≥ 3 码点走 FTS5 trigram，短词/中文回退转义 LIKE
 ```

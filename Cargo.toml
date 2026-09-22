@@ -25,6 +25,32 @@ runtime = { package = "heartflow-runtime", version = "1.1.0", path = "crates/run
 store = { package = "heartflow-store", version = "1.1.0", path = "crates/store" }
 tools = { package = "heartflow-tools", version = "1.1.0", path = "crates/tools" }
 
+# Shipped binaries were being built with rustc's defaults: no LTO, 16 codegen
+# units, DWARF left in. These profiles are the single largest runtime/startup
+# lever for a release `hf`, and they cost nothing in the CI gate — `cargo test`
+# and `cargo check` run under the `dev`/`test` profiles, which are untouched.
+[profile.release]
+# Whole-graph inlining: the workspace is 8 shallow crates, so cross-crate
+# devirtualization of the `ApiClient`/`Transport` trait objects pays off.
+lto = "fat"
+# Maximum optimization scope (slowest build, fastest code). Release builds now
+# take minutes, not seconds — that is the intended trade.
+codegen-units = 1
+# Drop DWARF but keep the symbol table, so a release panic still gives named
+# frames in a backtrace instead of a wall of addresses.
+strip = "debuginfo"
+# Kept deliberately: no `catch_unwind` exists anywhere in the workspace, so
+# `panic = "abort"` would be behaviourally safe and a little smaller/faster —
+# but it would also erase the backtrace of the first real production panic.
+# Switch to `abort` + `strip = "symbols"` only if size outranks diagnosability.
+panic = "unwind"
+
+# Benchmarks inherit `release` (incl. the fat LTO above) but keep debug info so
+# profilers (perf, flamegraph) can resolve frames.
+[profile.bench]
+debug = true
+strip = "none"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

@@ -30,11 +30,13 @@ cargo clippy --workspace --all-targets -- -D warnings -A clippy::pedantic
 cargo test --workspace         # 单测:cargo test -p <crate> <name>;重点 crates/store/tests/io_correctness.rs
 ```
 
-`clippy::all` 为零告警是硬门；pedantic 已降为提示（存量基线 ~27 处，效率优先，不强求清零）。冒烟：`cargo run -p heartflow -- --help`、`... -- doctor`、`... -- system-prompt`。
+`clippy::all` 为零告警是硬门；pedantic 已降为提示（存量基线 ~27 处，效率优先，不强求清零）。冒烟：`cargo run -p heartflow -- --help`、`cargo run -p heartflow -- doctor`、`cargo run -p heartflow -- system-prompt`（后两者是**子命令**，别写成 `--doctor` / `--system-prompt`——那是 flag 形态，会被参数解析器判为 usage error 并以 exit 2 退出）。
 
-**panic 预算棘轮（提交前手动跑）**：`python3 scripts/check_panic_budget.py`（`--list` 逐个列出分类，`--update` 刷新基线）。只统计 `crates/*/src/**/*.rs` 的**生产**行——剔除 `#[cfg(test)]` 项、测试文件、注释与字符串内容；基线在 `scripts/panic_budget.json`，**`debt` 只许变小，新增文件带 panic 一律失败**。刻意保留的 panic（即找不到「同样清晰且局部」的非 panic 写法）必须在命中行**行尾**或**紧邻上一行**标注 `// panic-ok: <理由 ≥8 字符>`，否则计为新增债。当前基线 `debt=2`（`crates/cli/src/main.rs:398,414`）/ `justified=8`。真的清理掉存量债之后再跑 `--update`——**不要为了让门禁变绿而标注**，棘轮被频繁刷新就等于没有。
+**panic 预算棘轮（提交前手动跑）**：`python3 scripts/check_panic_budget.py`（`--list` 逐个列出分类，`--update` 刷新基线）。只统计 `crates/*/src/**/*.rs` 的**生产**行——剔除 `#[cfg(test)]` 项、测试文件、注释与字符串内容；基线在 `scripts/panic_budget.json`（**本机、不入库**，语义见下条），**`debt` 只许变小，新增文件带 panic 一律失败**。刻意保留的 panic（即找不到「同样清晰且局部」的非 panic 写法）必须在命中行**行尾**或**紧邻上一行**标注 `// panic-ok: <理由 ≥8 字符>`，否则计为新增债。存量债已清零（`debt=0`）、合理 hack `justified=7`（`api/retry.rs` ×1、`runtime/bash.rs` ×2、`runtime/redact.rs` ×4）——这些数字由脚本**随时报告**，且基线是本机的（见下条），别把它当成跨机器常量记在脑子里。真的清理掉存量债之后再跑 `--update`——**不要为了让门禁变绿而标注**，棘轮被频繁刷新就等于没有。
 
-**预算基线必须入库**：`scripts/panic_budget.json` 是**源码树的属性**（换台机器跑出同样的数），不是机器本地量测，**不得写进 `.gitignore`**。注意它与 `scripts/bench-gate.sh` 的基线约定**相反**——后者是机器本地性能数，存 `TMPDIR`、从不提交。基线缺失时门禁以 exit 1 报 `no baseline`；此时正确做法是恢复基线，**不是**随手 `--update`（那会把已有回归一并赦免，棘轮当场失效）。
+脚本认的模式是 `panic!` / `todo!` / `unimplemented!` / `unreachable!` / `.expect(` / `.unwrap(` / `.expect_err(` / `.unwrap_err(`——后三者 2026-09-22 补入（`unreachable!` 就是 panic 宏；`unwrap_err`/`expect_err` **在 `Ok` 分支 panic**，与名字给人的直觉相反；补入时生产命中 **0**，只为接住未来第一个）。**刻意不含 `assert!`**：生产里的 `assert!` 是「我要强制的不变量」，本仓数百处几乎全在 `#[cfg(test)]`，计进去只会淹没信号。
+
+**预算基线是本机棘轮、刻意不入库**：`scripts/panic_budget.json` 在 `.gitignore` 里（`.gitignore:33`），它约束的是「**这台机器上**不许比上次更差」，而不是源码树的属性——所以它跑不进 CI，新克隆也没有基线。于是脚本把两种「没有可用基线」拆开对待：**基线缺失**（新机器 / 首次运行 / 刚手工删掉）是正常状态，脚本**采纳当前树为新起点**、打印采纳明细后 exit 0；**基线损坏**（无法解析或结构不对）才是真错误，exit 1 拒绝猜测——静默覆盖只会把数据丢失藏起来。注意这与 `scripts/bench-gate.sh` 的约定是**同向**的（两者都是机器本地量测、从不提交），别再当成一对相反项。唯一不变的纪律：**不要为了让门禁变绿而 `--update`**；现在 `--update` 会把「这次赦免了哪些回归」逐条打印出来，但打印出来不等于获准。
 
 **第三方代码归属**：任何衍生/移植自外部项目的代码（脚本、片段、算法）须在根 `NOTICE` 追加版权声明与许可证全文，并在 `README.md` §致谢与第三方代码点名来源。当前唯一项：`scripts/check_panic_budget.py`（衍生自 MIT 许可的 jcode，Copyright (c) 2025 Jeremy Huang）。`archive/` 已在 `.gitignore` 中、**不随仓库分发**，所以归属信息不能只写在存档里。
 
@@ -126,6 +128,7 @@ CI 只有两条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/
 ## 代码约定
 
 - `unsafe_code = forbid`；可失败路径禁用 `unwrap`/`expect`，用 `Result` + crate 内自定义错误（`ApiError`/`StoreError`/`RuntimeError`/`ConfigError`），不把 `anyhow` 风格泛型下沉到库。
+- `Mutex` 取锁必须区分**两种降级**：污染后结果会**变错**的用 `unwrap_or_else(PoisonError::into_inner)` **恢复**——凭据登记/剔除、会话 id 铸造/重绑、镜像写与重写标记、工具入参校验缓存、并发扫描收集器、MCP `Mcp-Session-Id`；`SessionState` 字段互相独立、无跨字段不变量，故恢复可证安全，收口点是 `crates/cli/src/storage.rs::lock_state`。只有降级**更安全**的才保留显式 `Err` 分支并注明原因（`redact_for_save` 退回全量清洗、折叠渲染器输出全文）。**不要写 `if let Ok(guard) = mutex.lock()`**——那会让锁污染静默丢弃工作。
 - 工具入参在执行前用 `jsonschema` crate 做完整 JSON-Schema 校验（draft 全能力；空/布尔/编译失败的 schema 一律放行，不误拦合法调用）；转发 provider 前对 MCP schema 做规整（object 补 `properties`、array 补 `items`、单元素 `type` 联合折叠）。
 - 全链路 UTF-8：BOM 剥除、非 UTF-8 字节经 `chardetng` 嗅探 + `encoding_rs` 解码遗留码页、CJK 宽度对齐；工具输出 32K 截断。Windows 走 PowerShell（`pwsh` 优先），提交的命令须跨平台可移植。
 - 日志走 `tracing` + `HEARTFLOW_LOG` 门控，一律 stderr，不污染渲染 stdout。
@@ -145,6 +148,8 @@ CI 只有两条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/
 - git-cliff 版本钉在 `.github/actions/install-git-cliff/action.yml`（模板引擎行为随版本变动，升级须显式改并先过本地 dry-run）。所有 action 按 SHA 固定。
 
 ## 其他
+
+- **动手前若觉得某处「写法很脏」，先查 `hack.md`**：那是本仓**刻意为之、别去"修"**的丑写法清单（`build.rs` 扫盘找 `rc.exe`、`panic-ok` 标注的 7 处、锁污染恢复的 11 处与刻意保留的 3 处、只重试 `PermissionDenied` 的原子写、`taskkill /T` 取代 Job Object 等），每条都写了「为什么干净写法更差」和代价/边界；B 档另有本机构建/环境的坑（`reg.exe`/`wmic.exe` 黑名单、盘满报 `LNK1108`、`os error 5` 瞬时、同文件批量编辑会静默丢）。
 
 - `.gitignore` 忽略 `target/`、`.heartflow/`、`archive/`、`.history/`、`.trae/`，以及本地笔记 `openmemory.md`、`ref.md`、`error.md`。
 - 文档源在 `docs/src`（mdBook，输出 `docs/book/` 已忽略）；`scripts/gen-llms.sh` 按 llms.txt v2 从 `docs/src/SUMMARY.md` 生成仓库根 `llms.txt`/`llms-full.txt`，改文档后重跑（本机 PATH 的 `bash` 若非 GNU bash 会缺 `mapfile`，用 Git 的 bash）。GitHub Pages 由 `docs.yml` 发布。

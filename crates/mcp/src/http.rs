@@ -135,7 +135,15 @@ async fn post_once(
     if let Some(token) = bearer {
         request = request.bearer_auth(token);
     }
-    if let Some(id) = session.lock().ok().and_then(|guard| guard.clone()) {
+    // Recover a poisoned guard rather than dropping the session id: the cell
+    // holds a plain `Option<String>` (always sound), and losing it would
+    // silently break `Mcp-Session-Id` continuity — every later request would
+    // look like a fresh session to the server.
+    let session_id = session
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(id) = session_id {
         request = request.header("mcp-session-id", id);
     }
 
@@ -149,9 +157,9 @@ async fn post_once(
         .get("mcp-session-id")
         .and_then(|value| value.to_str().ok())
     {
-        if let Ok(mut guard) = session.lock() {
-            *guard = Some(id.to_string());
-        }
+        *session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id.to_string());
     }
     let content_type = response
         .headers()

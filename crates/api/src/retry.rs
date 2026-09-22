@@ -106,26 +106,24 @@ impl RetryPolicy {
         Cfut: Future<Output = Result<reqwest::Response, ApiError>>,
     {
         let mut attempts = 0_u32;
-        let mut last_error: Option<ApiError>;
-
-        loop {
+        // The loop *yields* the error that ends it, so there is no `Option` to
+        // unwrap afterwards: every exit carries the error that already justified
+        // stopping. It also lets the retryable test live in one place instead of
+        // once per `match` arm.
+        let last_error = loop {
             attempts += 1;
-            match send().await {
+            let error = match send().await {
                 Ok(response) => match check(response).await {
                     Ok(response) => return Ok(response),
-                    Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => {
-                        last_error = Some(error);
-                    }
-                    Err(error) => return Err(error),
+                    Err(error) => error,
                 },
-                Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => {
-                    last_error = Some(error);
-                }
-                Err(error) => return Err(error),
+                Err(error) => error,
+            };
+            if !error.is_retryable() || attempts > self.max_retries + 1 {
+                return Err(error);
             }
-
             if attempts > self.max_retries {
-                break;
+                break error;
             }
 
             // A server-named delay wins over the local schedule: retrying
@@ -133,18 +131,17 @@ impl RetryPolicy {
             // wastes the turn. If it named a wait longer than we are willing to
             // sit out, stop and surface the error instead of blocking for
             // minutes.
-            let delay = match last_error.as_ref().and_then(ApiError::retry_after) {
-                Some(server) if server > MAX_HONOURED_RETRY_AFTER => break,
+            let delay = match error.retry_after() {
+                Some(server) if server > MAX_HONOURED_RETRY_AFTER => break error,
                 Some(server) => server,
                 None => self.backoff_for_attempt(attempts)?,
             };
             tokio::time::sleep(delay).await;
-        }
+        };
 
         Err(ApiError::RetriesExhausted {
             attempts,
-            // panic-ok: every path that leaves the loop above records an error first
-            last_error: Box::new(last_error.expect("retry loop must capture an error")),
+            last_error: Box::new(last_error),
         })
     }
 }
@@ -152,6 +149,8 @@ impl RetryPolicy {
 #[cfg(test)]
 mod tests {
     use super::RetryPolicy;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
@@ -243,5 +242,126 @@ mod tests {
         assert!(!super::is_retryable_status(
             reqwest::StatusCode::UNAUTHORIZED
         ));
+    }
+
+    /// A retryable transport-shaped error: what a 429/503 looks like by the time
+    /// the policy sees it.
+    fn retryable(retry_after: Option<Duration>) -> super::ApiError {
+        super::ApiError::Api {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            error_type: Some("rate_limit".to_string()),
+            message: Some("slow down".to_string()),
+            body: String::new(),
+            retryable: true,
+            retry_after,
+        }
+    }
+
+    /// `RetryPolicy::run` is the loop every transport funnels through, yet it had
+    /// no test at all — which also left the `expect` that used to guard its exit
+    /// unverified. These cover the three exits the loop can take (exhausted,
+    /// terminal, server-requested stop) plus the attempt counting that decides
+    /// between them. The success path is deliberately absent: it needs a real
+    /// `reqwest::Response`, which has no public constructor, so it is only
+    /// reachable through the transport integration tests.
+    #[tokio::test]
+    async fn retries_until_exhausted_and_reports_the_last_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let policy = RetryPolicy::new(2, Duration::ZERO, Duration::ZERO);
+
+        let outcome = policy
+            .run(
+                move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Err::<reqwest::Response, super::ApiError>(retryable(None)))
+                },
+                |_response: reqwest::Response| {
+                    std::future::ready(Err::<reqwest::Response, super::ApiError>(
+                        super::ApiError::MissingApiKey,
+                    ))
+                },
+            )
+            .await;
+
+        match outcome {
+            Err(super::ApiError::RetriesExhausted {
+                attempts,
+                last_error,
+            }) => {
+                // max_retries=2 means the initial try plus two retries.
+                assert_eq!(attempts, 3);
+                assert!(
+                    last_error.is_retryable(),
+                    "the carried error must be the one that justified retrying"
+                );
+            }
+            other => panic!("expected RetriesExhausted, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_error_is_returned_without_retrying() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let policy = RetryPolicy::new(3, Duration::ZERO, Duration::ZERO);
+
+        let outcome = policy
+            .run(
+                move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Err::<reqwest::Response, super::ApiError>(
+                        super::ApiError::MissingApiKey,
+                    ))
+                },
+                |_response: reqwest::Response| {
+                    std::future::ready(Err::<reqwest::Response, super::ApiError>(
+                        super::ApiError::MissingApiKey,
+                    ))
+                },
+            )
+            .await;
+
+        assert!(matches!(outcome, Err(super::ApiError::MissingApiKey)));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a non-retryable error must be surfaced on the first attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_beyond_the_cap_stops_immediately() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let policy = RetryPolicy::new(3, Duration::ZERO, Duration::ZERO);
+        let too_long = super::MAX_HONOURED_RETRY_AFTER + Duration::from_secs(1);
+
+        let outcome = policy
+            .run(
+                move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Err::<reqwest::Response, super::ApiError>(retryable(Some(
+                        too_long,
+                    ))))
+                },
+                |_response: reqwest::Response| {
+                    std::future::ready(Err::<reqwest::Response, super::ApiError>(
+                        super::ApiError::MissingApiKey,
+                    ))
+                },
+            )
+            .await;
+
+        match outcome {
+            Err(super::ApiError::RetriesExhausted { attempts, .. }) => assert_eq!(attempts, 1),
+            other => panic!("expected RetriesExhausted after one try, got {other:?}"),
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "waiting past the cap is worse than surfacing the error"
+        );
     }
 }

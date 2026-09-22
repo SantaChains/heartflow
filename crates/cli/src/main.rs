@@ -49,8 +49,8 @@ use config::{load_merged_mcp, load_provider_selection, ConfigWatcher};
 use core::{guide_context, guide_draft, HeartModel};
 use provider::{
     load_catalog, load_merged_settings, persist_discovered, persist_model, AnthropicStreamClient,
-    CatalogModel, ModelSource, ProviderCatalog, ProviderProtocol, ProviderSelection,
-    ProviderSettings, TransportClient, CONFIG_VERSION,
+    CassetteClient, CassetteMode, CatalogModel, ModelSource, ProviderCatalog, ProviderProtocol,
+    ProviderSelection, ProviderSettings, TransportClient, CONFIG_VERSION,
 };
 use render::TerminalRenderer;
 // Persistence subsystem (Phase 1 thinning): re-exported crate-wide so existing
@@ -146,7 +146,11 @@ const MAX_RESTART_DEPTH: usize = 5;
 /// kept in the session state for `/expand`. Chosen to fit a typical screen.
 pub(crate) const FOLD_TOOL_OUTPUT_LINES: usize = 40;
 
-pub(crate) type AgentRuntime = ConversationRuntime<TransportClient, AgentToolExecutor>;
+// The transport is wrapped in a cassette so a live session can be recorded and
+// replayed offline (`HEARTFLOW_CASSETTE`). Unset, the wrapper is an exact
+// passthrough: no relay task, no buffering, no behavioural delta.
+pub(crate) type AgentRuntime =
+    ConversationRuntime<CassetteClient<TransportClient>, AgentToolExecutor>;
 
 fn main() {
     init_logging();
@@ -417,11 +421,10 @@ fn import_config(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mcp_settings = crate::config::McpSettings::from_table(&table, &path.display().to_string());
 
     let target = home_dir().join(".heartflow").join("config.toml");
-    fs::create_dir_all(
-        target
-            .parent()
-            .expect("user config target always has a parent"),
-    )?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("config path {} has no parent directory", target.display()))?;
+    fs::create_dir_all(parent)?;
     backup_existing(&target)?;
     let mut text = settings.to_toml_string();
     text.push_str(&mcp_settings.to_toml_string());
@@ -434,12 +437,13 @@ pub(crate) fn backup_existing(target: &Path) -> std::io::Result<()> {
     if !target.exists() {
         return Ok(());
     }
-    let name = target
-        .file_name()
-        .expect("config target always has a file name")
-        .to_string_lossy()
-        .to_string();
-    let backup = target.with_file_name(format!("{name}.bak"));
+    let Some(name) = target.file_name() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("config path {} has no file name", target.display()),
+        ));
+    };
+    let backup = target.with_file_name(format!("{}.bak", name.to_string_lossy()));
     fs::rename(target, &backup)?;
     println!("previous config backed up -> {}", backup.display());
     Ok(())
@@ -2281,11 +2285,23 @@ fn build_runtime_with_mcp(
             }
         }
     }
-    let client = match selection {
-        ProviderSelection::Env { model } => {
-            TransportClient::Anthropic(AnthropicStreamClient::from_env(model, true)?)
+    // A malformed `HEARTFLOW_CASSETTE` is fatal before any turn runs: silently
+    // recording nothing would be worse than a clear startup error.
+    let client = match CassetteMode::from_env()? {
+        // Replay deliberately does not build a transport. That is what makes a
+        // recorded session runnable offline — no endpoint, and no key to exist.
+        Some(CassetteMode::Replay(path)) => CassetteClient::replay(path),
+        cassette => {
+            let live = match selection {
+                ProviderSelection::Env { model } => {
+                    TransportClient::Anthropic(AnthropicStreamClient::from_env(model, true)?)
+                }
+                ProviderSelection::Profile(profile) => {
+                    TransportClient::from_profile(&profile, true)
+                }
+            };
+            CassetteClient::live(live, cassette.unwrap_or(CassetteMode::Off))
         }
-        ProviderSelection::Profile(profile) => TransportClient::from_profile(&profile, true),
     };
     let mcp_read_only = mcp.read_only_tool_names();
     let questioner: Option<Arc<dyn UserQuestioner>> =
@@ -2915,6 +2931,66 @@ mod tests {
             action(&["hf", "prompt", "hello", "world"]),
             Action::Prompt {
                 instruction: "hello world".to_string(),
+                provider: None,
+                model: None,
+                quiet: false,
+                json: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_prompt_short_flag() {
+        // `-p` is the short spelling of the `prompt` subcommand: same positional
+        // text, same subcommand flags, same fold into `Action::Prompt`.
+        assert_eq!(
+            action(&["hf", "-p", "hello", "world"]),
+            Action::Prompt {
+                instruction: "hello world".to_string(),
+                provider: None,
+                model: None,
+                quiet: false,
+                json: false,
+            }
+        );
+        // Subcommand flags still apply through the short spelling.
+        assert_eq!(
+            action(&["hf", "-p", "summarize", "--quiet", "--json"]),
+            Action::Prompt {
+                instruction: "summarize".to_string(),
+                provider: None,
+                model: None,
+                quiet: true,
+                json: true,
+            }
+        );
+        // Bare `-p` with no text -> empty instruction, prompt read from stdin.
+        assert_eq!(
+            action(&["hf", "-p"]),
+            Action::Prompt {
+                instruction: String::new(),
+                provider: None,
+                model: None,
+                quiet: false,
+                json: false,
+            }
+        );
+        // A global flag composes with the short spelling.
+        assert_eq!(
+            action(&["hf", "--provider", "deepseek", "-p", "hi"]),
+            Action::Prompt {
+                instruction: "hi".to_string(),
+                provider: Some("deepseek".to_string()),
+                model: None,
+                quiet: false,
+                json: false,
+            }
+        );
+        // The long subcommand name is unchanged.
+        assert_eq!(
+            action(&["hf", "prompt", "hi"]),
+            Action::Prompt {
+                instruction: "hi".to_string(),
                 provider: None,
                 model: None,
                 quiet: false,

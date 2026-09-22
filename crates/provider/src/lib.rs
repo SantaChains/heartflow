@@ -2,13 +2,15 @@
 //! 并将阻塞的 `api` 客户端缝接成异步 `TurnStream`。
 
 pub mod adapter;
+pub mod cassette;
 pub mod config;
 pub mod load;
 
 pub use adapter::{AnthropicStreamClient, TransportClient};
+pub use cassette::{CassetteClient, CassetteMode, CASSETTE_ENV};
 pub use config::{
-    config_file_paths, load_merged_settings, set_config_override, ProviderProfile, ProviderProtocol,
-    ProviderSelection, ProviderSettings, CONFIG_VERSION,
+    config_file_paths, load_merged_settings, set_config_override, ProviderProfile,
+    ProviderProtocol, ProviderSelection, ProviderSettings, CONFIG_VERSION,
 };
 pub use load::{
     catalog_file_paths, catalog_write_path, default_catalog, load_catalog, persist_discovered,

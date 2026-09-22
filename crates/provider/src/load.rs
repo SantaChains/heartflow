@@ -566,8 +566,8 @@ pub fn persist_discovered(
 }
 
 /// Write via a sibling temp file then rename over the target, so a crash never
-/// leaves a truncated catalog. Mirrors `session.rs::save_to_path`; the short
-/// rename retry absorbs transient Windows file-lock/AV contention.
+/// leaves a truncated catalog. Same temp-then-rename shape and retry semantics
+/// as `session.rs::save_to_path`.
 fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -578,24 +578,44 @@ fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
     );
     let temp = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
     fs::write(&temp, contents)?;
-    let mut attempt = 0;
-    loop {
-        match fs::rename(&temp, path) {
+    if let Err(error) = rename_with_transient_retry(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Retry the couple-of-milliseconds-wide `rename` window.
+///
+/// On Windows a real-time AV scanner can hold the freshly written sibling temp
+/// file open for a few milliseconds after `fs::write` returns, which makes an
+/// otherwise-atomic rename fail with `ACCESS_DENIED` outright. Only
+/// `PermissionDenied` is retried — any other error kind is a real failure and is
+/// returned on the first attempt, so a genuinely invalid target (a directory, a
+/// vanished temp) does not burn two pointless retries. Byte-for-byte the
+/// semantics of `heartflow-runtime`'s `session.rs::rename_with_transient_retry`
+/// (the two crates cannot share the helper without a common dependency).
+fn rename_with_transient_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    const ATTEMPTS: usize = 3;
+    const BACKOFF: Duration = Duration::from_millis(50);
+
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 0..ATTEMPTS {
+        match fs::rename(from, to) {
             Ok(()) => return Ok(()),
-            Err(error) if attempt < 3 => {
-                attempt += 1;
-                std::thread::sleep(Duration::from_millis(20));
-                if attempt == 3 {
-                    let _ = fs::remove_file(&temp);
-                    return Err(error);
-                }
-            }
             Err(error) => {
-                let _ = fs::remove_file(&temp);
-                return Err(error);
+                let retryable = error.kind() == std::io::ErrorKind::PermissionDenied;
+                last = Some(error);
+                if !retryable {
+                    break;
+                }
+                if attempt + 1 < ATTEMPTS {
+                    std::thread::sleep(BACKOFF);
+                }
             }
         }
     }
+    Err(last.unwrap_or_else(|| std::io::Error::other("rename was never attempted")))
 }
 
 /// The lowercase host of a URL, stripped of scheme, path, port and any

@@ -484,6 +484,32 @@ cli 拆薄已把交互面分成默认 REPL 与 `HEARTFLOW_TUI=1` 可选全屏载
 
 同批补上 `tempfile_log` 缺失的清理策略：`BACKGROUND_LOG_RETENTION`（3 天）+ `prune_background_logs`，**只匹配 `bg-` 前缀**，外来文件一律不碰；mtime 缺失或未来时间一律视为「不过期」（保守方向）。`BashCommandOutput` 新增 `background_status_path: Option<String>`（`skip_serializing_if` 保证旧路径不破），全仓构造点仍只有 `bash.rs` 一处，故为纯增量。测试：`bash` 模块 19 → **21 passed**，runtime 全量 151 → **153 passed / 1 ignored**；新增用例含「侧写如实报告 exit 7」与「清理只删自家产物」。
 
+**实施（2026-09-22）——审计纠错三件：棘轮扩面 / 锁污染静默降级 / profile 档位。**
+
+（不编批次号：本文件两处「实施」序列的编号已互相重叠，再加一个必然歧义。）
+
+本轮不新增功能，三条共同指向**「错了也不报」的地方**。
+
+1. **棘轮扩面（先审计审计器）**：`PATTERNS` 补 `unreachable!` / `expect_err` / `unwrap_err`——后两者**在 `Ok` 分支 panic**，与名字给人的直觉相反。当前生产命中 **0**（`redact.rs` 那 2 处 `unreachable!()` 在 `#[test]` 内），故**不改动任何现有数字**（仍 `debt=0 justified=7`），只为接住未来第一个。刻意**不含 `assert!`**（生产 `assert!` 是要强制的不变量，本仓数百处几乎全在 `#[cfg(test)]`，计入只会淹没信号），理由已写进脚本注释与 AGENTS.md。
+
+2. **锁污染静默降级（`if let Ok(guard) = lock()` 一类，棘轮管不到）**：判据定为「污染后结果变『错』还是『安全降级』」。据此**改 11 处、保留 3 处**显式 `Err`：
+   - `runtime/schema.rs`：`.lock().ok()?` → 污染后**全进程工具入参校验整体静默失效**（最严重）；顺带把「持锁编译 jsonschema」改为**放锁后编译**（原本一个慢 schema 会挡住其它线程的缓存查询）。
+   - `cli/storage.rs`：新增 `pub(crate) fn lock_state()` 一处收口 6 站点。其中 `register_secret` / `registered_secrets` 是**安全**问题——污染会让已注册凭据退出剔除集，即**密钥可能落到盘上**；另 `rebind_conversation`（`/clear`、resume 后仍写旧会话）、`current_session_id`（会话被拆两段）、`note_mirror_rewrite`（把尾巴追加到陈旧基）、`mirror_to_store`（历史库静默漂移）。
+   - `mcp/http.rs` ×2：污染丢 `Mcp-Session-Id` → 后续请求被服务端当新会话。
+   - `runtime/file_ops.rs` ×3：并发扫描命中静默丢失。
+   - **保留**：`redact_for_save`（退回**永远正确的全量清洗**）、`main.rs` 折叠渲染（渲染**全部**输出而非丢弃）——二者的降级**更安全**，别顺手改掉。`main.rs` 的 `/expand` 污染时只是静默失效、不产错结果，低影响，未改。
+   - 可证性：`SessionState` 字段互相独立（`Option`/`Vec`/`String`），无「半写破坏跨字段不变量」的风险，故恢复安全。
+
+3. **`[profile.release]`**：本仓此前**没有 `[profile.*]`**，发版物吃 rustc 默认（**无 LTO / 16 cgu / 带 DWARF**）。补 `lto="fat" + codegen-units=1 + strip="debuginfo" + panic="unwind"`，`[profile.bench] debug=true`。`panic="abort"` **故意不选**：全仓无 `catch_unwind`（已 grep 确认），abort 行为安全且更小，但会**抹掉第一起生产 panic 的具名栈**（注释写明这是尺寸 vs 可诊断性的选择）。**对本地门禁零成本**（`test`/`check` 走 `dev`/`test`）。未做 `target-cpu=native`（毁发布物可移植性）与 PGO（需训练轮）；分配器早已是 `mimalloc`（`cli/main.rs:24` `#[global_allocator]`）。
+
+4. **顺带修正一处「自称镜像却不是」**：`provider/load.rs::atomic_write` 注释自称镜像 `session.rs::save_to_path`，实际**对所有错误一律重试 3 次**（「目标是个目录」这种真失败也白转两圈），且末臂 `Err(error) =>` **不可达**、还多睡 20ms 才报错。重写为同名 `rename_with_transient_retry`（50ms × 3，**只重试 `PermissionDenied`**），与 `session.rs` 语义对齐。
+
+**验证门（2026-09-22）**：`fmt --check` 0；`clippy --workspace --all-targets -- -D warnings -A clippy::pedantic` 0；`cargo test --workspace` **561 passed / 0 failed**；`scripts/check_panic_budget.py` **`debt=0 justified=7`**（扩面后数字不变）；`cargo build --release --bin hf` **0**（6m21s 冷构建），产物 **16.65 MiB**，`hf --version` / `hf doctor` 冒烟 exit 0。
+
+**方法学（比结论更值得记）**：`if let Ok(x) = mutex.lock()` 是**独立一类**缺陷——不是 panic 形态，`.lock()` 也不匹配棘轮的任何 pattern，棘轮永远抓不到它。审计这类只能靠「按语义穷举 `lock()` 站点」。另：同文件批量 Edit 仍会「报成功但没落」（本轮 6 个 Edit 落 4 个、1 个报 `EBUSY`、1 个报成功却未改），**改完必须 grep 复核**。
+
+本轮各条 hack 的理由、反例与代价已整理进新建的 **`hack.md`**（A 档源码层 12 条 + B 档本机构建/环境坑 7 条，判据集中在 §0）。
+
 ---
 
 ## 附：按底层度分层视图

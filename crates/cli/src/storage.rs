@@ -79,6 +79,27 @@ pub(crate) struct SessionState {
 /// Shared handle to one conversation's mutable state.
 pub(crate) type SessionShared = Arc<Mutex<SessionState>>;
 
+/// Lock the shared session state, recovering a poisoned guard instead of
+/// surrendering the work.
+///
+/// Poison means an earlier holder panicked while the guard was live. Every field
+/// of [`SessionState`] is an independent `Option`/`Vec`/`String` with no
+/// cross-field invariant a half-finished write could corrupt, so a poisoned
+/// value is still perfectly usable. Refusing to take it is never the safer
+/// choice here: it silently drops a credential out of the redaction set, drops
+/// search results, or routes a save at the wrong conversation. This is the same
+/// `PoisonError::into_inner` idiom already used by `tools/todo.rs`,
+/// `provider/cassette.rs` and `cli/theme.rs`.
+///
+/// The two sites that genuinely have a safer fallback keep their explicit `Err`
+/// arm and say why: [`redact_for_save`] redoes the always-correct full scrub,
+/// and the folded-output renderer prints the whole output rather than nothing.
+pub(crate) fn lock_state(state: &SessionShared) -> std::sync::MutexGuard<'_, SessionState> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// A fresh, empty state handle for one conversation/section.
 pub(crate) fn new_session_state() -> SessionShared {
     Arc::new(Mutex::new(SessionState::default()))
@@ -193,18 +214,14 @@ pub(crate) fn register_secret(state: &SessionShared, value: &str) {
     if value.len() < 4 {
         return;
     }
-    if let Ok(mut guard) = state.lock() {
-        if !guard.secrets.iter().any(|existing| existing == value) {
-            guard.secrets.push(value.to_string());
-        }
+    let mut guard = lock_state(state);
+    if !guard.secrets.iter().any(|existing| existing == value) {
+        guard.secrets.push(value.to_string());
     }
 }
 
 pub(crate) fn registered_secrets(state: &SessionShared) -> Vec<String> {
-    state
-        .lock()
-        .map(|guard| guard.secrets.clone())
-        .unwrap_or_default()
+    lock_state(state).secrets.clone()
 }
 
 /// Mirror the transcript into the searchable history store, opening the shared
@@ -220,9 +237,7 @@ pub(crate) fn mirror_to_store(state: &SessionShared, json_path: &Path, session: 
         provider: None,
         model: None,
     };
-    let Ok(mut guard) = state.lock() else {
-        return;
-    };
+    let mut guard = lock_state(state);
     let SessionState {
         store,
         store_opened,
@@ -331,9 +346,7 @@ impl MirrorTracker {
 /// Force the next mirror to fully rewrite. Called after any operation that
 /// mutates already-mirrored rows without necessarily growing the transcript.
 pub(crate) fn note_mirror_rewrite(state: &SessionShared) {
-    let Ok(mut guard) = state.lock() else {
-        return;
-    };
+    let mut guard = lock_state(state);
     if let Some(tracker) = guard.mirror.as_mut() {
         tracker.force_full = true;
     }
@@ -351,23 +364,21 @@ pub(crate) fn new_session_id() -> String {
     format!("{}-{}", unix_millis(), std::process::id())
 }
 
-/// The active conversation id, minted on first use. A poisoned lock falls back
-/// to a fresh id rather than blocking persistence.
+/// The active conversation id, minted on first use.
 pub(crate) fn current_session_id(state: &SessionShared) -> String {
-    match state.lock() {
-        Ok(mut guard) => guard.session_id.get_or_insert_with(new_session_id).clone(),
-        Err(_) => new_session_id(),
-    }
+    lock_state(state)
+        .session_id
+        .get_or_insert_with(new_session_id)
+        .clone()
 }
 
 /// Rebind persistence to `id`: point future saves at that conversation and drop
 /// the mirror tracker so the next write re-initializes (full, not append) under
 /// the same id, keeping the JSON file and the `SQLite` row keyed identically.
 pub(crate) fn rebind_conversation(state: &SessionShared, id: String) {
-    if let Ok(mut guard) = state.lock() {
-        guard.session_id = Some(id);
-        guard.mirror = None;
-    }
+    let mut guard = lock_state(state);
+    guard.session_id = Some(id);
+    guard.mirror = None;
 }
 
 /// Start a brand-new conversation (after `/clear`): a fresh id for both the

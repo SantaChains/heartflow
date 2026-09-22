@@ -80,7 +80,10 @@ const COMMANDS: &[(&str, &str)] = &[
 /// `/plan` sub-actions offered at the argument position. The plan goal itself is
 /// free text, so only these fixed verbs are enumerable.
 const PLAN_ACTIONS: &[(&str, &str)] = &[
-    ("approve", "Load the approved plan into the task list and execute it"),
+    (
+        "approve",
+        "Load the approved plan into the task list and execute it",
+    ),
     ("end", "Leave planning without executing"),
     ("status", "Show planning state and the plan file"),
 ];
@@ -313,7 +316,8 @@ fn fuzzy_score(label: &str, query: &str) -> Option<i64> {
     // Greedy left-to-right subsequence scan, recording where each query char
     // lands so an anchored prefix and a contiguous run can be rewarded.
     for query_char in query.chars().map(|c| c.to_ascii_lowercase()) {
-        let matched = (search_from..label_chars.len()).find(|&idx| label_chars[idx] == query_char)?;
+        let matched =
+            (search_from..label_chars.len()).find(|&idx| label_chars[idx] == query_char)?;
         search_from = matched + 1;
         if first_match.is_none() {
             first_match = Some(matched);
@@ -1277,7 +1281,10 @@ mod tests {
         // "pn" is a subsequence of /plan and /pin, neither anchored past `/`.
         let cands = complete("/pn", &ctx());
         let heads = labels(&cands);
-        assert!(heads.contains(&"/plan"), "fuzzy should reach /plan: {heads:?}");
+        assert!(
+            heads.contains(&"/plan"),
+            "fuzzy should reach /plan: {heads:?}"
+        );
         // A scattered model query still resolves to the deepseek ids.
         assert!(labels(&complete("/model dsk", &ctx())).contains(&"deepseek-v4-flash"));
     }

@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use glob::Pattern;
@@ -851,9 +851,10 @@ fn grep_search_once(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
             if let Some(scan) =
                 scan_file(path, &regex, input, &output_mode, context, &content_budget)
             {
-                if let Ok(mut sink) = results.lock() {
-                    sink.push(scan);
-                }
+                results
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(scan);
             }
             WalkState::Continue
         })
@@ -1072,9 +1073,10 @@ where
             let path = entry.path();
             let relative = path.strip_prefix(root).unwrap_or(path);
             if accept(relative, path) {
-                if let Ok(mut sink) = matches.lock() {
-                    sink.push(path.to_path_buf());
-                }
+                matches
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(path.to_path_buf());
             }
             WalkState::Continue
         })
@@ -1098,9 +1100,10 @@ fn collect_search_files(base_path: &Path) -> Vec<PathBuf> {
                 if entry.file_type().is_some_and(|t| t.is_file())
                     && seen.fetch_add(1, Ordering::Relaxed) < MAX_SEARCH_FILES
                 {
-                    if let Ok(mut sink) = files.lock() {
-                        sink.push(entry.path().to_path_buf());
-                    }
+                    files
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(entry.path().to_path_buf());
                 } else if entry.file_type().is_some_and(|t| t.is_file()) {
                     return WalkState::Quit;
                 }

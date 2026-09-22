@@ -4,6 +4,7 @@ hf 遵循 Unix 过滤工具约定：当 stdin 被管道或重定向（非交互�
 
 ```bash
 git diff HEAD | hf prompt --quiet "评审这次改动，只列风险点"
+git diff HEAD | hf -p "评审这次改动，只列风险点"    # -p 是 prompt 的短写法，同一个过滤器
 hf prompt --json "用三句话总结上面这段日志" | jq -r .text
 hf search 中文笔记 --json | jq -r '.[].snippet'   # ≥ 3 码点走 FTS5 trigram，短词/中文回退转义 LIKE
 ```

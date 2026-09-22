@@ -2,8 +2,12 @@
 """Ratcheting budget for panic-prone constructs in production Rust.
 
 Companion to `scripts/bench-gate.sh`: same three-mode shape (save / compare /
-fail-over-threshold), except **this baseline belongs in the repo** — it is a
-property of the source tree, not of the machine that measured it.
+fail-over-threshold). Unlike that one, this baseline is **local to the machine
+and deliberately gitignored** (`panic_budget.json`). It answers "is this working
+tree worse than it was the last time *I* looked?", which is a question about a
+developer's own trajectory, not a shared property of the source tree. Two honest
+consequences follow: CI cannot run this gate, and a fresh checkout starts with no
+baseline. `load_or_adopt_baseline` is where the second one is handled.
 
 Skeleton derived from jcode (https://github.com/1jehuang/jcode, MIT License,
 Copyright (c) 2025 Jeremy Huang): the three-mode shape and the brace-counting
@@ -60,7 +64,7 @@ across the whole tree and reads the same in every language's comment syntax.
 Usage:
     scripts/check_panic_budget.py --list              # every hit, classified
     scripts/check_panic_budget.py --update            # refresh the baseline
-    scripts/check_panic_budget.py                     # gate (exit 1 on regress)
+    scripts/check_panic_budget.py                     # gate (adopts if no baseline; exit 1 on regress)
     scripts/check_panic_budget.py --baseline path.json
 """
 
@@ -81,10 +85,24 @@ BASELINE_FILE = REPO_ROOT / "scripts" / "panic_budget.json"
 SCAN_GLOBS = ("crates/*/src/**/*.rs",)
 
 # Ordered longest-first so `.expect(` is never misread as `.unwrap(`-adjacent.
+#
+# `assert!`/`debug_assert!` are deliberately absent: a production `assert!` is
+# how code states an invariant it means to enforce, and the tree carries
+# hundreds of them (overwhelmingly inside `#[cfg(test)]`), so counting them would
+# drown the signal this script exists to provide.
+#
+# `unreachable!`/`expect_err`/`unwrap_err` are present because each panics on a
+# path that is genuinely reachable: `unwrap_err`/`expect_err` panic on the `Ok`
+# arm, which is the opposite of what a reader assumes when they gloss over the
+# name. All three currently have zero production hits — included so the ratchet
+# catches the first one, not to change today's numbers.
 PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("unimplemented!", re.compile(r"\bunimplemented!\s*\(")),
+    ("unreachable!", re.compile(r"\bunreachable!\s*\(")),
     ("todo!", re.compile(r"\btodo!\s*\(")),
     ("panic!", re.compile(r"\bpanic!\s*\(")),
+    ("expect_err", re.compile(r"\.expect_err\s*\(")),
+    ("unwrap_err", re.compile(r"\.unwrap_err\s*\(")),
     ("expect", re.compile(r"\.expect\s*\(")),
     ("unwrap", re.compile(r"\.unwrap\s*\(")),
 )
@@ -299,13 +317,53 @@ def summarise(hits: Iterable[dict[str, Any]]) -> tuple[dict[str, int], dict[str,
     return debt, justified
 
 
-def load_baseline(path: Path) -> dict[str, Any]:
+def read_json_object(path: Path) -> dict[str, Any] | None:
+    """Parse `path` as a JSON object, or return `None` if it is absent/unreadable/garbage.
+
+    Never raises: every caller wants "best effort or nothing", not an exception.
+    """
     if not path.exists():
-        raise SystemExit(f"error: no baseline at {path} — create one with --update")
-    data = json.loads(path.read_text(encoding="utf-8"))
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def load_baseline(path: Path) -> dict[str, Any]:
+    """Read an existing baseline. Absence is the caller's business, not ours."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"error: cannot read baseline {path}: {error}")
     if not isinstance(data, dict) or not isinstance(data.get("debt_files"), dict):
-        raise SystemExit(f"error: malformed baseline: {path}")
+        raise SystemExit(
+            f"error: malformed baseline {path} — refusing to guess at it. "
+            "Delete the file to re-adopt the current tree, or repair it by hand."
+        )
     return data
+
+
+def load_or_adopt_baseline(
+    path: Path, debt: dict[str, int], justified: dict[str, int]
+) -> dict[str, Any] | None:
+    """Return the baseline, or `None` after adopting the current tree as the start.
+
+    A missing baseline is a *normal* state here, because the file is gitignored:
+    fresh checkout, new machine, or a developer who tidied up. Failing hard would
+    be a trap — it trains people to reflexively run `--update`, which is the one
+    command that *forgives* regressions, i.e. it disarms the ratchet. So instead
+    we write the current counts as the starting point and let the caller announce
+    it loudly (a silent adoption is indistinguishable from a silent regression).
+
+    A *corrupt* baseline is the opposite case: that is real data loss, and
+    overwriting it would hide the loss, so `load_baseline` still refuses.
+    """
+    if path.exists():
+        return load_baseline(path)
+    write_baseline(path, debt, justified)
+    return None
 
 
 def write_baseline(path: Path, debt: dict[str, int], justified: dict[str, int]) -> None:
@@ -321,6 +379,45 @@ def write_baseline(path: Path, debt: dict[str, int], justified: dict[str, int]) 
         "justified_files": dict(sorted(justified.items())),
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+
+
+def report_adoption(path: Path, debt: dict[str, int], justified: dict[str, int]) -> None:
+    """Announce a first-run adoption of the current tree as the baseline.
+
+    Printed, not whispered: this is the single moment the numbers are set, and a
+    quiet adoption is indistinguishable from a quiet regression.
+    """
+    print(f"no baseline at {path} — adopted the current tree as the starting point.")
+    print(f"  debt={sum(debt.values())} justified={sum(justified.values())}")
+    for file, count in sorted(debt.items()):
+        print(f"    debt {file}: {count}")
+    print(
+        "  the baseline is gitignored (per-machine), so the gate now holds this "
+        "tree to 'no worse than here'. Pass --update after a deliberate cleanup."
+    )
+
+
+def describe_forgiven(path: Path, debt: dict[str, int]) -> list[str]:
+    """Regressions that `--update` is about to bake in, relative to the old file.
+
+    We cannot stop an author from refreshing the baseline — sometimes that is the
+    right move, e.g. after a deliberate, reviewed addition. But absorbing a
+    regression *silently* is precisely the failure this script exists to prevent,
+    so we make `--update` say what it is letting through.
+    """
+    previous = read_json_object(path)
+    old = previous.get("debt_files") if previous else None
+    if not isinstance(old, dict):
+        return []
+    forgiven: list[str] = []
+    old_total = sum(value for value in old.values() if isinstance(value, int))
+    if sum(debt.values()) > old_total:
+        forgiven.append(f"debt total {old_total} -> {sum(debt.values())}")
+    for file, count in sorted(debt.items()):
+        before = old.get(file, 0)
+        if isinstance(before, int) and count > before:
+            forgiven.append(f"{file}: {before} -> {count}")
+    return forgiven
 
 
 def main() -> int:
@@ -340,14 +437,20 @@ def main() -> int:
         return 0
 
     if args.update:
+        forgiven = describe_forgiven(args.baseline, debt)
         write_baseline(args.baseline, debt, justified)
         print(
             f"baseline updated: debt={sum(debt.values())} justified={sum(justified.values())} "
             f"files={len(debt)}/{len(justified)} -> {args.baseline}"
         )
+        for entry in forgiven:
+            print(f"  ! forgiven, now baked into the baseline: {entry}")
         return 0
 
-    baseline = load_baseline(args.baseline)
+    baseline = load_or_adopt_baseline(args.baseline, debt, justified)
+    if baseline is None:
+        report_adoption(args.baseline, debt, justified)
+        return 0
     old_debt: dict[str, int] = baseline["debt_files"]
     old_justified: dict[str, int] = baseline.get("justified_files", {})
     regressions: list[str] = []

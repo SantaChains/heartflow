@@ -8,7 +8,7 @@
 //! schema rejects input.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use serde_json::Value;
 
@@ -21,17 +21,31 @@ fn validator_cache() -> &'static Mutex<HashMap<String, jsonschema::Validator>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Compile (or fetch from cache) the validator for `schema`. `None` means
-/// "uncompilable or cache unavailable" — the caller applies the permissive
-/// contract and lets the call through.
+/// Compile (or fetch from cache) the validator for `schema`. `None` means the
+/// schema could not be canonicalized or compiled — the caller then applies the
+/// permissive contract and lets the call through. A poisoned cache lock is
+/// *not* one of those reasons: the cache holds nothing but compiled validators,
+/// so the guard is recovered rather than dropped, because dropping it would
+/// silently turn off tool-argument validation for the rest of the process.
 fn compiled_validator(schema: &Value) -> Option<jsonschema::Validator> {
     let key = serde_json::to_string(schema).ok()?;
-    let mut cache = validator_cache().lock().ok()?;
-    if let Some(validator) = cache.get(&key) {
-        return Some(validator.clone());
+    {
+        let cache = validator_cache()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(validator) = cache.get(&key) {
+            return Some(validator.clone());
+        }
     }
+    // Compile outside the lock: compiling a schema is the expensive part, and a
+    // slow compile on one thread must not stall cache lookups on another. Two
+    // threads racing on the same uncached schema merely compile it twice — the
+    // result is deterministic and the insert is idempotent, so that is benign.
     let validator = jsonschema::validator_for(schema).ok()?;
-    cache.insert(key, validator.clone());
+    validator_cache()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key, validator.clone());
     Some(validator)
 }
 

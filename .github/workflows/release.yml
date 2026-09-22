@@ -102,6 +102,10 @@ jobs:
         run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo build (hf.exe)
+        env:
+          # 开发机允许跳过版本资源,发布不允许:缺了它 Get-Command/文件属性/scoop
+          # 一律显示 0.0.0.0。build.rs 只在显式设此变量时把该失败当致命错误。
+          HF_REQUIRE_WINRES: "1"
         run: cargo build --release -p heartflow --target x86_64-pc-windows-msvc
       - name: pack zip + sha256
         id: pack
