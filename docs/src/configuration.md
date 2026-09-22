@@ -2,7 +2,7 @@
 
 优先级从高到低：CLI 参数 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量。同名字段逐项覆盖，坏字段跳过并告警，单条配置不阻断启动。
 
-REPL 运行期间编辑并保存 `config.toml` / `theme.toml` / `keymap.toml` / `settings.toml` 任一，下一回合边界会自动热重载（`config` 重建 provider 并保留当前会话与权限模式，`theme`/`keymap`/`settings` 就地生效；逐面上报，改 theme 不触发 config 重载）。环境异常可用 `hf doctor` 诊断，`hf doctor --fix` 应用安全修复。
+REPL 运行期间编辑并保存 `config.toml` / `theme.toml` / `keymap.toml` / `settings.toml` / `provider.toml` 任一，下一回合边界会自动热重载（`config` 重建 provider 并保留当前会话与权限模式，`theme`/`keymap`/`settings` 就地生效，`provider` 重载模型目录供 `/model` 与补全、绝不动活动传输；逐面上报，改 theme 不触发 config 重载）。环境异常可用 `hf doctor` 诊断，`hf doctor --fix` 应用安全修复。
 
 ```toml
 version = 1
@@ -41,6 +41,32 @@ read_only = true                       # 声明该 server 工具均只读：read
 - `deepseek`：OpenAI 协议，`api_key_env = "DEEPSEEK_API_KEY"`，默认模型 `deepseek-v4-flash`。
 - `anthropic`：Anthropic 协议，`api_key_env = "ANTHROPIC_API_KEY"`，基址可被 `ANTHROPIC_BASE_URL` 覆盖。
 - 任意 `[provider.NAME]` 表项即自定义 provider；都未命中且无内置名时回退到环境变量选路，此时默认模型为 `mimo-v2.5-pro`。
+
+## provider/模型目录（provider.toml）
+
+`~/.heartflow/provider.toml` 是 provider 与模型的**目录**（已知宇宙的注册表），**不是活动配置**：它从不决定某回合打哪个端点——那始终由 `config.toml`（或 `--provider`/环境变量）解析选定。目录只服务三件事：REPL `/model` 的状态行与参数补全、`/model` 切换后的模型留档，以及给 `hf --provider NAME` 一份可发现的候选。
+
+三层合并（后者按模型 id 覆盖前者）：
+
+1. **种子**：编译进二进制的国内常用 OpenAI 兼容供应商（DeepSeek、Moonshot/Kimi、智谱 GLM、阿里 Qwen、MiniMax、百川、千帆、硅基流动、火山方舟 Doubao、零一 Yi、阶跃 StepFun 及 OpenAI），随版本更新，**永不落盘**。
+2. **用户层**：你在 `~/.heartflow/provider.toml` 手写的覆盖/新增（参数不确定的模型可留空 `context_window`，宁缺毋臆造）。
+3. **自记层**：`hf models` 自举发现的模型（`source = "discovered"`）与 `/model NAME` 切换过的模型（`source = "user"`）由 heartflow 原子回写（temp+rename）到此文件。
+
+只有用户层与自记层会被写出；种子始终留在二进制内，故升级可刷新种子而无需迁移文件。坏字段跳过并告警，文件缺失或损坏降级回种子，绝不阻断启动。改后于下一回合边界热重载。`hf config export provider` 导出合并后的完整目录作为可编辑模板。
+
+```toml
+[providers.deepseek]
+protocol = "openai"                 # 参考信息；活动协议仍由 config.toml 决定
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"    # 只写变量名，供发现与提示
+
+[[providers.deepseek.models]]
+id = "deepseek-v4-flash"
+context_window = 1000000            # 可选；不确定就删掉这行，不要臆造
+note = "reasoning"                  # 可选自由标签
+source = "user"                     # seed | user | discovered（seed 不会出现在此文件）
+last_seen = 1730000000              # 可选；最近记录/发现的 Unix 秒
+```
 
 ## 终端配色（theme.toml）
 

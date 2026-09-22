@@ -27,7 +27,8 @@ Rust 实现的终端 AI agent。二进制命令 `hf`，在 REPL 中通过流式�
 - 自迭代记忆：`~/.heartflow/MEMORY.md`（或项目 `.heartflow/MEMORY.md`）作为跨会话的坑/决策/偏好记录，以极小 token（截断 4KB）注入系统提示词的 Memory 段；`/remember` 手动追加（去重），任务环遇硬坑（多次尝试失败被跳过）自动记录（非向量嵌入）
 - Unix 管道组合：stdin 被管道时读入为上下文，`git diff | hf prompt "评审这次改动"`；`--quiet` 只输出答案、`--json` 输出结构化结果，方便脚本串联
 - 外部 CLI 工具按需感知：系统提示词只广播主机上确已安装的非交互文本过滤器（jq/yq/gron/jc/rg/fd/tree/tokei/hyperfine/difft/xsv/gh），并约定首次使用前先 `<tool> --help` 学当前 flag 而非臆测；交互式/装饰性 TTY 工具（fzf、git-delta、less）归人类终端，不进 agent 提示（其能力已由原生 search_files 模糊检索与 apply_patch/真实 diff 覆盖）
-- 配置热重载：REPL 每回合边界按 mtime 探测 config/theme/keymap/settings 四面变更——config 自动重建 provider 并保留会话，theme/keymap/settings 就地生效（零依赖轮询，逐面上报，改 theme 不触发 config 重载）
+- 配置热重载：REPL 每回合边界按 mtime 探测 config/theme/keymap/settings/provider 五面变更——config 自动重建 provider 并保留会话，theme/keymap/settings 就地生效，provider 重载模型目录供 /model 与补全（绝不动活动传输）（零依赖轮询，逐面上报，改 theme 不触发 config 重载）
+- 模型目录与参数补全：`~/.heartflow/provider.toml` 是 provider/模型**目录**（已知宇宙的注册表，非活动配置——选路仍由 `config.toml` 决定），内置国内常用 OpenAI 兼容供应商种子（DeepSeek/Kimi/GLM/Qwen/…），`hf models` 自举发现与 `/model` 切换即时回写并热更；REPL 补全从命令名升级到参数值，`/model `/`/mode `/`/open ` 后敲空格弹出对齐表格下拉（模型附上下文窗口与来源）
 - 自检自愈：`hf doctor [--fix]` 校验配置解析、目录可写、provider 与密钥，并对历史库跑 `PRAGMA integrity_check`（库体过大时自动降级 `quick_check`）；`--fix` 建缺失目录、坏配置备份移开
 - 权限模型：read-only / workspace-write / full 三档，REPL 内 `/mode` 热切换（`auto` 归一为 full；`HEARTFLOW_PERMISSION_MODE` 另接受 `plan`，其硬门禁只允许写 `.heartflow/plans/*.md`），工具级覆盖；/plan 规划模式（硬门禁：仅可写 `.heartflow/plans/*.md`，其余写/bash 一律拒绝），审批后进入 Hermes 任务环逐任务新鲜上下文执行，收尾把复盘写入 `.heartflow/reflections/`（可选沉淀为 `.agent/skills`）；read-only 与 plan 两档自动放行标注为只读的 MCP 工具（`readOnlyHint`/`read_only`），让远程只读 MCP 在受限模式下亦可用
 - 健壮性：connect/read 双超时、子进程 kill_on_drop、UTF-8 全链路（BOM 剥除、PowerShell 编码前缀，非 UTF-8 字节经 `chardetng` 嗅探 + `encoding_rs` 解码 GBK 等遗留码页、不再 lossy 碎字、CJK 宽度对齐）、工具输出 32K 截断、缓存目录剪枝；工具入参执行前用 `jsonschema` crate 做完整 JSON-Schema 校验（draft 全能力；空/布尔/无法编译的 schema 一律放行，绝不误拦合法调用），转发给 provider 前对（MCP）schema 做规整（object 补 `properties`、array 补 `items`、单元素 `type` 联合折叠），MCP 握手（initialize+tools/list）失败按 200/400ms 退避重试 3 次（幂等），工具调用本身不自动重试（非幂等危险）交由模型层决策
@@ -80,7 +81,7 @@ export DEEPSEEK_API_KEY=sk-...
 hf --provider deepseek
 ```
 
-无参数启动即进入 REPL。输入基于 ratatui 内联视口（保留原生 scrollback、真实光标供 CJK/IME 候选）：Enter 发送，Shift/Alt+Enter 或 Ctrl+J 换行，输入 `/` 在下方弹出可选命令列表（↑/↓ 选择、高亮项按 Enter 或 Tab 补全、Esc 取消高亮；无高亮时 Enter 原样发送），空闲时 ↑/↓ 翻历史，Ctrl+C 取消当前回合（空闲行则仅清空），/exit 退出。命令列表需要高度随候选增减的内联视口，而 stock `Viewport::Inline` 高度构造时固定、一改即整屏 clear，故 `crates/cli/src/viewport_term.rs` 按 astrcodey/codex 的 resize-reflow 思路实现了动态高度行内视口终端（仅用 ratatui 公开 Backend/Buffer，零新依赖）；非 `/` 路径仍锁定 2 行，输入体验与既往逐像素一致。
+无参数启动即进入 REPL。输入基于 ratatui 内联视口（保留原生 scrollback、真实光标供 CJK/IME 候选）：Enter 发送，Shift/Alt+Enter 或 Ctrl+J 换行，输入 `/` 在下方弹出可选命令列表，命令后敲空格（如 `/model `）进一步弹出该命令的参数候选（模型/权限模式/会话序号）（↑/↓ 选择、高亮项按 Enter 或 Tab 补全、Esc 取消高亮；无高亮时 Enter 原样发送），空闲时 ↑/↓ 翻历史，Ctrl+C 取消当前回合（空闲行则仅清空），/exit 退出。命令列表需要高度随候选增减的内联视口，而 stock `Viewport::Inline` 高度构造时固定、一改即整屏 clear，故 `crates/cli/src/viewport_term.rs` 按 astrcodey/codex 的 resize-reflow 思路实现了动态高度行内视口终端（仅用 ratatui 公开 Backend/Buffer，零新依赖）；非 `/` 路径仍锁定 2 行，输入体验与既往逐像素一致。
 
 > **进不去 REPL / 输出乱码？** 几乎都是终端环境问题而非程序故障。一是密钥只在别的 shell 会话里设过：在**当前**终端重新 `export`（Windows 用 `setx` 后要重启终端），再 `hf doctor` 复核 provider 与密钥是否解析成功。二是 Windows 控制台默认 GBK 代码页把 UTF-8 显示成乱码（库内字节始终正确）：执行 `chcp 65001` 或 `[Console]::OutputEncoding=[Text.Encoding]::UTF8`，并换用支持中文的等宽字体即可。
 
@@ -94,11 +95,11 @@ hf prompt --json TEXT                             输出 {text, usage, session_i
 echo TEXT | hf prompt "指令"                       stdin 作为上下文与指令拼接（Unix 管道）
 hf search QUERY [--limit N] [--json]              跨会话全文检索历史（非交互，可管道）
 hf --resume[=SESSION.json] [--run /compact]       恢复会话（省略 PATH 进选择器），--run 恢复后立即执行 slash 命令
-hf config export [SURFACE] [--output FILE]        导出某一面配置（不含密钥）；SURFACE=config（默认）|theme|keymap|settings
+hf config export [SURFACE] [--output FILE]        导出某一面配置（不含密钥）；SURFACE=config（默认）|theme|keymap|settings|provider（provider 面导出合并后的模型目录）
 hf config import FILE                             导入配置（自动备份 .bak）
 hf doctor [--fix] [--ai]                          诊断环境（含历史库完整性）；--fix 应用安全修复，--ai 请内置模型给修复建议
 hf init [--force]                                 在当前目录生成 AGENTS.md 指令骨架（已存在不动，--force 覆盖）
-hf --provider NAME models [--balance]              provider 自举：列模型、报当前模型上下文窗口；--balance 才查余额（省额度）
+hf --provider NAME models [--balance]              provider 自举：列模型、报当前模型上下文窗口，发现的模型回写进 ~/.heartflow/provider.toml 目录；--balance 才查余额（省额度）
 hf system-prompt [--cwd PATH] [--date YYYY-MM-DD] 打印系统提示词
 hf -v | -V | --version                            打印版本号
 ```
@@ -108,7 +109,7 @@ hf -v | -V | --version                            打印版本号
 ## REPL 命令
 
 ```text
-/help     帮助              /model [NAME] 显示或切换模型
+/help     帮助              /model [NAME] 显示真实协议/base_url 或切换模型
 /mode     [NAME] 显示或切换权限模式（read-only/workspace-write/full）
 /status   会话状态          /compact      手动强制压缩会话历史（忽略阈值）
 /pin      切换末条消息的永不压缩标记（跨 /compact 逐字存活）
@@ -147,7 +148,7 @@ hf search 中文笔记 --json | jq -r '.[].snippet'   # ≥ 3 码点走 FTS5 tri
 
 优先级从高到低：CLI 参数 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量。同名字段逐项覆盖，坏字段跳过并告警，单条配置不阻断启动。
 
-REPL 运行期间编辑并保存 `config.toml` / `theme.toml` / `keymap.toml` / `settings.toml` 任一，下一回合边界会自动热重载（`config` 重建 provider 并保留当前会话与权限模式，`theme`/`keymap`/`settings` 就地生效）。环境异常可用 `hf doctor` 诊断，`hf doctor --fix` 应用安全修复。
+REPL 运行期间编辑并保存 `config.toml` / `theme.toml` / `keymap.toml` / `settings.toml` / `provider.toml` 任一，下一回合边界会自动热重载（`config` 重建 provider 并保留当前会话与权限模式，`theme`/`keymap`/`settings` 就地生效，`provider` 重载模型目录供 `/model` 与补全、绝不动活动传输）。环境异常可用 `hf doctor` 诊断，`hf doctor --fix` 应用安全修复。
 
 ```toml
 version = 1
@@ -177,6 +178,22 @@ url = "https://mcp.example.com/stream" # 与 command 二选一；两者都缺则
 headers = { "X-Tenant" = "acme" }      # 额外请求头；值支持 ${ENV_VAR} 展开
 bearer_token_env = "SEARCH_MCP_TOKEN"  # 从此环境变量读 Bearer token（为空则不发）
 read_only = true                       # 声明该 server 工具均只读：read-only/plan 模式下也放行
+```
+
+### provider/模型目录（provider.toml）
+
+`~/.heartflow/provider.toml` 是 provider 与模型的**目录**（已知宇宙的注册表），**不是活动配置**：它从不决定某回合打哪个端点——那始终由 `config.toml`（或 `--provider`/环境变量）选定，目录只服务 `/model` 状态行与参数补全、`/model` 切换后的模型留档。三层合并（后者按 id 覆盖前者）：编译进二进制的国内常用 OpenAI 兼容供应商种子（DeepSeek、Moonshot/Kimi、智谱 GLM、阿里 Qwen、MiniMax、百川、千帆、硅基流动、火山方舟、零一 Yi、阶跃 StepFun 及 OpenAI，随版本更新、永不落盘）+ 用户手写覆盖层 + heartflow 自记层（`hf models` 发现记 `source="discovered"`、`/model` 切换记 `source="user"`，原子 temp+rename 回写）。坏字段跳过并告警、缺失或损坏降级回种子，改后于回合边界热重载；参数不确定的模型留空 `context_window` 而非臆造。`hf config export provider` 导出合并后的完整目录作为可编辑模板。
+
+```toml
+[providers.deepseek]
+protocol = "openai"                 # 参考信息；活动协议仍由 config.toml 决定
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"    # 只写变量名，供发现与提示
+
+[[providers.deepseek.models]]
+id = "deepseek-v4-flash"
+context_window = 1000000            # 可选；不确定就删掉这行
+source = "user"                     # seed | user | discovered（seed 不落盘）
 ```
 
 ### 终端配色（theme.toml）

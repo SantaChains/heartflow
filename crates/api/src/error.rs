@@ -86,20 +86,20 @@ impl Display for ApiError {
                 body,
                 ..
             } => match (error_type, message) {
+                // Protocol-neutral wording: these arms fire for every transport
+                // (Anthropic, OpenAI, DeepSeek, ...), so naming one vendor here
+                // mislabels the others and misleads debugging.
                 (Some(error_type), Some(message)) => {
-                    write!(
-                        f,
-                        "anthropic api returned {status} ({error_type}): {message}"
-                    )
+                    write!(f, "api returned {status} ({error_type}): {message}")
                 }
-                _ => write!(f, "anthropic api returned {status}: {body}"),
+                _ => write!(f, "api returned {status}: {body}"),
             },
             Self::RetriesExhausted {
                 attempts,
                 last_error,
             } => write!(
                 f,
-                "anthropic api failed after {attempts} attempts: {last_error}"
+                "api request failed after {attempts} attempts: {last_error}"
             ),
             Self::InvalidSseFrame(message) => write!(f, "invalid sse frame: {message}"),
             Self::BackoffOverflow {

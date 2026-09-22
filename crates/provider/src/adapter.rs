@@ -1057,9 +1057,9 @@ mod tests {
             }],
         };
 
-        let wire = build_message_request(&request, "deepseek-flash", 8192, true, None);
+        let wire = build_message_request(&request, "deepseek-v4-flash", 8192, true, None);
         assert_eq!(wire.max_tokens, 8192);
-        assert_eq!(wire.model, "deepseek-flash");
+        assert_eq!(wire.model, "deepseek-v4-flash");
         let tools = wire.tools.expect("tools should be advertised");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "bash");
@@ -1107,7 +1107,7 @@ mod tests {
             }],
         };
 
-        let wire = build_chat_request(&request, "deepseek-flash", 8192, true, None);
+        let wire = build_chat_request(&request, "deepseek-v4-flash", 8192, true, None);
         assert_eq!(wire.messages.len(), 2);
         assert_eq!(wire.messages[0].role, ChatRole::System);
         assert_eq!(

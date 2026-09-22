@@ -528,7 +528,7 @@ mod tests {
     #[test]
     fn serializes_thinking_control_when_enabled() {
         let request = ChatRequest {
-            model: "deepseek-flash".to_string(),
+            model: "deepseek-v4-flash".to_string(),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: Some(ChatContent::Text("hi".to_string())),

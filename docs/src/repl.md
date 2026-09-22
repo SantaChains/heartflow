@@ -18,6 +18,23 @@
 /restart 以全新的配置与 MCP 装载重启进程（链式重启受深度上限约束）
 ```
 
+## 模型与补全
+
+`/model`（无参）打印当前**真实**传输身份，而非写死某一厂商：
+
+```text
+provider: deepseek
+protocol: openai
+base_url: https://api.deepseek.com/v1
+model: deepseek-v4-flash
+known models: deepseek-v4-flash, deepseek-v4-pro, deepseek-flash
+switch with: /model NAME
+```
+
+`provider` 是目录键（未命中目录则 `custom`，env-anthropic 路径为 `anthropic (env)`），`protocol` 是真实协议（`anthropic` | `openai` | `openai-responses`）。`known models` 来自 provider/模型目录（`~/.heartflow/provider.toml` + 内置种子）；`hf models` 自举发现与 `/model NAME` 切换都会把模型回写进目录，下一回合即可补全。传输失败时看这里的 `protocol`/`base_url` 就能确认真正在用哪个协议，不会被 "anthropic" 之类字样误导。
+
+补全不止命令名：在 `/model `、`/mode `、`/open ` 后敲空格，会按命令弹出参数候选表格——分别是当前 provider 的目录模型（附上下文窗口与来源）、权限三档、近期会话序号。↑/↓ 选择，Tab 或 Enter 只补全当前参数位（不整行重置），Esc 取消高亮；候选多时表格随高亮滚动。
+
 ## 权限模式
 
 `read-only` / `workspace-write` / `full` 三档，工具级覆盖，REPL 内 `/mode` 热切换（`auto` 归一为 `full`；`HEARTFLOW_PERMISSION_MODE` 另接受 `plan`）。`/plan` 规划模式是硬门禁：仅可写 `.heartflow/plans/*.md`，其余写/bash 一律拒绝；审批后进入 Hermes 任务环逐任务在新鲜上下文执行，收尾把复盘写入 `.heartflow/reflections/`。`read-only` 与 `plan` 两档自动放行标注为只读的 MCP 工具。

@@ -81,7 +81,7 @@ pub(crate) enum Action {
 )]
 #[command(subcommand_precedence_over_arg = true)]
 #[command(
-    after_help = "INTERACTION CONTRACT\n  Interactive:  no args or `hf chat` opens the REPL (this is the only mode that can prompt for confirmation).\n  Resume:       `hf --resume[=PATH] [--run \"/cmd\"]` reopens a saved session (PATH omitted = interactive picker; value form uses `=`).\n  Non-interactive: subcommands (prompt/search/...) never block on a human. Because there is no tty to answer a confirmation, `prompt` runs tools under the permission mode from HEARTFLOW_PERMISSION_MODE, defaulting to `full` (auto-allow). Set HEARTFLOW_PERMISSION_MODE=read-only for an unattended, read-only pipe.\n\nEXIT CODES\n  0  success\n  1  runtime/provider error (stream, config resolution, failed turn)\n  2  usage error (bad arguments; emitted by the argument parser)"
+    after_help = "INTERACTION CONTRACT\n  Interactive:  no args or `hf chat` opens the REPL (this is the only mode that can prompt for confirmation).\n  Resume:       `hf --resume[=PATH] [--run \"/cmd\"]` reopens a saved session (PATH omitted = most recent session; value form uses `=`).\n  Non-interactive: subcommands (prompt/search/...) never block on a human. Because there is no tty to answer a confirmation, `prompt` runs tools under the permission mode from HEARTFLOW_PERMISSION_MODE, defaulting to `full` (auto-allow). Set HEARTFLOW_PERMISSION_MODE=read-only for an unattended, read-only pipe.\n\nEXIT CODES\n  0  success\n  1  runtime/provider error (stream, config resolution, failed turn)\n  2  usage error (bad arguments; emitted by the argument parser)"
 )]
 pub(crate) struct Cli {
     /// Provider name (deepseek, anthropic, or a [provider] table entry).
@@ -95,14 +95,19 @@ pub(crate) struct Cli {
     /// one owns both spellings.
     #[arg(short = 'v', visible_short_alias = 'V', long = "version", action = ArgAction::Version)]
     pub(crate) version: (),
-    /// Resume a saved session; `--resume` alone picks interactively, `--resume=PATH`
-    /// opens a specific file. The value must use `=` so a bare `--resume` never
-    /// swallows a following subcommand token.
-    #[arg(long, num_args = 0..=1, require_equals = true, value_name = "PATH")]
+    /// Resume a saved session; `-r`/`--resume` alone restores the most recent
+    /// session, `--resume=PATH` opens a specific file. The value must use `=` so
+    /// a bare flag never swallows a following subcommand token.
+    #[arg(short = 'r', long, num_args = 0..=1, require_equals = true, value_name = "PATH")]
     // Two-level Option is the clap idiom for a tri-state flag: absent, bare
     // `--resume`, or `--resume=PATH`. An enum would fight the derive macros.
     #[allow(clippy::option_option)]
     pub(crate) resume: Option<Option<PathBuf>>,
+    /// Load configuration from an explicit file, merged as the highest file
+    /// layer above the project and user `config.toml`. Accepts TOML, or JSON
+    /// when the path ends in `.json`. CLI `--provider`/`--model` still win.
+    #[arg(short = 'c', long = "config", global = true, value_name = "PATH")]
+    pub(crate) config: Option<PathBuf>,
     /// Slash command to run right after resuming (requires --resume).
     #[arg(long, value_name = "CMD", requires = "resume")]
     pub(crate) run: Option<String>,
@@ -195,7 +200,7 @@ pub(crate) struct ModelsArgs {
 #[derive(Subcommand, Debug)]
 pub(crate) enum ConfigCommand {
     /// Export a merged config surface (without secrets): `config` (default),
-    /// `theme`, `keymap`, or `settings`.
+    /// `theme`, `keymap`, `settings`, or `provider` (the model catalog).
     Export {
         /// Which surface to export.
         #[arg(value_name = "SURFACE", default_value = "config")]
@@ -220,6 +225,7 @@ impl Cli {
             resume,
             run,
             command,
+            config: _,
             version: (),
         } = self;
         if let Some(session_path) = resume {
@@ -227,7 +233,7 @@ impl Cli {
                 return Err("--resume cannot be combined with a subcommand".to_string());
             }
             return Ok(Action::ResumeSession {
-                // `Some(None)` == bare `--resume` -> interactive picker.
+                // `Some(None)` == bare `--resume` -> most recent session.
                 session_path,
                 command: run,
                 provider,

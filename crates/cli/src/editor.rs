@@ -53,6 +53,11 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/save", "Persist the session now"),
     ("/clear", "Start a fresh session"),
     ("/sessions", "List saved sessions"),
+    ("/open <N>", "Jump the live REPL back to saved session N"),
+    (
+        "/remember <T>",
+        "Persist a durable pitfall/preference to MEMORY.md",
+    ),
     ("/search <Q>", "Full-text search saved conversation history"),
     ("/mcp", "List MCP servers and tools"),
     ("/expand [ID]", "Re-show a folded tool output"),
@@ -70,6 +75,20 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/restart", "Re-launch with a fresh config/MCP load"),
     ("/exit", "Quit the REPL"),
+];
+
+/// `/plan` sub-actions offered at the argument position. The plan goal itself is
+/// free text, so only these fixed verbs are enumerable.
+const PLAN_ACTIONS: &[(&str, &str)] = &[
+    ("approve", "Load the approved plan into the task list and execute it"),
+    ("end", "Leave planning without executing"),
+    ("status", "Show planning state and the plan file"),
+];
+
+/// `/queue` sub-actions offered at the argument position.
+const QUEUE_ACTIONS: &[(&str, &str)] = &[
+    ("pop", "Withdraw the last queued follow-up"),
+    ("clear", "Drop every queued follow-up"),
 ];
 
 /// Width of the prompt gutter (`› `). The input cell starts just past it so the
@@ -112,29 +131,226 @@ pub fn suggest_command(input: &str) -> Option<&'static str> {
     best.map(|(name, _)| name)
 }
 
-/// Commands whose leading token starts with `prefix` (the token currently being
-/// typed), for the completion hint / Tab cycling.
-#[must_use]
-pub fn completion_candidates(prefix: &str) -> Vec<&'static str> {
-    if !prefix.starts_with('/') || prefix.contains(char::is_whitespace) {
-        return Vec::new();
-    }
-    COMMANDS
-        .iter()
-        .filter_map(|(name, _)| {
-            let head = name.split([' ', '<']).next().unwrap_or(name);
-            head.starts_with(prefix).then_some(head)
-        })
-        .collect()
+/// One dropdown row: the text Tab/Enter inserts (`label`) plus a muted second
+/// column (`detail`) — a command's description, or a model's context window and
+/// provenance. Owned (not `&'static str`) so dynamic values from the catalog
+/// render alongside the fixed command heads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompletionItem {
+    pub(crate) label: String,
+    pub(crate) detail: String,
 }
 
-/// One-line description for a command head name, for the dropdown rows.
+impl CompletionItem {
+    pub(crate) fn new(label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
+/// The per-turn completion universe the REPL hands the editor: the active
+/// provider's catalog models, the permission modes, recent session ordinals, and
+/// the currently-active model/mode (tagged `(current)` in the dropdown so the
+/// live value is obvious). Plain, surface-agnostic data so [`complete`] stays a
+/// pure function the TUI can reuse later and tests can drive without a terminal.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CompletionContext {
+    pub(crate) models: Vec<CompletionItem>,
+    pub(crate) modes: Vec<CompletionItem>,
+    pub(crate) sessions: Vec<CompletionItem>,
+    pub(crate) current_model: Option<String>,
+    pub(crate) current_mode: Option<String>,
+}
+
+/// Where completion applies in the current input: the command head itself, or
+/// the single argument of a chosen command. Multi-line drafts and text past a
+/// first argument (a `/search` query, a `/remember` note) yield no site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionSite<'a> {
+    Command { prefix: &'a str },
+    Argument { command: &'a str, arg: &'a str },
+}
+
+impl<'a> CompletionSite<'a> {
+    /// The noun for the "no matches" hint, per command.
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Command { .. } => "command",
+            Self::Argument { command, .. } => match command {
+                "/model" => "model",
+                "/mode" => "mode",
+                "/open" => "session",
+                "/plan" | "/queue" => "action",
+                _ => "match",
+            },
+        }
+    }
+
+    /// The token being completed: the command prefix or the partial argument.
+    fn typed(self) -> &'a str {
+        match self {
+            Self::Command { prefix } => prefix,
+            Self::Argument { arg, .. } => arg,
+        }
+    }
+}
+
+/// Parse `text` into a completion site, or `None` when completion does not apply
+/// (no leading `/`, a multi-line draft, or more than one argument token).
+fn completion_site(text: &str) -> Option<CompletionSite<'_>> {
+    if !text.starts_with('/') || text.contains('\n') {
+        return None;
+    }
+    match text.split_once(char::is_whitespace) {
+        None => Some(CompletionSite::Command { prefix: text }),
+        // A second whitespace run means free text (a search query, a note), not
+        // an enumerable argument, so stop offering completions past the first.
+        Some((command, rest)) => (!rest.contains(char::is_whitespace))
+            .then_some(CompletionSite::Argument { command, arg: rest }),
+    }
+}
+
+/// The dropdown candidates for `text`: command heads while the head is typed, or
+/// the chosen command's argument pool filtered by the partial argument
+/// (`/model` → catalog models, `/mode` → permission modes, `/open` → sessions,
+/// `/plan` and `/queue` → their fixed sub-actions). Candidates are ranked by a
+/// lightweight fuzzy score and the active model/mode is tagged `(current)`.
+/// Pure and surface-agnostic; the REPL supplies `ctx` fresh each turn.
 #[must_use]
-fn command_desc(name: &str) -> &'static str {
-    COMMANDS
-        .iter()
-        .find(|(full, _)| full.split([' ', '<']).next().unwrap_or(full) == name)
-        .map_or("", |(_, desc)| *desc)
+pub(crate) fn complete(text: &str, ctx: &CompletionContext) -> Vec<CompletionItem> {
+    match completion_site(text) {
+        None => Vec::new(),
+        Some(CompletionSite::Command { prefix }) => command_completions(prefix),
+        Some(CompletionSite::Argument { command, arg }) => match command {
+            "/model" => ranked_matches(
+                ctx.models
+                    .iter()
+                    .map(|item| (item.label.as_str(), item.detail.as_str())),
+                arg,
+                ctx.current_model.as_deref(),
+            ),
+            "/mode" => ranked_matches(
+                ctx.modes
+                    .iter()
+                    .map(|item| (item.label.as_str(), item.detail.as_str())),
+                arg,
+                ctx.current_mode.as_deref(),
+            ),
+            "/open" => ranked_matches(
+                ctx.sessions
+                    .iter()
+                    .map(|item| (item.label.as_str(), item.detail.as_str())),
+                arg,
+                None,
+            ),
+            "/plan" => ranked_matches(PLAN_ACTIONS.iter().copied(), arg, None),
+            "/queue" => ranked_matches(QUEUE_ACTIONS.iter().copied(), arg, None),
+            _ => Vec::new(),
+        },
+    }
+}
+
+/// Command heads matching `prefix`, each paired with its description, ranked by
+/// fuzzy score so a closer head sorts first.
+fn command_completions(prefix: &str) -> Vec<CompletionItem> {
+    ranked_matches(
+        COMMANDS
+            .iter()
+            .map(|(name, desc)| (name.split([' ', '<']).next().unwrap_or(name), *desc)),
+        prefix,
+        None,
+    )
+}
+
+/// Filter `(label, detail)` candidates to those fuzzy-matching `query`, tag the
+/// `current` value's detail with `(current)`, and sort by descending score with
+/// the original pool order breaking ties (so equal-quality matches keep the
+/// catalog/help sequence rather than jittering).
+fn ranked_matches<'a, I>(pool: I, query: &str, current: Option<&str>) -> Vec<CompletionItem>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let mut scored: Vec<(i64, usize, CompletionItem)> = pool
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, (label, detail))| {
+            fuzzy_score(label, query).map(|score| {
+                let detail = if current == Some(label) {
+                    if detail.is_empty() {
+                        "(current)".to_string()
+                    } else {
+                        format!("{detail} · (current)")
+                    }
+                } else {
+                    detail.to_string()
+                };
+                (score, index, CompletionItem::new(label, detail))
+            })
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, _, item)| item).collect()
+}
+
+/// Lightweight fuzzy score, case-insensitive: `None` when `query` is not a
+/// subsequence of `label`, otherwise a rank where an empty query matches every
+/// label at 0, a query anchored at the label's head beats one whose first hit
+/// sits deeper, and a longer contiguous run beats scattered letters. Pure so
+/// `complete` stays surface-agnostic; ties fall back to pool order in
+/// [`ranked_matches`], keeping the catalog/help sequence stable.
+fn fuzzy_score(label: &str, query: &str) -> Option<i64> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let label_chars: Vec<char> = label.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let mut search_from = 0usize;
+    let mut first_match: Option<usize> = None;
+    let mut longest_run = 0i64;
+    let mut run = 0i64;
+    let mut prev_idx: Option<usize> = None;
+    // Greedy left-to-right subsequence scan, recording where each query char
+    // lands so an anchored prefix and a contiguous run can be rewarded.
+    for query_char in query.chars().map(|c| c.to_ascii_lowercase()) {
+        let matched = (search_from..label_chars.len()).find(|&idx| label_chars[idx] == query_char)?;
+        search_from = matched + 1;
+        if first_match.is_none() {
+            first_match = Some(matched);
+        }
+        run = if prev_idx.is_some_and(|prev| prev + 1 == matched) {
+            run + 1
+        } else {
+            1
+        };
+        longest_run = longest_run.max(run);
+        prev_idx = Some(matched);
+    }
+    let mut score = 100 + longest_run * 10;
+    match first_match {
+        Some(0) => score += 100,
+        Some(position) => score -= i64::try_from(position).unwrap_or(0),
+        None => {}
+    }
+    Some(score)
+}
+
+/// The `[start, end)` candidate slice to render so `selected` stays visible
+/// within `visible` rows, scrolling only when it would leave the window.
+#[must_use]
+fn menu_window(total: usize, visible: usize, selected: usize) -> (usize, usize) {
+    if total == 0 || visible == 0 {
+        return (0, 0);
+    }
+    let visible = visible.min(total);
+    let mut start = 0;
+    if selected >= visible {
+        start = selected - visible + 1;
+    }
+    if start + visible > total {
+        start = total - visible;
+    }
+    (start, start + visible)
 }
 
 /// The scrollback lines a submitted input leaves behind: the first line is
@@ -334,18 +550,19 @@ impl ReplEditor {
 
     /// Read one REPL line. `Ok(None)` means quit (Ctrl+D on an empty line);
     /// Ctrl+C clears the line rather than exiting. Non-TTY stdin (pipes, tests)
-    /// falls back to plain line reads so scripted input keeps working.
-    pub fn read_line(&mut self) -> io::Result<Option<String>> {
+    /// falls back to plain line reads so scripted input keeps working. `ctx`
+    /// supplies this turn's argument-completion universe (models/modes/sessions).
+    pub fn read_line(&mut self, ctx: &CompletionContext) -> io::Result<Option<String>> {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return read_line_fallback();
         }
-        match self.read_line_tui()? {
+        match self.read_line_tui(ctx)? {
             Exit::Submit(text) => Ok(Some(text)),
             Exit::Quit => Ok(None),
         }
     }
 
-    fn read_line_tui(&mut self) -> io::Result<Exit> {
+    fn read_line_tui(&mut self, ctx: &CompletionContext) -> io::Result<Exit> {
         enable_raw_mode()?;
         // Bracketed paste makes the terminal hand over a pasted block as one
         // event, so an embedded newline stays a multi-line draft instead of
@@ -366,7 +583,7 @@ impl ReplEditor {
         let mut textarea = blank_textarea();
         let mut status: Option<String> = None;
         // Tab-cycling state: candidate list + which one is currently offered.
-        let mut completions: Vec<&'static str> = Vec::new();
+        let mut completions: Vec<CompletionItem> = Vec::new();
         let mut completion_idx: Option<usize> = None;
         let mut exit = Exit::Quit;
 
@@ -377,6 +594,7 @@ impl ReplEditor {
             &mut completions,
             &mut completion_idx,
             &mut exit,
+            ctx,
         );
 
         // Teardown: erase the viewport, restore cooked mode, then hand the
@@ -407,25 +625,27 @@ impl ReplEditor {
         terminal: &mut CompanionTerminal<CrosstermBackend<io::Stdout>>,
         textarea: &mut TextArea<'static>,
         status: &mut Option<String>,
-        completions: &mut Vec<&'static str>,
+        completions: &mut Vec<CompletionItem>,
         completion_idx: &mut Option<usize>,
         exit: &mut Exit,
+        ctx: &CompletionContext,
     ) -> io::Result<()> {
         loop {
             let text = textarea.lines().join("\n");
-            let prefix = current_token_prefix(&text);
             let hint = build_hint(
-                prefix.as_deref(),
+                &text,
+                ctx,
                 completions,
                 completion_idx,
                 status.take().as_deref(),
             );
 
             // The dropdown lives in rows below the fixed input+hint viewport; only
-            // the slash path grows the height, so ordinary typing keeps it at 2 and
-            // behaves exactly like the old stable inline viewport.
-            let menu_rows = if prefix.is_some() {
-                completions.len()
+            // a completable position grows the height (capped at MAX_COMPLETIONS,
+            // scrolling past that), so ordinary typing keeps the stable 2 rows and
+            // behaves exactly like the old inline viewport.
+            let menu_rows = if completion_site(&text).is_some() {
+                completions.len().min(MAX_COMPLETIONS)
             } else {
                 0
             };
@@ -480,7 +700,7 @@ impl ReplEditor {
         &mut self,
         key: crossterm::event::KeyEvent,
         textarea: &mut TextArea<'static>,
-        completions: &mut Vec<&'static str>,
+        completions: &mut Vec<CompletionItem>,
         completion_idx: &mut Option<usize>,
         status: &mut Option<String>,
         exit: &mut Exit,
@@ -528,26 +748,26 @@ impl ReplEditor {
                     {
                         textarea.insert_newline();
                         false
-                    } else if menu_accept_on_enter(
-                        completions,
-                        *completion_idx,
-                        &textarea.lines().join("\n"),
-                    )
-                    .is_some()
-                    {
-                        // A dropdown row is highlighted and differs from what is
-                        // typed: Enter completes it rather than sending a partial.
-                        complete_menu(textarea, completions, completion_idx);
-                        false
                     } else {
-                        *exit = Exit::Submit(textarea.lines().join("\n"));
-                        true
+                        let text = textarea.lines().join("\n");
+                        if menu_accept_on_enter(completions, *completion_idx, &text).is_some() {
+                            // A dropdown row is highlighted and differs from what
+                            // is typed: Enter completes it rather than sending a
+                            // partial line.
+                            complete_menu(textarea, completions, completion_idx, &text);
+                            false
+                        } else {
+                            *exit = Exit::Submit(text);
+                            true
+                        }
                     }
                 }
                 KeyCode::Tab => {
-                    if let Some(candidate) = accept_completion(completions, completion_idx) {
-                        *textarea = blank_textarea();
-                        textarea.insert_str(format!("{candidate} "));
+                    let text = textarea.lines().join("\n");
+                    if let Some(site) = completion_site(&text) {
+                        if let Some(item) = accept_completion(completions, completion_idx) {
+                            apply_completion(textarea, &item, site);
+                        }
                     }
                     false
                 }
@@ -609,7 +829,7 @@ fn draw_frame(
     textarea: &TextArea<'static>,
     hint: &str,
     mascot: &Mascot,
-    completions: &[&'static str],
+    completions: &[CompletionItem],
     completion_idx: Option<usize>,
 ) -> Option<Position> {
     let theme = Theme::current();
@@ -682,25 +902,36 @@ fn draw_frame(
     Some(Position::new(x, size.y))
 }
 
-/// Draw the slash command dropdown: one row per candidate, the selected row
-/// marked and accented, each command's description in muted text. The rows are
-/// reserved by [`ReplEditor::edit_loop`] via the viewport height, so this only
-/// paints while the list is actually shown.
+/// Draw the completion dropdown as an aligned two-column table (label + muted
+/// detail), one row per visible candidate. The selected row is marked with `>`
+/// and accented. When candidates outnumber rows the window scrolls to keep the
+/// selection visible (see [`menu_window`]). The rows are reserved by
+/// [`ReplEditor::edit_loop`] via the viewport height, so this only paints while
+/// the list is actually shown.
 fn render_menu(
     buf: &mut Buffer,
     size: Rect,
-    completions: &[&'static str],
+    completions: &[CompletionItem],
     completion_idx: Option<usize>,
     theme: &Theme,
 ) {
     let menu_top = size.y + VIEWPORT_ROWS;
-    let name_col = completions
+    let avail = size.height.saturating_sub(VIEWPORT_ROWS);
+    if avail == 0 || completions.is_empty() {
+        return;
+    }
+    let selected = completion_idx.unwrap_or(0);
+    let (start, end) = menu_window(completions.len(), usize::from(avail), selected);
+    let window = &completions[start..end];
+    // Measure the label column across the whole list, not just the window, so
+    // the detail column does not jitter as the selection scrolls.
+    let label_col = completions
         .iter()
-        .map(|name| name.chars().count())
+        .map(|item| item.label.chars().count())
         .max()
         .unwrap_or(0)
         .saturating_add(2);
-    for (i, name) in completions.iter().enumerate() {
+    for (i, item) in window.iter().enumerate() {
         let Some(row_y) = menu_top.checked_add(u16::try_from(i).unwrap_or(u16::MAX)) else {
             break;
         };
@@ -708,21 +939,21 @@ fn render_menu(
             break; // viewport was clamped to the screen; drop overflow rows
         }
         let row = Rect::new(size.x, row_y, size.width, 1);
-        let is_sel = completion_idx == Some(i);
-        let name_style = if is_sel {
+        let is_sel = completion_idx == Some(start + i);
+        let label_style = if is_sel {
             Style::default()
                 .fg(theme.accent().ratatui())
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Reset)
         };
-        let pad = name_col.saturating_sub(name.chars().count());
+        let pad = label_col.saturating_sub(item.label.chars().count());
         let line = Line::from(vec![
-            Span::styled(if is_sel { "> " } else { "  " }, name_style),
-            Span::styled((*name).to_string(), name_style),
+            Span::styled(if is_sel { "> " } else { "  " }, label_style),
+            Span::styled(item.label.clone(), label_style),
             Span::styled(" ".repeat(pad), Style::default()),
             Span::styled(
-                command_desc(name).to_string(),
+                item.detail.clone(),
                 Style::default().fg(theme.muted().ratatui()),
             ),
         ]);
@@ -730,105 +961,122 @@ fn render_menu(
     }
 }
 
-/// The slash token typed so far, but only while it is a bare leading command
-/// being completed (no argument begun). `None` otherwise.
-fn current_token_prefix(text: &str) -> Option<String> {
-    if !text.starts_with('/') || text.contains(char::is_whitespace) {
-        return None;
-    }
-    Some(text.to_string())
-}
-
-/// Build the hint row: a transient status message wins, then slash completion
-/// feedback, else the idle key legend. Also refreshes the Tab-candidate set.
+/// Build the hint row: a transient status message wins, then completion feedback
+/// for the current site, else the idle key legend. Also refreshes the candidate
+/// set from [`complete`], preserving the highlight across a redraw so ↑/↓/Tab
+/// cycling stays stable.
 fn build_hint(
-    prefix: Option<&str>,
-    completions: &mut Vec<&'static str>,
+    text: &str,
+    ctx: &CompletionContext,
+    completions: &mut Vec<CompletionItem>,
     completion_idx: &mut Option<usize>,
     status: Option<&str>,
 ) -> String {
     if let Some(status) = status {
         return status.to_string();
     }
-    if let Some(prefix) = prefix {
-        // Recompute candidates only when the prefix stops matching the
-        // current set, so repeated keystrokes stay stable.
-        let still_valid = completions
-            .first()
-            .is_some_and(|first| first.starts_with(prefix));
-        if !still_valid {
-            *completions = completion_candidates(prefix);
-            completions.truncate(MAX_COMPLETIONS);
-            *completion_idx = None;
-        }
-        if completions.is_empty() {
-            return format!("no command matches {prefix}");
-        }
-        let shown = completion_idx
-            .and_then(|idx| completions.get(idx).copied())
-            .unwrap_or_else(|| completions.first().copied().unwrap_or(prefix));
-        let count = completions.len();
-        let pos = completion_idx.map_or(1, |idx| idx + 1);
-        format!("{shown}  ({pos}/{count}) · Tab completes")
-    } else {
-        // Leaving the slash prefix closes the menu: drop stale candidates so
-        // the viewport height and dropdown rows follow the current input.
+    let Some(site) = completion_site(text) else {
+        // Leaving a completable position closes the menu: drop stale candidates
+        // so the viewport height and dropdown rows follow the current input.
         completions.clear();
         *completion_idx = None;
-        String::from(
+        return String::from(
             "Enter send · Alt+Enter newline · / commands · ↑/↓ select · Tab complete · Ctrl+D quit",
-        )
+        );
+    };
+    // Recompute only when the candidate set actually changed, so cycling the
+    // highlight survives a redraw without snapping back to the top.
+    let fresh = complete(text, ctx);
+    if !same_labels(completions, &fresh) {
+        *completions = fresh;
+        *completion_idx = None;
     }
+    if completions.is_empty() {
+        return format!("no {} matches {}", site.noun(), site.typed());
+    }
+    let shown = completion_idx
+        .and_then(|idx| completions.get(idx))
+        .or_else(|| completions.first())
+        .map_or_else(|| site.typed().to_string(), |item| item.label.clone());
+    let count = completions.len();
+    let pos = completion_idx.map_or(1, |idx| idx + 1);
+    format!("{shown}  ({pos}/{count}) · Tab completes")
 }
 
-/// Complete the highlighted dropdown row into the buffer and close the menu
-/// (Enter while a row is actively selected).
+/// Whether two candidate lists offer the same labels in the same order (the
+/// detail column may differ without invalidating the highlight).
+fn same_labels(a: &[CompletionItem], b: &[CompletionItem]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(left, right)| left.label == right.label)
+}
+
+/// Complete the highlighted dropdown row into the buffer (Enter while a row is
+/// actively selected), leaving the menu open so the next frame recomputes it for
+/// the now-longer input (e.g. `/mod` → `/model ` → the model list).
 fn complete_menu(
     textarea: &mut TextArea<'static>,
-    completions: &mut Vec<&'static str>,
+    completions: &[CompletionItem],
     completion_idx: &mut Option<usize>,
+    text: &str,
 ) {
-    if let Some(candidate) = accept_completion(completions, completion_idx) {
-        *textarea = blank_textarea();
-        textarea.insert_str(format!("{candidate} "));
+    if let Some(idx) = completion_idx.take() {
+        if let (Some(item), Some(site)) = (completions.get(idx), completion_site(text)) {
+            apply_completion(textarea, item, site);
+        }
     }
-    completions.clear();
     *completion_idx = None;
 }
 
+/// Rewrite the buffer for a chosen candidate: a command head becomes
+/// `"<label> "` (the trailing space opens its argument menu); an argument
+/// replaces only the partial arg, keeping the command (`/model de` → the id).
+fn apply_completion(
+    textarea: &mut TextArea<'static>,
+    item: &CompletionItem,
+    site: CompletionSite<'_>,
+) {
+    let text = match site {
+        CompletionSite::Command { .. } => format!("{} ", item.label),
+        CompletionSite::Argument { command, .. } => format!("{command} {}", item.label),
+    };
+    *textarea = blank_textarea();
+    textarea.insert_str(text);
+}
+
 /// Whether Enter should complete a highlighted dropdown row instead of
-/// submitting: only when the menu is up, a row is actively highlighted (via
-/// Up/Down/Tab), and that candidate is not already the whole typed token. A
-/// `None` return means Enter submits the line exactly as typed.
+/// submitting: only when a completable site is active, a row is highlighted (via
+/// ↑/↓/Tab), and that candidate is not already the whole typed token. `None`
+/// means Enter submits the line exactly as typed; otherwise the row to complete.
 #[must_use]
 fn menu_accept_on_enter(
-    completions: &[&'static str],
+    completions: &[CompletionItem],
     completion_idx: Option<usize>,
     text: &str,
-) -> Option<&'static str> {
-    if !text.starts_with('/') || text.contains(char::is_whitespace) {
-        return None;
-    }
-    let candidate = completion_idx.and_then(|i| completions.get(i).copied())?;
-    (candidate != text).then_some(candidate)
+) -> Option<usize> {
+    let site = completion_site(text)?;
+    let idx = completion_idx?;
+    let item = completions.get(idx)?;
+    (item.label != site.typed()).then_some(idx)
 }
 
 /// Take the currently offered completion and advance the cycle to the next one.
 fn accept_completion(
-    completions: &[&'static str],
+    completions: &[CompletionItem],
     completion_idx: &mut Option<usize>,
-) -> Option<&'static str> {
+) -> Option<CompletionItem> {
     if completions.is_empty() {
         return None;
     }
-    let idx = completion_idx.get_or_insert(0);
-    let chosen = completions.get(*idx).copied();
+    let idx = *completion_idx.get_or_insert(0);
+    let chosen = completions.get(idx).cloned();
     cycle_completion(completions, completion_idx, false);
     chosen
 }
 
 fn cycle_completion(
-    completions: &[&'static str],
+    completions: &[CompletionItem],
     completion_idx: &mut Option<usize>,
     backward: bool,
 ) {
@@ -894,42 +1142,113 @@ fn read_line_fallback() -> io::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_desc, completion_candidates, decode_history, echo_lines, encode_history_line,
-        menu_accept_on_enter, suggest_command, History,
+        complete, decode_history, echo_lines, encode_history_line, menu_accept_on_enter,
+        menu_window, suggest_command, CompletionContext, CompletionItem, History,
     };
+
+    /// A context with a few models, the three modes, and two sessions, so the
+    /// argument-position tests exercise every pool.
+    fn ctx() -> CompletionContext {
+        CompletionContext {
+            models: vec![
+                CompletionItem::new("deepseek-v4-flash", "1M ctx · seed"),
+                CompletionItem::new("deepseek-v4-pro", "1M ctx · seed"),
+                CompletionItem::new("kimi-k3", "seed"),
+            ],
+            modes: vec![
+                CompletionItem::new("read-only", ""),
+                CompletionItem::new("workspace-write", ""),
+                CompletionItem::new("full", ""),
+            ],
+            sessions: vec![
+                CompletionItem::new("1", "a.json"),
+                CompletionItem::new("2", "b.json"),
+            ],
+            current_model: Some("deepseek-v4-flash".to_string()),
+            current_mode: Some("workspace-write".to_string()),
+        }
+    }
+
+    fn labels(items: &[CompletionItem]) -> Vec<&str> {
+        items.iter().map(|item| item.label.as_str()).collect()
+    }
+
+    #[test]
+    fn command_position_completes_heads_with_details() {
+        let cands = complete("/comp", &ctx());
+        assert_eq!(labels(&cands), vec!["/compact"]);
+        assert_eq!(cands[0].detail, "Compact session history");
+        // A bare `/` lists every command; the head is what completes.
+        assert!(complete("/", &ctx()).len() > 5);
+        assert!(labels(&complete("/model", &ctx())).contains(&"/model"));
+    }
+
+    #[test]
+    fn argument_position_completes_the_right_pool() {
+        // `/model ` (trailing space) opens the model list, unfiltered.
+        assert_eq!(
+            labels(&complete("/model ", &ctx())),
+            vec!["deepseek-v4-flash", "deepseek-v4-pro", "kimi-k3"]
+        );
+        // A partial arg narrows it; matching is case-insensitive.
+        assert_eq!(
+            labels(&complete("/model DEEP", &ctx())),
+            vec!["deepseek-v4-flash", "deepseek-v4-pro"]
+        );
+        assert_eq!(labels(&complete("/mode ", &ctx())).len(), 3);
+        assert_eq!(labels(&complete("/open ", &ctx())), vec!["1", "2"]);
+        // The detail column carries the model's context/provenance.
+        assert_eq!(complete("/model kimi", &ctx())[0].detail, "seed");
+    }
+
+    #[test]
+    fn completion_stops_where_there_is_nothing_to_offer() {
+        // No pool for `/search`; a second argument is free text; non-slash is a turn.
+        assert!(complete("/search foo", &ctx()).is_empty());
+        assert!(complete("/model a b", &ctx()).is_empty());
+        assert!(complete("hello", &ctx()).is_empty());
+        assert!(complete("/model zzz", &ctx()).is_empty());
+        // A command with no matching head.
+        assert!(complete("/zzz", &ctx()).is_empty());
+    }
 
     #[test]
     fn enter_completes_only_an_active_highlight() {
-        let cands = completion_candidates("/comp");
-        assert_eq!(cands, vec!["/compact"]);
+        let cands = complete("/comp", &ctx());
         // No row highlighted yet: Enter submits the partial rather than completing.
         assert_eq!(menu_accept_on_enter(&cands, None, "/comp"), None);
         // A highlighted row that differs from the token: Enter completes it.
-        assert_eq!(
-            menu_accept_on_enter(&cands, Some(0), "/comp"),
-            Some("/compact")
-        );
+        assert_eq!(menu_accept_on_enter(&cands, Some(0), "/comp"), Some(0));
         // The exact command already typed: Enter submits (nothing to complete).
-        let exact = completion_candidates("/compact");
+        let exact = complete("/compact", &ctx());
         assert_eq!(menu_accept_on_enter(&exact, Some(0), "/compact"), None);
-        // Once an argument has begun the menu is closed, so Enter submits.
-        assert_eq!(menu_accept_on_enter(&cands, Some(0), "/comp x"), None);
+        // Argument position: a highlighted model differing from the arg completes.
+        let models = complete("/model deep", &ctx());
+        assert_eq!(
+            menu_accept_on_enter(&models, Some(1), "/model deep"),
+            Some(1)
+        );
+        // Once the arg equals the highlighted label, Enter submits.
+        let one = complete("/model deepseek-v4-pro", &ctx());
+        assert_eq!(
+            menu_accept_on_enter(&one, Some(0), "/model deepseek-v4-pro"),
+            None
+        );
     }
 
     #[test]
-    fn command_desc_resolves_heads_only() {
-        assert_eq!(command_desc("/compact"), "Compact session history");
-        assert_eq!(command_desc("/nope"), "");
-    }
-
-    #[test]
-    fn completions_match_prefix_and_ignore_args() {
-        assert!(completion_candidates("/comp").contains(&"/compact"));
-        assert!(completion_candidates("/que").contains(&"/queue"));
-        assert!(completion_candidates("/sessions").contains(&"/sessions"));
-        // Once an argument has begun, command completion stops.
-        assert!(completion_candidates("/model gpt").is_empty());
-        assert!(completion_candidates("hello").is_empty());
+    fn menu_window_scrolls_to_follow_the_selection() {
+        // Fewer candidates than rows: show them all from the top.
+        assert_eq!(menu_window(3, 8, 0), (0, 3));
+        // Selection inside the first window: no scroll.
+        assert_eq!(menu_window(20, 8, 7), (0, 8));
+        // Selection just past the window: scroll one.
+        assert_eq!(menu_window(20, 8, 8), (1, 9));
+        // Selection near the end: clamp so the last row stays visible.
+        assert_eq!(menu_window(20, 8, 19), (12, 20));
+        // Degenerate inputs.
+        assert_eq!(menu_window(0, 8, 0), (0, 0));
+        assert_eq!(menu_window(20, 0, 5), (0, 0));
     }
 
     #[test]
@@ -937,6 +1256,66 @@ mod tests {
         assert_eq!(suggest_command("/compct"), Some("/compact"));
         assert_eq!(suggest_command("/m"), None, "too short to judge");
         assert_eq!(suggest_command("just text"), None);
+    }
+
+    #[test]
+    fn plan_and_queue_arguments_complete_their_actions() {
+        // A bare `/plan ` lists its three fixed verbs in declared order.
+        assert_eq!(
+            labels(&complete("/plan ", &ctx())),
+            vec!["approve", "end", "status"]
+        );
+        assert_eq!(labels(&complete("/plan app", &ctx())), vec!["approve"]);
+        assert_eq!(labels(&complete("/queue ", &ctx())), vec!["pop", "clear"]);
+        assert_eq!(labels(&complete("/queue c", &ctx())), vec!["clear"]);
+        // A non-matching action query offers nothing.
+        assert!(complete("/plan zzz", &ctx()).is_empty());
+    }
+
+    #[test]
+    fn fuzzy_matching_reaches_non_prefix_letters() {
+        // "pn" is a subsequence of /plan and /pin, neither anchored past `/`.
+        let cands = complete("/pn", &ctx());
+        let heads = labels(&cands);
+        assert!(heads.contains(&"/plan"), "fuzzy should reach /plan: {heads:?}");
+        // A scattered model query still resolves to the deepseek ids.
+        assert!(labels(&complete("/model dsk", &ctx())).contains(&"deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn current_model_and_mode_are_marked() {
+        let models = complete("/model ", &ctx());
+        let flash = models
+            .iter()
+            .find(|item| item.label == "deepseek-v4-flash")
+            .expect("flash present");
+        assert!(
+            flash.detail.contains("(current)"),
+            "active model must be tagged: {}",
+            flash.detail
+        );
+        let pro = models
+            .iter()
+            .find(|item| item.label == "deepseek-v4-pro")
+            .expect("pro present");
+        assert!(!pro.detail.contains("(current)"));
+        // An empty-detail mode still reads clearly when it is the active one.
+        let modes = complete("/mode ", &ctx());
+        let active = modes
+            .iter()
+            .find(|item| item.label == "workspace-write")
+            .expect("mode present");
+        assert_eq!(active.detail, "(current)");
+    }
+
+    #[test]
+    fn open_and_remember_join_command_completion() {
+        let cands = complete("/", &ctx());
+        let all = labels(&cands);
+        assert!(all.contains(&"/open"), "missing /open: {all:?}");
+        assert!(all.contains(&"/remember"), "missing /remember: {all:?}");
+        // /remember takes free text, so it never offers an argument pool.
+        assert!(complete("/remember buy milk", &ctx()).is_empty());
     }
 
     #[test]

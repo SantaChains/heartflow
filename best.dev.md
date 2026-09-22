@@ -1,21 +1,28 @@
-# best.dev.md — 从 jcode 借鉴什么、以及不该借鉴什么
+# best.dev.md — 外部项目借鉴清单（jcode / rig / ADK-Rust / Pica / Morphz）
 
-> 对象：`archive/jcode`（v0.86.0，101 个 workspace crate，Rust 终端 AI agent，单 server 多 client 架构）。
+> 对象（第一批）：`archive/jcode`（v0.86.0，101 个 workspace crate，Rust 终端 AI agent，单 server 多 client 架构）。
 > 受益方：heartflow（8 crate，35,139 行生产代码 / 60 个文件，无 daemon，SQLite 存储，REPL + 可选 TUI）。
 > 方法：读源码与设计文档，**每条结论都指到 `文件:行号`**；无法证实的一律标注为「待验证前提」。
 > 诚实边界：jcode 体量约为本项目的 3–5 倍，且自带 server/daemon/swarm/遥测产品面。**它的多数模块对本项目不适用**——本文只收窄到「机制可移植」的部分，不搬运产品面。
+> 对象（第二批）：`rig.rs`（= `0xPlaygrounds/rig`）／`zavora-ai/adk-rust`／`picahq/pica`／`morphz-ai/morphz`。同一判据，见「第二批来源」一节的 **D/E/F/G** 档。
 
 ---
 
-## 0. 导读：这份文档的三个分档
+## 0. 导读：两批来源、七档分档
 
-| 档 | 含义 | 处置 |
-|---|---|---|
-| **A** | 机制可移植、与 heartflow 现有约束兼容 | 建议进 `list.md`，按顺序落地 |
-| **B** | jcode 有，但 heartflow **已有等价物** | 明确不再投入（防重复劳动） |
-| **C** | 依赖 jcode 的 server/daemon/云/体量，**不该抄** | 记录理由，避免日后反复讨论 |
+**第一批 = jcode**（下节 A/B/C 三档）。**第二批 = rig / ADK-Rust / Pica / Morphz**（文末「第二批来源」D/E/F/G 四档）。两批**独立分档**，因为它们的来源与判据不同，混在一起会看不清哪些结论来自哪个项目。
 
-一条贯穿全文的判据：**jcode 真正值得抄的不是功能，而是「把一个模糊的工程问题变成可回归的数值」的方法**。它几乎所有高价值机制都遵循同一形状——*先定义度量，再设棘轮，最后才动代码*。
+| 档 | 来源 | 含义 | 处置 |
+|---|---|---|---|
+| **A** | jcode | 机制可移植、与 heartflow 现有约束兼容 | 建议进 `list.md`，按顺序落地 |
+| **B** | jcode | jcode 有，但 heartflow **已有等价物** | 明确不再投入（防重复劳动） |
+| **C** | jcode | 依赖 jcode 的 server/daemon/云/体量，**不该抄** | 记录理由，避免日后反复讨论 |
+| **D** | 第二批 | 真缺、且成本可控 | 建议按文末顺序落地 |
+| **E** | 第二批 | heartflow **已有等价物** | 明确不再投入 |
+| **F** | 第二批 | 规模/范式不匹配，**不该抄** | 记录理由 |
+| **G** | 第二批 | 工程纪律（许可、依赖审计） | 与代码解耦，可独立决定 |
+
+一条贯穿全文的判据：**真正值得抄的不是功能，而是「把一个模糊的工程问题变成可回归的数值」的方法**。jcode 几乎所有高价值机制都遵循同一形状——*先定义度量，再设棘轮，最后才动代码*。第二批沿用同一判据：**先核实本项目现状，再判断缺什么**（本轮据此推翻了我自己的一条先入之见，见 D 档前的「先纠正一条先入之见」）。
 
 ---
 
@@ -335,6 +342,83 @@ jcode 的 `jcode-schema-dialect` 是三段式：**allow-list 校验 → 单一�
 
 ---
 
+## 第二批来源：rig / ADK-Rust / Pica / Morphz
+
+> 判据与第一批相同：**先核实 heartflow 现状，再判断缺什么**。本节所有「heartflow 实测」句均可复现（命令附在证据索引）。
+> 一句话总览：**四个来源里，rig 与 Morphz 各给出一条真缺口（D1 回放、D2 命名诚实性），ADK-Rust 给出两条（D3 特性分层、D4 评估层），Pica 可借鉴项最少。**
+
+### D 档前的更正：一条先入之见被实测推翻
+
+调研前我预期「heartflow 没有 provider 级 mock，所以该抄 rig 的 `MockCompletionModel`」。**实测推翻了它**，如实记录，避免日后照着错误前提重复讨论：
+
+| 我原本以为 | 实测 |
+|---|---|
+| 没有 mock | `crates/runtime/src/conversation.rs` 测试模块里有 **15 个 `impl ApiClient`**（`ScriptedApiClient:1200`、`SingleCallApiClient:1341`、`TruncatedApiClient:1533`、`StreamingApiClient:1564`、`OneToolClient:1663`、`EagerClient:1900`、`TwoStepClient:1951`、`ToolBatchClient:2224` …）与 **5 个 `impl ToolExecutor`**（`StaticToolExecutor:1073`、`SpecExecutor:1596`、`SchemaExecutor:1640`、`PlanExecutor:1750`、`ProbeExecutor:2199`） |
+| 测试靠真网 | `crates/api/tests/client_integration.rs`（445 行）**自建 `TcpListener` 假服务器**，捕获请求体 + 回放固定 SSE/JSON——保真度高于 trait 级 mock（连 reqwest 与 SSE 解析一起测） |
+| 无法端到端 | `crates/cli/tests/e2e.rs`（156 行）用 `Command` **拉起真实 `hf` 二进制**，驱 `hf --resume <file> --run <slash>` 的离线路径（该路径"never touches a provider"） |
+| 压缩无法量测 | `crates/runtime/tests/calibration_measurement.rs` 是 `#[ignore]` 的人工仪器，**且已有记录基线**：2026-09-21，28 会话 / 451 轮，原始启发式误差中位 **62.4%**／偏差 **−57.5%**；校准后 **8.9%**／**−1.5%**；learned density ≈**2.23**、固定开销 ≈**11.6k** tokens |
+
+**命名坑（我踩了）：本项目测试替身叫 `ScriptedApiClient` / `SimpleApi` / `*Client`，不叫 `Mock*`。** 用 `grep -i mock` 会得到零结果并误判为「没有 mock」。教训与 A1 的口径教训同型：**先确认命名约定，再下结论**。
+
+### D 档：真缺、且成本可控
+
+#### D1 · 效果日志与回放（rig `EffectLog` / `rig-cassette`）★ 最高性价比
+
+- rig 把全部副作用建模为可序列化效果，经 `EffectLog` 记录，`LogHeader{format, run_spec, handlers, signature}` 让**整轮运行可重放**，重放时校验签名族匹配。
+- heartflow 的缺口很**精确**：`conversation.rs` 的脚本化 client 是**进程内**的——只能断言「给定这个脚本，循环这么做」；**无法把一次真实回合（真实 provider 流）录下来再离线重放**。这正是「只有真机冒烟能验」的根因。
+- **接缝已经现成**：`crates/runtime/src/conversation.rs:110` 的 `pub trait ApiClient: Send { fn stream(&mut self, request: ApiRequest) -> Result<TurnStream, RuntimeError>; }` 是整条链路的**唯一咽喉**。一个装饰器式 `RecordingApiClient`（录）＋ `ReplayApiClient`（放）即可覆盖，**不碰循环本体**。
+- 与 A5（隔离影子环境）、A4（同机差分）互补：A5 管「在哪跑」，D1 管「跑完能不能重复跑」。
+- **待验证前提**：`TurnStream` 能否在 `runtime` crate 外构造。若不能，录制层要么放进 `runtime` 内部，要么加 `#[doc(hidden)]` 构造器——**先验证这一点再动手**。
+
+#### D2 · `dangerously_disable_sandbox` 命名过度承诺（Morphz 的真沙箱作对照）★ 置信度最高、成本最低
+
+- Morphz 有**真**沙箱：macOS/Linux/Windows 各有原生实现；Linux 的 `workspace-write` 依赖 Bubblewrap + 非特权 user namespace；Windows 安全声明依赖 helper bundle；**安装器还会在下载前把这一边界报告给用户**。
+- heartflow 实测：**全树不存在任何 OS 级隔离**——`seccomp` / `seatbelt` / `bubblewrap` / `namespaces` / `CreateRestrictedToken` 零命中。`crates/runtime/src/bash.rs:132-134` 的 `if !input.dangerously_disable_sandbox.unwrap_or(false) { scrub_credential_env(&mut spawn); }` 里，该开关的**唯一作用**是跳过 `scrub_credential_env`（`:383-389`，仅移除名字命中凭据规则的环境变量）。
+- 所以这是**过度承诺的公开参数**：名字读作「关掉 OS 沙箱」，实际是「让子进程继承凭据环境」。两条路选一条：①**改名为 `dangerously_inherit_credentials`**（诚实、零风险、纯重命名）；②真做隔离（大工程，Windows 上无低成本方案）。
+- 建议先做 ①——与 `list.md` 里「斜杠派发不盲改」同一取向：**先让名字说真话，再讨论要不要真做。**
+
+#### D3 · 特性分层（ADK-Rust 的 feature tier）
+
+- ADK-Rust 用 Cargo feature 把编译面切四层（默认 `minimal` = 仅 Gemini + Agent + Session）。
+- heartflow 实测：**全仓零个 `[features]` 段**（`^\[features\]` 仅命中 `archive/jcode`）。每个构建都要吃下 `store` 的 `rusqlite bundled`（含 C 代码）、`cli` 的 `syntect 5`、`runtime` 的 `simd-json 0.18`、`tools/web` 的 `reqwest blocking`。
+- 收益是**构建时间与依赖面**，不是正确性。代价要认：`AGENTS.md` 规定改公共契约须同步 README/`docs`/`llms.txt`/`bucket/heartflow.json`，feature 矩阵属于公共契约的一部分，**引入即新增一条同步义务**。建议**只切一刀**（`mcp` 与 `tools/web` 可关），不做四层。
+
+#### D4 · 轨道评估层（ADK-Rust `adk-eval`）
+
+- ADK 的 eval 提供：**轨迹评估**（工具调用序列 精确 / 子集 / 顺序无关 三种匹配）、文本相似度（Jaccard/Levenshtein/ROUGE）、LLM-as-judge、rubric 加权评分。
+- heartflow 的脚本化 client 已能断言「循环行为」，但缺**对真实运行的打分**：例如「这一轮的工具调用序列是否是该任务的合理序列」「压缩后是否丢了关键事实」。
+- 与 D1 是同一件事的两半：**D1 提供可重放的输入，D4 提供判据**。故 **D1 先行、D4 后置**——没有可重放输入的打分器只能测人工脚本，价值有限。
+- 可沿用既有形态：`calibration_measurement.rs` 已经示范了「`#[ignore]` 人工仪器 + 记录基线 + 写明怎么跑」这一套。
+
+### E 档：heartflow 已有等价物（勿重复投入）
+
+| 借鉴点 | 来源 | heartflow 等价物（已核实） |
+|---|---|---|
+| 工具白名单 / 按 agent 限权 | Pica `availableTools`、ADK RBAC | `crates/cli/src/permissions.rs:38-85` 的 `PermissionPolicy`：逐工具 `Allow`/`Prompt`/`Deny` + `with_prompt_gate`（`plan` 模式挂 `BlockPrompter` 硬闸）；`read-only`/`plan` 两模式额外并入 MCP 只读工具名（`:79-84`）。**比 Pica 的静态白名单更细**（多一个 `Prompt` 中间态） |
+| 系统提示由工具目录生成 | Pica `generateSystemPrompt()` | `crates/runtime/src/prompt.rs` 负责组装；`-- system-prompt` 子命令可直接打印（见 `AGENTS.md` 冒烟清单） |
+| 脚本化模型 | rig `MockCompletionModel.script()` | 15 个 `impl ApiClient`（见上表） |
+| 人机协同中断 / 恢复 | rig `OutcomeSink::detach()`、ADK HITL checkpointer | 已有三个 trait：`PermissionPrompter`（`runtime/src/permissions.rs:24`）、`UserQuestioner`（`cli/src/interact.rs:91`）、`EscalationHandler`（`cli/src/plan.rs:124`） |
+| 无头 UI 测试 | （两者均无） | heartflow 领先：`TestBackend`（`cli/src/tui.rs:2863,2957`、`viewport_term.rs:251+`） |
+| 结构化上下文替代 transcript | Morphz cognitive Frame | `runtime/src/compact.rs` 的压缩模型（取径不同，见 F 档） |
+
+### F 档：不该抄（附理由）
+
+- **rig 的 effect-bus**（单通道 + `Handle<F>` 类型化视图 + `Bus::reopen`）。它是**规模驱动**的答案——rig 要面对 Bevy/ECS/WASM 与多运行时托管。heartflow 是单进程 CLI、8 个 crate。引入总线等于把**编译期可查的调用关系**换成**运行期 handler 查表**，与 A6「把编译期失效边界当度量」的既定取向**正好相反**。理由同 `list.md` 对斜杠派发的处置：**爆炸半径与收益不成比例**。
+- **ADK-Rust 的 39-crate 分层 + `GraphAgent`/`PregelExecutor`（BSP 并行 + checkpoint）**。heartflow 是单 agent 交互式终端，不是 DAG 编排引擎。其中**唯一值得留意的是 checkpoint 崩溃恢复**，但会话已落 SQLite、`--resume` 可用，收益撑不起一个执行器。
+- **Pica 的 OneTool（100+ 托管集成）+ AuthKit**。这是**托管服务的产品面**（Gmail/Slack/Salesforce 的 OAuth 由它代管），不是可移植架构；heartflow 无账号体系，其 MCP 已覆盖「接外部工具」。**此来源可借鉴项最少，如实记录。**
+- **Morphz 的 S-expression 认知机 / Yao 语言 / Mind Frame Exchange**。它主张「把结构化上下文而非不断增长的 transcript 作为模型直接评估的对象」，与 heartflow 的 transcript + 压缩是**范式级分歧**；且其自述为 Developer Preview（0.1），明确「不声称生产级多租户」。**读其 preprint，不照搬。**
+- **MCP Elicitation**（ADK-Rust 提到的协议能力）：heartflow 的 `mcp` crate 实现了 `initialize`/`tools/list`/`tools/call`；对 **server 发起的请求**只在 `ping` 时回空结果，其余一律以 `-32601 "method not supported by heartflow"` 拒绝（`mcp/src/client.rs:141-152`）——`sampling/createMessage` 因此被挡在门外，`elicit` 全树亦零命中。已有自研 `ask_user` 工具承担同类职责，暂不引入协议级 elicitation。
+
+### G 档：工程纪律（来自 Morphz 仓库布局，与刚做完的归属工作直接相关）
+
+- **许可分层的形状值得记一笔**：Morphz 是 `LICENSE` + **`LICENSE_SCOPE.md`**（明确哪部分适用哪个许可）+ `TRADEMARKS.md` + `PATENTS.md`，且中英各一份。
+- 对照 heartflow：只有 `LICENSE` + `NOTICE`（本轮刚补上 jcode 的 MIT 归属）。**当前无需扩建**；但若将来出现「vendored 第三方代码」或「分许可发布」（例如把某些 crate 单独再许可），`LICENSE_SCOPE` 这个形状是现成模板。
+- **另一条：依赖审计门**。Morphz 的 CI 审计每个已提交的 lockfile；heartflow 无 `deny.toml`、无 `.cargo/`、workflows 里无 `cargo-deny`/`cargo-audit`（仅 `release.yml`/`docs.yml`，`ci.yml.bak` 刻意停用）。考虑到依赖面含 `rusqlite bundled`（C 代码）、`syntect`、`reqwest`，**一个 advisory 门有价值——但前提是先决定 CI 是否恢复**，否则又是一个「只在提交前手动跑」的脚本。
+
+**第二批落地顺序**：**D2**（改名，零风险）→ **D1**（回放，先验证 `TurnStream` 构造可达性）→ **D3**（只切一刀 feature）→ **D4**（评估层，依赖 D1）。G 档两项彼此独立，可随时决定。
+
+---
+
 ## 落地顺序建议（按「先验前提、再谈改造」）
 
 结合 `list.md` 已确立的测试纪律（先测前提 → 确定性指标优先 → 报分位数 → 负结果同等记录）：
@@ -381,6 +465,15 @@ jcode 的 `jcode-schema-dialect` 是三段式：**allow-list 校验 → 单一�
 | 能力探测可注入 | `crates/jcode-tui-style/src/color.rs` | `:15-41` |
 | schema 方言 | `crates/jcode-schema-dialect/src/` | `lib.rs` 596 行、`quirks.rs` 243 行 |
 
+**第二批来源（本节 D/E/F/G 档的依据）**
+
+| 来源 | 出处 | 本轮取用的具体主张 |
+|---|---|---|
+| **rig** | `https://github.com/0xPlaygrounds/rig`（= `rig.rs`） | effect-bus（单通道 + `Handle<F>` 类型化视图 + `Bus::reopen`）；`EffectLog` / `LogHeader{format,run_spec,handlers,signature}` 可重放；`rig-cassette` 记录/回放；`const _: () = {…}` 编译期尺寸预算（`Dispatcher` 32B / `Pending` 64B）；`ContextValue{const KEY}` 声明式键；单点擦除守卫（只允许 `bus/handler.rs` 出现 `dyn Handler`）；`OutcomeSink::detach()` 外部应答；`MockCompletionModel.script()`；loom 并发模型检验；provider 别名由 rustdoc 生成（114 个） |
+| **ADK-Rust** | `https://github.com/zavora-ai/adk-rust`（v1.0.0，Apache-2.0，39 crate，17+ provider，130K+ 下载 / 6 个月） | 五个核心 trait（`Agent`/`Llm`/`Tool`/`Session`/`Toolset`）；`#[tool]` 宏从 doc comment 提描述 + 由 args 类型推导 JSON Schema；`GraphAgent` + `PregelExecutor`(BSP) + checkpoint 崩溃恢复 + HITL 中断恢复；`adk-eval`（轨迹 精确/子集/顺序无关 三态匹配 + Jaccard/Levenshtein/ROUGE + LLM-as-judge + rubric）；RBAC/SSO/Guardrail（PII 脱敏、内容过滤、JSON Schema 校验）+ JSONL 审计日志；**feature tier**（minimal/standard/enterprise/full）；MCP Elicitation |
+| **Pica** | `https://github.com/picahq/pica`（经 `https://juejin.cn/post/7463802171998994466`） | OneTool 统一 SDK 接 100+ 平台；`availableTools` 按 agent 限权；`generateSystemPrompt()` 按可用工具自动生成系统提示；AuthKit 托管 OAuth。**注**：该来源为产品面，可移植架构成分最少 |
+| **Morphz** | `https://github.com/morphz-ai/morphz` | 「从 chat completion 到结构化上下文评估」：模型只负责非确定语义，**确定性事务内核**持有事实/授权/状态/执行/恢复；Agent 拥有独立于 session 的**版本化 cognitive Frame**；并发具因果结构（Objectives/Threads/Activations/dependencies）；**原生沙箱**（macOS/Linux/Windows；Linux `workspace-write` 需 Bubblewrap + 非特权 userns）；`LICENSE_SCOPE.md` + `TRADEMARKS.md` + `PATENTS.md`（中英各一份）；CI 审计每个已提交 lockfile；`update status/update/rollback` + SHA-256 校验 |
+
 **heartflow（本仓）**
 
 | 事实 | 路径:行 |
@@ -397,3 +490,14 @@ jcode 的 `jcode-schema-dialect` 是三段式：**allow-list 校验 → 单一�
 | panic 预算棘轮（已落地，含 `panic-ok:` 第三类） | `scripts/check_panic_budget.py`；基线 `scripts/panic_budget.json` |
 | 合理 hack 的 8 处标注 | `crates/runtime/src/redact.rs:40,50,63,74`；`crates/api/src/retry.rs:23,147`；`crates/runtime/src/bash.rs:481,483` |
 | 可无痛消除的 2 处（已审计：不可达，非缺陷） | `crates/cli/src/main.rs:398,414` |
+| **回放接缝（D1 落点，唯一咽喉）** | `crates/runtime/src/conversation.rs:110`（`trait ApiClient`）、`:118`（`trait ToolExecutor`） |
+| 脚本化测试替身：15 个 `impl ApiClient` | `crates/runtime/src/conversation.rs:1200,1341,1392,1431,1474,1533,1564,1612,1663,1765,1781,1900,1951,2010,2224` |
+| 脚本化测试替身：5 个 `impl ToolExecutor` | `crates/runtime/src/conversation.rs:1073,1596,1640,1750,2199` |
+| socket 级假 HTTP 服务器（捕获请求 + 回放 SSE） | `crates/api/tests/client_integration.rs`（445 行） |
+| 真实二进制 e2e（仅离线路径） | `crates/cli/tests/e2e.rs`（156 行） |
+| 压缩估算器人工仪器 + 记录基线 | `crates/runtime/tests/calibration_measurement.rs`（451 轮：原始 62.4% / 校准 8.9%） |
+| **无 OS 级沙箱**（该开关只控凭据擦除，D2 落点） | `crates/runtime/src/bash.rs:132-134`；`scrub_credential_env` `:383-389` |
+| 全仓零 `[features]` 段（D3 落点） | `grep '^\[features\]'` 仅命中 `archive/jcode` |
+| 全仓零编译期尺寸断言（对照 rig 的 `const _`） | `grep 'const _: ()'` 零命中 |
+| 无依赖审计门（G 档） | 无 `deny.toml`、无 `.cargo/`；workflows 仅 `release.yml`/`docs.yml`（`ci.yml.bak` 刻意停用） |
+| MCP 方法面：无 elicitation，server 请求除 ping 外一律 `-32601` 拒绝 | 我方方法 `crates/mcp/src/client.rs:63,86,98`；拒绝点 `:141-152`；测试 `:277` |

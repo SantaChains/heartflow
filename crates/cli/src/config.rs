@@ -7,6 +7,7 @@ use provider::config::{
     config_file_paths, load_merged_settings, materialize, quote_toml_string, resolve_spec,
     string_field, ProviderSelection,
 };
+use provider::load::catalog_file_paths;
 use tracing::warn;
 
 use crate::{keymap::keymap_file_paths, settings::settings_file_paths, theme::theme_file_paths};
@@ -256,6 +257,10 @@ pub enum ConfigSurface {
     Keymap,
     /// Shell behavior knobs (`settings.toml`).
     Settings,
+    /// Provider/model catalog (`provider.toml`): the known-universe registry
+    /// that feeds `/model` display and completion. A reference surface only —
+    /// it never selects the active transport (that is `config.toml`).
+    Provider,
 }
 
 /// Per-surface change flags from one [`ConfigWatcher::changed`] poll. Callers
@@ -268,13 +273,14 @@ pub struct ChangedSurfaces {
     pub theme: bool,
     pub keymap: bool,
     pub settings: bool,
+    pub provider: bool,
 }
 
 impl ChangedSurfaces {
     /// True when at least one surface changed since the last poll.
     #[must_use]
     pub fn any(self) -> bool {
-        self.config || self.theme || self.keymap || self.settings
+        self.config || self.theme || self.keymap || self.settings || self.provider
     }
 }
 
@@ -312,6 +318,14 @@ impl ConfigWatcher {
                 .into_iter()
                 .map(|path| (ConfigSurface::Settings, path)),
         );
+        // The catalog is user-layer only (`~/.heartflow/provider.toml`), so it
+        // takes just `home`; hot-reloading it keeps `/model` completion fresh
+        // after a hand-edit or a background `hf models` discovery.
+        watched.extend(
+            catalog_file_paths(home)
+                .into_iter()
+                .map(|path| (ConfigSurface::Provider, path)),
+        );
         let entries = watched
             .into_iter()
             .map(|(surface, path)| {
@@ -337,6 +351,7 @@ impl ConfigWatcher {
                     ConfigSurface::Theme => changed.theme = true,
                     ConfigSurface::Keymap => changed.keymap = true,
                     ConfigSurface::Settings => changed.settings = true,
+                    ConfigSurface::Provider => changed.provider = true,
                 }
             }
         }

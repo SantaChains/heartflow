@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use tracing::{debug, warn};
 
@@ -26,7 +27,7 @@ pub enum ProviderProtocol {
 }
 
 impl ProviderProtocol {
-    fn parse(text: &str) -> Option<Self> {
+    pub(crate) fn parse(text: &str) -> Option<Self> {
         match text.trim().to_ascii_lowercase().as_str() {
             "anthropic" => Some(Self::Anthropic),
             "openai" | "openai-compatible" | "openai_compat" => Some(Self::OpenAi),
@@ -474,7 +475,18 @@ fn read_provider_file(path: &Path) -> ProviderSettings {
             return empty;
         }
     };
-    match toml::from_str::<toml::Table>(&contents) {
+    // `.json` configs are parsed as JSON then transcoded into the same table
+    // shape; everything else is TOML. Both feed `from_table` identically, and a
+    // bad file of either format is skipped with a warning rather than aborting.
+    let is_json = path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+    let parsed: Result<toml::Table, String> = if is_json {
+        serde_json::from_str::<toml::Table>(&contents).map_err(|error| error.to_string())
+    } else {
+        toml::from_str::<toml::Table>(&contents).map_err(|error| error.to_string())
+    };
+    match parsed {
         Ok(table) => ProviderSettings::from_table(&table, &path.display().to_string()),
         Err(error) => {
             warn!(file = %path.display(), error = %error, "config file unparseable; skipped");
@@ -483,13 +495,42 @@ fn read_provider_file(path: &Path) -> ProviderSettings {
     }
 }
 
-/// Layered config file paths in merge order: user then project (project wins).
-#[must_use]
-pub fn config_file_paths(cwd: &Path, home: &Path) -> Vec<PathBuf> {
-    vec![
+/// Process-wide explicit config file (`-c/--config`), set once at startup. When
+/// present it merges as the highest-precedence file layer, above the project and
+/// user `config.toml`. A `OnceLock` keeps the many `resolve_selection` call sites
+/// signature-free; CLI `--provider`/`--model` still override it downstream.
+static CONFIG_OVERRIDE: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Record the explicit `-c/--config` path (absolute) for this process. First
+/// writer wins; later calls are ignored (the CLI sets it once before dispatch).
+pub fn set_config_override(path: Option<PathBuf>) {
+    let _ = CONFIG_OVERRIDE.set(path);
+}
+
+/// The explicit override path, if one was set.
+fn config_override() -> Option<&'static PathBuf> {
+    CONFIG_OVERRIDE.get()?.as_ref()
+}
+
+/// Layered config paths in merge order: user, project, then the explicit
+/// `-c/--config` override (last wins). Split from [`config_file_paths`] so tests
+/// drive the override directly without touching the process-global `OnceLock`.
+fn config_layers(cwd: &Path, home: &Path, extra: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = vec![
         home.join(".heartflow").join("config.toml"),
         cwd.join(".heartflow").join("config.toml"),
-    ]
+    ];
+    if let Some(path) = extra {
+        paths.push(path.to_path_buf());
+    }
+    paths
+}
+
+/// Layered config file paths in merge order: user then project (project wins),
+/// then the explicit `-c/--config` override when set (it wins over both).
+#[must_use]
+pub fn config_file_paths(cwd: &Path, home: &Path) -> Vec<PathBuf> {
+    config_layers(cwd, home, config_override().map(PathBuf::as_path))
 }
 
 /// Merge user `~/.heartflow/config.toml` then project `.heartflow/config.toml`
@@ -595,7 +636,7 @@ mod tests {
             "protocol = \"anthropic\"\n",
             "base_url = \"https://api.deepseek.com/anthropic\"\n",
             "api_key_env = \"DEEPSEEK_API_KEY\"\n",
-            "model = \"deepseek-flash\"\n"
+            "model = \"deepseek-v4-flash\"\n"
         ));
         assert_eq!(parsed.protocol, Some(ProviderProtocol::Anthropic));
 
@@ -625,7 +666,7 @@ mod tests {
         let mut merged = settings(
             "[provider]\nname = \"deepseek\"\nmodel = \"deepseek-v4-pro\"\nmax_tokens = 16384\n",
         );
-        merged.merge(settings("[provider]\nmodel = \"deepseek-flash\"\n"));
+        merged.merge(settings("[provider]\nmodel = \"deepseek-v4-flash\"\n"));
         let spec = resolve_spec(None, Some("deepseek-v4-pro"), &merged).expect("resolve");
         match spec {
             ProviderSpec::Resolved {
@@ -813,10 +854,10 @@ mod tests {
             "name = \"deepseek\"\n",
             "base_url = 42\n",
             "max_tokens = \"oops\"\n",
-            "model = \"deepseek-flash\"\n"
+            "model = \"deepseek-v4-flash\"\n"
         ));
         assert_eq!(parsed.name.as_deref(), Some("deepseek"));
-        assert_eq!(parsed.model.as_deref(), Some("deepseek-flash"));
+        assert_eq!(parsed.model.as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(parsed.base_url, None);
         assert_eq!(parsed.max_tokens, None);
     }
@@ -832,13 +873,13 @@ mod tests {
             "protocol = \"grpc\"\n",
             "base_url = 42\n",
             "api_key = true\n",
-            "model = \"deepseek-flash\"\n",
+            "model = \"deepseek-v4-flash\"\n",
             "max_tokens = \"oops\"\n",
             "reasoning_effort = 7\n",
             "context_window = -5\n",
         ));
         assert_eq!(parsed.name.as_deref(), Some("deepseek"));
-        assert_eq!(parsed.model.as_deref(), Some("deepseek-flash"));
+        assert_eq!(parsed.model.as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(parsed.protocol, None);
         assert_eq!(parsed.base_url, None);
         assert_eq!(parsed.api_key, None);
@@ -949,6 +990,46 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert_eq!(paths[0], PathBuf::from("/home/.heartflow/config.toml"));
         assert_eq!(paths[1], PathBuf::from("/proj/.heartflow/config.toml"));
+    }
+
+    #[test]
+    fn config_layers_append_override_last() {
+        // `-c/--config` merges as the highest file layer: user, project, override.
+        // Driven directly so the test never writes the process-global `OnceLock`.
+        let paths = super::config_layers(
+            Path::new("/proj"),
+            Path::new("/home"),
+            Some(Path::new("/explicit/cfg.toml")),
+        );
+        assert_eq!(paths.len(), 3);
+        assert_eq!(paths[0], PathBuf::from("/home/.heartflow/config.toml"));
+        assert_eq!(paths[1], PathBuf::from("/proj/.heartflow/config.toml"));
+        assert_eq!(paths[2], PathBuf::from("/explicit/cfg.toml"));
+    }
+
+    #[test]
+    fn json_config_file_parses_into_settings() {
+        // A `.json` override is transcoded into the same table shape as TOML.
+        let path = temp_path("json-config").with_extension("json");
+        fs::write(
+            &path,
+            r#"{"provider": {"name": "deepseek", "model": "deepseek-v4-pro", "max_tokens": 8192}}"#,
+        )
+        .expect("write json");
+        let parsed = super::read_provider_file(&path);
+        assert_eq!(parsed.name.as_deref(), Some("deepseek"));
+        assert_eq!(parsed.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(parsed.max_tokens, Some(8192));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn broken_json_config_degrades_to_empty_layer() {
+        let path = temp_path("json-broken").with_extension("json");
+        fs::write(&path, "{\"provider\": ").expect("write broken json");
+        let parsed = super::read_provider_file(&path);
+        assert_eq!(parsed, ProviderSettings::default());
+        let _ = fs::remove_file(&path);
     }
 
     fn temp_path(label: &str) -> PathBuf {

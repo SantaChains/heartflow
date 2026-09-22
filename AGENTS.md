@@ -48,7 +48,7 @@ CI 只有两条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/
 
 全局：`--provider NAME`、`--model MODEL`、`--version`（`-v`，`-V` 为可见短别名；内建版本 flag 已禁用）、`--resume[=PATH]`（`require_equals`，裸形式进选择器）、`--run CMD`（`requires = "resume"`）。
 
-子命令：`chat`、`prompt [TEXT...] [-q|--quiet] [--json]`、`search <QUERY...> [--limit N=20] [--json]`、`system-prompt [--cwd PATH] [--date YYYY-MM-DD]`、`config export [SURFACE=config|theme|keymap|settings] [--output FILE]` / `config import FILE`、`doctor [--fix] [--ai]`、`init [--force]`、`models [--provider] [--model] [--balance]`。
+子命令：`chat`、`prompt [TEXT...] [-q|--quiet] [--json]`、`search <QUERY...> [--limit N=20] [--json]`、`system-prompt [--cwd PATH] [--date YYYY-MM-DD]`、`config export [SURFACE=config|theme|keymap|settings|provider] [--output FILE]` / `config import FILE`、`doctor [--fix] [--ai]`、`init [--force]`、`models [--provider] [--model] [--balance]`。
 
 交互契约：无参数或 `hf chat` 进 REPL（唯一可弹确认的模式）；子命令永不阻塞等人。退出码 0 成功 / 1 运行时与 provider 错误 / 2 用法错误。
 
@@ -59,6 +59,8 @@ CI 只有两条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/
 ### REPL（`crates/cli/src/main.rs:1689` `dispatch_slash_command`）
 
 `/help /status /model [NAME] /mode [NAME] /plan [GOAL|approve|end|status] /compact /pin /save /clear /sessions /open N /remember T /search Q /mcp /expand [ID] /queue [pop|clear] /guide TASK /init /restart /exit`（`/quit` 为别名），以及不走模型的 `!CMD` 前缀。
+
+`/model`（无参）打印当前**真实**传输身份——`provider`（目录键，未命中则 `custom`）/ `protocol` / `base_url` / `model` / `known models`（目录中该 provider 的模型），取代旧的写死 DeepSeek 清单，使传输失败一眼可辨协议而非误读厂商（env-anthropic 路径显示 `provider: anthropic (env)`）；`/model NAME` 切换成功后把该模型记入 `~/.heartflow/provider.toml`（`source=user`）。REPL 补全不止命令名：`/model `、`/mode `、`/open ` 后跟空格按命令弹出参数候选表格（分别为目录中当前 provider 的模型 / 权限三档 / 会话序号），↑/↓ 选择、Tab 或 Enter 只补全当前参数位，Esc 取消高亮。
 
 ### 原生工具（`crates/tools/src/lib.rs:137` 注册，`:362` `execute_tool` 分发）
 
@@ -98,9 +100,11 @@ CI 只有两条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/
 
 `[settings]`：`scroll_step`（u16，默认 3）、`tool_inline_lines`（usize，默认 3）、`fold_thinking`（bool，默认 true）、`frame_budget_ms`（u64，默认 80，仅启动时读取）；同 theme 两层逐项覆盖（`crates/cli/src/settings.rs`）。
 
-`hf config export [SURFACE]`（`config` 默认 / `theme` / `keymap` / `settings`）导出该面生效值为可编辑模板，永不落密钥。
+`~/.heartflow/provider.toml`（`crates/provider/src/load.rs`）是 provider/模型**目录**（已知宇宙的注册表），**不是活动配置**——它从不决定某回合打哪个端点（那由 `config.toml` 经 `resolve_spec`/`materialize` 选定），只服务 `/model` 状态行、补全下拉与 `hf --provider NAME` 的可选清单。三层合并：编译进二进制的国内常用 OpenAI 兼容供应商种子（`default_catalog`，永不落盘）+ 用户可编辑覆盖层 + heartflow 自记层（`hf models` 发现记 `source=discovered`、`/model` 切换记 `source=user`）。表结构 `[providers.KEY]`（`protocol`/`base_url`/`api_key_env`）与 `[[providers.KEY.models]]`（`id`/`context_window`/`note`/`source`/`last_seen`）；坏字段跳过并告警，文件缺失或损坏降级回种子，绝不阻断启动。只有用户/发现层被原子回写（temp+rename）。
 
-配置优先级：CLI 参数 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量；同名字段逐项覆盖。`ConfigWatcher`（`crates/cli/src/config.rs`）每回合边界按 mtime 逐面探测 config/theme/keymap/settings 四面并热重载：`changed() -> ChangedSurfaces` 逐面上报，config 重建 runtime、theme 换入进程级调色板、keymap/settings 就地重载（改 theme 绝不触发 config 重载）。
+`hf config export [SURFACE]`（`config` 默认 / `theme` / `keymap` / `settings` / `provider`）导出该面生效值为可编辑模板，永不落密钥；`provider` 面导出合并后的目录（种子+用户+发现）作为可编辑模板。
+
+配置优先级：CLI 参数 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量；同名字段逐项覆盖。`ConfigWatcher`（`crates/cli/src/config.rs`）每回合边界按 mtime 逐面探测 config/theme/keymap/settings/provider 五面并热重载：`changed() -> ChangedSurfaces` 逐面上报，config 重建 runtime、theme 换入进程级调色板、keymap/settings 就地重载、provider 重载模型目录（仅供 `/model` 展示与补全，绝不重建 runtime 或改活动传输）（改 theme 绝不触发 config 重载）。
 
 ### 运行时可写路径
 
@@ -109,6 +113,7 @@ CI 只有两条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/
 | `~/.heartflow/sessions/<id>.json`                | 权威会话快照，simd-json 序列化后 temp+rename 原子覆盖（`crates/runtime/src/session.rs:157`）                                                       |
 | `~/.heartflow/sessions/<id>.jsonl`               | 只读的追加段（header 记录其扩展的快照长度），坏段降级回快照（`crates/runtime/src/session.rs:204`）                                                 |
 | `~/.heartflow/heartflow.db`                      | SQLite 镜像缓存：WAL、FTS5 trigram、`user_version` 迁移；`append_messages` 增量追加，转录缩短或原地改动时回退全量重写。JSON 恒为权威，库可删库重建 |
+| `~/.heartflow/provider.toml`                     | provider/模型**目录**（非活动配置）：用户可编辑覆盖层 + `hf models`/`/model` 自记层，原子 temp+rename 回写，种子编译进二进制不落盘；仅服务 `/model` 展示与补全，绝不选路传输（`crates/provider/src/load.rs`）                       |
 | `~/.heartflow/MEMORY.md`、`.heartflow/MEMORY.md` | 跨会话长期记忆，user/project 两层公平夹紧后注入提示词 Memory 段                                                                                    |
 | `~/.agent/rules/*.md`、`.agent/rules/`           | 规则全量注入（按名排序，上限 32 个，单个截断 32KB）                                                                                                |
 | `~/.agent/skills/*/SKILL.md`、`.agent/skills/`   | 技能仅注入 name/description 元数据（上限 64 个），正文按需读取                                                                                     |

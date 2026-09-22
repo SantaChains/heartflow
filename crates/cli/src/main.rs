@@ -27,7 +27,7 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -36,7 +36,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use api::OpenAiClient;
 use clap::Parser;
 use crossterm::style::Stylize;
-use inquire::{Confirm, Select};
+use inquire::Confirm;
 use runtime::{
     execute_bash, is_dangerous_command, load_system_prompt, truncate_chars, AgentEvent,
     BashCommandInput, CompactionConfig, ContentBlock, ConversationRuntime, MessageRole, Session,
@@ -48,7 +48,8 @@ use tokio_util::sync::CancellationToken;
 use config::{load_merged_mcp, load_provider_selection, ConfigWatcher};
 use core::{guide_context, guide_draft, HeartModel};
 use provider::{
-    load_merged_settings, AnthropicStreamClient, ProviderProtocol, ProviderSelection,
+    load_catalog, load_merged_settings, persist_discovered, persist_model, AnthropicStreamClient,
+    CatalogModel, ModelSource, ProviderCatalog, ProviderProtocol, ProviderSelection,
     ProviderSettings, TransportClient, CONFIG_VERSION,
 };
 use render::TerminalRenderer;
@@ -237,6 +238,16 @@ fn init_logging() {
 
 async fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    // An explicit `-c/--config` file is the highest file layer; record it before
+    // any provider resolution so every `resolve_selection` call sees it. Relative
+    // paths anchor to the current directory for stable reads and display.
+    provider::set_config_override(cli.config.clone().map(|path| {
+        if path.is_absolute() {
+            path
+        } else {
+            env::current_dir().map_or_else(|_| path.clone(), |cwd| cwd.join(&path))
+        }
+    }));
     // One conversation's mutable state (persistence, mirror, folded-output
     // stash); instance-scoped so a future parallel section owns its own.
     let state = new_session_state();
@@ -249,28 +260,38 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
             provider,
             model,
         } => {
-            let session_path = match session_path {
-                Some(path) => path,
-                None => pick_session()?,
-            };
-            if let Some(command) = command {
-                // One-shot slash command run against the saved session, then exit.
-                resume_session(&session_path, &command);
-                return Ok(false);
+            // Bare `-r`/`--resume` restores the most recent session; `list_sessions`
+            // is mtime-descending, so its head is the last one touched.
+            match session_path.or_else(|| list_sessions().into_iter().next()) {
+                Some(session_path) => {
+                    if let Some(command) = command {
+                        // One-shot slash command run against the saved session, then exit.
+                        resume_session(&session_path, &command);
+                        return Ok(false);
+                    }
+                    // No --run: reopen the interactive REPL with the conversation restored.
+                    let session = load_saved_session(&session_path)
+                        .map_err(|error| format!("failed to restore session: {error}"))?;
+                    // Continue this transcript in place: adopt its id so later
+                    // turns overwrite the same file and update the same row.
+                    adopt_session_path(&state, &session_path);
+                    let selection = resolve_selection(provider.as_deref(), model.as_deref())?;
+                    println!(
+                        "Restored session from {} ({} messages).",
+                        session_path.display(),
+                        session.messages.len()
+                    );
+                    restart = run_repl(&state, selection, session).await?;
+                }
+                None => {
+                    if command.is_some() {
+                        return Err("no saved session to run --run against".to_string().into());
+                    }
+                    eprintln!("no saved session to resume; starting a fresh REPL");
+                    let selection = resolve_selection(provider.as_deref(), model.as_deref())?;
+                    restart = run_repl(&state, selection, Session::new()).await?;
+                }
             }
-            // No --run: reopen the interactive REPL with the conversation restored.
-            let session = load_saved_session(&session_path)
-                .map_err(|error| format!("failed to restore session: {error}"))?;
-            // Continue this transcript in place: adopt its id so later
-            // turns overwrite the same file and update the same row.
-            adopt_session_path(&state, &session_path);
-            let selection = resolve_selection(provider.as_deref(), model.as_deref())?;
-            println!(
-                "Restored session from {} ({} messages).",
-                session_path.display(),
-                session.messages.len()
-            );
-            restart = run_repl(&state, selection, session).await?;
         }
         Action::Prompt {
             instruction,
@@ -367,6 +388,10 @@ fn export_config(
         ConfigSurface::Theme => theme::Theme::load(&cwd, &home).to_toml_string(),
         ConfigSurface::Keymap => keymap::Keymap::load(&cwd, &home).to_toml_string(),
         ConfigSurface::Settings => settings::Settings::load(&cwd, &home).to_toml_string(),
+        // Export emits the full merged catalog (seed + your additions) as a
+        // ready-to-edit `provider.toml` template, matching the other surfaces'
+        // "fully-resolved effective values" contract.
+        ConfigSurface::Provider => load_catalog(&home).to_toml_string(),
     };
     match output {
         Some(path) => {
@@ -601,6 +626,21 @@ async fn run_models(
                     profile.model
                 ),
             }
+            // Cache the discovery into the catalog's persisted layer so `/model`
+            // and completion can offer these ids next session, filed under the
+            // provider that owns this base_url.
+            let discovered: Vec<(String, Option<u64>)> = models
+                .iter()
+                .map(|info| (info.id.clone(), info.context_length.map(u64::from)))
+                .collect();
+            if let Err(error) = persist_discovered(
+                &home_dir(),
+                &profile.base_url,
+                profile.protocol,
+                &discovered,
+            ) {
+                println!("\n(could not cache discovered models: {error})");
+            }
         }
         Err(error) => println!("\nmodel list unavailable: {error}"),
     }
@@ -669,48 +709,6 @@ fn resume_session(session_path: &Path, command: &str) {
 
 pub(crate) fn stdin_is_terminal() -> bool {
     io::stdin().is_terminal()
-}
-
-fn pick_session() -> Result<PathBuf, String> {
-    let sessions = list_sessions();
-    if sessions.is_empty() {
-        return Err("no saved sessions found".to_string());
-    }
-
-    if stdin_is_terminal() {
-        let labels: Vec<String> = sessions
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect();
-        let chosen = Select::new("Resume which session?", labels)
-            .prompt()
-            .map_err(|_| "session selection cancelled".to_string())?;
-        return sessions
-            .into_iter()
-            .find(|path| path.display().to_string() == chosen)
-            .ok_or_else(|| "selected session vanished".to_string());
-    }
-
-    // Non-interactive fallback: numbered selection over a plain stream.
-    println!("Saved sessions (newest first):");
-    for (index, path) in sessions.iter().enumerate().take(9) {
-        println!("  {}. {}", index + 1, path.display());
-    }
-    print!("Select session number: ");
-    let _ = io::stdout().flush();
-
-    let mut choice = String::new();
-    io::stdin()
-        .read_line(&mut choice)
-        .map_err(|error| error.to_string())?;
-    let index: usize = choice
-        .trim()
-        .parse()
-        .map_err(|_| format!("invalid selection: {}", choice.trim()))?;
-    sessions
-        .get(index.wrapping_sub(1))
-        .cloned()
-        .ok_or_else(|| format!("selection out of range: {index}"))
 }
 
 async fn run_repl(
@@ -782,6 +780,9 @@ async fn run_repl(
     let mut mode = default_permission_mode(true);
     let cwd = env::current_dir()?;
     let mut watcher = ConfigWatcher::new(&cwd, &home_dir());
+    // The provider/model catalog backs `/model` display + completion. Loaded
+    // once at startup and hot-reloaded on a `provider.toml` edit below.
+    let mut catalog = load_catalog(&home_dir());
     let mut runtime = build_runtime(state, session, selection.clone(), true, &mode)?;
     let mut prompter = CliPermissionPrompter::new();
     // Planning runs on the *same* runtime (policy swapped in place) so the todo
@@ -815,7 +816,8 @@ async fn run_repl(
         // Ctrl+D / EOF is a documented quit path (see the banner): save the
         // session and print the resume command just like `/exit`, so the
         // conversation is never silently dropped on the EOF path.
-        let Some(line) = editor.read_line()? else {
+        let ctx = build_completion_context(&selection, &catalog, &mode);
+        let Some(line) = editor.read_line(&ctx)? else {
             exit_with_resume_hint(state, &runtime).await;
             break;
         };
@@ -832,6 +834,9 @@ async fn run_repl(
         if changed.theme {
             theme::Theme::reload(&cwd, &home_dir());
         }
+        if changed.provider {
+            catalog = load_catalog(&home_dir());
+        }
         let trimmed = line.trim();
         let control = if trimmed.starts_with('/') {
             dispatch_slash_command(
@@ -845,6 +850,7 @@ async fn run_repl(
                 &mut model,
                 &mut prompter,
                 &cwd,
+                &catalog,
             )
             .await?
         } else if trimmed.starts_with('!') {
@@ -958,6 +964,7 @@ async fn dispatch_slash_command(
     model: &mut HeartModel,
     prompter: &mut CliPermissionPrompter,
     cwd: &Path,
+    catalog: &ProviderCatalog,
 ) -> Result<LoopControl, Box<dyn std::error::Error>> {
     // Every arm yields the loop-level control directly; the match is wrapped in
     // `Ok` once so each arm stays one statement shorter.
@@ -1043,7 +1050,7 @@ async fn dispatch_slash_command(
             LoopControl::Continue
         }
         _ if trimmed == "/model" || trimmed.starts_with("/model ") => {
-            handle_model_command(state, trimmed, selection, runtime, mode);
+            handle_model_command(state, trimmed, selection, runtime, mode, catalog);
             *planning = false;
             LoopControl::Continue
         }
@@ -1300,26 +1307,20 @@ fn confirm_restart() -> bool {
         .unwrap_or(false)
 }
 
-/// Models known to work with the built-in `DeepSeek` provider (per the official
-/// API docs, 2026-09). `deepseek-v4-flash` is accepted by the endpoint but is
-/// served by `DeepSeek-V4.1-Flash`.
-const KNOWN_DEEPSEEK_MODELS: &[&str] = &["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"];
-
 fn handle_model_command(
     state: &SessionShared,
     input: &str,
     selection: &mut ProviderSelection,
     runtime: &mut AgentRuntime,
     mode: &str,
+    catalog: &ProviderCatalog,
 ) {
     let requested = input
         .strip_prefix("/model")
         .map(str::trim)
         .unwrap_or_default();
     if requested.is_empty() {
-        println!("model: {}", selection.model());
-        println!("known models: {}", KNOWN_DEEPSEEK_MODELS.join(", "));
-        println!("switch with: /model NAME");
+        print_model_status(selection, catalog);
         return;
     }
 
@@ -1330,8 +1331,143 @@ fn handle_model_command(
             *runtime = rebuilt;
             *selection = next;
             println!("model -> {}", selection.model());
+            // Record the switch into the catalog's persisted layer so the model
+            // shows up in later `/model` listings and completion. Only a profile
+            // selection carries the base_url/protocol to file it under; the
+            // legacy env-Anthropic path has no endpoint to key on, so it skips.
+            if let ProviderSelection::Profile(profile) = selection {
+                if let Err(error) = persist_model(
+                    &home_dir(),
+                    &profile.base_url,
+                    profile.protocol,
+                    requested,
+                    profile.context_window.map(u64::from),
+                    ModelSource::User,
+                ) {
+                    println!("(could not record model in catalog: {error})");
+                }
+            }
         }
         Err(error) => println!("failed to switch model: {error}"),
+    }
+}
+
+/// `/model` with no argument: report the provider/protocol/base_url that is
+/// *actually* active (so a transport failure is never misread as the wrong
+/// vendor), the current model, and the catalog's known models for that
+/// provider. Replaces the old hardcoded DeepSeek shortlist: the list now tracks
+/// the resolved transport and grows from `hf models` discovery and hand-edits.
+fn print_model_status(selection: &ProviderSelection, catalog: &ProviderCatalog) {
+    match selection {
+        ProviderSelection::Env { model } => {
+            println!("provider: anthropic (env)");
+            println!("protocol: {}", ProviderProtocol::Anthropic.as_str());
+            println!("model: {model}");
+            println!("switch with: /model NAME");
+        }
+        ProviderSelection::Profile(profile) => {
+            let key = catalog
+                .provider_key_by_host(&profile.base_url)
+                .unwrap_or_else(|| "custom".to_string());
+            println!("provider: {key}");
+            println!("protocol: {}", profile.protocol.as_str());
+            println!("base_url: {}", profile.base_url);
+            println!("model: {}", profile.model);
+            match catalog.provider_by_host(&profile.base_url) {
+                Some(entry) if !entry.models.is_empty() => {
+                    let names: Vec<&str> = entry
+                        .models
+                        .iter()
+                        .map(|model| model.id.as_str())
+                        .collect();
+                    println!("known models: {}", names.join(", "));
+                }
+                _ => println!(
+                    "known models: none cached yet (run `hf models` to discover, or add them to provider.toml)"
+                ),
+            }
+            println!("switch with: /model NAME");
+        }
+    }
+}
+
+/// Cap on session ordinals offered to `/open ` completion: enough to be useful
+/// without scanning an unbounded list into the dropdown every turn.
+const SESSION_COMPLETION_MAX: usize = 20;
+
+/// Build this turn's completion universe for the editor: the active provider's
+/// catalog models (label = id, detail = context window + provenance), the
+/// permission modes, recent session ordinals for `/open`, and the live
+/// model/mode so the dropdown can tag the current value. Kept out of `run_repl`
+/// so that function stays within its length budget, and rebuilt each turn so a
+/// hot-reloaded catalog or a just-saved session shows up at once.
+fn build_completion_context(
+    selection: &ProviderSelection,
+    catalog: &ProviderCatalog,
+    mode: &str,
+) -> editor::CompletionContext {
+    let models = match selection {
+        ProviderSelection::Profile(profile) => catalog
+            .provider_by_host(&profile.base_url)
+            .map(|entry| {
+                entry
+                    .models
+                    .iter()
+                    .map(|model| editor::CompletionItem::new(model.id.clone(), model_detail(model)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        // The legacy env-Anthropic path has no catalog entry to draw from.
+        ProviderSelection::Env { .. } => Vec::new(),
+    };
+    let modes = KNOWN_PERMISSION_MODES
+        .iter()
+        .map(|mode| editor::CompletionItem::new(*mode, ""))
+        .collect();
+    let sessions = list_sessions()
+        .iter()
+        .take(SESSION_COMPLETION_MAX)
+        .enumerate()
+        .map(|(index, path)| {
+            let detail = path
+                .file_stem()
+                .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
+            editor::CompletionItem::new((index + 1).to_string(), detail)
+        })
+        .collect();
+    editor::CompletionContext {
+        models,
+        modes,
+        sessions,
+        current_model: Some(selection.model().to_string()),
+        current_mode: Some(mode.to_string()),
+    }
+}
+
+/// The muted detail column for a catalog model: a humanized context window plus
+/// its provenance, e.g. `1M ctx · seed`, or just `discovered` when unknown.
+fn model_detail(model: &CatalogModel) -> String {
+    match model.context_window {
+        Some(tokens) => format!(
+            "{} ctx · {}",
+            humanize_tokens(tokens),
+            model.source.as_str()
+        ),
+        None => model.source.as_str().to_string(),
+    }
+}
+
+/// Render a token count compactly: exact millions as `NM`, thousands as `NK`,
+/// otherwise the raw number. Only for the completion detail column.
+fn humanize_tokens(tokens: u64) -> String {
+    const M: u64 = 1_000_000;
+    const K: u64 = 1_000;
+    if tokens >= M && tokens.is_multiple_of(M) {
+        format!("{}M", tokens / M)
+    } else if tokens >= K {
+        format!("{}K", tokens / K)
+    } else {
+        tokens.to_string()
     }
 }
 
@@ -2874,7 +3010,7 @@ mod tests {
 
     #[test]
     fn parses_resume_flag_forms() {
-        // Bare `--resume` -> interactive picker, no path.
+        // Bare `--resume` -> most recent session (resolved in run()), no path.
         assert_eq!(
             action(&["hf", "--resume"]),
             Action::ResumeSession {
@@ -2893,6 +3029,39 @@ mod tests {
                 provider: None,
                 model: None,
             }
+        );
+        // `-r` is the short spelling of bare `--resume` (most recent session).
+        assert_eq!(
+            action(&["hf", "-r"]),
+            Action::ResumeSession {
+                session_path: None,
+                command: None,
+                provider: None,
+                model: None,
+            }
+        );
+        // `-r=PATH` carries an explicit path, same as `--resume=PATH`.
+        assert_eq!(
+            action(&["hf", "-r=s.json"]),
+            Action::ResumeSession {
+                session_path: Some(PathBuf::from("s.json")),
+                command: None,
+                provider: None,
+                model: None,
+            }
+        );
+        // `-c/--config` parses into the global config field (applied in run()).
+        assert_eq!(
+            Cli::try_parse_from(["hf", "-c", "custom.toml"])
+                .expect("parses")
+                .config,
+            Some(PathBuf::from("custom.toml"))
+        );
+        assert_eq!(
+            Cli::try_parse_from(["hf", "--config", "custom.json", "chat"])
+                .expect("parses")
+                .config,
+            Some(PathBuf::from("custom.json"))
         );
         // A bare flag must not swallow a following subcommand token.
         assert!(Cli::try_parse_from(["hf", "--resume", "prompt", "hi"]).is_ok());
@@ -3054,7 +3223,9 @@ mod tests {
     }
 
     #[test]
-    fn bare_resume_defers_to_session_picker() {
+    fn bare_resume_carries_no_explicit_path() {
+        // Bare `--resume` folds to `session_path: None`; run() resolves it to the
+        // most recent session (the interactive picker was retired).
         assert_eq!(
             action(&["hf", "--resume"]),
             Action::ResumeSession {
