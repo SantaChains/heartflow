@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crossterm::cursor::Show;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::backend::CrosstermBackend;
@@ -345,6 +347,13 @@ impl ReplEditor {
 
     fn read_line_tui(&mut self) -> io::Result<Exit> {
         enable_raw_mode()?;
+        // Bracketed paste makes the terminal hand over a pasted block as one
+        // event, so an embedded newline stays a multi-line draft instead of
+        // reading as a bare Enter that submits (the "paste auto-runs" bug).
+        if let Err(error) = execute!(io::stdout(), EnableBracketedPaste) {
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = match CompanionTerminal::with_inline(backend, VIEWPORT_ROWS) {
             Ok(terminal) => terminal,
@@ -375,7 +384,7 @@ impl ReplEditor {
         let _ = terminal.hide_cursor();
         let _ = terminal.clear();
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), Show);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, Show);
         loop_result?;
 
         if let Exit::Submit(ref text) = exit {
@@ -447,6 +456,14 @@ impl ReplEditor {
             }
             let key = match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => key,
+                // A bracketed-paste block is inserted whole; its newlines stay
+                // a multi-line draft rather than each firing a bare-Enter submit.
+                Event::Paste(text) => {
+                    self.mascot.resume_idle();
+                    textarea.insert_str(text);
+                    *completion_idx = None;
+                    continue;
+                }
                 _ => continue,
             };
             // Any key means the user is engaging again: clear the lingering

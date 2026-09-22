@@ -290,6 +290,19 @@ cargo build --release
 cargo clippy --workspace --all-targets -- -D warnings -A clippy::pedantic   # 阻断正确性；pedantic 仅提示
 ```
 
+## 致谢与第三方代码
+
+本项目的部分工具脚本与设计取舍参考了 **[jcode](https://github.com/1jehuang/jcode)**（MIT License，Copyright (c) 2025 Jeremy Huang）。
+
+具体来源：
+
+- **`scripts/check_panic_budget.py`** —— 衍生自 jcode 的同名脚本：三模式棘轮骨架（`--list` / `--update` / 门禁比对）、以及「按花括号计数跳过内联 `#[cfg(test)]` 模块」的剔除手法，均沿袭自 jcode。本项目在其上扩展了 **`justified` 第三类**与 **`panic-ok: <理由>` 标注机制**，使「刻意的合理 panic」与「待消除的真债」可区分（判据与可达性审计见 `best.dev.md`）。
+- 若干架构取舍（预算棘轮、命令风险分级、压缩两档阈值、隔离影子环境等）的比对与评估记录见 `best.dev.md`，其中引用的 jcode 源码均已标注 `文件:行号`。
+
+jcode 的 MIT 许可全文随本仓库记录于 [NOTICE](NOTICE)；上游原文见 [1jehuang/jcode/LICENSE](https://github.com/1jehuang/jcode/blob/master/LICENSE)。
+
+本项目自身以 Apache License 2.0 开源——两者不冲突：Apache-2.0 覆盖本项目代码，MIT 覆盖上述衍生部分。
+
 ## License
 
 本项目以 [Apache License 2.0](LICENSE) 开源。

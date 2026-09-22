@@ -19,6 +19,7 @@ pub(crate) fn build_http() -> reqwest::Client {
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
         .build()
+        // panic-ok: only static timeouts are configured, so build() cannot fail
         .expect("static reqwest configuration must build")
 }
 
@@ -142,6 +143,7 @@ impl RetryPolicy {
 
         Err(ApiError::RetriesExhausted {
             attempts,
+            // panic-ok: every path that leaves the loop above records an error first
             last_error: Box::new(last_error.expect("retry loop must capture an error")),
         })
     }

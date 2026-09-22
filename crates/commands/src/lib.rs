@@ -120,7 +120,10 @@ mod tests {
         )
         .expect("slash command should be handled");
 
-        assert!(result.message.contains("Compacted 2 messages"));
+        // preserve_recent_messages=2 would cut right before the tool_result at
+        // index 2; boundary alignment walks back over it so the preserved tail
+        // never opens on an orphaned result, folding only the leading message.
+        assert!(result.message.contains("Compacted 1 messages"));
         assert_eq!(result.session.messages[0].role, MessageRole::System);
     }
 

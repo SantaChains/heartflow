@@ -29,3 +29,5 @@ error.md
 .workbuddy/
 openmemory copy.md
 *.bak
+
+panic_budget.json

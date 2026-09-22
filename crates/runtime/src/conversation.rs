@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
@@ -322,6 +322,58 @@ fn build_replay_messages(
         .collect()
 }
 
+/// Drop tool results whose matching `tool_use` never appears earlier in the
+/// transcript, so the wire request stays provider-valid.
+///
+/// A `tool_result` (OpenAI `role:tool`, Anthropic `tool_result` block) must
+/// answer a preceding tool call; an orphan makes the provider reject the whole
+/// request (OpenAI 400 "Messages with role 'tool' must be a response to a
+/// preceding message with 'tool_calls'"). Compaction now aligns its cut to
+/// avoid creating these, but a resumed or interrupted session can still carry
+/// one, so this is the protocol-agnostic safety net applied to every request.
+/// Scanning in order, a result survives only once an earlier assistant message
+/// has advertised its `tool_use_id`; a `Tool` message left empty is dropped.
+#[must_use]
+fn repair_tool_pairing(messages: Vec<ConversationMessage>) -> Vec<ConversationMessage> {
+    let mut advertised: HashSet<String> = HashSet::new();
+    messages
+        .into_iter()
+        .filter_map(|message| match message.role {
+            MessageRole::Assistant => {
+                for block in &message.blocks {
+                    if let ContentBlock::ToolUse { id, .. } = block {
+                        advertised.insert(id.clone());
+                    }
+                }
+                Some(message)
+            }
+            MessageRole::Tool => {
+                let blocks: Vec<ContentBlock> = message
+                    .blocks
+                    .into_iter()
+                    .filter(|block| match block {
+                        ContentBlock::ToolResult { tool_use_id, .. } => {
+                            advertised.contains(tool_use_id)
+                        }
+                        _ => true,
+                    })
+                    .collect();
+                if blocks.is_empty() {
+                    None
+                } else {
+                    Some(ConversationMessage {
+                        role: message.role,
+                        blocks,
+                        usage: message.usage,
+                        pinned: message.pinned,
+                    })
+                }
+            }
+            MessageRole::System | MessageRole::User => Some(message),
+        })
+        .collect()
+}
+
 pub struct ConversationRuntime<C, T> {
     session: Session,
     api_client: C,
@@ -459,10 +511,10 @@ where
 
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
-                messages: build_replay_messages(
+                messages: repair_tool_pairing(build_replay_messages(
                     &self.session.messages,
                     self.compaction.replay_verbatim_tail,
-                ),
+                )),
                 tools: self.tool_executor.specs(),
             };
             let mut stream = self.api_client.stream(request)?;
@@ -1029,8 +1081,9 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_replay_messages, AgentEvent, ApiClient, ApiRequest, ConversationRuntime,
-        RuntimeError, StaticToolExecutor, ToolError, ToolExecutor, ToolSpec, TurnStream,
+        build_replay_messages, repair_tool_pairing, AgentEvent, ApiClient, ApiRequest,
+        ConversationRuntime, RuntimeError, StaticToolExecutor, ToolError, ToolExecutor, ToolSpec,
+        TurnStream,
     };
     use crate::compact::{compact_session_in_place, estimate_session_tokens, CompactionConfig};
     use crate::permissions::{
@@ -1046,6 +1099,70 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn repair_drops_a_leading_orphan_and_keeps_the_advertised_pair() {
+        let call = ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "call_1".to_string(),
+            name: "bash".to_string(),
+            input: "{}".to_string(),
+        }]);
+        let result = ConversationMessage::tool_result("call_1", "bash", "ok", false);
+        // An orphan: a tool result whose tool_use never appeared earlier, the
+        // shape a mis-aligned compaction boundary used to hand the provider.
+        let orphan = ConversationMessage::tool_result("ghost", "bash", "stale", false);
+
+        let repaired = repair_tool_pairing(vec![orphan, call, result]);
+
+        assert_eq!(repaired.len(), 2, "the leading orphan is dropped");
+        assert_eq!(repaired[0].role, MessageRole::Assistant);
+        assert_eq!(repaired[1].role, MessageRole::Tool);
+        assert!(
+            matches!(&repaired[1].blocks[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_1"),
+            "the advertised pair survives in order"
+        );
+    }
+
+    #[test]
+    fn repair_strips_only_the_orphan_block_from_a_mixed_tool_message() {
+        let call = ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "keep".to_string(),
+            name: "bash".to_string(),
+            input: "{}".to_string(),
+        }]);
+        let mixed = ConversationMessage {
+            role: MessageRole::Tool,
+            blocks: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "keep".to_string(),
+                    tool_name: "bash".to_string(),
+                    output: "ok".to_string(),
+                    is_error: false,
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "ghost".to_string(),
+                    tool_name: "bash".to_string(),
+                    output: "stale".to_string(),
+                    is_error: false,
+                },
+            ],
+            usage: None,
+            pinned: false,
+        };
+
+        let repaired = repair_tool_pairing(vec![call, mixed]);
+
+        assert_eq!(repaired.len(), 2, "the message itself survives");
+        assert_eq!(
+            repaired[1].blocks.len(),
+            1,
+            "only the orphan block is stripped"
+        );
+        assert!(
+            matches!(&repaired[1].blocks[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "keep"),
+            "the valid result is retained"
+        );
+    }
 
     /// A dropped `TurnStream` must abort its producer task. The driver ignores
     /// send errors, so without the `Drop` abort an early-dropped stream would

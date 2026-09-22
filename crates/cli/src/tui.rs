@@ -51,7 +51,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
     EnterAlternateScreen, LeaveAlternateScreen,
@@ -87,6 +90,9 @@ type Backend = CrosstermBackend<io::Stdout>;
 pub(crate) enum Msg {
     /// A key press from the crossterm event stream.
     Key(KeyEvent),
+    /// A bracketed-paste block, inserted whole into the editor so embedded
+    /// newlines stay a multi-line draft instead of each firing a submit.
+    Paste(String),
     /// The terminal was resized; forces a relayout + repaint.
     Resize,
     /// One streamed event from the running turn.
@@ -326,6 +332,7 @@ impl App {
         match msg {
             Msg::Resize => true,
             Msg::Key(key) => self.on_key(key),
+            Msg::Paste(text) => self.on_paste(text),
             Msg::Event(event) => self.apply_event(&event),
             Msg::TurnStarted => {
                 self.turn_active = true;
@@ -456,6 +463,18 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Insert a bracketed-paste block as literal text. The whole block arrives
+    /// as one event, so an embedded newline becomes a multi-line draft rather
+    /// than a submit — the fix for "pasting text auto-runs the turn". A modal
+    /// overlay swallows paste exactly as it swallows keys, so a stray block can
+    /// never reach the editor behind it.
+    fn on_paste(&mut self, text: String) -> bool {
+        if self.permission.is_some() || self.guide.is_some() || self.help_open {
+            return false;
+        }
+        self.input.insert_str(text)
     }
 
     /// The interrupt key's display name, for status hints that must stay
@@ -1603,14 +1622,14 @@ fn render_help_overlay(app: &App, frame: &mut Frame) {
 fn enter() -> io::Result<Terminal<Backend>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     terminal.clear()?;
 
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
         previous(info);
     }));
     Ok(terminal)
@@ -1620,7 +1639,11 @@ fn enter() -> io::Result<Terminal<Backend>> {
 /// a failure to leave the alt screen never masks the real result.
 fn exit(terminal: &mut Terminal<Backend>) -> io::Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()
 }
 
@@ -1893,6 +1916,11 @@ fn pump_events(tx: mpsc::UnboundedSender<Msg>, shutdown: &AtomicBool, budget: Du
                         break;
                     }
                 }
+                Ok(Event::Paste(text)) => {
+                    if tx.send(Msg::Paste(text)).is_err() {
+                        break;
+                    }
+                }
                 Ok(_) => {}
                 Err(_) => break,
             },
@@ -2146,6 +2174,30 @@ mod tests {
         assert!(
             app.input.lines().iter().all(String::is_empty),
             "editor clears"
+        );
+    }
+
+    #[test]
+    fn pasted_newlines_stay_a_multiline_draft_and_never_submit() {
+        let mut app = App::new();
+        // A bracketed-paste block arrives whole, so its embedded newline becomes
+        // a draft line rather than a bare Enter that fires the turn.
+        assert!(app.update(Msg::Paste("line1\nline2".to_string())));
+        assert_eq!(app.input.lines().join("\n"), "line1\nline2");
+        assert!(app.take_submit().is_none(), "paste must not submit");
+        assert!(app.transcript.is_empty(), "nothing ran");
+    }
+
+    #[test]
+    fn paste_behind_the_permission_overlay_is_swallowed() {
+        let mut app = App::new();
+        app.update(request("bash"));
+        // A modal overlay swallows paste exactly as it swallows keys, so a stray
+        // block can never reach the editor behind it.
+        app.update(Msg::Paste("rm -rf /".to_string()));
+        assert!(
+            app.input.lines().iter().all(String::is_empty),
+            "the editor stays empty behind the overlay"
         );
     }
 

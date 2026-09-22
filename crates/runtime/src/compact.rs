@@ -316,8 +316,19 @@ pub fn compact_session_in_place(
         };
     }
 
-    let keep_from = message_count.saturating_sub(config.preserve_recent_messages);
+    let mut keep_from = message_count.saturating_sub(config.preserve_recent_messages);
     let mut messages = std::mem::take(&mut session.messages);
+    // Align the cut so the preserved tail never opens on an orphaned tool
+    // result: a `Tool` message answers a `tool_use` in the assistant message
+    // before it, and folding that assistant into the summary would leave the
+    // result with no matching call. Providers reject such a message outright
+    // (OpenAI 400 "role 'tool' must be a response to a preceding message with
+    // 'tool_calls'"), so walk the boundary back over any trailing tool results
+    // to pull their assistant into the preserved window. This only ever keeps
+    // more, never fewer, messages than `preserve_recent_messages` asked for.
+    while keep_from > 0 && messages[keep_from].role == MessageRole::Tool {
+        keep_from -= 1;
+    }
     let preserved = messages.split_off(keep_from);
 
     // A pinned message inside the would-be-summarized window is never folded
@@ -692,7 +703,11 @@ mod tests {
                 ..CompactionConfig::default()
             },
         );
-        assert_eq!(result.removed_message_count, 2);
+        // preserve_recent_messages=2 would cut right before the tool_result at
+        // index 2; boundary alignment walks back over it so the tail never opens
+        // on an orphaned result, pulling the preceding assistant in too. Only the
+        // leading user message is therefore folded, not two.
+        assert_eq!(result.removed_message_count, 1);
 
         assert_eq!(session.messages[0].role, MessageRole::System);
         assert!(matches!(
@@ -708,6 +723,50 @@ mod tests {
             }
         ));
         assert!(estimate_session_tokens(&session) < estimated_before);
+    }
+
+    #[test]
+    fn compaction_never_orphans_a_tool_result_at_the_boundary() {
+        // preserve_recent_messages = 1 would naively cut right before the tool
+        // result, folding its assistant(tool_use) into the summary and leaving
+        // an orphan the provider rejects with HTTP 400. The boundary must walk
+        // back over the trailing tool result to keep the pair together.
+        let mut session = Session {
+            version: 1,
+            messages: vec![
+                ConversationMessage::user_text("older context ".repeat(80)),
+                ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "bash".to_string(),
+                    input: "{}".to_string(),
+                }]),
+                ConversationMessage::tool_result("call_1", "bash", "ok", false),
+            ],
+        };
+
+        let result = compact_session_in_place(
+            &mut session,
+            CompactionConfig {
+                preserve_recent_messages: 1,
+                max_estimated_tokens: 1,
+                ..CompactionConfig::default()
+            },
+        );
+
+        // Only the leading user message is folded; the assistant+result pair is
+        // pulled whole into the preserved tail, so no orphan reaches the wire.
+        assert_eq!(result.removed_message_count, 1);
+        assert_eq!(session.messages[0].role, MessageRole::System);
+        assert_eq!(
+            session.messages[1].role,
+            MessageRole::Assistant,
+            "the tool_use assistant survives with its result, never orphaned"
+        );
+        assert_eq!(session.messages[2].role, MessageRole::Tool);
+        assert!(matches!(
+            &session.messages[1].blocks[0],
+            ContentBlock::ToolUse { id, .. } if id == "call_1"
+        ));
     }
 
     #[test]

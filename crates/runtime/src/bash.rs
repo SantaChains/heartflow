@@ -477,7 +477,9 @@ async fn execute_bash_async(
     let collected = timeout(
         Duration::from_millis(timeout_ms),
         Box::pin(async {
+            // panic-ok: spawned with Stdio::piped() above; take() runs once here
             let stdout = read_stream_bounded(child.stdout.take().expect("piped stdout"));
+            // panic-ok: spawned with Stdio::piped() above; take() runs once here
             let stderr = read_stream_bounded(child.stderr.take().expect("piped stderr"));
             let wait = child.wait();
             let (status_res, (out_bytes, out_dropped), (err_bytes, err_dropped)) =

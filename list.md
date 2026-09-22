@@ -38,6 +38,7 @@
 | 33 | 子进程环境凭据洗刷 | `runtime/src/bash.rs`：新增 `is_credential_env_name`（后缀形状表 + 精确名，**刻意不含裸 `_KEY`**，以免误伤 `SSH_KEY`/`GPG_KEY` 这类标识符）与 `scrub_credential_env`；两条 spawn 路径均按名剔除。`dangerously_disable_sandbox` 复用为**洗刷的显式退出开关**，因此 `gh pr create` 这类真需要 `GITHUB_TOKEN` 的工作流仍可达 | 同上 **19 passed**（新增：判定表正反用例、端到端「子进程拿不到凭据」、opt-out 保留用例） |
 | 35 | token 估算器在线自校准 | `runtime/src/compact.rs` 新增 `TokenCalibration`（仿射最小二乘 + 滚动窗口 16 + 首样本播种截距 + 双向钳位）；`runtime/src/usage.rs` 新增 `TokenUsage::context_input_tokens`（`input_tokens` 不含缓存命中，须加 `cache_creation`/`cache_read`）；`conversation.rs` 在 `record` 点喂入真值：`estimated_tokens` 返回校准值，`raw_estimated_tokens` 供拟合与缓存，二者分离以防因子自我复合 | `-p heartflow-runtime` → **151 passed**（含 8 条新增用例）。**精度已用真实会话实测**，见下节 |
 | 64 | 后台任务状态收敛 | `runtime/src/bash.rs`：新增 `BackgroundTaskStatus` / `BackgroundTaskState` 侧写文件（`<log>.status.json`）——spawn 时先落 `running`，再由**两平台共用的一个 detached reaper** 在 `wait()` 返回后覆写 `exited` + `exit_code`/`success`（原 Windows 分支是 `drop(child)`，句柄一关退出码就永远拿不到，这正是缺口）；`BashCommandOutput` 增 `background_status_path` 字段，消息里直接给出该路径；`tempfile_log` 增加 3 天保留期清理（`prune_background_logs`，**只动 `bg-` 前缀自家产物**，外来文件不碰） | `-p heartflow-runtime --lib bash` → **21 passed**（新增：侧写如实报告 exit code 7、保留期清理只删自家产物且放过外来文件） |
+| A1 | panic 预算棘轮（`best.dev.md` A1 落地，工具类，不动 crate 代码） | 新增 `scripts/check_panic_budget.py` + 基线 `scripts/panic_budget.json`；三模式（`--list` / `--update` / 默认门禁），扫 `crates/*/src/**/*.rs`，剔除 `#[cfg(test)]` 项、测试文件、注释与字符串内容。**补了 jcode 没有的第三类 `justified`**——命中行带 `// panic-ok: <理由 ≥8 字符>` 即计入合理 hack（计数、允许增长），其余为 `debt`（硬门禁、只许变小）。生产真债共 **10** 处：标注 8 处合理 hack（`redact.rs` 4 处字面量 regex、`retry.rs` 2 处 static 配置与循环不变量、`bash.rs` 2 处 `Stdio::piped()` 后 `take()`），`debt=2` 保留在 `cli/main.rs:398,414`（同在返回 `Result` 的函数里，`ok_or_else(…)?` 可无痛消除，故不标注） | 探针文件实测分类器：`#[cfg(test)]` / 注释 / 字符串内命中均不计，裸 `panic!` 与短理由 `panic-ok: ok` 均判 `debt`，前置标记行判 `justified`；门禁行为：干净树退出 0，注入第 3 处债 → 退出 1 并报 `debt total grew: 2 -> 3`，移除后恢复 0；`cargo fmt --all --check` 通过 |
 
 跨 crate 回归：`-p heartflow-runtime` → **153 passed / 1 ignored**（ignored 者为新加的手工测量仪器 `tests/calibration_measurement.rs`）；`-p heartflow-provider` → **38 passed**；clippy（`--all-targets -D warnings -A clippy::pedantic`）对 runtime / store / api / provider **全绿**；`cargo fmt -p heartflow-runtime -- --check` 清零；下游 `-p heartflow-tools` `cargo check` 通过（新增字段是纯增量，`BashCommandOutput` 的构造点全仓仍只有 `bash.rs`）。
 
@@ -92,6 +93,36 @@
 - **#65 写类工具回传副作用清单**：成功路径已内建——`apply_patch` 返回 `ApplyPatchOutput{files_changed, results:[{file_path, kind, structured_patch}]}`（每个落盘文件的路径 + create/update + 真实 diff hunk），`write_file`/`edit_file` 各自返回 `file_path`；失败路径由 #61 的回滚错误消息报「rolled back N previously written file(s)」。信息面已闭合，无需另立实现。
 
 **本批核验后仍延后的落地项（理由）.** #20（FTS5 external content：镜像库可删重建、非权威热路径，且属 schema 迁移，无真机跑 store 测试下不宜盲改）、#31（wire 日志：属 api 传输层，AGENTS.md 硬约束改传输须端到端冒烟）、#45（TTFT 可观测：TTFT 半段在流式路径，同需真机）、#44（release.sh 404 重试：发布脚本须本地 dry-run 验证）、#6/#14（bytes 零拷贝 / compact_str SSO：跨多文件的机械改造，收益偏软，不跑构建下编译 churn 风险高）、#60（search_documents 限额/参数面：降 4MB→2MB 无实测可能误伤大归档检索，加 -C 等参数须同步 README/docs/llms.txt/bucket/wiki 文档面）、#56（grep 参数收敛：同属文档面 + 近似破坏性 API 改动）。
+
+### 第六批实施（2026-09-21）——A1 棘轮落地：panic 预算脚本 + 8 处「合理 hack」标注
+
+本批不碰 crate 代码，只把 `best.dev.md` A1 里最高性价比的一条（panic 预算棘轮）从「建议」变成「已运行、有基线、门禁已验」。
+
+**为什么必须重写而不能照抄 jcode.** jcode 的 `check_panic_budget.py` 只有一条规则「不许变多」，它默认**所有** panic 形态都是债。但本仓 10 处生产命中里 8 处是刻意为之且没有更好写法——照抄会把它们一并钉成债，然后逼着维护者要么去写更差的代码、要么频繁 `--update`，而**棘轮一旦被频繁刷新就失去了意义**。所以本脚本多出第三类 `justified`，判据只有一句话：
+
+> **有没有「同样清晰且局部」的非 panic 写法？有 → `debt`；没有 → `justified`。**
+
+| 命中 | 分类 | 理由 |
+|---|---|---|
+| `runtime/src/redact.rs:40,50,63,74` | `justified` | `Regex::new(<字面量>)`——Rust 没有不可能失败的 regex 构造器，panic 是这个 API 的固有代价；模式是字面量且被模块测试覆盖 |
+| `api/src/retry.rs:23` | `justified` | `ClientBuilder::build()` 只配了编译期常量；签名返回 `Client` 而非 `Result`，改成 `Result` 会把错误穿透到全部调用点，而失败条件（TLS 初始化）本就不可恢复 |
+| `api/src/retry.rs:147` | `justified` | 循环不变量：两个 `break` 出口都先写 `last_error`；改成 `break value` 反而要为第二个出口再引入一个 `Option`，严格更差 |
+| `runtime/src/bash.rs:481,483` | `justified` | 两行之上刚 spawn 时设了 `Stdio::piped()`，`take()` 在此作用域只执行一次；外层 future 产出元组而非 `Result`，改造侵入性高 |
+| `cli/src/main.rs:398,414` | **`debt`** | 同为「常量路径必有 parent / file_name」，但所在函数**已经返回 `Result`**——`ok_or_else(…)?` / `let-else` 同样长度即可消除 panic。**故不标注，保留为棘轮起始债** |
+
+**棘轮起始状态：`debt=2` / `justified=8`。** 刻意保留 2 处真债：全标注虽也能让 `debt` 归零后继续拦住新增 panic，但会丢掉「存量确实还有可无痛消除项」这个信号。这 2 处应作为后续 `cli/main.rs` 拆薄时的顺手清理项。
+
+**口径本身就是最大的坑.** 同一棵树：naive grep 得 **512** 处、脚本口径得 **10** 处，差 51 倍。差额几乎全部来自内联 `#[cfg(test)] mod tests` 里的 `unwrap`/`expect`——而测试正是该 panic 的地方。用三个高命中文件独立核对剔除逻辑可信：
+
+| 文件 | naive 命中 | 内联测试起始 | 脚本判定 | 核对 |
+|---|---|---|---|---|
+| `runtime/src/prompt.rs` | 65 | `:643 mod tests`（首个命中 `:656`） | **0** | ✅ 全部落在测试内 |
+| `runtime/src/file_ops.rs` | 55 | `:1377 mod tests`（首个命中 `:1388`） | **0** | ✅ 全部落在测试内 |
+| `runtime/src/bash.rs` | 19 | `:712 mod tests`（生产命中 `:480,481`） | **2** | ✅ 与生产命中一一对应 |
+
+另外用一个临时探针文件（已删除）实测了分类器边界：`#[cfg(test)]` 内、注释内、字符串内含 panic 形态的命中**均不计**；裸 `panic!` 判 `debt`；带前置 `// panic-ok: <长理由>` 判 `justified`；而 `// panic-ok: ok`（理由 <8 字符）**仍判 `debt`**——理由必须是真的理由，不能是橡皮图章。门禁行为亦已验证：干净树退出 0；临时注入第 3 处债 → 退出 1 并报 `debt total grew: 2 -> 3`；移除后恢复退出 0。
+
+**尚未接入 CI.** 本仓 `.github/workflows/ci.yml` 现为 `ci.yml.bak`（已停用），且没有 jcode 那样的 `scripts/check_guardrails.sh` 汇总入口，故当前**只在提交前手动跑**。若要接入，建议先建一个 guardrails 汇总脚本，而不是只把这一个 python 塞进 workflow。
 
 ---
 

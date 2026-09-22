@@ -32,6 +32,12 @@ cargo test --workspace         # 单测:cargo test -p <crate> <name>;重点 crat
 
 `clippy::all` 为零告警是硬门；pedantic 已降为提示（存量基线 ~27 处，效率优先，不强求清零）。冒烟：`cargo run -p heartflow -- --help`、`... -- doctor`、`... -- system-prompt`。
 
+**panic 预算棘轮（提交前手动跑）**：`python3 scripts/check_panic_budget.py`（`--list` 逐个列出分类，`--update` 刷新基线）。只统计 `crates/*/src/**/*.rs` 的**生产**行——剔除 `#[cfg(test)]` 项、测试文件、注释与字符串内容；基线在 `scripts/panic_budget.json`，**`debt` 只许变小，新增文件带 panic 一律失败**。刻意保留的 panic（即找不到「同样清晰且局部」的非 panic 写法）必须在命中行**行尾**或**紧邻上一行**标注 `// panic-ok: <理由 ≥8 字符>`，否则计为新增债。当前基线 `debt=2`（`crates/cli/src/main.rs:398,414`）/ `justified=8`。真的清理掉存量债之后再跑 `--update`——**不要为了让门禁变绿而标注**，棘轮被频繁刷新就等于没有。
+
+**预算基线必须入库**：`scripts/panic_budget.json` 是**源码树的属性**（换台机器跑出同样的数），不是机器本地量测，**不得写进 `.gitignore`**。注意它与 `scripts/bench-gate.sh` 的基线约定**相反**——后者是机器本地性能数，存 `TMPDIR`、从不提交。基线缺失时门禁以 exit 1 报 `no baseline`；此时正确做法是恢复基线，**不是**随手 `--update`（那会把已有回归一并赦免，棘轮当场失效）。
+
+**第三方代码归属**：任何衍生/移植自外部项目的代码（脚本、片段、算法）须在根 `NOTICE` 追加版权声明与许可证全文，并在 `README.md` §致谢与第三方代码点名来源。当前唯一项：`scripts/check_panic_budget.py`（衍生自 MIT 许可的 jcode，Copyright (c) 2025 Jeremy Huang）。`archive/` 已在 `.gitignore` 中、**不随仓库分发**，所以归属信息不能只写在存档里。
+
 CI 只有两条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/**`/`scripts/gen-llms.sh` 变动才触发）；`ci.yml.bak` 是刻意停用的质量门，改名 `.bak` 后 GitHub 不识别。Actions 不跑代码检查。
 
 ## 接口面

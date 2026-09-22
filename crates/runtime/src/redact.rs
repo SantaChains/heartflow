@@ -36,6 +36,7 @@ fn url_userinfo() -> &'static Regex {
         // `scheme://user:password@` -> `scheme://[REDACTED]@` (password gone,
         // scheme preserved so the endpoint is still identifiable).
         Regex::new(r"([A-Za-z][A-Za-z0-9+.-]*://)[^\s/@:][^\s/@]*:[^\s@/]*@")
+            // panic-ok: literal pattern, compiled once, exercised by module tests
             .expect("valid url-userinfo regex")
     })
 }
@@ -45,6 +46,7 @@ fn auth_header() -> &'static Regex {
     RE.get_or_init(|| {
         // `Authorization: Bearer <tok>` / `... Basic <tok>` (header or `=` form).
         Regex::new(r"(?i)\b(authorization\s*[:=]\s*(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]{6,}")
+            // panic-ok: literal pattern, compiled once, exercised by module tests
             .expect("valid auth-header regex")
     })
 }
@@ -57,6 +59,7 @@ fn labeled_secret() -> &'static Regex {
         Regex::new(
             r#"(?i)(\b(?:api[_-]?key|apikey|secret[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd)\b\s*[:=]\s*["']?)([^\s"',;}\]]{6,})"#,
         )
+        // panic-ok: literal pattern, compiled once, exercised by module tests
         .expect("valid labeled-secret regex")
     })
 }
@@ -67,6 +70,7 @@ fn prefixed_key() -> &'static Regex {
         // Well-known high-entropy key prefixes (Anthropic/OpenAI/DeepSeek `sk-`,
         // GitHub `ghp_`/`gho_`/..., AWS `AKIA...`).
         Regex::new(r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})")
+            // panic-ok: literal pattern, compiled once, exercised by module tests
             .expect("valid prefixed-key regex")
     })
 }
