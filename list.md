@@ -176,7 +176,7 @@
 | 44 | crates.io 传播 404 重试 | 落地 | 1 | 3 | 5 | `scripts/release.sh` publish 循环 | 依赖刚发布即发依赖方会 "no package named"(非 429)，单独 sleep+retry 分支 |
 | 45 | 启动与 TTFT 可观测性 | 落地 | 1 | 2 | 4 | tracing 无请求级计时 | `HF_PROFILE` 打印 started-in-Xms + 每回合 TTFT 入 usage；防启动回归 |
 | 46 | 流式重试只在首字节前 | **已具备** | 2 | 4 | 5 | 核验（2026-09-21）：`api/retry.rs:95-100` 的 `check` 只判状态码即返回 `Ok(response)`，**body 不在重试闭包内被消费**；`client.rs:87` 只包住建连；`provider/adapter.rs:246` 收到内容后 `keep what arrived`，仅在「无内容到达」时回退非流式 | 中途断流不会重发整请求，「重试导致内容重复」的隐患不存在，无须实施 |
-| 47 | file_ops symlink 逃逸专项审计 | 审计 | 3 | 4 | 3 | workspace-write 下 read/write/edit/apply_patch 的路径解析链（未核实现状） | canonicalize 后须仍在 cwd 前缀内；符号链接指向仓外即越权，需专项逐工具验 |
+| 47 | file_ops symlink 逃逸专项审计 | **已实施** | 3 | 5 | 3 | 审计结论：不是「漏了一条检查」，而是那条检查**不可能生效**——`write_file`/`edit_file`/`apply_patch` 在 workspace-write 下是 `Allow`，而 `Allow` 的工具根本不查 gate（`runtime/src/permissions.rs` 的 `authorize`）。另：`plan` 模式的 plan 文档判定是**子串包含**（`path.contains(".heartflow/plans/")`），接受 `../` 穿越，也接受只把 plan 目录写在第一个 change 上的 `apply_patch` 诱饵 | 已落地：`escapes_workspace`（`file_ops.rs:1488`；词法折叠 `..` → 解析最长**存在**前缀以吃下符号链接 → 逐组件前缀比较，Windows 转小写；证不出「在内部」即判逃逸）+ 三个写工具改 `Prompt` + gate 改为返回 `Some(理由)`。详见「第七批实施」 |
 | 51 | 加权 / Damerau-Levenshtein 编辑匹配 | 范式 | 4 | 3 | 4 | `file_ops.rs:1051` → `:1062` 精算用普通 normalized-levenshtein：无加权、无换位 | STOC 2025 加权有界编辑距离最优算法（Gorbachev & Kociumaka）。`fn`↔`nf` 换位当前计 2 次编辑，Damerau 计 1 次。**先去分配（#4）再换距离函数** |
 | 53 | 前缀复用点由执行语义预测 | 落地 | 2 | 5 | 3 | 与 #34 同落点：`api` 请求组装处的 `cache_control` 断点位置 | CacheScout 范式。#34 只取「静态最稳前缀」，本条让断点随工具调用分布 / 轮次动态选取。**前置：#34 须先落地** |
 | 50 | 扫描预算按选择率自适应 | 落地 | 2 | 3 | 3 | `file_ops.rs:178` `MAX_SEARCH_FILES` 为固定常数；`:154` `SKIP_DIRS` 为固定集合 | learned pruning（HELMSON, OSDI'26；lakehouse arXiv 2608.05441「剪枝前置」）：先由模式选择率估应扫规模，再决定是否截断，替换固定上限。**与 #1 同文件，宜合并实施** |
@@ -195,7 +195,13 @@
 | 55 | search_documents 常驻化 + rga 缺失降级 | **刻意不做** | 1 | 3 | 5 | `tool_exec.rs:110` 仅当 `rga_available()`（`doc_search.rs:124`）为真才注册 | 现状是**刻意设计**：无 rga 时不下发一个必然失败的工具，避免污染工具表与误导模型。原条目主张「常驻 + 结构化缺失提示」，但那会把一个不可用工具塞进每回合 schema（token 成本）；权衡后维持条件下发 |
 | 57 | 搜索类四工具边界审计 | 审计 | 1 | 2 | 5 | glob_search（路径通配）/ search_files（nucleo 模糊路径）/ grep_search（内容正则）/ search_documents（归档内文本）职责实为清晰四分，**非功能冗余** | 「重叠工具是推理税」：description 须显式写出「何时用 A 而非 B」。纯文档改动，零风险 |
 | 60 | search_documents 限额与其他工具对齐 | 落地 | 1 | 2 | 5 | `doc_search.rs:19-23`：4MB 输出 / 30s 超时；对比 `read_file` 2MB、`web_fetch` 文本仅 2 万字符 | 结果质量最低的工具反而拿到最大额度（无上下文行、无排序）。另其参数面（`lib.rs:234`）缺 `-B/-A/-C`、`type`、`-n`，而归档内检索恰最需要上下文行 |
-| 56 | grep_search 参数收敛至 ≤8 | 落地 | 1 | 2 | 4 | `lib.rs:199` 起共 13 个参数；其中 `-B/-A/-C` 短名与 `context` 长名语义重叠，属同义参数并存 | AWS Prescriptive Guidance 建议工具参数 ≤8。`output_mode` 已用 enum 消歧是对的方向，应延续并择一保留上下文参数 |
+| 56 | grep_search 参数收敛至 ≤8 | 落地 | 1 | 2 | 4 | `lib.rs:199` 起共 13 个参数；其中 `-B/-A/-C` 短名与 `context` 长名语义重叠，属同义参数并存 | AWS Prescriptive Guidance 建议工具参数 ≤8。`output_mode` 已用 enum 消歧是对的方向（2026-09-22 已在 schema 补 `enum` 并在 runtime 收紧为**拒绝未知值**），应延续并择一保留上下文参数 |
+| 67 | web.rs 逐跳 SSRF 复查 | 落地 | 3 | 4 | 3 | `web.rs:65-70` 用 `redirect::Policy::limited(5)`，由 reqwest 内部跟随；`:93-97` 只对 `response.url()`（终点）调 `ensure_public`。**中间跳的请求已经发出**——打内网状态变更端点、利用 DNS rebinding 都发生在被检查之前 | 修法：`Policy::custom` 里对每一跳自查并记录拒绝原因，`send()` 后取出。**离线不可证**：本地测试服务器必落 loopback，而 `ensure_public` 按设计拒绝 loopback，故无法用本地服务器写端到端测试；须真机冒烟（起两端点做 `public → private` 跳转，断言第二跳未被请求）。清单原「每跳复查」的表述已于本轮更正 |
+| 68 | TUI 退出丢弃未发送草稿 | 落地 | 1 | 3 | 4 | `tui.rs:403/413` 置 `quit` 后输入区内容直接消失；而 `history.txt`（`:1707`）持久化的只有**已提交**项——写了三行长提示再按 Esc 即全部作废 | 修法：退出时若非空则 `history.push(&history_path, draft)` 进同一文件，下次会话 ↑ 即可召回；退出提示写明「草稿已存入历史」。**须真机 TUI**（alt-screen 与事件循环行为无法离线断言），故不入本批 |
+| 69 | 非 UTF-8 文件的**可编辑**性 | 落地 | 3 | 3 | 2 | #59 让 `read_file` 能解码 GBK/UTF-16（`file_ops.rs:258-281`），但 `edit_file`/`apply_patch` 只认 UTF-8：本轮已把错误信息改为「带文件名的可行动提示」，可**编辑**本身仍未解决 | 正解是「按原编码回写」——读时记住探测到的编码，写时再编码回去，否则一次编辑会把 GBK 文件整个变成 UTF-8（内容对但 diff 巨大、外部工具可能读不动）。需先定「编码变了要不要告知调用方」的策略，故单列 |
+| 70 | 内置预置静默覆盖显式 `[provider] protocol` | 落地 | 3 | 4 | 5 | `provider/src/config.rs:391-395`：`builtin.map_or_else(|| settings.protocol.unwrap_or(Anthropic), \|p\| p.protocol)`——只要 provider 名命中了内置预置，用户**显式写的** `[provider] protocol` 就被**静默忽略**。违反「显式配置优先」原则，且失败形态是「请求用错协议、报一个与配置无关的错」 | 修法二选一：让显式值优先并 warn，或保持预置优先但 warn 出「你的 protocol 被忽略了」。需读完整装配链（`base_url`/`api_key_env`/`model` 三处同构回落）再定，避免只改一处造成不一致 |
+| 71 | `Set-Cookie` 的 `Domain` 未做 domain-match 校验 | 落地 | 3 | 4 | 4 | `tools/src/web.rs:396-399`：`domain.map_or(response_host, \|d\| d.trim_start_matches('.').to_ascii_lowercase())`——`Domain` 属性被**原样采信**。于是 `evil.com` 的响应可写 `Domain=example.com`，jar 把它存到 `example.com` 名下，之后**每次抓取 example.com 都会带上它**（cookie 注入 / 会话固定） | RFC 6265 §5.3 第 6 步：`Domain` 必须是请求 host 的 domain-match，否则**整条 cookie 丢弃**。也可顺带拒 `Domain` 为公共后缀者。修法纯函数、可离线测（`store_set_cookies` 已是纯函数，`web.rs:385`），单独成条是因为判据需对照 RFC 逐条落 |
+| 72 | URL userinfo 与真实主机不一致 | 落地 | 2 | 2 | 5 | `web.rs:409` `ensure_public` 取 `url.host_str()`——**判 SSRF 用的是正确主机**，这一层没问题；问题在展示：`https://api.github.com@evil.com/x` 的 `host_str()` 是 `evil.com`，但字符串读起来像 GitHub。reqwest 不把 userinfo 当凭据发，故不是凭据泄漏，而是**误导读模型** | 修法：`ensure_public` 或 `web_fetch` 入口拒收带 userinfo 的 URL（消息说明「URL 里不能带用户名/密码」）。低严重度，但成本极小、可离线测 |
 
 ---
 
@@ -213,7 +219,7 @@
 | 编辑距离提示的两段式 | `file_ops.rs:1053` 粗筛 jaro-winkler → `:1062` 前 10 名精算 normalized-levenshtein，且 `:1039` 有 5 万窗口上限 | 已是「粗筛 + 精验」，无须替换算法 |
 | 崩溃恢复幂等 | JSON 权威 + 原子 temp+rename；SQLite 事务 | 已满足 |
 | 全局单遍扫描 | 压缩、token 估算、grep 均为单趟 | 已满足 |
-| curl 式 redirect 上限 + 每跳 SSRF 复查 | `web.rs:68` `redirect::Policy::limited(5)`(≈`--max-redirs`)；`:90` redirect 后复查最终 URL 防落到内网 | 已是 curl 逐跳重验证纪律，勿再“引入 redirect 安全” |
+| curl 式 redirect 上限 + **终点** SSRF 复查 | `web.rs:68` `redirect::Policy::limited(5)`(≈`--max-redirs`)；`:93-97` 只对 `response.url()`（**最终**跳）复查 | ⚠️ **2026-09-22 更正**：原写「逐跳重验证」是误记。`limited(5)` 由 reqwest 内部跟随，中间跳的请求**已经发出**，只有终点过 `ensure_public`。终点复查确实阻断了「把内网响应体交给模型」，但中间跳的盲 SSRF 副作用（打内网状态变更端点 / DNS rebinding）未被拦。真实逐跳须 `Policy::custom`——因离线不可测（本地测试服务器落 loopback，必被 `ensure_public` 拒绝）而列入 #67 |
 | curl 式分层超时 | `retry.rs:6` CONNECT 15s + `:8` READ 300s(≈`--connect-timeout`+读上限) | 已具备 |
 | curl 式 gzip 解压 | `api/Cargo.toml:19` reqwest `gzip` feature(≈`--compressed`) | 已具备 |
 | curl 式幂等感知重试 | MCP 握手幂等重试 3 次、工具调用非幂等不重试(与 curl 默认只重试安全方法同哲学) | 已对齐，勿改成无脑全重试 |
@@ -510,6 +516,44 @@ cli 拆薄已把交互面分成默认 REPL 与 `HEARTFLOW_TUI=1` 可选全屏载
 
 本轮各条 hack 的理由、反例与代价已整理进新建的 **`hack.md`**（A 档源码层 12 条 + B 档本机构建/环境坑 7 条，判据集中在 §0）。
 
+### 第七批实施（2026-09-22）——权限面三处「名不副实」+ 六处静默失败
+
+> 来源：4 路并行只读审计（cli-UX / runtime-security / provider-api-store / tools-observability，合计 43 条发现）的汇总。**只取离线可验证的那部分**进本批；凡必须真机网络或真机 TUI 才能证的（#67–#72），一律只入清单、不改代码。
+
+**本批主线是一条结构性的：#47「workspace-write 不约束写入」不是缺一个检查，而是那个检查在这套设计里不可能生效。**
+
+`PermissionMode::Prompt` 的工具才会问 gate；`Allow` 的工具**根本不查 gate**（`runtime/src/permissions.rs` 的 `authorize`，`Allow` 臂直接返回）。而 `workspace-write` 此前把 `write_file` / `edit_file` / `apply_patch` 全设成 `Allow`——**所以「写哪都行」不是漏检，是必然**。修法因此不是「加一条路径比较」，而是分两步：
+
+1. 三个写工具改 `Prompt`（`cli/src/permissions.rs:100-113`），使 gate 有机会被调用；
+2. 把「拦不拦」表达成一个**返回 `Option<String>` 的 gate**——`None` = 静默放行，`Some(理由)` = 停下来问，并把理由带到提问界面。
+
+第 2 步顺带解掉了旧 gate 的签名天花板：`PromptGate` 从 `fn(&str,&str)->bool` 变成 `Arc<dyn Fn(&str,&str)->Option<String>+Send+Sync>`（`runtime/src/permissions.rs:55`），于是 gate 可以**捕获工作区根**（闭包而非函数指针），并**说明原因**而不只是回答「要不要问」。`PermissionRequest` 增加 `reason: Option<String>`（`:23`）；`CliPermissionPrompter`（`cli/src/interact.rs:42-47`）与 TUI 弹层（`cli/src/tui.rs:1470-1481`，有理由时多占一行）都会把它打出来——「为什么拦我」从只能猜变成写在脸上。
+
+**收敛判据**：`escapes_workspace(root, candidate)`（`runtime/src/file_ops.rs:1488`）——词法折叠 `..` → 解析最长**存在**前缀（吃下符号链接，同时允许叶子尚不存在，供写入）→ 逐组件前缀比较（Windows 下转小写）。**证不出「在内部」就判为逃逸**（fail-closed）。
+
+| 项 | 改动落点 | 说明 | 测试 |
+|---|---|---|---|
+| #47 | `runtime/src/file_ops.rs:1488-1587`、`cli/src/permissions.rs:141-296` | `escapes_workspace` + 4 个助手（`lexical_normalize` / `resolve_existing_prefix` / `has_prefix` / `component_eq`）；`workspace_write_gate`（bash 按**形状**、写入按**位置**、`dangerouslyDisableSandbox` 一律问）；`plan_gate_for` 改为**按解析后的路径**判是否 plan 文档，替换原来的 `path.contains(".heartflow/plans/")` 子串包含（后者接受 `.heartflow/plans/../../src/lib.rs`，也接受只把 plan 目录写在第一个 change 上的 `apply_patch` 诱饵）；`write_targets` 取不到路径即「问」，不静默降级成「没问题」 | runtime 新增 6 条逃逸用例（含 `ws2` 不是 `ws` 子目录这一**名字前缀**陷阱、符号链接目录不可洗白、根尚不存在时仍能约束）；cli 新增 workspace-write 路径约束专项用例 |
+| — | `cli/src/permissions.rs:44-67` | `permission_policy_for_mode_in(mode, mcp, workspace)` 抽出：旧签名只能吃 `env::current_dir()`，无法为「临时工作区」写测试 | 同上 |
+| — | `cli/src/permissions.rs:58-67` | **未知 mode 不再静默套用「全允许」**：`eprintln!` 报出非法值并退回 `workspace-write`（可能被指的几个里最窄的那个）。原 `_ =>` 臂把 `HEARTFLOW_PERMISSION_MODE=readonly` 这类笔误解释成「什么都允许」 | 行为变更，随 cli 测试 |
+| — | `cli/src/permissions.rs:192-201` | `sandbox_opt_out`：`dangerouslyDisableSandbox` 是**模型可控字段**，而它唯一的效果就是关掉 `scrub_credential_env`。留在无人值守路径上即一句话提权——`{"command":"ls","dangerouslyDisableSandbox":true}` 让子进程拿到 agent 自己的 `GITHUB_TOKEN`。现在它与「危险命令」同档，`command` 长什么样都不影响 | cli 新增：`ls -la` + 该字段 → 仍 `Deny` |
+| #2（审计） | `runtime/src/doc_search.rs:121-160` | **rga 参数注入**。`pattern`/`path` 原本是**裸位置参数**，而 `rga` 会把未知参数转发给 `ripgrep`——以 `-` 开头的裸参数就是**标志**，`--pre=<cmd>` 正是 ripgrep 的预处理器，即任意命令执行。而 `search_documents` 在 `read-only`/`plan` 里是 **Allow**（理由是「它只读」），所以这是一条**在只读模式下可用的提权**。修法双层：显式拒绝首字符为 `-` 的 `pattern`/`path`（不依赖下游如何转发），并在 path 前插 `--` 终止选项解析（两层都做，因为哪一层被下游尊重事先不可知） | runtime 新增 3 条：path 被 trim 且跟在 `--` 之后、`--pre=` 出现在 pattern 或 path 位均被拒、空 path 被拒 |
+| — | `runtime/src/file_ops.rs:417,442,572,624` | **数据丢失**：`apply_patch` 的 `PreparedFile.original` 由 `fs::read_to_string().ok()` 得到，于是「文件不存在」与「存在但非 UTF-8」**无法区分**；而回滚把 `None` 解释成「本批新建」，动作是 **`fs::remove_file`**。即：一个二进制文件被批次覆写、随后批次失败，回滚会把它**删掉**。改为 `original_bytes: Option<Vec<u8>>`（存在性看字节读，diff 仍用文本），回滚按字节原样写回（`write_bytes_atomic` 从 `write_text_atomic` 拆出） | runtime 新增：二进制被覆写后回滚 → **文件仍在**且字节逐字节相同；另新增「二进制 + 非空 `old_string` 直接拒」——原来会报 `old_string not found`，把调用者引向一个永远匹配不上的文件 |
+| — | `runtime/src/file_ops.rs:287-302` | `write_file` 同样按字节判存在性：覆写一个二进制文件此前报 `kind:"create"`（且 `original_file: None`），等于告诉调用方「没什么需要恢复的」 | runtime 新增：二进制覆写的 `kind` 必须是 `update` |
+| — | `runtime/src/file_ops.rs:315-326` | `edit_file` 遇非 UTF-8 此前只抛 `read_to_string` 的裸解码错（且不带路径）；现在报出文件名与出路（`write_file` 可整档替换） | runtime 新增：消息同时含「not valid UTF-8」与文件名 |
+| — | `runtime/src/file_ops.rs:345-358` | `edit_file` 的**多处匹配**此前**静默替换第一处**。同仓 `apply_patch` 对同样输入是**拒绝**的——两个工具对「`old_string` 不唯一」给出相反语义。统一为拒绝（消息给出匹配数）；`replace_all` 与空串行为不变 | runtime 新增：两处匹配 → `InvalidInput`；唯一匹配仍成功；`replace_all` 仍全替换 |
+| — | `runtime/src/file_ops.rs:890-905` | `grep_search` 的 `output_mode` 此前**任何未识别值都静默退化为 `files_with_matches`**：要 `count` 而拼成 `counts` 会拿到文件列表加 `numMatches: null`——读起来像「没有匹配」，把检索带偏。改为显式枚举校验，并把合法值写进错误 | runtime 新增：`counts` → `InvalidInput`，消息含坏值与合法值 |
+| — | `tools/src/lib.rs:184,207-211` | 与上两条配套的**接口面**：`edit_file` 的 description 由「Replace text in a workspace file.」补成「唯一性要求 + 不唯一会被拒 + `replace_all` 语义 + 建议先读文件再逐字复制」；`grep_search.output_mode` 补 `enum`（原是裸 `{"type":"string"}`，靠模型猜） | schema 变更，随 clippy/test 通过 |
+| #7（审计） | `cli/src/main.rs:1134-1168` | `!<cmd>` 是操作者自己的逃生口，**不该被 mode 一刀封死**；但 `read-only`/`plan` 承诺的是「这会话什么都不改」，静默例外会让承诺失真。改为把 mode 折进**同一个**确认里（原因如实写出），危险命令的确认也并进同一处，不再连问两次 | 编译期签名变更（`handle_bang_command` 收 `mode`） |
+| #8（审计） | `tools/src/web.rs:42,150-170,267-272` | cookie jar 落盘失败此前是 `let _ = fs::write(...)`——静默丢弃。症状与「服务器不再发 cookie」完全一样，无法区分。现在 `save_cookie_jar` 返回 `Result`，调用方写进 `WebFetchReport.cookieJarWarning`（`skip_serializing_if = "Option::is_none"`，未启用 jar 时输出形状不变）。**不**让抓取失败：cookie 是抓取的副作用，不是本体 | tools 新增 2 条：正常落盘往返、路径不可写时如实返回错误 |
+
+**为什么这几条要一起做**：它们共享同一个形态——**「出错了也不报」**。区别只在后果：#47 与 #2 是越权，`original_bytes` 是数据丢失，其余是可诊断性。上一批（棘轮扩面）抓的是 `unwrap` 形态；这一批抓的是 `let _ =` / `.ok()` / `_ =>` 形态——**棘轮永远看不见后者**。
+
+**顺带更正两处清单自身的误记**：
+
+- 原「已具备」栏的「curl 式 redirect 上限 + **每跳** SSRF 复查」是误记。`limited(5)` 由 reqwest 内部跟随，只有**终点** `response.url()` 过 `ensure_public`（`web.rs:93-97`）；中间跳的请求**已经发出**。终点复查确实阻断了「把内网响应体交给模型」，但中间跳的盲 SSRF 副作用没拦。已改注并立为 #67。
+- 另核出两条**证据在手但离线不可证**的新缺陷，立为 #70（`config.rs:391-395` 内置预置静默覆盖显式 `[provider] protocol`）与 #71（`web.rs:396-399` `Set-Cookie` 的 `Domain` 属性**未做 domain-match 校验**，即 `evil.com` 可写 `Domain=example.com`，随后把该 cookie 重放到 example.com——RFC 6265 §5.3 第 6 步要求拒绝）。
+
 ---
 
 ## 附：按底层度分层视图
@@ -517,9 +561,9 @@ cli 拆薄已把交互面分成默认 REPL 与 `HEARTFLOW_TUI=1` 可选全屏载
 | 层 | 含义 | 条目 |
 |---|---|---|
 | L1 硬件层 | CPU 缓存、SIMD、多核、存储介质 | 8, 14 |
-| L2 OS 原语层 | 系统调用、内存映射、文件系统、进程、字节编码 | 1, 6, 7, 16, 22, 32, 33, 41, 43, 47, 59, 61, 64 |
+| L2 OS 原语层 | 系统调用、内存映射、文件系统、进程、字节编码 | 1, 6, 7, 16, 22, 32, 33, 41, 43, 47, 59, 61, 64, 68, 69 |
 | L3 数据结构与算法范式层 | 索引结构、编码、哈希、合并、字符串匹配 | 2, 3, 4, 9, 10, 11, 12, 13, 17, 18, 19, 20, 21, 23, 25, 26, 27, 38, 39, 51 |
-| L4 策略与调度层 | 代价估算、缓存目录、任务编排、网络协议语义、schema 装配、审计、形式化验证 | 5, 15, 24, 28, 29, 30, 31, 34, 35, 36, 37, 40, 42, 44, 45, 46, 48, 49, 50, 52, 53, 54, 55, 56, 57, 58, 60, 62, 63, 65, 66 |
+| L4 策略与调度层 | 代价估算、缓存目录、任务编排、网络协议语义、schema 装配、审计、形式化验证 | 5, 15, 24, 28, 29, 30, 31, 34, 35, 36, 37, 40, 42, 44, 45, 46, 48, 49, 50, 52, 53, 54, 55, 56, 57, 58, 60, 62, 63, 65, 66, 67, 70, 71, 72 |
 
 ---
 

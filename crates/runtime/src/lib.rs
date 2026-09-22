@@ -30,10 +30,10 @@ pub use conversation::{
 };
 pub use doc_search::{rga_available, search_documents, DocSearchInput, DocSearchOutput};
 pub use file_ops::{
-    apply_patch, edit_file, glob_search, grep_search, read_file, search_files, write_file,
-    ApplyPatchOutput, EditFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput,
-    PatchChange, PatchFileResult, ReadFileOutput, SearchFilesOutput, StructuredPatchHunk,
-    TextFilePayload, WriteFileOutput,
+    apply_patch, edit_file, escapes_workspace, glob_search, grep_search, read_file, search_files,
+    write_file, ApplyPatchOutput, EditFileOutput, GlobSearchOutput, GrepSearchInput,
+    GrepSearchOutput, PatchChange, PatchFileResult, ReadFileOutput, SearchFilesOutput,
+    StructuredPatchHunk, TextFilePayload, WriteFileOutput,
 };
 pub use permissions::{
     PermissionMode, PermissionOutcome, PermissionPolicy, PermissionPromptDecision,

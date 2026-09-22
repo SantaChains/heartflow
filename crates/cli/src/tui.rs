@@ -1447,8 +1447,12 @@ fn render_permission_overlay(app: &App, frame: &mut Frame) {
     };
     let theme = Theme::current();
     let area = frame.area();
+    // The policy's reason for stopping is worth a row of its own: it turns the
+    // popup from "approve this?" into "approve this because it leaves the
+    // workspace".
+    let reason = pending.request.reason.as_deref();
     let width = (area.width * 3 / 5).clamp(40, 80).min(area.width);
-    let height = 9u16.min(area.height);
+    let height = (if reason.is_some() { 11u16 } else { 9u16 }).min(area.height);
     let x = area.x + (area.width.saturating_sub(width) / 2);
     let y = area.y + (area.height.saturating_sub(height) / 2);
     let popup = Rect {
@@ -1471,8 +1475,14 @@ fn render_permission_overlay(app: &App, frame: &mut Frame) {
             preview,
             Style::default().fg(theme.muted().ratatui()),
         )),
-        Line::from(""),
     ];
+    if let Some(reason) = reason {
+        lines.push(Line::from(Span::styled(
+            format!("why: {reason}"),
+            Style::default().fg(theme.error().ratatui()),
+        )));
+    }
+    lines.push(Line::from(""));
     for (index, option) in pending.options.iter().enumerate() {
         let selected = index == pending.selected;
         let prefix = if selected { "❯ " } else { "  " };
@@ -2075,6 +2085,7 @@ mod tests {
         Msg::PermissionRequest(PermissionRequest {
             tool_name: tool.to_string(),
             input: r#"{"command":"rm -rf /"}"#.to_string(),
+            reason: Some("the command looks destructive".to_string()),
         })
     }
 
@@ -2139,6 +2150,30 @@ mod tests {
         assert!(app.permission.is_some(), "and the overlay stays open");
     }
 
+    #[test]
+    fn permission_overlay_renders_the_policys_reason() {
+        let mut app = App::new();
+        app.update(Msg::TurnStarted);
+        app.update(Msg::PermissionRequest(PermissionRequest {
+            tool_name: "write_file".to_string(),
+            input: r#"{"path":"../escape.rs"}"#.to_string(),
+            reason: Some("outside the workspace root".to_string()),
+        }));
+        // The render path must surface the policy's `reason`, not just the tool
+        // name — the operator is being asked *because* the call leaves the
+        // workspace, and that is the fact they need to decide on.
+        let rows = render_app_rows(&app, 80, 16);
+        assert!(
+            rows.iter().any(|row| row.contains("why:")),
+            "the popup labels the reason: {rows:#?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("outside the workspace root")),
+            "the popup prints the reason text: {rows:#?}"
+        );
+    }
+
     #[tokio::test]
     async fn prompter_allow_all_short_circuits_the_overlay() {
         let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<Msg>();
@@ -2151,6 +2186,7 @@ mod tests {
         let req = PermissionRequest {
             tool_name: "bash".to_string(),
             input: "x".to_string(),
+            reason: None,
         };
         let decision = prompter.decide(&req).await;
         assert!(matches!(decision, PermissionPromptDecision::Allow));

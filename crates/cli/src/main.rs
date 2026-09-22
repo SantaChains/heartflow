@@ -858,7 +858,7 @@ async fn run_repl(
             )
             .await?
         } else if trimmed.starts_with('!') {
-            handle_bang_command(state, trimmed).await;
+            handle_bang_command(state, &mode, trimmed).await;
             LoopControl::Continue
         } else {
             // Running turns cannot be submitted through the blocking line
@@ -1125,15 +1125,31 @@ fn handle_guide_command(input: &str, runtime: &AgentRuntime) {
 /// model uses (pwsh on Windows, UTF-8 wrapped), with no model round-trip.
 /// Dangerous commands are confirmed first; output is folded like tool output
 /// and stays reachable via `/expand`.
-async fn handle_bang_command(state: &SessionShared, input: &str) {
+///
+/// `!` is the operator's own escape hatch so it is never *blocked* by the
+/// permission mode — but `read-only`/`plan` promise that nothing in the session
+/// changes, and a silent exception makes that promise false. So the mode is
+/// folded into the same confirmation, with the reason stated, instead of being
+/// quietly ignored or bluntly refused.
+async fn handle_bang_command(state: &SessionShared, mode: &str, input: &str) {
     let command = input.trim().strip_prefix('!').unwrap_or("").trim();
     if command.is_empty() {
         println!("usage: !<shell command>   e.g. !git status");
         return;
     }
-    if is_dangerous_command(command)
+    let mut reasons: Vec<String> = Vec::new();
+    if matches!(mode, "read-only" | "plan") {
+        reasons.push(format!(
+            "this session is in `{mode}` mode, where tools cannot write"
+        ));
+    }
+    if is_dangerous_command(command) {
+        reasons.push("the command looks destructive".to_string());
+    }
+    if !reasons.is_empty()
         && !Confirm::new(&format!(
-            "Run potentially destructive command?\n  {command}"
+            "Run `{command}`?\n  because: {}",
+            reasons.join("; ")
         ))
         .with_default(false)
         .prompt()
@@ -2510,10 +2526,16 @@ mod tests {
         assert_eq!(plan.mode_for("bash"), PermissionMode::Deny);
         assert_eq!(plan.mode_for("edit_file"), PermissionMode::Deny);
         assert_eq!(plan.mode_for("read_file"), PermissionMode::Allow);
-        // workspace-write: bash prompts, writers allowed.
+        // workspace-write: bash prompts, and writers prompt too so the
+        // confinement gate gets to see them (an Allow tool never consults it).
         let write = permission_policy_for_mode("workspace-write", &[]);
         assert_eq!(write.mode_for("bash"), PermissionMode::Prompt);
-        assert_eq!(write.mode_for("edit_file"), PermissionMode::Allow);
+        assert_eq!(write.mode_for("edit_file"), PermissionMode::Prompt);
+        assert_eq!(write.mode_for("write_file"), PermissionMode::Prompt);
+        assert_eq!(write.mode_for("apply_patch"), PermissionMode::Prompt);
+        // Readers stay unattended.
+        assert_eq!(write.mode_for("read_file"), PermissionMode::Allow);
+        assert_eq!(write.mode_for("glob_search"), PermissionMode::Allow);
         // web_fetch reaches the network: prompts in workspace-write, denied in read-only.
         assert_eq!(write.mode_for("web_fetch"), PermissionMode::Prompt);
         assert_eq!(plan.mode_for("web_fetch"), PermissionMode::Deny);
@@ -2553,6 +2575,65 @@ mod tests {
                 .await,
             PermissionOutcome::Deny { .. }
         ));
+        // ...and so does a harmless command that asks to keep the agent's
+        // credentials in its environment. The opt-out is the escalation.
+        assert!(matches!(
+            write
+                .authorize(
+                    "bash",
+                    r#"{"command":"ls -la","dangerouslyDisableSandbox":true}"#,
+                    None
+                )
+                .await,
+            PermissionOutcome::Deny { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn workspace_write_confines_writes_to_the_workspace_root() {
+        use super::permission_policy_for_mode_in;
+        use runtime::PermissionOutcome;
+        let workspace = std::env::temp_dir().join("hf-ws-confine-test");
+        let _ = std::fs::create_dir_all(&workspace);
+        let write = permission_policy_for_mode_in("workspace-write", &[], &workspace);
+        let inside = workspace.join("src").join("lib.rs");
+        let inside_json = serde_json::json!({ "path": inside.to_string_lossy() }).to_string();
+
+        // A write that resolves inside the workspace still runs unattended.
+        assert!(matches!(
+            write.authorize("write_file", &inside_json, None).await,
+            PermissionOutcome::Allow
+        ));
+
+        // `..` traversal is caught even though the path is not absolute.
+        assert!(matches!(
+            write
+                .authorize("write_file", r#"{"path":"../../etc/passwd"}"#, None)
+                .await,
+            PermissionOutcome::Deny { .. }
+        ));
+
+        // A writer with no parseable path fails closed.
+        assert!(matches!(
+            write
+                .authorize("write_file", r#"{"content":"no path here"}"#, None)
+                .await,
+            PermissionOutcome::Deny { .. }
+        ));
+
+        // An `apply_patch` batch is judged on every change, not just the first.
+        assert!(matches!(
+            write
+                .authorize(
+                    "apply_patch",
+                    r#"{"changes":[{"path":"src/ok.rs"},{"path":"../escape.rs"}]}"#,
+                    None
+                )
+                .await,
+            PermissionOutcome::Deny { .. }
+        ));
+
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[tokio::test]
@@ -2599,6 +2680,37 @@ mod tests {
         assert!(matches!(
             plan.authorize("write_file", r#"{"path":"README.md"}"#, None)
                 .await,
+            PermissionOutcome::Deny { .. }
+        ));
+        // A `..` escape spelled from inside the plan directory is not a plan doc.
+        assert!(matches!(
+            plan.authorize(
+                "write_file",
+                r#"{"path":".heartflow/plans/../../src/lib.rs"}"#,
+                Some(&mut BlockPrompter)
+            )
+            .await,
+            PermissionOutcome::Deny { .. }
+        ));
+        // An `apply_patch` that nominates the plans folder but also writes a
+        // source file is refused: every change must be a plan document.
+        assert!(matches!(
+            plan.authorize(
+                "apply_patch",
+                r#"{"changes":[{"path":".heartflow/plans/p.md"},{"path":"src/lib.rs"}]}"#,
+                Some(&mut BlockPrompter)
+            )
+            .await,
+            PermissionOutcome::Deny { .. }
+        ));
+        // A non-Markdown file inside the plan directory is still not a plan doc.
+        assert!(matches!(
+            plan.authorize(
+                "write_file",
+                r#"{"path":".heartflow/plans/notes.txt"}"#,
+                Some(&mut BlockPrompter)
+            )
+            .await,
             PermissionOutcome::Deny { .. }
         ));
     }

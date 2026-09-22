@@ -40,6 +40,11 @@ impl PermissionPrompter for CliPermissionPrompter {
             let preview: String = request.input.chars().take(200).collect();
             let mut stdout = io::stdout();
             let _ = writeln!(stdout, "\npermission requested: {}", request.tool_name);
+            // Say *why* we stopped. The policy already decided the call leaves
+            // the workspace; without this line the operator has to guess.
+            if let Some(reason) = &request.reason {
+                let _ = writeln!(stdout, "  why: {reason}");
+            }
             let _ = writeln!(stdout, "  {preview}");
 
             if stdin_is_terminal() {

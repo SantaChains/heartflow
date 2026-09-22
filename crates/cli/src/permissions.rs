@@ -6,11 +6,12 @@
 
 use std::env;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use runtime::{
-    PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
-    PermissionRequest,
+    escapes_workspace, PermissionMode, PermissionPolicy, PermissionPromptDecision,
+    PermissionPrompter, PermissionRequest,
 };
 
 use crate::AgentRuntime;
@@ -29,13 +30,42 @@ pub(crate) fn default_permission_mode(interactive: bool) -> String {
 
 /// Permission resolution: `read-only` allows pure readers, `full`/`auto` run
 /// everything without asking, and the default `workspace-write` runs routine
-/// commands but confirms only high-blast-radius ones (a `bash` command is
-/// auto-allowed unless it looks destructive; `web_fetch` always confirms).
+/// work unattended while stopping for anything that leaves the workspace — a
+/// `bash` command that looks destructive, a write whose target resolves outside
+/// the workspace root, or a network tool.
 ///
 /// `mcp_read_only` names (from `McpToolset::read_only_tool_names`) are added to
 /// the Allow set for the two Deny-default modes, so read-only MCP tools stay
 /// usable in `read-only`/`plan` without opening up write-capable ones.
+///
+/// An unrecognised mode is reported and treated as `workspace-write`: silently
+/// applying a policy the user did not ask for is the worst option, and
+/// `workspace-write` is the narrowest of the modes they might have meant.
 pub(crate) fn permission_policy_for_mode(mode: &str, mcp_read_only: &[String]) -> PermissionPolicy {
+    // The workspace root is the directory the agent was started in; tool paths
+    // resolve against it, which is what write confinement checks against.
+    let workspace = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    permission_policy_for_mode_in(mode, mcp_read_only, &workspace)
+}
+
+/// [`permission_policy_for_mode`] with an explicit workspace root, so tests can
+/// aim confinement at a temp directory instead of the process cwd.
+pub(crate) fn permission_policy_for_mode_in(
+    mode: &str,
+    mcp_read_only: &[String],
+    workspace: &Path,
+) -> PermissionPolicy {
+    let mode = match mode {
+        "read-only" | "workspace-write" | "full" | "auto" | "plan" => mode,
+        other => {
+            eprintln!(
+                "heartflow: unknown permission mode `{other}`; using `workspace-write`. \
+                 Valid values are read-only, workspace-write, full (auto) and plan."
+            );
+            "workspace-write"
+        }
+    };
+
     let base = match mode {
         "read-only" => PermissionPolicy::new(PermissionMode::Deny)
             .with_tool_mode("read_file", PermissionMode::Allow)
@@ -48,9 +78,10 @@ pub(crate) fn permission_policy_for_mode(mode: &str, mcp_read_only: &[String]) -
             .with_tool_mode("ask_user", PermissionMode::Allow),
         "full" | "auto" => PermissionPolicy::new(PermissionMode::Allow),
         // Planning: read/research freely, but the only mutation allowed is the
-        // plan document itself. Writers route to `Prompt`; the gate auto-allows
-        // `.heartflow/plans/*.md` and every other write hits `BlockPrompter`
-        // (a hard gate). `bash` and everything else fall to the `Deny` default.
+        // plan document itself. Writers route to `Prompt`; the gate auto-allows a
+        // write that resolves into `.heartflow/plans/` and every other write
+        // hits `BlockPrompter` (a hard gate). `bash` and everything else fall to
+        // the `Deny` default.
         "plan" => PermissionPolicy::new(PermissionMode::Deny)
             .with_tool_mode("read_file", PermissionMode::Allow)
             .with_tool_mode("glob_search", PermissionMode::Allow)
@@ -65,15 +96,23 @@ pub(crate) fn permission_policy_for_mode(mode: &str, mcp_read_only: &[String]) -
             .with_tool_mode("write_file", PermissionMode::Prompt)
             .with_tool_mode("edit_file", PermissionMode::Prompt)
             .with_tool_mode("apply_patch", PermissionMode::Prompt)
-            .with_prompt_gate(plan_gate),
+            .with_prompt_gate(plan_gate_for(workspace)),
+        // `workspace-write`, the default interactive mode. Writers are `Prompt`
+        // rather than `Allow` so the gate sees them at all — an `Allow` tool
+        // never consults the gate, which is how writes outside the workspace
+        // went through unchecked while the mode name promised otherwise.
         _ => PermissionPolicy::new(PermissionMode::Allow)
+            .with_tool_mode("write_file", PermissionMode::Prompt)
+            .with_tool_mode("edit_file", PermissionMode::Prompt)
+            .with_tool_mode("apply_patch", PermissionMode::Prompt)
             .with_tool_mode("bash", PermissionMode::Prompt)
             // Network egress leaves the sandbox; ask like a dangerous command does.
             .with_tool_mode("web_fetch", PermissionMode::Prompt)
             .with_tool_mode("web_search", PermissionMode::Prompt)
             .with_tool_mode("generate_image", PermissionMode::Prompt)
-            .with_prompt_gate(confirm_only_when_risky),
+            .with_prompt_gate(workspace_write_gate(workspace)),
     };
+
     // The Deny-default modes must still reach read-only MCP tools; Allow modes
     // already permit them, so adding them again is a harmless no-op there.
     match mode {
@@ -92,13 +131,70 @@ pub(crate) fn set_runtime_mode_policy(runtime: &mut AgentRuntime, mode: &str) {
     runtime.set_permission_policy(permission_policy_for_mode(mode, &mcp_read_only));
 }
 
-/// Prompt gate for `workspace-write`: `bash` needs confirmation only when the
-/// command looks destructive; every other `Prompt`-mode tool always confirms.
-fn confirm_only_when_risky(tool_name: &str, input: &str) -> bool {
-    if tool_name != "bash" {
-        return true;
+/// Prompt gate for `workspace-write`. Returns `None` (run without asking) for
+/// routine work, `Some(reason)` when the call leaves the workspace.
+///
+/// `bash` is judged by shape (`is_dangerous_command`); writes are judged by
+/// *location* — a target resolving inside the workspace runs unattended, one
+/// resolving outside stops for a human. Network tools always ask, since they
+/// leave the sandbox by nature and have no "inside" to compare against.
+fn workspace_write_gate(
+    workspace: &Path,
+) -> impl Fn(&str, &str) -> Option<String> + Send + Sync + 'static {
+    let workspace = workspace.to_path_buf();
+    move |tool_name, input| {
+        if tool_name == "bash" {
+            // `dangerouslyDisableSandbox` is a *model-supplied* field, and the
+            // only thing it turns off is `scrub_credential_env`. Left in the
+            // unattended path it is a one-word escalation: `{"command":"ls",
+            // "dangerouslyDisableSandbox":true}` hands the child the agent's own
+            // `GITHUB_TOKEN` / `HF_API_KEY`. So it is treated exactly like a
+            // destructive command — the shape of `command` is irrelevant.
+            if sandbox_opt_out(input) {
+                return Some(
+                    "runs with the agent's credentials in its environment \
+                     (dangerouslyDisableSandbox)"
+                        .to_string(),
+                );
+            }
+            return runtime::is_dangerous_command(&input_str_field(input, "command"))
+                .then(|| "the command looks destructive".to_string());
+        }
+
+        let targets = write_targets(tool_name, input);
+        if !targets.is_empty() {
+            let escaped: Vec<String> = targets
+                .into_iter()
+                .filter(|target| escapes_workspace(&workspace, target))
+                .collect();
+            return (!escaped.is_empty()).then(|| {
+                format!(
+                    "{} resolves outside the workspace root ({})",
+                    escaped.join(", "),
+                    workspace.display()
+                )
+            });
+        }
+
+        // Fail closed: a writer whose input named no path at all (missing field,
+        // or unparsable JSON) lands here and is confirmed rather than allowed.
+        match tool_name {
+            "web_fetch" | "web_search" => Some("network egress leaves the workspace".to_string()),
+            "generate_image" => Some("generates an image through a remote API".to_string()),
+            other => Some(format!("`{other}` is not covered by a workspace rule")),
+        }
     }
-    runtime::is_dangerous_command(&input_str_field(input, "command"))
+}
+
+/// Whether a `bash` input asks to skip credential scrubbing. Read as a strict
+/// boolean so a swapped-out field type (a string `"true"`, a `null`) is not
+/// mistaken for consent with the safe reading.
+fn sandbox_opt_out(input: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(input)
+        .ok()
+        .and_then(|value| value.get("dangerouslyDisableSandbox").cloned())
+        .and_then(|flag| flag.as_bool())
+        .unwrap_or(false)
 }
 
 /// Read a top-level string field from a tool's JSON input, falling back to the
@@ -116,22 +212,90 @@ fn input_str_field(input: &str, key: &str) -> String {
         .unwrap_or_else(|| input.to_string())
 }
 
-/// Prompt gate for `plan` mode. Returns `true` when confirmation is required
-/// (which `BlockPrompter` then refuses). Only writes to a plan document under
-/// `.heartflow/plans/*.md` are auto-allowed and therefore return `false`.
-fn plan_gate(_tool_name: &str, input: &str) -> bool {
-    !is_plan_doc_input(input)
+/// Prompt gate for `plan` mode. `None` (no confirmation) only for a write that
+/// genuinely resolves into the plan directory; everything else asks, and
+/// `BlockPrompter` then refuses.
+///
+/// The path is *resolved*, not substring-matched. The previous
+/// `path.contains(".heartflow/plans/")` test accepted any input that merely
+/// mentioned that directory: `.heartflow/plans/../../src/lib.rs` matched, a
+/// backslash spelling slipped the separator check, and an `apply_patch` batch
+/// could hide its real target while one change nominated the plans folder.
+fn plan_gate_for(
+    workspace: &Path,
+) -> impl Fn(&str, &str) -> Option<String> + Send + Sync + 'static {
+    let workspace = workspace.to_path_buf();
+    move |tool_name, input| {
+        let plans = workspace.join(".heartflow").join("plans");
+        let targets = write_targets(tool_name, input);
+        let all_are_plan_docs = !targets.is_empty()
+            && targets
+                .iter()
+                .all(|target| is_markdown(target) && resolves_into(&workspace, &plans, target));
+        if all_are_plan_docs {
+            return None;
+        }
+        Some(
+            "planning mode writes only a Markdown plan under .heartflow/plans/; anything else \
+             needs `/plan approve` first"
+                .to_string(),
+        )
+    }
 }
 
-/// Whether a write targets a planning document: a `.md` under `.heartflow/plans/`.
-fn is_plan_doc_input(input: &str) -> bool {
-    let path = input_str_field(input, "path")
-        .replace('\\', "/")
-        .to_lowercase();
-    path.contains(".heartflow/plans/")
-        && std::path::Path::new(&path)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+/// Whether `target` (spelled the way the model wrote it) resolves inside `dir`,
+/// with a relative target taken against `workspace`.
+fn resolves_into(workspace: &Path, dir: &Path, target: &str) -> bool {
+    let raw = Path::new(target);
+    let absolute = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        workspace.join(raw)
+    };
+    !escapes_workspace(dir, absolute)
+}
+
+fn is_markdown(target: &str) -> bool {
+    Path::new(target)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+}
+
+/// The paths a writer will touch, read out of its JSON input.
+///
+/// Empty for a non-writer — and also for a writer whose input does not name one
+/// path per change, so an unexpected shape is never silently reduced to
+/// "nothing to check": both gates turn an empty list into "ask".
+fn write_targets(tool_name: &str, input: &str) -> Vec<String> {
+    if !matches!(tool_name, "write_file" | "edit_file" | "apply_patch") {
+        return Vec::new();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(input) else {
+        return Vec::new();
+    };
+    match tool_name {
+        "write_file" | "edit_file" => value
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(|path| vec![path.to_string()])
+            .unwrap_or_default(),
+        _ => {
+            let Some(changes) = value.get("changes").and_then(serde_json::Value::as_array) else {
+                return Vec::new();
+            };
+            let paths: Vec<String> = changes
+                .iter()
+                .filter_map(|change| change.get("path").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .collect();
+            // One readable path per change, or nothing at all.
+            if paths.len() == changes.len() {
+                paths
+            } else {
+                Vec::new()
+            }
+        }
+    }
 }
 
 /// Prompter used while planning: any action the plan policy routed to `Prompt`

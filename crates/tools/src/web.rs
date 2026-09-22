@@ -32,6 +32,14 @@ pub struct WebFetchReport {
     pub title: Option<String>,
     pub truncated: bool,
     pub text: String,
+    /// Set when the opt-in cookie jar could not be written. Session cookies are
+    /// a *side effect* of the fetch, so a failed save must not fail the fetch —
+    /// but it must not vanish either: silently dropping it is how "why am I
+    /// logged out again" becomes unexplainable. Omitted when there is nothing
+    /// to report, so the shape is unchanged for callers that never set
+    /// `HEARTFLOW_COOKIE_JAR`.
+    #[serde(rename = "cookieJarWarning", skip_serializing_if = "Option::is_none")]
+    pub cookie_jar_warning: Option<String>,
 }
 
 #[derive(Debug)]
@@ -139,9 +147,16 @@ pub fn web_fetch(input: &WebFetchInput) -> Result<WebFetchReport, WebError> {
         truncated = true;
     }
 
+    let mut cookie_jar_warning = None;
     if let (Some(path), Some(final_host)) = (jar_path.as_deref(), final_url.host_str()) {
         store_set_cookies(&mut jar, &set_cookies, final_host, unix_now());
-        save_cookie_jar(path, &jar);
+        if let Err(error) = save_cookie_jar(path, &jar) {
+            cookie_jar_warning = Some(format!(
+                "cookie jar at {} could not be saved: {error}; cookies set by this response \
+                 are gone at the next turn",
+                path.display()
+            ));
+        }
     }
 
     Ok(WebFetchReport {
@@ -151,6 +166,7 @@ pub fn web_fetch(input: &WebFetchInput) -> Result<WebFetchReport, WebError> {
         title,
         truncated,
         text,
+        cookie_jar_warning,
     })
 }
 
@@ -244,10 +260,14 @@ fn load_cookie_jar(path: &Path) -> CookieJar {
         .unwrap_or_default()
 }
 
-fn save_cookie_jar(path: &Path, jar: &CookieJar) {
-    if let Ok(text) = serde_json::to_string_pretty(jar) {
-        let _ = fs::write(path, text);
-    }
+/// Persist the jar, reporting failure instead of discarding it: the caller
+/// turns this into a note on the fetch report, because a jar that silently
+/// stops being written is indistinguishable from a server that stopped
+/// sending cookies.
+fn save_cookie_jar(path: &Path, jar: &CookieJar) -> std::io::Result<()> {
+    let text = serde_json::to_string_pretty(jar)
+        .map_err(|error| std::io::Error::other(format!("serialize failed: {error}")))?;
+    fs::write(path, text)
 }
 
 /// A stored `scope` applies to `host` on exact match or parent-domain suffix
@@ -1180,9 +1200,23 @@ mod tests {
             "example.com",
             0,
         );
-        save_cookie_jar(&path, &jar);
+        save_cookie_jar(&path, &jar).expect("jar should save");
         assert_eq!(load_cookie_jar(&path), jar);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cookie_jar_save_reports_an_unwritable_path() {
+        // A directory where the jar file should be: creating the file fails, and
+        // the failure must reach the caller rather than being dropped.
+        let dir = std::env::temp_dir().join(format!("hf-jar-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let error = save_cookie_jar(&dir, &CookieJar::new()).expect_err("writing a dir must fail");
+        assert!(
+            !error.to_string().is_empty(),
+            "the error carries the OS reason"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

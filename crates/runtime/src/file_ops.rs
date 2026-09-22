@@ -281,14 +281,21 @@ fn decode_text(bytes: &[u8]) -> String {
 
 pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     let absolute_path = normalize_path_allow_missing(path)?;
-    let original_file = fs::read_to_string(&absolute_path).ok();
+    // Read bytes, not `read_to_string`: a non-UTF-8 file *exists* and is being
+    // replaced whole, and reporting that as a "create" would tell the caller
+    // there is nothing to restore.
+    let original_bytes = fs::read(&absolute_path).ok();
+    let original_file = original_bytes
+        .as_deref()
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .map(|text| strip_bom(text).to_string());
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent)?;
     }
     write_text_atomic(&absolute_path, content)?;
 
     Ok(WriteFileOutput {
-        kind: if original_file.is_some() {
+        kind: if original_bytes.is_some() {
             String::from("update")
         } else {
             String::from("create")
@@ -308,7 +315,17 @@ pub fn edit_file(
     replace_all: bool,
 ) -> io::Result<EditFileOutput> {
     let absolute_path = normalize_path(path)?;
-    let original_file = strip_bom(&fs::read_to_string(&absolute_path)?).to_string();
+    // `fs::read` first so a non-UTF-8 file produces a message that names the
+    // file and the way out, not a bare `read_to_string` decoding error.
+    let raw = fs::read(&absolute_path)?;
+    let decoded = std::str::from_utf8(&raw).map_err(|_| {
+        invalid_input(format!(
+            "{} is not valid UTF-8; edit_file edits text only (write_file replaces \
+             the whole file)",
+            absolute_path.display()
+        ))
+    })?;
+    let original_file = strip_bom(decoded).to_string();
     if old_string == new_string {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -321,6 +338,21 @@ pub fn edit_file(
             format!(
                 "old_string not found in file{}",
                 nearest_snippet(&original_file, old_string).unwrap_or_default()
+            ),
+        ));
+    }
+    // Ambiguity is refused rather than silently resolved to the first hit: the
+    // caller wrote `old_string` believing it identified one site, and editing a
+    // different one of `matches` sites is a wrong edit that looks like success.
+    // `apply_patch` already refuses the same input; this keeps the two tools
+    // from disagreeing about what a non-unique `old_string` means.
+    let matches = original_file.matches(old_string).count();
+    if !replace_all && !old_string.is_empty() && matches > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "old_string matches {matches} times in {}; set replace_all or make it unique",
+                absolute_path.display()
             ),
         ));
     }
@@ -376,7 +408,14 @@ pub struct ApplyPatchOutput {
 /// A single in-memory file being assembled across a batch (before any write).
 struct PreparedFile {
     absolute_path: PathBuf,
-    /// On-disk content the first time this path was seen; `None` for new files.
+    /// The on-disk bytes as first seen; `None` means the file did not exist.
+    ///
+    /// Bytes rather than `String` on purpose. Reading through `read_to_string`
+    /// made "does not exist" and "exists but is not UTF-8" indistinguishable,
+    /// and the rollback resolves `None` by *deleting* the file — so one failed
+    /// write turned an overwritten binary file into a missing one.
+    original_bytes: Option<Vec<u8>>,
+    /// The same content decoded as text, when it is valid UTF-8; drives the diff.
     original: Option<String>,
     content: String,
 }
@@ -400,13 +439,16 @@ pub fn apply_patch(changes: &[PatchChange]) -> io::Result<ApplyPatchOutput> {
         let absolute_path = normalize_path_allow_missing(&change.path)?;
         let entry = by_path.entry(absolute_path.clone()).or_insert_with(|| {
             order.push(absolute_path.clone());
-            let original = fs::read_to_string(&absolute_path)
-                .ok()
-                .map(|text| strip_bom(&text).to_string());
+            let original_bytes = fs::read(&absolute_path).ok();
+            let original = original_bytes
+                .as_deref()
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .map(|text| strip_bom(text).to_string());
             PreparedFile {
                 absolute_path: absolute_path.clone(),
                 content: original.clone().unwrap_or_default(),
                 original,
+                original_bytes,
             }
         });
 
@@ -418,6 +460,16 @@ pub fn apply_patch(changes: &[PatchChange]) -> io::Result<ApplyPatchOutput> {
         if change.old_string == change.new_string {
             return Err(invalid_input(format!(
                 "old_string and new_string must differ for {}",
+                change.path
+            )));
+        }
+        // A file that exists but does not decode as UTF-8 can never contain the
+        // `old_string`. Say that plainly instead of "old_string not found",
+        // which would send the caller off to re-read a file it can never match.
+        if entry.original_bytes.is_some() && entry.original.is_none() {
+            return Err(invalid_input(format!(
+                "{} is not valid UTF-8; apply_patch edits text only. Use an empty old_string \
+                 to replace the whole file.",
                 change.path
             )));
         }
@@ -476,12 +528,17 @@ pub fn apply_patch(changes: &[PatchChange]) -> io::Result<ApplyPatchOutput> {
             ));
         }
         written.push(absolute_path);
-        let (kind, structured_patch) = match &prepared.original {
-            Some(original) => (
+        // Existence comes from the byte read, not from whether the content
+        // decoded as text: an existing-but-binary file is an *update*. Its
+        // hunks are omitted rather than drawn against an empty string, which
+        // would claim the file used to be empty.
+        let (kind, structured_patch) = match (&prepared.original, &prepared.original_bytes) {
+            (Some(original), _) => (
                 String::from("update"),
                 make_patch(original, &prepared.content),
             ),
-            None => (String::from("create"), make_patch("", &prepared.content)),
+            (None, Some(_)) => (String::from("update"), Vec::new()),
+            (None, None) => (String::from("create"), make_patch("", &prepared.content)),
         };
         results.push(PatchFileResult {
             file_path: prepared.absolute_path.to_string_lossy().into_owned(),
@@ -512,8 +569,9 @@ fn write_failure(
     let mut restore_errors = Vec::new();
     for path in written.iter().rev() {
         let prepared = &by_path[*path];
-        let restore = match &prepared.original {
-            Some(original) => write_text_atomic(path, original),
+        let restore = match &prepared.original_bytes {
+            // Byte-for-byte, so a non-UTF-8 file comes back unchanged.
+            Some(original) => write_bytes_atomic(path, original),
             // The file did not exist before this batch, so its creation is the
             // thing to undo. A concurrent delete is fine — the goal is absence.
             None => fs::remove_file(path).or_else(|error| {
@@ -557,6 +615,13 @@ fn not_found(message: impl Into<String>) -> io::Error {
 /// intact instead of a truncated file. (`std::fs::rename` replaces existing
 /// files on both Unix and Windows.)
 fn write_text_atomic(path: &Path, content: &str) -> io::Result<()> {
+    write_bytes_atomic(path, content.as_bytes())
+}
+
+/// The byte-level primitive behind [`write_text_atomic`]. Rollback restores the
+/// exact bytes it read, so a binary file that a batch overwrote comes back
+/// byte-identical instead of being re-encoded through `&str`.
+fn write_bytes_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
 
     static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -573,7 +638,7 @@ fn write_text_atomic(path: &Path, content: &str) -> io::Result<()> {
 
     let result = (|| {
         let mut file = fs::File::create(&tmp_path)?;
-        file.write_all(content.as_bytes())?;
+        file.write_all(content)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&tmp_path, path)
@@ -817,9 +882,25 @@ fn grep_search_once(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let output_mode = input
         .output_mode
         .as_deref()
+        .map(str::trim)
         .unwrap_or("files_with_matches")
-        .trim()
         .to_owned();
+    // Validate the mode instead of letting anything unrecognised fall through to
+    // `files_with_matches`: a caller that asked for `count` and mistyped it got a
+    // silent file list with `num_matches: null`, which reads as "no matches" and
+    // sends the search in the wrong direction.
+    if !matches!(
+        output_mode.as_str(),
+        "files_with_matches" | "content" | "count"
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unknown output_mode `{output_mode}`; expected one of \
+                 `files_with_matches`, `content`, `count`"
+            ),
+        ));
+    }
     let context = input.context.or(input.context_short).unwrap_or(0);
 
     // ripgrep's shape: the whole per-file pipeline (filter -> read -> sniff ->
@@ -1376,13 +1457,138 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
     Ok(candidate)
 }
 
+/// Whether a model-supplied path resolves somewhere OUTSIDE `root`.
+///
+/// This is the check behind `workspace-write`'s write confinement: the mode
+/// name promises that mutations stay in the workspace, and before this existed
+/// nothing enforced it — `write_file`/`edit_file`/`apply_patch` were plain
+/// `Allow`, so `../../etc/hosts` or `C:\Users\me\.ssh\config` went through
+/// untouched.
+///
+/// Correctness notes, in the order the work happens:
+/// - a relative path is taken against `root`;
+/// - `..` is collapsed **lexically first**, because `Path::join` does not fold
+///   it and a raw `root/../..` would otherwise still pass a naive `starts_with`
+///   test while pointing above the root;
+/// - then the **longest existing ancestor** is canonicalized, so a symlinked
+///   directory cannot launder an escape (`ws/link -> /etc`, `ws/link/passwd`).
+///   The final component is allowed not to exist yet — writes create files —
+///   which is exactly why the ancestor, not the whole path, is resolved;
+/// - comparison is component-wise and case-insensitive on Windows, so
+///   `C:\ws` does not "contain" `C:\ws2`.
+///
+/// Fails **closed**: a candidate that cannot be proven to stay inside `root` is
+/// reported as an escape, so the failure mode is "ask the human", never
+/// "silently allow".
+///
+/// Both sides are resolved the same way, so a `root` that does not exist yet
+/// (`.heartflow/plans`, before the first plan is written) is still usable: only
+/// the components that exist are canonicalized on either side.
+#[must_use]
+pub fn escapes_workspace(root: &Path, candidate: impl AsRef<Path>) -> bool {
+    let root_real = resolve_existing_prefix(&lexical_normalize(root));
+    let raw = candidate.as_ref();
+    let joined = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        root.join(raw)
+    };
+    let resolved = resolve_existing_prefix(&lexical_normalize(&joined));
+    !has_prefix(&resolved, &root_real)
+}
+
+/// Collapse `.` and `..` without touching the filesystem.
+///
+/// A `..` that would climb above the filesystem root is dropped, and one at the
+/// start of a relative path is kept verbatim (there is nothing to cancel it
+/// against) — keeping it is deliberate: the existence probe downstream then
+/// fails to prove containment and the caller asks.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut stack: Vec<Component<'_>> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(stack.last(), Some(Component::Normal(_))) {
+                    stack.pop();
+                } else if !matches!(
+                    stack.last(),
+                    Some(Component::RootDir | Component::Prefix(_))
+                ) {
+                    stack.push(component);
+                }
+            }
+            other => stack.push(other),
+        }
+    }
+
+    let mut out = PathBuf::new();
+    for component in stack {
+        out.push(component.as_os_str());
+    }
+    out
+}
+
+/// Canonicalize the longest existing prefix of `path`, then re-append the
+/// components that do not exist yet. Mirrors what a create would do while still
+/// resolving every symlink on the way down.
+///
+/// Falls back to returning `path` unchanged when nothing along it exists, which
+/// the caller reports as an escape.
+fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    let mut probe = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(real) = probe.canonicalize() {
+            let mut resolved = clean_canonical(real);
+            for part in tail.iter().rev() {
+                resolved.push(part);
+            }
+            return resolved;
+        }
+        let Some(name) = probe.file_name().map(std::ffi::OsStr::to_os_string) else {
+            return path.to_path_buf();
+        };
+        tail.push(name);
+        if !probe.pop() {
+            return path.to_path_buf();
+        }
+    }
+}
+
+/// Component-wise prefix test. Windows paths are case-insensitive, so compare
+/// each component lowercased there; a string-level test would wrongly accept
+/// `C:\ws2` as living under `C:\ws`.
+fn has_prefix(path: &Path, base: &Path) -> bool {
+    let mut rest = path.components();
+    for expected in base.components() {
+        match rest.next() {
+            Some(actual) if component_eq(actual, expected) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn component_eq(left: std::path::Component<'_>, right: std::path::Component<'_>) -> bool {
+    if cfg!(windows) {
+        left.as_os_str().to_string_lossy().to_lowercase()
+            == right.as_os_str().to_string_lossy().to_lowercase()
+    } else {
+        left == right
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        apply_patch, edit_file, glob_search, grep_search, make_patch, read_file, search_files,
-        with_read_retry, write_file, ApplyPatchOutput, GrepSearchInput, PatchChange,
+        apply_patch, edit_file, escapes_workspace, glob_search, grep_search, make_patch, read_file,
+        search_files, with_read_retry, write_file, ApplyPatchOutput, GrepSearchInput, PatchChange,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -1608,6 +1814,152 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bytes that decode as neither UTF-8 nor any BOM-prefixed encoding: `0xFF`
+    /// is never a valid UTF-8 lead byte.
+    fn binary_bytes() -> Vec<u8> {
+        vec![0x00, 0x01, 0xFF, 0xFE, 0x7F, 0x80]
+    }
+
+    #[test]
+    fn apply_patch_rollback_restores_a_binary_file_byte_for_byte() {
+        let dir = temp_path("patch-rollback-binary");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let binary = dir.join("image.bin");
+        let original = binary_bytes();
+        std::fs::write(&binary, &original).expect("write binary");
+
+        let blocker = dir.join("blocked");
+        write_file(blocker.to_string_lossy().as_ref(), "not a directory").expect("write blocker");
+
+        // Whole-file replace on the binary (nothing can match inside it), then a
+        // write that cannot succeed. The rollback used to treat "exists but does
+        // not decode" as "did not exist" and *deleted* the file.
+        let error = apply_patch(&[
+            PatchChange {
+                path: binary.to_string_lossy().into_owned(),
+                old_string: String::new(),
+                new_string: "clobbered".to_string(),
+                replace_all: false,
+            },
+            PatchChange {
+                path: blocker.join("nested.txt").to_string_lossy().into_owned(),
+                old_string: String::new(),
+                new_string: "created".to_string(),
+                replace_all: false,
+            },
+        ])
+        .expect_err("the second write must fail");
+
+        assert!(
+            error.to_string().contains("rolled back"),
+            "error should report the rollback: {error}"
+        );
+        assert!(
+            binary.exists(),
+            "a rolled-back overwrite must not delete the file"
+        );
+        assert_eq!(
+            std::fs::read(&binary).expect("read back"),
+            original,
+            "the bytes must come back unchanged"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_patch_refuses_to_match_inside_a_binary_file() {
+        let dir = temp_path("patch-binary-match");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let binary = dir.join("blob.bin");
+        std::fs::write(&binary, binary_bytes()).expect("write binary");
+
+        let error = apply_patch(&[PatchChange {
+            path: binary.to_string_lossy().into_owned(),
+            old_string: "anything".to_string(),
+            new_string: "else".to_string(),
+            replace_all: false,
+        }])
+        .expect_err("matching inside a binary file must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("not valid UTF-8"),
+            "the message names the real problem: {error}"
+        );
+        // Refused up front: nothing was written.
+        assert_eq!(std::fs::read(&binary).expect("read back"), binary_bytes());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_file_reports_a_non_utf8_overwrite_as_an_update() {
+        let file = temp_path("overwrite-binary.bin");
+        std::fs::write(&file, binary_bytes()).expect("write binary");
+
+        let output = write_file(file.to_string_lossy().as_ref(), "now text").expect("write over");
+        // It existed, so it is an update — calling it a "create" would tell the
+        // caller there is nothing to put back.
+        assert_eq!(output.kind, "update");
+        assert!(
+            output.original_file.is_none(),
+            "binary has no text to quote"
+        );
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn edit_file_names_the_file_when_it_is_not_utf8() {
+        let file = temp_path("edit-binary.bin");
+        std::fs::write(&file, binary_bytes()).expect("write binary");
+
+        let error = edit_file(file.to_string_lossy().as_ref(), "a", "b", false)
+            .expect_err("editing a binary file must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("not valid UTF-8") && message.contains("edit-binary.bin"),
+            "the message names both the problem and the file: {message}"
+        );
+        assert_eq!(std::fs::read(&file).expect("read back"), binary_bytes());
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn edit_file_refuses_an_ambiguous_old_string() {
+        let file = temp_path("edit-ambiguous.txt");
+        write_file(file.to_string_lossy().as_ref(), "let x = 1;\nlet y = 2;\n")
+            .expect("write file");
+
+        let error = edit_file(file.to_string_lossy().as_ref(), "let ", "const ", false)
+            .expect_err("two matches with replace_all=false must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("matches 2 times"),
+            "the error counts the matches: {error}"
+        );
+        // Refused, not half-applied. (`read_file` reports a trimmed trailing
+        // newline, which is what the round-trip below compares against.)
+        assert_eq!(
+            read_file(file.to_string_lossy().as_ref(), None, None)
+                .expect("read back")
+                .file
+                .content,
+            "let x = 1;\nlet y = 2;"
+        );
+
+        // A unique `old_string` still works, and `replace_all` still replaces all.
+        let output = edit_file(file.to_string_lossy().as_ref(), "let x", "let z", false)
+            .expect("a unique match succeeds");
+        assert_eq!(output.new_string, "let z");
+        let output = edit_file(file.to_string_lossy().as_ref(), "let ", "const ", true)
+            .expect("replace_all accepts many matches");
+        assert!(output.replace_all);
+
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]
@@ -1919,6 +2271,38 @@ mod tests {
     }
 
     #[test]
+    fn unknown_grep_output_mode_is_refused() {
+        let dir = scratch_dir("grep-mode");
+        std::fs::write(dir.join("a.rs"), "needle\n").expect("write file");
+
+        let error = grep_search(&GrepSearchInput {
+            pattern: "needle".to_string(),
+            path: Some(dir.to_string_lossy().into_owned()),
+            glob: None,
+            output_mode: Some(String::from("counts")),
+            before: None,
+            after: None,
+            context_short: None,
+            context: None,
+            line_numbers: None,
+            case_insensitive: None,
+            file_type: None,
+            head_limit: None,
+            offset: None,
+            multiline: None,
+        })
+        .expect_err("a mistyped mode must not pass as files_with_matches");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let message = error.to_string();
+        assert!(
+            message.contains("counts") && message.contains("files_with_matches"),
+            "the error names the bad value and the valid ones: {message}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn read_strips_utf8_bom_and_windows_prefixes() {
         let path = temp_path("bom.txt");
         write_file(path.to_string_lossy().as_ref(), "header").expect("write should succeed");
@@ -1933,5 +2317,109 @@ mod tests {
         assert_eq!(output.file.content, "header");
         assert!(!output.file.file_path.starts_with("\\\\?\\"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |delta| delta.as_nanos());
+        let dir = std::env::temp_dir().join(format!("hf-escape-{tag}-{unique}"));
+        std::fs::create_dir_all(&dir).expect("scratch dir should be creatable");
+        dir
+    }
+
+    /// `symlink_dir`, or an error when the platform refuses (Windows needs
+    /// Developer Mode or an elevated token, so this is expected to skip there).
+    #[cfg(unix)]
+    fn make_dir_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn make_dir_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
+    #[test]
+    fn writes_inside_the_workspace_are_not_escapes() {
+        let root = scratch_dir("inside");
+        assert!(!escapes_workspace(&root, "a.txt"));
+        // The whole path may be missing: only the existing ancestor is resolved.
+        assert!(!escapes_workspace(&root, "sub/deep/a.txt"));
+        // `..` that cancels out stays inside.
+        assert!(!escapes_workspace(&root, "sub/../b.txt"));
+        // The root itself, given absolutely, is inside.
+        assert!(!escapes_workspace(&root, root.to_string_lossy().as_ref()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parent_traversal_is_detected() {
+        let root = scratch_dir("parent");
+        assert!(escapes_workspace(&root, "../outside.txt"));
+        assert!(escapes_workspace(&root, "sub/../../outside.txt"));
+        assert!(escapes_workspace(&root, ".."));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn absolute_paths_are_judged_by_location() {
+        let root = scratch_dir("absolute");
+        let inside = root.join("x.txt");
+        assert!(!escapes_workspace(&root, inside.to_string_lossy().as_ref()));
+        let outside = std::env::temp_dir().join("hf-outside-probe.txt");
+        assert!(escapes_workspace(&root, outside.to_string_lossy().as_ref()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A component-wise test, not a string prefix: `ws2` is not under `ws`.
+    #[test]
+    fn sibling_with_a_shared_name_prefix_is_not_inside() {
+        let base = scratch_dir("prefix");
+        let root = base.join("ws");
+        std::fs::create_dir_all(&root).expect("root should be creatable");
+        let sibling = base.join("ws2").join("hit.txt");
+        assert!(escapes_workspace(&root, sibling.to_string_lossy().as_ref()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A not-yet-created root must stay usable — plan mode writes
+    /// `.heartflow/plans/` before that directory exists.
+    #[test]
+    fn a_missing_root_is_resolved_lexically_and_still_confines() {
+        let base = scratch_dir("missing-root");
+        let root = base.join(".heartflow").join("plans");
+        assert!(!escapes_workspace(&root, "plan.md"));
+        assert!(escapes_workspace(&root, "../../src/lib.rs"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_symlinked_directory_cannot_launder_an_escape() {
+        let base = scratch_dir("symlink");
+        let root = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).expect("root should be creatable");
+        std::fs::create_dir_all(&outside).expect("outside should be creatable");
+
+        let link = root.join("link");
+        if make_dir_symlink(&outside, &link).is_err() {
+            // Unprivileged Windows: asserted on Unix, skipped here.
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        assert!(
+            escapes_workspace(&root, "link/secret.txt"),
+            "a symlink pointing out of the workspace is an escape"
+        );
+
+        // Control: the same shape pointing back inside stays inside.
+        let inner = root.join("inner");
+        std::fs::create_dir_all(&inner).expect("inner should be creatable");
+        let inner_link = root.join("inner-link");
+        if make_dir_symlink(&inner, &inner_link).is_ok() {
+            assert!(!escapes_workspace(&root, "inner-link/ok.txt"));
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

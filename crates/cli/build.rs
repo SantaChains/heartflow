@@ -38,10 +38,7 @@ fn main() {
             // Build-script assert rather than `if required { panic! }`: same
             // semantics (fatal only under the release pipeline), and it keeps
             // this file free of the `manual_assert` advisory lint.
-            assert!(
-                !required,
-                "failed to compile windows resources: {error}"
-            );
+            assert!(!required, "failed to compile windows resources: {error}");
             println!(
                 "cargo:warning=skipped embedded version resource ({error}); \
                  Get-Command/文件属性 will show 0.0.0.0 for this build. \

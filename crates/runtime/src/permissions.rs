@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionMode {
@@ -13,6 +15,12 @@ pub enum PermissionMode {
 pub struct PermissionRequest {
     pub tool_name: String,
     pub input: String,
+    /// Why the policy stopped to ask. Set by the prompt gate when it has a
+    /// specific reason (a path leaving the workspace, a destructive command);
+    /// `None` when the tool is in `Prompt` mode for its own sake, e.g. network
+    /// egress. Prompters render it so the human sees *why*, not just the raw
+    /// JSON of a tool call.
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,11 +47,31 @@ pub enum PermissionOutcome {
     Deny { reason: String },
 }
 
-#[derive(Debug, Clone)]
+/// Prompt gate: given `(tool_name, input)` it either reports "no confirmation
+/// needed" (`None`) or demands one and says why (`Some(reason)`).
+///
+/// Boxed rather than a bare `fn` pointer so a gate can capture process state —
+/// write confinement needs the workspace root, which a `fn` cannot carry.
+pub type PromptGate = Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
+
+#[derive(Clone)]
 pub struct PermissionPolicy {
     default_mode: PermissionMode,
     tool_modes: BTreeMap<String, PermissionMode>,
-    prompt_gate: Option<fn(&str, &str) -> bool>,
+    prompt_gate: Option<PromptGate>,
+}
+
+/// Hand-written because `dyn Fn` is not `Debug`; the gate is reported as an
+/// opaque marker so `{:?}` on a policy stays useful without leaking its state.
+impl fmt::Debug for PermissionPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PermissionPolicy")
+            .field("default_mode", &self.default_mode)
+            .field("tool_modes", &self.tool_modes)
+            .field("prompt_gate", &self.prompt_gate.as_ref().map(|_| "<gate>"))
+            .finish()
+    }
 }
 
 impl PermissionPolicy {
@@ -62,13 +90,17 @@ impl PermissionPolicy {
         self
     }
 
-    /// Install a confirmation gate consulted only for tools in `Prompt` mode:
-    /// `gate(tool_name, input)` returns whether interactive confirmation is
-    /// actually required. When it returns `false`, the call auto-runs (Allow),
-    /// letting high-risk actions prompt while routine ones proceed.
+    /// Install a confirmation gate consulted only for tools in `Prompt` mode.
+    /// `gate(tool_name, input)` returns `None` to auto-run the call (Allow) or
+    /// `Some(reason)` to require confirmation, with `reason` handed to the
+    /// prompter. That lets high-risk actions prompt while routine ones proceed —
+    /// and lets the prompt explain itself instead of showing a bare tool call.
     #[must_use]
-    pub fn with_prompt_gate(mut self, gate: fn(&str, &str) -> bool) -> Self {
-        self.prompt_gate = Some(gate);
+    pub fn with_prompt_gate<F>(mut self, gate: F) -> Self
+    where
+        F: Fn(&str, &str) -> Option<String> + Send + Sync + 'static,
+    {
+        self.prompt_gate = Some(Arc::new(gate));
         self
     }
 
@@ -92,15 +124,23 @@ impl PermissionPolicy {
                 reason: format!("tool '{tool_name}' denied by permission policy"),
             },
             PermissionMode::Prompt => {
-                if self.prompt_gate.is_some_and(|gate| !gate(tool_name, input)) {
-                    return PermissionOutcome::Allow;
-                }
+                // The gate is consulted first: `None` means "this one does not
+                // need a human", `Some(reason)` proceeds to the prompt carrying
+                // the explanation. No gate at all means we always ask.
+                let reason = match &self.prompt_gate {
+                    Some(gate) => match gate(tool_name, input) {
+                        None => return PermissionOutcome::Allow,
+                        Some(reason) => Some(reason),
+                    },
+                    None => None,
+                };
                 match prompter.as_mut() {
                     Some(prompter) => {
                         match prompter
                             .decide(&PermissionRequest {
                                 tool_name: tool_name.to_string(),
                                 input: input.to_string(),
+                                reason,
                             })
                             .await
                         {
@@ -110,8 +150,16 @@ impl PermissionPolicy {
                             }
                         }
                     }
+                    // Unattended: the reason is still worth reporting, since it
+                    // is the difference between "denied" and "denied because it
+                    // pointed outside the workspace".
                     None => PermissionOutcome::Deny {
-                        reason: format!("tool '{tool_name}' requires interactive approval"),
+                        reason: match reason {
+                            Some(reason) => format!(
+                                "tool '{tool_name}' requires interactive approval: {reason}"
+                            ),
+                            None => format!("tool '{tool_name}' requires interactive approval"),
+                        },
                     },
                 }
             }
@@ -157,12 +205,15 @@ mod tests {
         }
     }
 
-    // Free functions so they coerce to the `fn(&str, &str) -> bool` gate type.
-    fn gate_flags_only_rm(_tool: &str, input: &str) -> bool {
-        input.contains("rm")
+    // Free functions so they coerce to the `PromptGate` type; a `fn` item is
+    // itself `Fn`, so the generic `with_prompt_gate` accepts them unchanged.
+    fn gate_flags_only_rm(_tool: &str, input: &str) -> Option<String> {
+        input
+            .contains("rm")
+            .then(|| "the command looks destructive".to_string())
     }
-    fn gate_flags_everything(_tool: &str, _input: &str) -> bool {
-        true
+    fn gate_flags_everything(_tool: &str, _input: &str) -> Option<String> {
+        Some("always confirm".to_string())
     }
 
     #[tokio::test]
@@ -273,6 +324,60 @@ mod tests {
         assert!(matches!(
             policy.authorize("bash", "ls", None).await,
             PermissionOutcome::Deny { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn gate_reason_reaches_the_prompter() {
+        struct ReasonPrompter;
+
+        impl PermissionPrompter for ReasonPrompter {
+            fn decide<'a>(
+                &'a mut self,
+                request: &'a PermissionRequest,
+            ) -> Pin<Box<dyn Future<Output = PermissionPromptDecision> + 'a>> {
+                Box::pin(async move {
+                    assert_eq!(
+                        request.reason.as_deref(),
+                        Some("points outside the workspace")
+                    );
+                    PermissionPromptDecision::Allow
+                })
+            }
+        }
+
+        let policy = PermissionPolicy::new(PermissionMode::Allow)
+            .with_tool_mode("write_file", PermissionMode::Prompt)
+            .with_prompt_gate(|_tool, _input| Some("points outside the workspace".to_string()));
+        assert_eq!(
+            policy
+                .authorize("write_file", "{}", Some(&mut ReasonPrompter))
+                .await,
+            PermissionOutcome::Allow
+        );
+    }
+
+    /// The gate is boxed precisely so it can capture state — the CLI captures the
+    /// workspace root; this proves a closure (not just a `fn`) is accepted.
+    #[tokio::test]
+    async fn a_capturing_gate_uses_outer_state() {
+        let root = std::path::PathBuf::from("/workspace");
+        let policy = PermissionPolicy::new(PermissionMode::Allow)
+            .with_tool_mode("write_file", PermissionMode::Prompt)
+            .with_prompt_gate(move |_tool, input| {
+                (!input.starts_with(root.to_string_lossy().as_ref()))
+                    .then(|| format!("{input} is outside {}", root.display()))
+            });
+
+        assert_eq!(
+            policy
+                .authorize("write_file", "/workspace/a.txt", None)
+                .await,
+            PermissionOutcome::Allow
+        );
+        assert!(matches!(
+            policy.authorize("write_file", "/etc/passwd", None).await,
+            PermissionOutcome::Deny { reason } if reason.contains("/etc/passwd")
         ));
     }
 }

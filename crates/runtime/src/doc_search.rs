@@ -85,6 +85,58 @@ pub fn search_documents(input: &DocSearchInput) -> io::Result<DocSearchOutput> {
         .head_limit
         .unwrap_or(DEFAULT_HEAD_LIMIT)
         .clamp(1, MAX_HEAD_LIMIT);
+    let args = build_rga_args(input, head_limit)?;
+
+    let (status, stdout, stdout_capped, stderr) = run_rga(&args)?;
+    // ripgrep exit codes: 0 = matches, 1 = no matches, 2 = error.
+    if !matches!(status.code(), Some(0 | 1)) {
+        let detail = stderr_summary(&stderr);
+        return Err(io::Error::other(format!("rga failed: {detail}")));
+    }
+    let hits = parse_rg_json(&stdout, head_limit);
+    Ok(DocSearchOutput {
+        duration_ms: started.elapsed().as_millis(),
+        num_matches: hits.len(),
+        truncated: hits.len() >= head_limit || stdout_capped,
+        hits,
+    })
+}
+
+/// Build the `rga` argv.
+///
+/// Split out of [`search_documents`] so the *shape* of the command can be
+/// asserted without a live `rga`. The shape is the security boundary: `rga`
+/// forwards unknown arguments to `ripgrep`, so a bare positional beginning with
+/// `-` is read as a **flag**. `--pre=<cmd>` is the dangerous one — ripgrep runs
+/// it as the preprocessor, i.e. arbitrary command execution, and
+/// `search_documents` is enabled by `read-only` and `plan` modes precisely
+/// because it is advertised as a pure reader. A prompt-injected model could
+/// therefore shell out through a tool the policy believes cannot write.
+///
+/// Two defences, stacked so neither has to be perfect:
+/// 1. Reject a `pattern`/`path` that starts with `-` after trimming — fails
+///    closed and is independent of how the arguments are forwarded downstream.
+/// 2. Terminate option parsing with `--` before the path, so even a path that
+///    slipped past (1) cannot become a flag.
+fn build_rga_args(input: &DocSearchInput, head_limit: usize) -> io::Result<Vec<String>> {
+    let path = input.path.trim();
+    if path.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path must not be empty",
+        ));
+    }
+    for (label, value) in [("pattern", input.pattern.as_str()), ("path", path)] {
+        if value.starts_with('-') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "`{label}` must not start with `-` (got `{value}`): it would be parsed as \
+                     an rga/ripgrep flag. Escape it (`\\-`) or anchor the regex instead."
+                ),
+            ));
+        }
+    }
 
     let mut args: Vec<String> = vec![
         String::from("--json"),
@@ -100,21 +152,10 @@ pub fn search_documents(input: &DocSearchInput) -> io::Result<DocSearchOutput> {
         args.push(glob.clone());
     }
     args.push(input.pattern.clone());
-    args.push(input.path.clone());
-
-    let (status, stdout, stdout_capped, stderr) = run_rga(&args)?;
-    // ripgrep exit codes: 0 = matches, 1 = no matches, 2 = error.
-    if !matches!(status.code(), Some(0 | 1)) {
-        let detail = stderr_summary(&stderr);
-        return Err(io::Error::other(format!("rga failed: {detail}")));
-    }
-    let hits = parse_rg_json(&stdout, head_limit);
-    Ok(DocSearchOutput {
-        duration_ms: started.elapsed().as_millis(),
-        num_matches: hits.len(),
-        truncated: hits.len() >= head_limit || stdout_capped,
-        hits,
-    })
+    // End of options: the path is a path, never a flag.
+    args.push(String::from("--"));
+    args.push(path.to_string());
+    Ok(args)
 }
 
 /// True when `rga --version` runs successfully. Cached for the process.
@@ -314,6 +355,75 @@ mod tests {
         }
         let hits = parse_rg_json(&stdout, 3);
         assert_eq!(hits.len(), 3);
+    }
+
+    #[test]
+    fn rga_argv_puts_the_path_behind_a_double_dash() {
+        let args = super::build_rga_args(
+            &DocSearchInput {
+                pattern: "release".to_string(),
+                path: " docs.zip ".to_string(),
+                case_insensitive: Some(true),
+                glob: Some("*.md".to_string()),
+                head_limit: None,
+            },
+            50,
+        )
+        .expect("args build");
+        let terminator = args.iter().position(|arg| arg == "--").expect("has --");
+        assert_eq!(
+            args[terminator + 1],
+            "docs.zip",
+            "the path is trimmed and follows --"
+        );
+        assert_eq!(args[terminator], "--");
+        assert!(
+            args.contains(&"-i".to_string()),
+            "case-insensitivity survives"
+        );
+        assert!(args.contains(&"*.md".to_string()), "glob survives");
+    }
+
+    #[test]
+    fn flag_shaped_pattern_or_path_is_refused() {
+        // `--pre=<cmd>` turns a bare positional into arbitrary command execution,
+        // which is exactly what a prompt-injected caller would reach for: this
+        // tool stays enabled in `read-only` and `plan` modes.
+        for (pattern, path) in [
+            ("--pre=calc.exe", "docs.zip"),
+            ("release", "--pre=calc.exe"),
+            ("sorted", "-n"),
+        ] {
+            let result = super::build_rga_args(
+                &DocSearchInput {
+                    pattern: pattern.to_string(),
+                    path: path.to_string(),
+                    case_insensitive: None,
+                    glob: None,
+                    head_limit: None,
+                },
+                50,
+            );
+            assert!(
+                matches!(&result, Err(error) if error.kind() == io::ErrorKind::InvalidInput),
+                "`{pattern}` + `{path}` must be refused, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_path_is_refused() {
+        let result = super::build_rga_args(
+            &DocSearchInput {
+                pattern: "x".to_string(),
+                path: "   ".to_string(),
+                case_insensitive: None,
+                glob: None,
+                head_limit: None,
+            },
+            50,
+        );
+        assert!(matches!(&result, Err(error) if error.kind() == io::ErrorKind::InvalidInput));
     }
 
     #[test]

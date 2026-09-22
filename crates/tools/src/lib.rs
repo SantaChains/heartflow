@@ -181,7 +181,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_file",
-            description: "Replace text in a workspace file.",
+            description: "Replace text in a workspace file. `old_string` must appear exactly once unless `replace_all` is true; when it appears several times the call is refused (rather than editing the first hit), so either make it unique — include surrounding lines — or set `replace_all`. Read the file first and copy `old_string` verbatim, including indentation. Use write_file to replace a file whole, and apply_patch for several coordinated edits.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -204,7 +204,11 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "pattern": { "type": "string" },
                     "path": { "type": "string" },
                     "glob": { "type": "string" },
-                    "output_mode": { "type": "string" },
+                    "output_mode": {
+                        "type": "string",
+                        "enum": ["files_with_matches", "content", "count"],
+                        "description": "files_with_matches (default) lists paths, content prints matching lines, count returns per-file match counts."
+                    },
                     "-B": { "type": "integer", "minimum": 0 },
                     "-A": { "type": "integer", "minimum": 0 },
                     "-C": { "type": "integer", "minimum": 0 },
