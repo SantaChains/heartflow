@@ -1,0 +1,37 @@
+# PR 质量门:仅在外部 PR 上触发,验证进入 main 的代码。
+# 与"不做每 push CI"的既定策略不冲突:
+#   - 没有 push 触发,作者日常自推不烧 Actions 额度(质量门在本地,见 CONTRIBUTING.md)
+#   - fork PR 走 pull_request,checkout 的是 PR 合并结果,不发放任何 secrets,
+#     本 job 不需要写权限
+# 工具链经 `rustup show` 交给 rust-toolchain.toml 决定,不在此写版本(见 ci.yml.bak 头注)。
+
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain --install
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy (correctness gate; pedantic advisory only)
+        run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::pedantic
+      - name: Test
+        run: cargo test --workspace

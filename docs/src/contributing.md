@@ -1,21 +1,11 @@
 # 贡献与质量门
 
-日常迭代按效率优先：提交前保证下列四条绿。pedantic 级风格 clippy 仅作提示不阻断，但 `clippy::all` 正确性 lint 仍为阻断门。
+贡献入口以仓库根的两份文件为权威，本文不再重复维护：
 
-```bash
-cargo fmt --all -- --check
-cargo test --workspace
-cargo build --release
-cargo clippy --workspace --all-targets -- -D warnings -A clippy::pedantic   # 阻断正确性；pedantic 仅提示
-```
+- [CONTRIBUTING.md](https://github.com/SantaChains/heartflow/blob/main/CONTRIBUTING.md)：开发环境、本地质量门、panic 预算棘轮、提交规范与发版语义、PR 流程、接口面同步清单、架构边界
+- [AGENTS.md](https://github.com/SantaChains/heartflow/blob/main/AGENTS.md)：面向 agent 的完整仓库指令，两者冲突时以 AGENTS.md 为准
 
-## 提交规范
-
-版本语义由 git-cliff 从提交信息推导：`feat:` → minor，`fix:` → patch，`!` 或 `BREAKING CHANGE:` → major；`chore/docs/test/ci/style/build` 不触发发版。scope 用 crate 名，如 `feat(tools): ...`。
-
-## 文档
-
-改 README 里列出的 CLI/REPL 接口时，同步更新 `docs/src/` 对应章节与 `--help`。文档站构建见 [AI 文档集成](ai-integration.md)。
+一句话版本：提交前保证 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings -A clippy::pedantic`、`cargo test --workspace` 三条全绿，提交信息遵循 Conventional Commits（`feat:` 触发 minor、`fix:` 触发 patch，scope 用 crate 名），Issue 与 PR 使用仓库提供的模板。
 
 ## License
 
