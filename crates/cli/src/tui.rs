@@ -216,6 +216,10 @@ pub(crate) struct App {
     thinking_buf: String,
     /// Name of the tool currently executing, if any.
     running_tool: Option<String>,
+    /// Number of tools started in the current turn. Resets to 0 when a new
+    /// turn begins; used by the status-bar step indicator so users can see
+    /// at a glance how far along a multi-tool turn is.
+    tool_step: usize,
     /// Most recent usage sample, surfaced in the status bar.
     last_usage: Option<TokenUsage>,
     /// Ctrl+C double-tap arming for cancelling a running turn.
@@ -304,6 +308,7 @@ impl App {
             assistant_buf: String::new(),
             thinking_buf: String::new(),
             running_tool: None,
+            tool_step: 0,
             last_usage: None,
             ctrl_c_armed: false,
             pending_submit: None,
@@ -339,6 +344,7 @@ impl App {
                 self.assistant_buf.clear();
                 self.thinking_buf.clear();
                 self.running_tool = None;
+                self.tool_step = 0;
                 self.ctrl_c_armed = false;
                 let hint = self.cancel_key_hint();
                 self.status_note = format!("turn running · {hint} twice to cancel");
@@ -650,8 +656,9 @@ impl App {
                 // A tool call ends the current assistant segment; flush what
                 // streamed so far so ordering in the transcript stays honest.
                 self.flush_assistant();
+                self.tool_step += 1;
                 self.running_tool = Some(name.clone());
-                self.status_note = format!("running `{name}`");
+                self.status_note = format!("tool {}: `{name}`", self.tool_step);
                 true
             }
             AgentEvent::ToolResult {
@@ -678,11 +685,19 @@ impl App {
                 )));
                 true
             }
-            AgentEvent::Error(message) => {
+            AgentEvent::Error { message, hint } => {
                 self.push_line(Line::from(Span::styled(
                     format!("✘ {message}"),
                     Style::default().fg(Theme::current().error().ratatui()),
                 )));
+                if let Some(h) = hint {
+                    self.push_line(Line::from(Span::styled(
+                        format!("  hint: {h}"),
+                        Style::default()
+                            .fg(Theme::current().muted().ratatui())
+                            .add_modifier(Modifier::DIM),
+                    )));
+                }
                 true
             }
         }
@@ -1215,7 +1230,7 @@ impl Shell {
         } else {
             areas[1]
         };
-        view(section, body, frame);
+        view(section, body, frame, Some(self.chrome.context_window));
     }
 
     /// The top context bar: identity (`heartflow · model · cwd`) on the left,
@@ -1298,7 +1313,7 @@ impl Shell {
 /// bar. The shell renders the tab bar above this and hands the active section
 /// the body below it, so a section never draws its own chrome. Overlays are
 /// modal and float over the whole frame.
-fn view(app: &App, area: Rect, frame: &mut Frame) {
+fn view(app: &App, area: Rect, frame: &mut Frame, context_window: Option<usize>) {
     let theme = Theme::current();
     let areas = Layout::default()
         .direction(Direction::Vertical)
@@ -1421,6 +1436,31 @@ fn view(app: &App, area: Rect, frame: &mut Frame) {
                 .fg(theme.muted().ratatui())
                 .add_modifier(Modifier::DIM),
         ));
+        // Context-pressure warning: when cumulative usage exceeds 70% of the
+        // window, show a soft hint; past 90% make it loud. Helps users notice
+        // they're approaching a compaction cliff before the model starts
+        // truncating context silently.
+        if let Some(window) = context_window {
+            let total = usage.input_tokens.saturating_add(usage.output_tokens);
+            let pct = if window > 0 {
+                total as f64 / window as f64
+            } else {
+                0.0
+            };
+            if pct >= 0.9 {
+                status_spans.push(Span::styled(
+                    format!("  [context: {:.0}% — near limit]", pct * 100.0),
+                    Style::default()
+                        .fg(theme.error().ratatui())
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else if pct >= 0.7 {
+                status_spans.push(Span::styled(
+                    format!("  [context: {:.0}%]", pct * 100.0),
+                    Style::default().fg(theme.accent().ratatui()),
+                ));
+            }
+        }
     }
     let queued = app.model.queue().len();
     if queued > 0 {
@@ -2038,7 +2078,10 @@ async fn run_one_turn(
         let text = err_note
             .clone()
             .unwrap_or_else(|| String::from("turn failed"));
-        shell.section_mut().apply_event(&AgentEvent::Error(text));
+        shell.section_mut().apply_event(&AgentEvent::Error {
+            message: text,
+            hint: None,
+        });
     }
     // Turn boundary (locked FollowUpQueue semantics): drop the running flag so
     // a submit racing the save routes to the next turn, then merge everything
@@ -3044,7 +3087,7 @@ mod tests {
     fn render_app_rows(app: &App, w: u16, h: u16) -> Vec<String> {
         use ratatui::backend::TestBackend;
         let mut term = ratatui::Terminal::new(TestBackend::new(w, h)).expect("test backend");
-        term.draw(|frame| view(app, frame.area(), frame))
+        term.draw(|frame| view(app, frame.area(), frame, None))
             .expect("draw");
         let buf = term.backend().buffer().clone();
         (0..h)

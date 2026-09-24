@@ -21,7 +21,8 @@ use std::time::Duration;
 
 use crossterm::cursor::Show;
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -50,6 +51,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/compact", "Compact session history"),
     ("/pin", "Toggle never-compacted on the last message"),
+    ("/focus", "Toggle focus mode (hide mascot, minimal chrome)"),
     ("/save", "Persist the session now"),
     ("/clear", "Start a fresh session"),
     ("/sessions", "List saved sessions"),
@@ -428,6 +430,43 @@ impl History {
         self.cursor = self.entries.len();
     }
 
+    /// Find the index of the next older entry (lower index) that starts with
+    /// `prefix`, searching from `from_idx` (exclusive) going backward.
+    pub(crate) fn search_prefix_backward(&self, prefix: &str, from_idx: usize) -> Option<usize> {
+        if prefix.is_empty() {
+            return None;
+        }
+        let start = from_idx.min(self.entries.len());
+        (0..start)
+            .rev()
+            .find(|&i| self.entries[i].starts_with(prefix))
+    }
+
+    /// Find the index of the next newer entry (higher index) that starts with
+    /// `prefix`, searching from `from_idx` (exclusive) going forward.
+    pub(crate) fn search_prefix_forward(&self, prefix: &str, from_idx: usize) -> Option<usize> {
+        if prefix.is_empty() {
+            return None;
+        }
+        let start = from_idx.saturating_add(1);
+        self.entries
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find(|(_, entry)| entry.starts_with(prefix))
+            .map(|(i, _)| i)
+    }
+
+    /// Get the entry at `idx`, if within bounds.
+    pub(crate) fn entry_at(&self, idx: usize) -> Option<&str> {
+        self.entries.get(idx).map(String::as_str)
+    }
+
+    /// Number of entries in the history.
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Record a submitted line: appended to the file (escaped onto one physical
     /// line) and pushed in memory, capped at `HISTORY_MAX`. An empty `path`
     /// means in-memory only (hermetic construction), so no file is touched.
@@ -530,6 +569,13 @@ pub struct ReplEditor {
     /// remembers the last outcome; the REPL reports each turn via
     /// [`ReplEditor::note_turn`] and the badge reverts to idle on the next key.
     mascot: Mascot,
+    /// When true, hide the mascot badge and reduce decorative chrome so the
+    /// user can focus on the conversation. Toggled by `/focus`.
+    focus_mode: bool,
+    /// When true, skip idle mascot animations (no heartbeat / breathing)
+    /// and show a static badge instead. Reduces visual flicker for users
+    /// sensitive to motion or who prefer a calmer terminal.
+    reduced_motion: bool,
 }
 
 impl ReplEditor {
@@ -541,7 +587,21 @@ impl ReplEditor {
             history_path: history_path.to_path_buf(),
             history: History::load(history_path),
             mascot: Mascot::new(),
+            focus_mode: false,
+            reduced_motion: false,
         }
+    }
+
+    /// Toggle focus mode on/off. Returns the new state.
+    pub fn toggle_focus(&mut self) -> bool {
+        self.focus_mode = !self.focus_mode;
+        self.focus_mode
+    }
+
+    /// Set reduced-motion mode. When true, the mascot stays static instead
+    /// of idling with a heartbeat.
+    pub fn set_reduced_motion(&mut self, enabled: bool) {
+        self.reduced_motion = enabled;
     }
 
     /// Report the just-finished turn's outcome to the companion: `ok` picks the
@@ -589,6 +649,9 @@ impl ReplEditor {
         // Tab-cycling state: candidate list + which one is currently offered.
         let mut completions: Vec<CompletionItem> = Vec::new();
         let mut completion_idx: Option<usize> = None;
+        // Prefix history search: (prefix, match_index) — shows a ghost suffix
+        // inline when the user cycles history entries matching the typed prefix.
+        let mut prefix_search: Option<(String, usize)> = None;
         let mut exit = Exit::Quit;
 
         let loop_result = self.edit_loop(
@@ -597,6 +660,7 @@ impl ReplEditor {
             &mut status,
             &mut completions,
             &mut completion_idx,
+            &mut prefix_search,
             &mut exit,
             ctx,
         );
@@ -631,6 +695,7 @@ impl ReplEditor {
         status: &mut Option<String>,
         completions: &mut Vec<CompletionItem>,
         completion_idx: &mut Option<usize>,
+        prefix_search: &mut Option<(String, usize)>,
         exit: &mut Exit,
         ctx: &CompletionContext,
     ) -> io::Result<()> {
@@ -663,6 +728,12 @@ impl ReplEditor {
                     &self.mascot,
                     completions,
                     *completion_idx,
+                    prefix_search.as_ref().and_then(|(prefix, idx)| {
+                        self.history.entry_at(*idx).and_then(|entry| {
+                            entry.strip_prefix(prefix.as_str())
+                        })
+                    }),
+                    self.focus_mode,
                 )
             })?;
 
@@ -671,7 +742,9 @@ impl ReplEditor {
             // frame entirely: with the cursor parking deduped downstream, an
             // idle REPL emits zero escape sequences until the mascot actually
             // blinks — the root fix for the Windows Terminal cursor flicker.
-            if !event::poll(MASCOT_TICK)? {
+            // When `reduced_motion` is on, skip the heartbeat loop and block
+            // directly on input: no animation, no per-tick redraw cost.
+            if !self.reduced_motion && !event::poll(MASCOT_TICK)? {
                 let before = self.mascot.badge();
                 self.mascot.advance(MASCOT_TICK.as_secs_f64());
                 if self.mascot.badge() == before {
@@ -693,19 +766,21 @@ impl ReplEditor {
             // Any key means the user is engaging again: clear the lingering
             // Done/Error badge so the companion returns to its idle baseline.
             self.mascot.resume_idle();
-            if self.handle_key(key, textarea, completions, completion_idx, status, exit) {
+            if self.handle_key(key, textarea, completions, completion_idx, prefix_search, status, exit) {
                 return Ok(());
             }
         }
     }
 
     /// Handle one key press; returns `true` when the edit session should end.
+    #[allow(clippy::too_many_arguments)]
     fn handle_key(
         &mut self,
         key: crossterm::event::KeyEvent,
         textarea: &mut TextArea<'static>,
         completions: &mut Vec<CompletionItem>,
         completion_idx: &mut Option<usize>,
+        prefix_search: &mut Option<(String, usize)>,
         status: &mut Option<String>,
         exit: &mut Exit,
     ) -> bool {
@@ -717,6 +792,7 @@ impl ReplEditor {
                     *textarea = blank_textarea();
                     completions.clear();
                     *completion_idx = None;
+                    *prefix_search = None;
                     self.history.reset_cursor();
                     *status = Some(String::from(
                         "^C line cleared. Ctrl+C interrupts a running turn; /exit or Ctrl+D quits.",
@@ -729,16 +805,85 @@ impl ReplEditor {
                         return true;
                     }
                     textarea.delete_next_char();
+                    *prefix_search = None;
                     false
                 }
                 KeyCode::Char('j') => {
                     textarea.insert_newline();
                     *completion_idx = None;
+                    *prefix_search = None;
+                    false
+                }
+                KeyCode::Char('u') => {
+                    // Ctrl+U: clear the whole line silently (readline convention).
+                    // Unlike Ctrl+C, no status hint — this is an intentional edit.
+                    *textarea = blank_textarea();
+                    completions.clear();
+                    *completion_idx = None;
+                    *prefix_search = None;
+                    self.history.reset_cursor();
+                    false
+                }
+                KeyCode::Char(']') => {
+                    // Ctrl+]: prefix history search forward (older / next match).
+                    // Grabs text before cursor as prefix, cycles through matches.
+                    let (row, col) = textarea.cursor();
+                    let line = textarea.lines().get(row).cloned().unwrap_or_default();
+                    let prefix = line[..col].to_string();
+                    if prefix.is_empty() {
+                        *prefix_search = None;
+                        return false;
+                    }
+                    let next_idx = match *prefix_search {
+                        Some((ref p, idx)) if *p == prefix => {
+                            // Continuing search: find next older match.
+                            self.history.search_prefix_backward(&prefix, idx)
+                        }
+                        _ => {
+                            // New search: start from most recent (end of list).
+                            self.history
+                                .search_prefix_backward(&prefix, self.history.len())
+                        }
+                    };
+                    match next_idx {
+                        Some(idx) => {
+                            *prefix_search = Some((prefix, idx));
+                        }
+                        None => {
+                            // No match — keep existing state if any, noop.
+                        }
+                    }
+                    false
+                }
+                KeyCode::Char('[') => {
+                    // Ctrl+[: prefix history search backward (newer / prev match).
+                    // Only works when a prefix search is already active.
+                    if let Some((ref prefix, idx)) = *prefix_search {
+                        if let Some(prev_idx) =
+                            self.history.search_prefix_forward(prefix, idx)
+                        {
+                            *prefix_search = Some((prefix.clone(), prev_idx));
+                        }
+                        // If no newer match, stay on current match (no wrap).
+                    }
+                    false
+                }
+                KeyCode::Left => {
+                    move_word(textarea, true);
+                    *completion_idx = None;
+                    *prefix_search = None;
+                    false
+                }
+                KeyCode::Right => {
+                    move_word(textarea, false);
+                    *completion_idx = None;
+                    *prefix_search = None;
                     false
                 }
                 _ => {
                     textarea.input(key);
                     *completion_idx = None;
+                    *prefix_search = None;
                     false
                 }
             }
@@ -773,12 +918,14 @@ impl ReplEditor {
                             apply_completion(textarea, &item, site);
                         }
                     }
+                    *prefix_search = None;
                     false
                 }
                 // Esc only closes the completion hint; it never cancels a turn
                 // (turn cancellation is double-Ctrl+C, wired later).
                 KeyCode::Esc => {
                     *completion_idx = None;
+                    *prefix_search = None;
                     false
                 }
                 KeyCode::Up => {
@@ -791,6 +938,7 @@ impl ReplEditor {
                     } else {
                         textarea.input(key);
                     }
+                    *prefix_search = None;
                     false
                 }
                 KeyCode::Down => {
@@ -804,6 +952,46 @@ impl ReplEditor {
                     } else {
                         textarea.input(key);
                     }
+                    *prefix_search = None;
+                    false
+                }
+                KeyCode::Right | KeyCode::End => {
+                    // If a prefix search hint is active and cursor is at end of
+                    // line, accept the hint by inserting the ghost suffix.
+                    let accepted = if let Some((ref prefix, idx)) = *prefix_search {
+                        let (row, col) = textarea.cursor();
+                        let line = textarea.lines().get(row).cloned().unwrap_or_default();
+                        if col == line.len() {
+                            if let Some(entry) = self.history.entry_at(idx) {
+                                if let Some(suffix) = entry.strip_prefix(prefix.as_str()) {
+                                    // Only accept up to end of the first line of
+                                    // the match (input is single-line here).
+                                    let first_line_suffix = suffix
+                                        .split_once('\n')
+                                        .map(|(first, _)| first)
+                                        .unwrap_or(suffix);
+                                    textarea.insert_str(first_line_suffix);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if accepted {
+                        *prefix_search = None;
+                        *completion_idx = None;
+                    } else {
+                        textarea.input(key);
+                        *prefix_search = None;
+                        *completion_idx = None;
+                    }
                     false
                 }
                 _ => {
@@ -811,6 +999,7 @@ impl ReplEditor {
                     // Editing the token invalidates the offered completion so the
                     // hint recomputes next frame.
                     *completion_idx = None;
+                    *prefix_search = None;
                     false
                 }
             }
@@ -826,7 +1015,7 @@ impl ReplEditor {
 /// math is done by hand to avoid coupling to the layout-algorithm API.
 // The render-closure contract returns `Option` (`None` hides the cursor), even
 // though this frame always parks it on the input cell.
-#[allow(clippy::unnecessary_wraps)]
+#[allow(clippy::too_many_arguments, clippy::unnecessary_wraps)]
 fn draw_frame(
     buf: &mut Buffer,
     area: Rect,
@@ -835,6 +1024,8 @@ fn draw_frame(
     mascot: &Mascot,
     completions: &[CompletionItem],
     completion_idx: Option<usize>,
+    prefix_suffix: Option<&str>,
+    focus_mode: bool,
 ) -> Option<Position> {
     let theme = Theme::current();
     let size = area;
@@ -846,7 +1037,7 @@ fn draw_frame(
     let badge_width = badge_rows
         .first()
         .map_or(0, |r| u16::try_from(r.chars().count()).unwrap_or(0));
-    let show_mascot = size.width >= MASCOT_MIN_WIDTH && badge_width > 0;
+    let show_mascot = !focus_mode && size.width >= MASCOT_MIN_WIDTH && badge_width > 0;
     let reserve = if show_mascot {
         (badge_width + 2).min(size.width.saturating_sub(PROMPT_WIDTH + 4))
     } else {
@@ -867,6 +1058,30 @@ fn draw_frame(
     )))
     .render(gutter, buf);
     textarea.render(editor, buf);
+
+    // Inline prefix-history ghost text: draws the suffix of the matched history
+    // entry right after the cursor in muted color. Only shown when the cursor is
+    // on the first (input) row and there is room to display it.
+    if let Some(suffix) = prefix_suffix {
+        let (cursor_row, cursor_col) = textarea.cursor();
+        if cursor_row == 0 {
+            let start_x = editor.x + u16::try_from(cursor_col).unwrap_or(u16::MAX);
+            let max_x = editor.x + editor.width;
+            let ghost_style = Style::default().fg(theme.muted().ratatui()).add_modifier(Modifier::DIM);
+            let mut x = start_x;
+            for ch in suffix.chars() {
+                if x >= max_x {
+                    break;
+                }
+                let mut glyph = [0u8; 4];
+                if let Some(cell) = buf.cell_mut(Position::new(x, editor.y)) {
+                    cell.set_symbol(ch.encode_utf8(&mut glyph));
+                    cell.set_style(ghost_style);
+                }
+                x += 1; // simplistic: assume ASCII-width; CJK would overflow, which is fine
+            }
+        }
+    }
     if show_mascot {
         let fg = mascot.badge_color(&theme).ratatui();
         let badge_x = size.x + size.width.saturating_sub(badge_width);
@@ -1109,6 +1324,301 @@ fn cycle_completion(
 
 fn blank_textarea() -> TextArea<'static> {
     configure_textarea(TextArea::default())
+}
+
+/// Character classification for subword-aware word motion. The categories are
+/// deliberately coarse — enough to distinguish code identifiers (camelCase,
+/// snake_case, kebab-case, digit transitions) from punctuation and whitespace,
+/// plus a CJK bucket that advances two ideographs at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CharClass {
+    Lower,      // a-z
+    Upper,      // A-Z
+    Digit,      // 0-9
+    Underscore, // _
+    Hyphen,     // -
+    Cjk,        // CJK ideograph (U+4E00..U+9FFF + common extensions)
+    Whitespace, // space, tab, etc.
+    Other,      // punctuation, symbols, everything else
+}
+
+fn char_class(c: char) -> CharClass {
+    if c.is_ascii_lowercase() {
+        CharClass::Lower
+    } else if c.is_ascii_uppercase() {
+        CharClass::Upper
+    } else if c.is_ascii_digit() {
+        CharClass::Digit
+    } else if c == '_' {
+        CharClass::Underscore
+    } else if c == '-' {
+        CharClass::Hyphen
+    } else if c.is_whitespace() {
+        CharClass::Whitespace
+    } else if is_cjk_ideograph(c) {
+        CharClass::Cjk
+    } else {
+        CharClass::Other
+    }
+}
+
+/// Whether `c` is a CJK ideograph we treat as "one character" for the
+/// two-step word motion rule. Covers the common Unified Ideographs block plus
+/// Extension A; rare extensions are lumped into `Other` and behave like
+/// punctuation (one at a time).
+fn is_cjk_ideograph(c: char) -> bool {
+    matches!(c as u32,
+        0x3400..=0x4DBF   // Extension A
+        | 0x4E00..=0x9FFF // Unified Ideographs
+        | 0xF900..=0xFAFF // Compatibility Ideographs
+    )
+}
+
+/// Byte index of the previous word-break position in `line`, given a byte
+/// offset `col`. Always returns a value in `0..=col`.
+///
+/// Subword boundaries match what code editors do:
+///   camelCaseWord → camel|Case|Word
+///   snake_case    → snake|_|case
+///   kebab-case    → kebab|-|case
+///   foo123bar     → foo|123|bar
+///   HTTPRequest   → HTTP|Request
+///   CJK ideographs → 2 chars per jump
+///   whitespace    → one jump per contiguous run
+///   punctuation   → one jump per contiguous run
+fn word_break_prev(line: &str, col: usize) -> usize {
+    let col = col.min(line.len());
+    if col == 0 {
+        return 0;
+    }
+
+    let chars: Vec<(usize, char)> = line.char_indices().collect();
+    // Map byte offset → char index (first char at or after col).
+    let cur_char = match chars.binary_search_by_key(&col, |&(b, _)| b) {
+        Ok(i) => i,
+        Err(i) => i,
+    };
+    if cur_char == 0 {
+        return 0;
+    }
+
+    let target_char = word_break_prev_char_idx(&chars, cur_char);
+    chars[target_char].0
+}
+
+fn word_break_prev_char_idx(chars: &[(usize, char)], cur: usize) -> usize {
+    if cur == 0 {
+        return 0;
+    }
+    let mut pos = cur - 1; // start from char immediately before cursor
+
+    // Skip trailing whitespace so we always land on a content character
+    // before looking for the subword boundary. This matches readline:
+    // "hello |world" → Ctrl+Left → "|hello world" (jump past the space
+    // and land at the start of the previous word).
+    if char_class(chars[pos].1) == CharClass::Whitespace {
+        while pos > 0 && char_class(chars[pos - 1].1) == CharClass::Whitespace {
+            pos -= 1;
+        }
+        // pos now points to the leftmost whitespace char. Move past it
+        // to land on the last content char before the whitespace run.
+        if pos == 0 {
+            return 0;
+        }
+        pos -= 1;
+        // pos now points to the rightmost non-whitespace char; fall through
+        // to find the start of that subword.
+    }
+
+    // Find left boundary of the subword we landed on.
+    match char_class(chars[pos].1) {
+        CharClass::Cjk => {
+            // Jump back by 2 CJK chars, or to the start of the CJK run.
+            let mut steps = 1; // chars[pos] already counts as one
+            while pos > 0 && steps < 2 {
+                if char_class(chars[pos - 1].1) == CharClass::Cjk {
+                    pos -= 1;
+                    steps += 1;
+                } else {
+                    break;
+                }
+            }
+            pos
+        }
+        CharClass::Lower => {
+            // Scan left through the lowercase run.
+            while pos > 0 && char_class(chars[pos - 1].1) == CharClass::Lower {
+                pos -= 1;
+            }
+            // If preceded by a single uppercase → camelCase hump start.
+            // Include that uppercase as the subword start.
+            if pos > 0 && char_class(chars[pos - 1].1) == CharClass::Upper {
+                pos -= 1;
+                // Don't continue left into a longer Upper run — that's the
+                // previous subword (e.g. "HTTP" in "HTTPRequest").
+            }
+            pos
+        }
+        CharClass::Upper => {
+            // Scan left through the uppercase run.
+            while pos > 0 && char_class(chars[pos - 1].1) == CharClass::Upper {
+                pos -= 1;
+            }
+            pos
+        }
+        CharClass::Digit => {
+            while pos > 0 && char_class(chars[pos - 1].1) == CharClass::Digit {
+                pos -= 1;
+            }
+            pos
+        }
+        CharClass::Underscore | CharClass::Hyphen => {
+            let sep = char_class(chars[pos].1);
+            while pos > 0 && char_class(chars[pos - 1].1) == sep {
+                pos -= 1;
+            }
+            pos
+        }
+        CharClass::Whitespace => {
+            pos // unreachable after the skip above, here for exhaustiveness
+        }
+        CharClass::Other => {
+            while pos > 0 && char_class(chars[pos - 1].1) == CharClass::Other {
+                pos -= 1;
+            }
+            pos
+        }
+    }
+}
+
+/// Byte index of the next word-break position in `line`, given a byte
+/// offset `col`. Always returns a value in `col..=line.len()`.
+fn word_break_next(line: &str, col: usize) -> usize {
+    let col = col.min(line.len());
+    if col >= line.len() {
+        return line.len();
+    }
+
+    let chars: Vec<(usize, char)> = line.char_indices().collect();
+    let cur_char = match chars.binary_search_by_key(&col, |&(b, _)| b) {
+        Ok(i) => i,
+        Err(i) => i,
+    };
+    if cur_char >= chars.len() {
+        return line.len();
+    }
+
+    let target_char = word_break_next_char_idx(&chars, cur_char);
+    if target_char >= chars.len() {
+        line.len()
+    } else {
+        chars[target_char].0
+    }
+}
+
+fn word_break_next_char_idx(chars: &[(usize, char)], cur: usize) -> usize {
+    let len = chars.len();
+    if cur >= len {
+        return len;
+    }
+    let mut pos = cur;
+
+    // Skip leading whitespace so we always land on a content character
+    // before looking for the subword boundary. This matches readline:
+    // "hello| world" → Ctrl+Right → "hello world|" (skip past the space
+    // and land at the end of the next word).
+    if char_class(chars[pos].1) == CharClass::Whitespace {
+        while pos < len && char_class(chars[pos].1) == CharClass::Whitespace {
+            pos += 1;
+        }
+        if pos == len {
+            return len;
+        }
+        // pos now points to the first non-whitespace char; fall through
+        // to find the end of that subword.
+    }
+
+    // Find right boundary of the subword we're at.
+    match char_class(chars[pos].1) {
+        CharClass::Cjk => {
+            let mut steps = 0;
+            while pos < len && steps < 2 {
+                if char_class(chars[pos].1) == CharClass::Cjk {
+                    pos += 1;
+                    steps += 1;
+                } else {
+                    break;
+                }
+            }
+            pos
+        }
+        CharClass::Upper => {
+            let start = pos;
+            // Consume the uppercase run first.
+            while pos < len && char_class(chars[pos].1) == CharClass::Upper {
+                pos += 1;
+            }
+            let upper_run_len = pos - start;
+            if upper_run_len == 1 && pos < len && char_class(chars[pos].1) == CharClass::Lower {
+                // Single uppercase + following lowercase = one camelCase hump.
+                // Continue through the lowercase run: "camelCase" → "Case".
+                while pos < len && char_class(chars[pos].1) == CharClass::Lower {
+                    pos += 1;
+                }
+            } else if upper_run_len > 1 && pos < len && char_class(chars[pos].1) == CharClass::Lower {
+                // Multi-uppercase followed by lowercase: "HTTPRequest" → "HTTP|Request".
+                // Last uppercase starts the next hump — back up by one.
+                pos -= 1;
+            }
+            pos
+        }
+        CharClass::Lower | CharClass::Digit => {
+            let cls = char_class(chars[pos].1);
+            while pos < len && char_class(chars[pos].1) == cls {
+                pos += 1;
+            }
+            pos
+        }
+        CharClass::Underscore | CharClass::Hyphen => {
+            let sep = char_class(chars[pos].1);
+            while pos < len && char_class(chars[pos].1) == sep {
+                pos += 1;
+            }
+            pos
+        }
+        CharClass::Whitespace => {
+            pos // unreachable after the skip above, here for exhaustiveness
+        }
+        CharClass::Other => {
+            while pos < len && char_class(chars[pos].1) == CharClass::Other {
+                pos += 1;
+            }
+            pos
+        }
+    }
+}
+
+/// Move the textarea cursor by one word in `direction`. Operates on the
+/// current line only (no cross-line jumps).
+fn move_word(textarea: &mut TextArea<'static>, backward: bool) {
+    let (row, col) = textarea.cursor();
+    let Some(line) = textarea.lines().get(row).cloned() else {
+        return;
+    };
+    let target_byte = if backward {
+        word_break_prev(&line, col)
+    } else {
+        word_break_next(&line, col)
+    };
+    // Count char positions: tui-textarea's Left/Right moves by grapheme,
+    // which for our purposes is close enough to char-counted movement.
+    let cur_chars = line[..col].chars().count();
+    let tgt_chars = line[..target_byte].chars().count();
+    let delta = cur_chars.abs_diff(tgt_chars);
+    let key_code = if backward { KeyCode::Left } else { KeyCode::Right };
+    for _ in 0..delta {
+        textarea.input(KeyEvent::new(key_code, KeyModifiers::NONE));
+    }
 }
 
 fn textarea_from(text: &str) -> TextArea<'static> {
@@ -1361,5 +1871,293 @@ mod tests {
         assert_eq!(h.next(), None, "past newest means the draft");
         h.reset_cursor();
         assert_eq!(h.cursor, 2);
+    }
+
+    #[test]
+    fn history_prefix_search_backward_finds_match() {
+        let h = History {
+            entries: vec!["ls -la".into(), "cd /tmp".into(), "ls foo".into()],
+            cursor: 3,
+        };
+        // Search from end (most recent) for "ls" → finds "ls foo" at index 2
+        assert_eq!(h.search_prefix_backward("ls", 3), Some(2));
+        // From index 2, search further back → finds "ls -la" at index 0
+        assert_eq!(h.search_prefix_backward("ls", 2), Some(0));
+        // From index 0, no older match → None
+        assert_eq!(h.search_prefix_backward("ls", 0), None);
+    }
+
+    #[test]
+    fn history_prefix_search_forward_finds_match() {
+        let h = History {
+            entries: vec!["ls -la".into(), "cd /tmp".into(), "ls foo".into()],
+            cursor: 3,
+        };
+        // Search forward from index 0 for "ls" → finds "ls foo" at index 2
+        assert_eq!(h.search_prefix_forward("ls", 0), Some(2));
+        // From index 2, no newer match → None
+        assert_eq!(h.search_prefix_forward("ls", 2), None);
+    }
+
+    #[test]
+    fn history_prefix_search_empty_prefix_returns_none() {
+        let h = History {
+            entries: vec!["hello".into()],
+            cursor: 1,
+        };
+        assert_eq!(h.search_prefix_backward("", 1), None);
+        assert_eq!(h.search_prefix_forward("", 0), None);
+    }
+
+    #[test]
+    fn history_prefix_search_no_match_returns_none() {
+        let h = History {
+            entries: vec!["ls -la".into(), "cd /tmp".into()],
+            cursor: 2,
+        };
+        assert_eq!(h.search_prefix_backward("git", 2), None);
+        assert_eq!(h.search_prefix_forward("git", 0), None);
+    }
+
+    #[test]
+    fn history_prefix_search_partial_match() {
+        let h = History {
+            entries: vec!["cargo build".into(), "cargo test".into(), "cargo run".into()],
+            cursor: 3,
+        };
+        // "car" matches all three
+        assert_eq!(h.search_prefix_backward("car", 3), Some(2));
+        assert_eq!(h.search_prefix_backward("car", 2), Some(1));
+        assert_eq!(h.search_prefix_backward("car", 1), Some(0));
+        // "cargo t" matches only "cargo test"
+        assert_eq!(h.search_prefix_backward("cargo t", 3), Some(1));
+    }
+
+    #[test]
+    fn history_entry_at_and_len() {
+        let h = History {
+            entries: vec!["a".into(), "b".into(), "c".into()],
+            cursor: 3,
+        };
+        assert_eq!(h.len(), 3);
+        assert_eq!(h.entry_at(0), Some("a"));
+        assert_eq!(h.entry_at(2), Some("c"));
+        assert_eq!(h.entry_at(3), None);
+    }
+
+    // ── word motion (subword-aware + CJK 2-step) ──────────────────────
+
+    use super::{word_break_next, word_break_prev};
+
+    fn prev_at(line: &str, col_byte: usize) -> usize {
+        word_break_prev(line, col_byte)
+    }
+    fn next_at(line: &str, col_byte: usize) -> usize {
+        word_break_next(line, col_byte)
+    }
+
+    #[test]
+    fn word_prev_at_start_stays_at_start() {
+        assert_eq!(prev_at("hello world", 0), 0);
+    }
+
+    #[test]
+    fn word_next_at_end_stays_at_end() {
+        let s = "hello";
+        assert_eq!(next_at(s, s.len()), s.len());
+    }
+
+    #[test]
+    fn word_prev_simple_words() {
+        let s = "hello world";
+        // from end of "world" → start of "world"
+        assert_eq!(&s[prev_at(s, s.len())..s.len()], "world");
+        // from start of "world" → start of "hello"
+        let world_start = s.find('w').unwrap();
+        assert_eq!(prev_at(s, world_start), 0);
+    }
+
+    #[test]
+    fn word_next_simple_words() {
+        let s = "hello world";
+        let first_end = next_at(s, 0);
+        assert_eq!(&s[..first_end], "hello");
+        // skip the space
+        let second_start = first_end + 1;
+        assert!(s[second_start..].starts_with('w'));
+        let second_end = next_at(s, second_start);
+        assert_eq!(&s[second_start..second_end], "world");
+    }
+
+    #[test]
+    fn word_prev_camel_case() {
+        let s = "camelCaseWord";
+        // end → start of "Word"
+        let pos = prev_at(s, s.len());
+        assert_eq!(&s[pos..], "Word");
+        // "Word" start → start of "Case"
+        let pos2 = prev_at(s, pos);
+        assert_eq!(&s[pos2..pos], "Case");
+    }
+
+    #[test]
+    fn word_next_camel_case() {
+        let s = "camelCaseWord";
+        let pos = next_at(s, 0);
+        assert_eq!(&s[..pos], "camel");
+        let pos2 = next_at(s, pos);
+        assert_eq!(&s[pos..pos2], "Case");
+        let pos3 = next_at(s, pos2);
+        assert_eq!(&s[pos2..pos3], "Word");
+    }
+
+    #[test]
+    fn word_prev_snake_case() {
+        let s = "snake_case_name";
+        // end → start of "name"
+        let pos = prev_at(s, s.len());
+        assert_eq!(&s[pos..], "name");
+        // "name" start → underscore (jump back into separator)
+        let pos2 = prev_at(s, pos);
+        assert_eq!(&s[pos2..pos], "_");
+        // underscore → start of "case"
+        let pos3 = prev_at(s, pos2);
+        assert_eq!(&s[pos3..pos2], "case");
+    }
+
+    #[test]
+    fn word_next_snake_case() {
+        let s = "snake_case";
+        let pos = next_at(s, 0);
+        assert_eq!(&s[..pos], "snake");
+        let pos2 = next_at(s, pos);
+        assert_eq!(&s[pos..pos2], "_");
+        let pos3 = next_at(s, pos2);
+        assert_eq!(&s[pos2..pos3], "case");
+    }
+
+    #[test]
+    fn word_prev_kebab_case() {
+        let s = "kebab-case-thing";
+        let pos = prev_at(s, s.len());
+        assert_eq!(&s[pos..], "thing");
+    }
+
+    #[test]
+    fn word_prev_digit_transition() {
+        let s = "foo123bar";
+        // end → start of "bar"
+        let pos = prev_at(s, s.len());
+        assert_eq!(&s[pos..], "bar");
+        // "bar" → "123"
+        let pos2 = prev_at(s, pos);
+        assert_eq!(&s[pos2..pos], "123");
+        // "123" → "foo"
+        let pos3 = prev_at(s, pos2);
+        assert_eq!(&s[pos3..pos2], "foo");
+    }
+
+    #[test]
+    fn word_next_digit_transition() {
+        let s = "foo123bar";
+        let pos = next_at(s, 0);
+        assert_eq!(&s[..pos], "foo");
+        let pos2 = next_at(s, pos);
+        assert_eq!(&s[pos..pos2], "123");
+        let pos3 = next_at(s, pos2);
+        assert_eq!(&s[pos2..pos3], "bar");
+    }
+
+    #[test]
+    fn word_prev_pascal_upper_run() {
+        // "HTTPRequest" → "HTTP" | "Request"
+        let s = "HTTPRequest";
+        let pos = prev_at(s, s.len());
+        assert_eq!(&s[pos..], "Request");
+        let pos2 = prev_at(s, pos);
+        assert_eq!(&s[pos2..pos], "HTTP");
+    }
+
+    #[test]
+    fn word_next_pascal_upper_run() {
+        let s = "HTTPRequest";
+        let pos = next_at(s, 0);
+        assert_eq!(&s[..pos], "HTTP");
+        let pos2 = next_at(s, pos);
+        assert_eq!(&s[pos..pos2], "Request");
+    }
+
+    #[test]
+    fn word_prev_cjk_two_chars() {
+        let s = "你好世界";
+        // end → position after "世界" start (2 chars back)
+        let pos = prev_at(s, s.len());
+        let suffix = &s[pos..];
+        assert_eq!(suffix.chars().count(), 2);
+        assert_eq!(suffix, "世界");
+        // another jump → first two
+        let pos2 = prev_at(s, pos);
+        assert_eq!(&s[pos2..pos], "你好");
+    }
+
+    #[test]
+    fn word_next_cjk_two_chars() {
+        let s = "你好世界";
+        let pos = next_at(s, 0);
+        assert_eq!(&s[..pos], "你好");
+        let pos2 = next_at(s, pos);
+        assert_eq!(&s[pos..pos2], "世界");
+        assert_eq!(pos2, s.len());
+    }
+
+    #[test]
+    fn word_prev_cjk_mixed_with_ascii() {
+        let s = "hello你好世界";
+        let pos = prev_at(s, s.len());
+        // last 2 CJK chars
+        assert_eq!(&s[pos..], "世界");
+        let pos2 = prev_at(s, pos);
+        assert_eq!(&s[pos2..pos], "你好");
+        let pos3 = prev_at(s, pos2);
+        assert_eq!(&s[pos3..pos2], "hello");
+    }
+
+    #[test]
+    fn word_prev_whitespace_run() {
+        let s = "hello   world";
+        let world_start = s.find('w').unwrap();
+        // from start of "world" → start of "hello" (readline-style:
+        // whitespace is skipped, not treated as a jump target)
+        let pos = prev_at(s, world_start);
+        assert_eq!(pos, 0);
+        assert_eq!(&s[pos..pos + 5], "hello");
+    }
+
+    #[test]
+    fn word_prev_punctuation_run() {
+        let s = "hello...world";
+        let world_start = s.find("world").unwrap();
+        let pos = prev_at(s, world_start);
+        assert_eq!(&s[pos..world_start], "...");
+    }
+
+    #[test]
+    fn word_prev_empty_line() {
+        assert_eq!(prev_at("", 0), 0);
+    }
+
+    #[test]
+    fn word_next_empty_line() {
+        assert_eq!(next_at("", 0), 0);
+    }
+
+    #[test]
+    fn word_prev_single_char() {
+        assert_eq!(prev_at("a", 1), 0);
+    }
+
+    #[test]
+    fn word_next_single_char() {
+        assert_eq!(next_at("a", 0), 1);
     }
 }

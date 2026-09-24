@@ -74,7 +74,13 @@ impl ApiClient for AnthropicStreamClient {
 
         let handle = tokio::spawn(async move {
             if let Err(error) = drive_stream(&client, message_request, &tx).await {
-                let _ = tx.send(AgentEvent::Error(error.to_string())).await;
+                let hint = error.suggestion().map(str::to_string);
+                let _ = tx
+                    .send(AgentEvent::Error {
+                        message: error.to_string(),
+                        hint,
+                    })
+                    .await;
             }
         });
 
@@ -120,7 +126,13 @@ impl ApiClient for OpenAiStreamClient {
 
         let handle = tokio::spawn(async move {
             if let Err(error) = drive_openai_stream(&client, chat_request, &tx).await {
-                let _ = tx.send(AgentEvent::Error(error.to_string())).await;
+                let hint = error.suggestion().map(str::to_string);
+                let _ = tx
+                    .send(AgentEvent::Error {
+                        message: error.to_string(),
+                        hint,
+                    })
+                    .await;
             }
         });
 
@@ -727,7 +739,13 @@ impl ApiClient for ResponsesStreamClient {
         let body = build_responses_body(&request, &self.model, self.max_tokens, self.enable_tools);
         let handle = tokio::spawn(async move {
             if let Err(error) = drive_responses_stream(&client, body, &tx).await {
-                let _ = tx.send(AgentEvent::Error(error.to_string())).await;
+                let hint = error.suggestion().map(str::to_string);
+                let _ = tx
+                    .send(AgentEvent::Error {
+                        message: error.to_string(),
+                        hint,
+                    })
+                    .await;
             }
         });
         Ok(TurnStream::new(rx, handle.abort_handle()))
@@ -920,9 +938,10 @@ async fn drive_responses_stream(
     match terminal {
         Some(ResponsesTerminal::Failed(reason)) => {
             let _ = tx
-                .send(AgentEvent::Error(format!(
-                    "responses request failed: {reason}"
-                )))
+                .send(AgentEvent::Error {
+                    message: format!("responses request failed: {reason}"),
+                    hint: None,
+                })
                 .await;
             return Ok(());
         }
@@ -930,9 +949,10 @@ async fn drive_responses_stream(
         // reporting; surfacing the partial stream would just fail downstream.
         Some(ResponsesTerminal::Incomplete(reason)) if !saw_content => {
             let _ = tx
-                .send(AgentEvent::Error(format!(
-                    "responses response ended incomplete: {reason}"
-                )))
+                .send(AgentEvent::Error {
+                    message: format!("responses response ended incomplete: {reason}"),
+                    hint: None,
+                })
                 .await;
             return Ok(());
         }

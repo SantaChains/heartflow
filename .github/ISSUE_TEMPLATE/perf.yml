@@ -1,0 +1,113 @@
+name: 性能反馈
+description: 报告 heartflow 的延迟、卡顿或资源占用问题
+title: "[Perf] "
+labels: ["performance"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你反馈性能问题。
+
+        性能问题与普通 Bug 的定位方式不同，请尽量补充模型、网络与会话规模信息。
+
+  - type: dropdown
+    id: perf-area
+    attributes:
+      label: 性能场景
+      description: 感知到性能问题最明显的环节
+      options:
+        - 流式输出（首字延迟/卡顿）
+        - 工具执行（bash/文件/检索）
+        - 任务环（plan/Hermes）
+        - 上下文压缩（自动或手动）
+        - 历史检索（hf search）
+        - 启动速度
+        - 内存或磁盘占用
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 问题描述
+      description: 具体表现，如耗时数值、卡顿频率
+      placeholder: 例如：流式首字延迟约 5 秒，正常应为 1 秒内
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 软件版本
+      description: "`hf --version` 的输出"
+      placeholder: 例如：v0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: 操作系统
+      description: 你使用的操作系统
+      options:
+        - Windows 11
+        - Windows 10
+        - Linux
+        - macOS
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: model-info
+    attributes:
+      label: 模型与网络
+      description: 使用的 provider、模型名，以及网络环境（直连/代理/中转）
+      placeholder: 例如：DeepSeek，直连，1000 Mbps 宽带
+    validations:
+      required: true
+
+  - type: textarea
+    id: session-scale
+    attributes:
+      label: 会话规模
+      description: 如果与上下文相关，请说明会话消息数量、是否开启自动压缩、历史库大小
+      placeholder: 例如：单会话约 200 条消息，已开启自动压缩，历史库约 50 MB
+
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: 复现步骤
+      description: 如何重现这个性能问题
+      placeholder: |
+        1. 启动 hf
+        2. 执行……
+        3. 观察……
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: 期望表现
+      description: 你认为合理的性能水平
+      placeholder: 本应该……
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志
+      description: 如果有耗时日志或性能数据，请粘贴在这里
+      render: shell
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 检查清单
+      description: 请确认以下内容
+      options:
+        - label: 我已经搜索过现有的 Issues
+          required: true
+        - label: 我已提供版本、操作系统、模型与网络信息
+          required: true

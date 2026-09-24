@@ -1,0 +1,16 @@
+# PR 自动打标签:按 .github/labeler.yml 的路径规则执行。
+# pull_request_target 只在 PR 存在时触发,不烧每-push 额度。
+
+name: Labeler
+
+on: [pull_request_target]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@v5

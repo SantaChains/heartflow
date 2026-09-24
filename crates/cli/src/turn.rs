@@ -43,6 +43,9 @@ struct TurnRenderer {
     spinner_active: bool,
     saw_text: bool,
     last_usage: Option<TokenUsage>,
+    /// Number of tools started in this turn; shown in the spinner label so
+    /// multi-tool turns give a sense of progress (tool 1 of N).
+    tool_step: usize,
     /// Accumulated assistant text for the current message segment; rendered
     /// as finished markdown on `MessageStop`.
     assistant_text: String,
@@ -60,6 +63,7 @@ impl TurnRenderer {
             spinner_active: true,
             saw_text: false,
             last_usage: None,
+            tool_step: 0,
             assistant_text: String::new(),
         }
     }
@@ -82,12 +86,20 @@ impl TurnRenderer {
                 io::stdout().flush().ok();
             }
             AgentEvent::ToolUse { name, .. } => {
+                self.tool_step += 1;
                 if self.spinner_active {
                     self.spinner
-                        .tick(&format!("Running `{name}`"), &self.theme, &mut out)
+                        .tick(
+                            &format!("Tool {}: `{name}`", self.tool_step),
+                            &self.theme,
+                            &mut out,
+                        )
                         .ok();
                 } else {
-                    println!("{}", format!("· running `{name}`").with(self.theme.muted()));
+                    println!(
+                        "{}",
+                        format!("· tool {}: `{name}`", self.tool_step).with(self.theme.muted())
+                    );
                 }
             }
             AgentEvent::ToolResult {
@@ -141,8 +153,37 @@ impl TurnRenderer {
                 .ok();
                 out.flush().ok();
             }
-            AgentEvent::Error(_) => {}
+            AgentEvent::Error { .. } => {}
         }
+    }
+
+    /// Render any partially-accumulated assistant text as an incomplete
+    /// fragment. Called when a turn fails before `MessageStop` arrives, so
+    /// the user keeps visibility into what was generated instead of losing
+    /// it behind a bare error line. The output is marked clearly as
+    /// incomplete (muted + italic + prefix label) and is intentionally
+    /// NOT re-rendered through the full markdown pipeline — a truncated
+    /// block can break fences/tables, so raw text with a clear label is
+    /// safer and faster.
+    fn render_incomplete(&mut self) {
+        if self.assistant_text.is_empty() {
+            return;
+        }
+        let mut out = io::stdout();
+        // Ensure we start on a fresh line regardless of where the last
+        // delta left the cursor.
+        writeln!(out).ok();
+        let label = "· incomplete response";
+        writeln!(out, "{}", label.with(self.theme.muted()).italic()).ok();
+        // Render the partial text as muted raw text. We intentionally
+        // skip full markdown rendering here because a mid-stream failure
+        // can leave unclosed code fences, broken tables, etc.
+        let trimmed = self.assistant_text.trim_end_matches('\n');
+        for line in trimmed.lines() {
+            writeln!(out, "{}", format!("  {line}").with(self.theme.muted())).ok();
+        }
+        self.assistant_text.clear();
+        out.flush().ok();
     }
 }
 
@@ -239,6 +280,7 @@ pub(crate) async fn run_turn_interactive(
         }
         Err(error) => {
             let interrupted = error.to_string().contains("cancelled");
+            turn.render_incomplete();
             if turn.spinner_active {
                 if interrupted {
                     turn.spinner
@@ -257,6 +299,13 @@ pub(crate) async fn run_turn_interactive(
                 );
             } else {
                 println!("{}", format!("\u{2718} {error}").red());
+                // If the error carries a human-readable suggestion (common
+                // failure modes like auth errors, rate limits, connection
+                // issues), surface it as a muted hint so users know what to
+                // try next without having to parse a raw status code.
+                if let Some(hint) = error.hint() {
+                    println!("{}", format!("  hint: {hint}").dark_grey());
+                }
             }
             if let Ok(path) = save_session_async(state, runtime.session()).await {
                 println!(

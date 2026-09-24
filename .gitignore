@@ -31,3 +31,4 @@ openmemory copy.md
 *.bak
 
 panic_budget.json
+heartflow-ui-optimization.design

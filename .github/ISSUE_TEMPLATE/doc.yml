@@ -1,0 +1,69 @@
+name: 文档改进
+description: 报告文档中的错误、缺失或难以理解的内容
+title: "[Doc] "
+labels: ["documentation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你帮助改进文档。
+
+        文档源位于 docs/src，文档站由 docs.yml 构建发布。
+
+  - type: input
+    id: location
+    attributes:
+      label: 文档位置
+      description: 问题所在页面 URL 或 docs/src 下的文件路径
+      placeholder: 例如：docs/src/usage/repl.md 或文档站某一页的链接
+    validations:
+      required: true
+
+  - type: dropdown
+    id: doc-type
+    attributes:
+      label: 问题类型
+      description: 选择最符合的问题类型
+      options:
+        - 内容错误
+        - 内容缺失
+        - 内容过时
+        - 表述难以理解
+        - 链接失效
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 问题描述
+      description: 描述文档当前的问题
+      placeholder: 例如：该页描述的配置项在新版本中已改名
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: 建议内容
+      description: 你期望文档如何描述这部分内容
+      placeholder: 例如：补充……的说明，或改为……
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: 补充信息
+      description: 相关的软件版本、环境或其他背景信息
+      placeholder: 例如：发现问题时使用的是 v0.1.0
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 检查清单
+      description: 请确认以下内容
+      options:
+        - label: 我已经搜索过现有的 Issues
+          required: true
+        - label: 我已提供文档位置和问题描述
+          required: true

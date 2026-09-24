@@ -1,0 +1,23 @@
+# PR 按改动路径自动打标签(labeler v5 格式)。
+# 标签 rust / docs / ci 需在仓库中预先创建,否则不会打上。
+
+rust:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/**"
+          - "Cargo.toml"
+          - "Cargo.lock"
+          - "rust-toolchain.toml"
+
+docs:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/**"
+          - "*.md"
+          - "llms.txt"
+
+ci:
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+          - "scripts/**"

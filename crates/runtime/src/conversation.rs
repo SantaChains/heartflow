@@ -65,7 +65,14 @@ pub enum AgentEvent {
     /// into `max_output_tokens`). Whatever streamed so far is kept and the turn
     /// still finishes normally; the notice only warns that the answer is partial.
     Truncated(String),
-    Error(String),
+    Error {
+        message: String,
+        /// Optional human-readable hint for what to try next. Populated by
+        /// the provider layer when it recognises a common failure mode (auth
+        /// errors, rate limits, connection issues) so the CLI can surface
+        /// actionable advice alongside the raw error message.
+        hint: Option<String>,
+    },
 }
 
 /// Live handle to one assistant message stream.
@@ -184,6 +191,7 @@ impl std::error::Error for ToolError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {
     message: String,
+    hint: Option<String>,
 }
 
 impl RuntimeError {
@@ -191,7 +199,22 @@ impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            hint: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_hint(message: impl Into<String>, hint: Option<String>) -> Self {
+        Self {
+            message: message.into(),
+            hint,
+        }
+    }
+
+    /// A human-readable hint for what to try next, when the error carries one.
+    #[must_use]
+    pub fn hint(&self) -> Option<&str> {
+        self.hint.as_deref()
     }
 }
 
@@ -531,11 +554,11 @@ where
             };
             let mut stream = self.api_client.stream(request)?;
 
-            let (blocks, usage, finished, cancelled, stream_error) =
+            let (blocks, usage, finished, cancelled, stream_error, error_hint) =
                 Self::consume_stream(&mut stream, notify, cancel).await;
 
             if let Some(message) = stream_error {
-                return Err(RuntimeError::new(message));
+                return Err(RuntimeError::with_hint(message, error_hint));
             }
             if !finished {
                 // Preserve streamed text so the transcript stays API-consistent,
@@ -632,6 +655,7 @@ where
         bool,
         bool,
         Option<String>,
+        Option<String>,
     ) {
         let mut text = String::new();
         let mut blocks = Vec::new();
@@ -639,6 +663,7 @@ where
         let mut finished = false;
         let mut cancelled = false;
         let mut error = None;
+        let mut error_hint = None;
 
         loop {
             tokio::select! {
@@ -676,8 +701,9 @@ where
                     Some(AgentEvent::Truncated(reason)) => {
                         notify(&AgentEvent::Truncated(reason));
                     }
-                    Some(AgentEvent::Error(message)) => {
+                    Some(AgentEvent::Error { message, hint }) => {
                         error = Some(message);
+                        error_hint = hint;
                         break;
                     }
                     // ToolResult events are produced by the runtime itself.
@@ -690,7 +716,7 @@ where
         }
 
         flush_text_block(&mut text, &mut blocks);
-        (blocks, usage, finished, cancelled, error)
+        (blocks, usage, finished, cancelled, error, error_hint)
     }
 
     async fn authorize_tools(

@@ -40,6 +40,10 @@ pub struct Settings {
     /// loop. Lower is smoother but busier; higher is calmer but laggier. Applied
     /// when the shell starts (a mid-session edit takes effect on the next run).
     pub frame_budget_ms: u64,
+    /// When true, disable decorative animations (mascot bounce, progress
+    /// shimmer, float effects) so the UI is static except for content
+    /// updates. An accessibility / low-distraction knob.
+    pub reduced_motion: bool,
 }
 
 impl Default for Settings {
@@ -49,6 +53,7 @@ impl Default for Settings {
             tool_inline_lines: 3,
             fold_thinking: true,
             frame_budget_ms: 80,
+            reduced_motion: false,
         }
     }
 }
@@ -72,8 +77,8 @@ impl Settings {
     #[must_use]
     pub fn to_toml_string(self) -> String {
         format!(
-            "[settings]\nscroll_step = {}\ntool_inline_lines = {}\nfold_thinking = {}\nframe_budget_ms = {}\n",
-            self.scroll_step, self.tool_inline_lines, self.fold_thinking, self.frame_budget_ms
+            "[settings]\nscroll_step = {}\ntool_inline_lines = {}\nfold_thinking = {}\nframe_budget_ms = {}\nreduced_motion = {}\n",
+            self.scroll_step, self.tool_inline_lines, self.fold_thinking, self.frame_budget_ms, self.reduced_motion
         )
     }
 }
@@ -87,6 +92,7 @@ struct SettingsOverrides {
     tool_inline_lines: Option<usize>,
     fold_thinking: Option<bool>,
     frame_budget_ms: Option<u64>,
+    reduced_motion: Option<bool>,
 }
 
 impl SettingsOverrides {
@@ -97,7 +103,7 @@ impl SettingsOverrides {
         for key in settings.keys() {
             if !matches!(
                 key.as_str(),
-                "scroll_step" | "tool_inline_lines" | "fold_thinking" | "frame_budget_ms"
+                "scroll_step" | "tool_inline_lines" | "fold_thinking" | "frame_budget_ms" | "reduced_motion"
             ) {
                 tracing::debug!(file = %source, field = %key, "unknown setting; ignored");
             }
@@ -107,6 +113,7 @@ impl SettingsOverrides {
             tool_inline_lines: opt_usize(settings, "tool_inline_lines", source),
             fold_thinking: opt_bool(settings, "fold_thinking", source),
             frame_budget_ms: opt_u64(settings, "frame_budget_ms", source),
+            reduced_motion: opt_bool(settings, "reduced_motion", source),
         }
     }
 
@@ -123,6 +130,9 @@ impl SettingsOverrides {
         }
         if let Some(value) = self.frame_budget_ms {
             settings.frame_budget_ms = value;
+        }
+        if let Some(value) = self.reduced_motion {
+            settings.reduced_motion = value;
         }
     }
 }
@@ -233,6 +243,7 @@ mod tests {
         assert_eq!(settings.tool_inline_lines, 3);
         assert!(settings.fold_thinking, "reasoning folds by default");
         assert_eq!(settings.frame_budget_ms, 80);
+        assert!(!settings.reduced_motion, "animations enabled by default");
     }
 
     #[test]
@@ -330,6 +341,7 @@ mod tests {
             tool_inline_lines: 2,
             fold_thinking: false,
             frame_budget_ms: 120,
+            reduced_motion: true,
         };
         let exported = settings.to_toml_string();
         let table = toml::from_str::<toml::Table>(&exported).expect("export emits valid TOML");

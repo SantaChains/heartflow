@@ -1,0 +1,39 @@
+# Issue/PR 腐烂治理:30 天无活动标记 stale,再 7 天无回复自动关闭。
+# 每日一次 cron,开销极小,不违背仓库"不为 push 烧 CI 额度"的策略。
+# 注:docs.yml 策略是 action 钉 commit SHA;此处用 tag 便于首启,
+#     dependabot 的 github-actions 生态会跟进版本,稳定后可自行换成 SHA。
+#     标记为 pinned/security 的 issue 豁免;有 assignee 的豁免(维护者跟进中)。
+
+name: Stale
+
+on:
+  schedule:
+    - cron: "30 1 * * *" # 每日 01:30 UTC,避开整点高峰
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: stale
+  cancel-in-progress: false
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v9
+        with:
+          days-before-stale: 30
+          days-before-close: 7
+          stale-issue-message: "该 Issue 30 天无活动，已标记 stale，7 天后将自动关闭。若问题仍存在，请回复任意内容以保持开启。"
+          stale-pr-message: "该 PR 30 天无活动，已标记 stale，7 天后将自动关闭。若继续推进，请回复任意内容。"
+          close-issue-message: "因长期无活动自动关闭。如需重新打开，请补充新信息后留言。"
+          close-pr-message: "因长期无活动自动关闭。如需继续，请重新发起或留言。"
+          stale-issue-label: "stale"
+          stale-pr-label: "stale"
+          exempt-issue-labels: "pinned,security"
+          exempt-pr-labels: "pinned,security"
+          exempt-all-assignees: true
+          operations-per-run: 100

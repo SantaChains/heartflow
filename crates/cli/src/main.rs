@@ -796,6 +796,7 @@ async fn run_repl(
     let mut plan_path: Option<PathBuf> = None;
     let history_path = home_dir().join(".heartflow").join("history.txt");
     let mut editor = editor::ReplEditor::new(&history_path);
+    editor.set_reduced_motion(settings::Settings::load(&cwd, &home_dir()).reduced_motion);
     // Single live-turn state (queue/guide core). Under the blocking line
     // editor the model is running only inside a turn, so the queue stays
     // empty until P4-c wires keyboard polling; the injection point below is
@@ -855,6 +856,7 @@ async fn run_repl(
                 &mut prompter,
                 &cwd,
                 &catalog,
+                &mut editor,
             )
             .await?
         } else if trimmed.starts_with('!') {
@@ -969,6 +971,7 @@ async fn dispatch_slash_command(
     prompter: &mut CliPermissionPrompter,
     cwd: &Path,
     catalog: &ProviderCatalog,
+    editor: &mut editor::ReplEditor,
 ) -> Result<LoopControl, Box<dyn std::error::Error>> {
     // Every arm yields the loop-level control directly; the match is wrapped in
     // `Ok` once so each arm stays one statement shorter.
@@ -1011,6 +1014,14 @@ async fn dispatch_slash_command(
         }
         "/pin" => {
             handle_pin_command(state, runtime);
+            LoopControl::Continue
+        }
+        "/focus" => {
+            let focused = editor.toggle_focus();
+            println!(
+                "focus mode: {}",
+                if focused { "on (mascot hidden)" } else { "off" }
+            );
             LoopControl::Continue
         }
         "/mcp" => {
@@ -1912,6 +1923,7 @@ fn print_repl_help() {
     println!("  /plan <GOAL>   Plan first (writes gated to .heartflow/plans), then /plan approve to execute");
     println!("  /compact       Compact session history");
     println!("  /pin           Toggle never-compacted on the last message (survives /compact)");
+    println!("  /focus         Toggle focus mode (hide mascot, minimal chrome)");
     println!("  /save          Persist the session now");
     println!("  /clear         Start a fresh session");
     println!("  /sessions      List saved sessions");

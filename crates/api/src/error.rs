@@ -31,6 +31,58 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// Short machine-readable category of the failure, shown alongside the
+    /// raw error in `RetriesExhausted` so users can tell at a glance whether
+    /// the problem is DNS, TLS, connectivity, rate limiting, etc.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Http(error) => {
+                if error.is_connect() {
+                    "connection failed"
+                } else if error.is_timeout() {
+                    "timeout"
+                } else if error.is_decode() {
+                    "decode error"
+                } else if error.is_body() {
+                    "body error"
+                } else if error.is_request() {
+                    "request error"
+                } else if error.is_redirect() {
+                    "redirect error"
+                } else {
+                    "http error"
+                }
+            }
+            Self::Api { status, .. } => {
+                let code = status.as_u16();
+                match code {
+                    400 => "bad request",
+                    401 | 403 => "auth error",
+                    404 => "not found",
+                    408 => "request timeout",
+                    409 => "conflict",
+                    413 => "payload too large",
+                    429 => "rate limited",
+                    500 => "server error",
+                    502 => "bad gateway",
+                    503 => "service unavailable",
+                    504 => "gateway timeout",
+                    _ if (400..500).contains(&code) => "client error",
+                    _ if (500..600).contains(&code) => "server error",
+                    _ => "api error",
+                }
+            }
+            Self::RetriesExhausted { last_error, .. } => last_error.kind(),
+            Self::MissingApiKey => "missing api key",
+            Self::InvalidApiKeyEnv(_) => "invalid api key env",
+            Self::Io(_) => "io error",
+            Self::Json(_) => "json decode error",
+            Self::InvalidSseFrame(_) => "sse frame error",
+            Self::BackoffOverflow { .. } => "backoff overflow",
+        }
+    }
+
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -57,6 +109,48 @@ impl ApiError {
             Self::Api { retry_after, .. } => *retry_after,
             Self::RetriesExhausted { last_error, .. } => last_error.retry_after(),
             _ => None,
+        }
+    }
+
+    /// A short, human-readable hint for what to try next. Returns `None` when
+    /// the error is self-explanatory or no concrete advice applies. Used by
+    /// the CLI to surface next-steps alongside the raw error (error
+    /// humanization), so users don't have to guess from a raw status code.
+    #[must_use]
+    pub fn suggestion(&self) -> Option<&'static str> {
+        match self {
+            Self::RetriesExhausted { last_error, .. } => last_error.suggestion(),
+            Self::Http(error) => {
+                if error.is_connect() {
+                    Some("check your network connection and base_url, or try a different provider")
+                } else if error.is_timeout() {
+                    Some("the request timed out — check network latency or try again")
+                } else if error.is_decode() {
+                    Some("response decode error — the server may have returned an unexpected format")
+                } else {
+                    None
+                }
+            }
+            Self::Api { status, .. } => {
+                let code = status.as_u16();
+                match code {
+                    401 | 403 => Some("check your API key and ensure it has the required permissions"),
+                    404 => Some("model or endpoint not found — check the model name and base_url"),
+                    429 => Some("rate limited — wait a moment and try again, or reduce request frequency"),
+                    500 | 502 | 503 => Some("provider-side error — this is usually temporary, try again shortly"),
+                    504 => Some("gateway timeout — the provider is slow, try again in a moment"),
+                    413 => Some("payload too large — try a shorter prompt or fewer attached files"),
+                    _ => None,
+                }
+            }
+            Self::MissingApiKey => Some(
+                "set ANTHROPIC_AUTH_TOKEN or DEEPSEEK_API_KEY (or the relevant env var for your provider)",
+            ),
+            Self::InvalidApiKeyEnv(_) => {
+                Some("check that the API key environment variable is set correctly")
+            }
+            Self::Json(_) => Some("unexpected response format — the provider API may have changed"),
+            Self::Io(_) | Self::InvalidSseFrame(_) | Self::BackoffOverflow { .. } => None,
         }
     }
 }
@@ -99,7 +193,8 @@ impl Display for ApiError {
                 last_error,
             } => write!(
                 f,
-                "api request failed after {attempts} attempts: {last_error}"
+                "api request failed after {attempts} attempts ({}): {last_error}",
+                last_error.kind()
             ),
             Self::InvalidSseFrame(message) => write!(f, "invalid sse frame: {message}"),
             Self::BackoffOverflow {
