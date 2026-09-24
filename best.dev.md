@@ -1,5 +1,7 @@
 # best.dev.md — 外部项目借鉴清单（jcode / rig / ADK-Rust / Pica / Morphz）
 
+> **时效说明（2026-09-24）**：本文所引的 `list.md`（含其 #N 编号）已从仓库删除（2fdf341），文中引用均为历史调研语境；`syntect` 已于 7d81c80 移除，D3/G 档中涉及它的依赖面描述已过时。
+
 > 对象（第一批）：`archive/jcode`（v0.86.0，101 个 workspace crate，Rust 终端 AI agent，单 server 多 client 架构）。
 > 受益方：heartflow（8 crate，35,139 行生产代码 / 60 个文件，无 daemon，SQLite 存储，REPL + 可选 TUI）。
 > 方法：读源码与设计文档，**每条结论都指到 `文件:行号`**；无法证实的一律标注为「待验证前提」。

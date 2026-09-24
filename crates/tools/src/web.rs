@@ -1021,13 +1021,18 @@ mod tests {
     fn rejects_internal_host_suffixes_and_unresolved_hosts() {
         // `.localhost` and friends are rejected on the literal host string, before
         // any DNS lookup, so these assertions never touch the network.
-        for host in ["http://sub.localhost/", "http://printer.internal/", "http://nas.local/"] {
+        for host in [
+            "http://sub.localhost/",
+            "http://printer.internal/",
+            "http://nas.local/",
+        ] {
             let url = reqwest::Url::parse(host).expect("parse");
             assert!(ensure_public(&url).is_err(), "{host} should be blocked");
         }
         // `.invalid` is guaranteed by RFC 2606 to never resolve; reaching this
         // line exercises the `BlockedHost (unresolved)` branch.
-        let unresolved = reqwest::Url::parse("http://heartflow-does-not-exist.invalid/").expect("parse");
+        let unresolved =
+            reqwest::Url::parse("http://heartflow-does-not-exist.invalid/").expect("parse");
         assert!(ensure_public(&unresolved).is_err());
     }
 

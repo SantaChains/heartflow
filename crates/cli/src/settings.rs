@@ -103,7 +103,11 @@ impl SettingsOverrides {
         for key in settings.keys() {
             if !matches!(
                 key.as_str(),
-                "scroll_step" | "tool_inline_lines" | "fold_thinking" | "frame_budget_ms" | "reduced_motion"
+                "scroll_step"
+                    | "tool_inline_lines"
+                    | "fold_thinking"
+                    | "frame_budget_ms"
+                    | "reduced_motion"
             ) {
                 tracing::debug!(file = %source, field = %key, "unknown setting; ignored");
             }

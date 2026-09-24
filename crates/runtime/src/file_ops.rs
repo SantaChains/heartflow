@@ -1467,10 +1467,13 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
 ///
 /// Correctness notes, in the order the work happens:
 /// - a relative path is taken against `root`;
-/// - `..` is collapsed **lexically first**, because `Path::join` does not fold
-///   it and a raw `root/../..` would otherwise still pass a naive `starts_with`
-///   test while pointing above the root;
-/// - then the **longest existing ancestor** is canonicalized, so a symlinked
+/// - `..` is **not** folded lexically: it is resolved by the filesystem during
+///   canonicalization. POSIX resolves `..` *after* symlink substitution, so
+///   folding `ws/link/../x` to `ws/x` before probing would bless a write that
+///   actually lands beside the link's target — a platform-conditional bypass.
+///   (Windows' Win32 layer folds `..` lexically before the object manager sees
+///   the path, so `canonicalize` already matches real resolution there.)
+/// - the **longest existing ancestor** is canonicalized, so a symlinked
 ///   directory cannot launder an escape (`ws/link -> /etc`, `ws/link/passwd`).
 ///   The final component is allowed not to exist yet — writes create files —
 ///   which is exactly why the ancestor, not the whole path, is resolved;
@@ -1479,56 +1482,29 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
 ///
 /// Fails **closed**: a candidate that cannot be proven to stay inside `root` is
 /// reported as an escape, so the failure mode is "ask the human", never
-/// "silently allow".
+/// "silently allow". That includes a `root` that cannot itself be resolved to
+/// an absolute path (deleted cwd, empty path): against an empty base every
+/// candidate would pass, so the gate reports escape instead.
 ///
 /// Both sides are resolved the same way, so a `root` that does not exist yet
 /// (`.heartflow/plans`, before the first plan is written) is still usable: only
 /// the components that exist are canonicalized on either side.
 #[must_use]
 pub fn escapes_workspace(root: &Path, candidate: impl AsRef<Path>) -> bool {
-    let root_real = resolve_existing_prefix(&lexical_normalize(root));
+    let root_real = resolve_existing_prefix(root);
+    // A root that cannot be resolved to an absolute path proves nothing:
+    // `has_prefix` against an empty base accepts every candidate.
+    if !root_real.is_absolute() {
+        return true;
+    }
     let raw = candidate.as_ref();
     let joined = if raw.is_absolute() {
         raw.to_path_buf()
     } else {
         root.join(raw)
     };
-    let resolved = resolve_existing_prefix(&lexical_normalize(&joined));
+    let resolved = resolve_existing_prefix(&joined);
     !has_prefix(&resolved, &root_real)
-}
-
-/// Collapse `.` and `..` without touching the filesystem.
-///
-/// A `..` that would climb above the filesystem root is dropped, and one at the
-/// start of a relative path is kept verbatim (there is nothing to cancel it
-/// against) — keeping it is deliberate: the existence probe downstream then
-/// fails to prove containment and the caller asks.
-fn lexical_normalize(path: &Path) -> PathBuf {
-    use std::path::Component;
-
-    let mut stack: Vec<Component<'_>> = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if matches!(stack.last(), Some(Component::Normal(_))) {
-                    stack.pop();
-                } else if !matches!(
-                    stack.last(),
-                    Some(Component::RootDir | Component::Prefix(_))
-                ) {
-                    stack.push(component);
-                }
-            }
-            other => stack.push(other),
-        }
-    }
-
-    let mut out = PathBuf::new();
-    for component in stack {
-        out.push(component.as_os_str());
-    }
-    out
 }
 
 /// Canonicalize the longest existing prefix of `path`, then re-append the
@@ -2421,5 +2397,47 @@ mod tests {
             assert!(!escapes_workspace(&root, "inner-link/ok.txt"));
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// POSIX resolves `..` *after* symlink substitution, so `link/../x` must
+    /// not be folded to `x` before probing — the write would actually land
+    /// beside the link's target. (Windows folds `..` lexically in Win32 before
+    /// the object manager sees the path, so real resolution matches the gate
+    /// there; this bypass only existed on Unix.)
+    #[cfg(unix)]
+    #[test]
+    fn parent_dotdot_through_a_symlink_is_an_escape() {
+        let base = scratch_dir("symlink-dotdot");
+        let root = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).expect("root should be creatable");
+        std::fs::create_dir_all(&outside).expect("outside should be creatable");
+
+        let link = root.join("link");
+        if make_dir_symlink(&outside, &link).is_err() {
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        assert!(
+            escapes_workspace(&root, "link/../secret.txt"),
+            ".. resolved after a symlink is judged at the link's target"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Regression: the cwd-unresolvable fallback used to lexical-normalize
+    /// `.` to an empty path, against which every candidate passed.
+    #[test]
+    fn a_relative_root_still_confines() {
+        // A temp-dir path outside the (relative) cwd is an escape.
+        assert!(escapes_workspace(
+            std::path::Path::new("."),
+            std::env::temp_dir().join("hf-rel-root-out.txt")
+        ));
+        // A candidate under the cwd stays inside.
+        assert!(!escapes_workspace(
+            std::path::Path::new("."),
+            "hf-rel-root-in.txt"
+        ));
     }
 }

@@ -33,6 +33,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use tui_textarea::{CursorMove, TextArea};
+use unicode_width::UnicodeWidthChar;
 
 use crate::mascot::Mascot;
 use crate::theme::{glyphs, Theme};
@@ -729,9 +730,9 @@ impl ReplEditor {
                     completions,
                     *completion_idx,
                     prefix_search.as_ref().and_then(|(prefix, idx)| {
-                        self.history.entry_at(*idx).and_then(|entry| {
-                            entry.strip_prefix(prefix.as_str())
-                        })
+                        self.history
+                            .entry_at(*idx)
+                            .and_then(|entry| entry.strip_prefix(prefix.as_str()))
                     }),
                     self.focus_mode,
                 )
@@ -766,7 +767,15 @@ impl ReplEditor {
             // Any key means the user is engaging again: clear the lingering
             // Done/Error badge so the companion returns to its idle baseline.
             self.mascot.resume_idle();
-            if self.handle_key(key, textarea, completions, completion_idx, prefix_search, status, exit) {
+            if self.handle_key(
+                key,
+                textarea,
+                completions,
+                completion_idx,
+                prefix_search,
+                status,
+                exit,
+            ) {
                 return Ok(());
             }
         }
@@ -829,7 +838,10 @@ impl ReplEditor {
                     // Grabs text before cursor as prefix, cycles through matches.
                     let (row, col) = textarea.cursor();
                     let line = textarea.lines().get(row).cloned().unwrap_or_default();
-                    let prefix = line[..col].to_string();
+                    // `cursor()` is character-wise; convert to a byte offset
+                    // before slicing (any CJK char before the cursor would
+                    // otherwise panic on a non-char-boundary index).
+                    let prefix = line[..col_char_to_byte(&line, col)].to_string();
                     if prefix.is_empty() {
                         *prefix_search = None;
                         return false;
@@ -859,9 +871,7 @@ impl ReplEditor {
                     // Ctrl+[: prefix history search backward (newer / prev match).
                     // Only works when a prefix search is already active.
                     if let Some((ref prefix, idx)) = *prefix_search {
-                        if let Some(prev_idx) =
-                            self.history.search_prefix_forward(prefix, idx)
-                        {
+                        if let Some(prev_idx) = self.history.search_prefix_forward(prefix, idx) {
                             *prefix_search = Some((prefix.clone(), prev_idx));
                         }
                         // If no newer match, stay on current match (no wrap).
@@ -961,7 +971,10 @@ impl ReplEditor {
                     let accepted = if let Some((ref prefix, idx)) = *prefix_search {
                         let (row, col) = textarea.cursor();
                         let line = textarea.lines().get(row).cloned().unwrap_or_default();
-                        if col == line.len() {
+                        // `cursor()` is character-wise; compare against the
+                        // char count — the byte length never matches for CJK
+                        // input, so the hint could never be accepted.
+                        if col == line.chars().count() {
                             if let Some(entry) = self.history.entry_at(idx) {
                                 if let Some(suffix) = entry.strip_prefix(prefix.as_str()) {
                                     // Only accept up to end of the first line of
@@ -1065,9 +1078,23 @@ fn draw_frame(
     if let Some(suffix) = prefix_suffix {
         let (cursor_row, cursor_col) = textarea.cursor();
         if cursor_row == 0 {
-            let start_x = editor.x + u16::try_from(cursor_col).unwrap_or(u16::MAX);
+            // Ghost text starts at the display width (cells) before the
+            // cursor, not the char count: tui-textarea renders CJK glyphs
+            // two cells wide via unicode-width, so char counts drift.
+            let line = textarea
+                .lines()
+                .first()
+                .map(String::as_str)
+                .unwrap_or_default();
+            let before = &line[..col_char_to_byte(line, cursor_col)];
+            let width: usize = before.chars().map(|ch| ch.width().unwrap_or(0)).sum();
+            let start_x = editor
+                .x
+                .saturating_add(u16::try_from(width).unwrap_or(u16::MAX));
             let max_x = editor.x + editor.width;
-            let ghost_style = Style::default().fg(theme.muted().ratatui()).add_modifier(Modifier::DIM);
+            let ghost_style = Style::default()
+                .fg(theme.muted().ratatui())
+                .add_modifier(Modifier::DIM);
             let mut x = start_x;
             for ch in suffix.chars() {
                 if x >= max_x {
@@ -1078,7 +1105,9 @@ fn draw_frame(
                     cell.set_symbol(ch.encode_utf8(&mut glyph));
                     cell.set_style(ghost_style);
                 }
-                x += 1; // simplistic: assume ASCII-width; CJK would overflow, which is fine
+                // Advance by display width so CJK glyphs align; min 1 keeps
+                // zero-width marks from stalling the loop.
+                x = x.saturating_add(u16::try_from(ch.width().unwrap_or(0).max(1)).unwrap_or(1));
             }
         }
     }
@@ -1565,7 +1594,8 @@ fn word_break_next_char_idx(chars: &[(usize, char)], cur: usize) -> usize {
                 while pos < len && char_class(chars[pos].1) == CharClass::Lower {
                     pos += 1;
                 }
-            } else if upper_run_len > 1 && pos < len && char_class(chars[pos].1) == CharClass::Lower {
+            } else if upper_run_len > 1 && pos < len && char_class(chars[pos].1) == CharClass::Lower
+            {
                 // Multi-uppercase followed by lowercase: "HTTPRequest" → "HTTP|Request".
                 // Last uppercase starts the next hump — back up by one.
                 pos -= 1;
@@ -1598,6 +1628,16 @@ fn word_break_next_char_idx(chars: &[(usize, char)], cur: usize) -> usize {
     }
 }
 
+/// Byte offset for tui-textarea's character-wise cursor column. `cursor()`
+/// returns "0-base character-wise" columns (its own doc); slicing and the
+/// `word_break_*` helpers want byte offsets. Past-the-end columns clamp to
+/// the line length instead of panicking.
+fn col_char_to_byte(line: &str, col: usize) -> usize {
+    line.char_indices()
+        .nth(col)
+        .map_or(line.len(), |(byte, _)| byte)
+}
+
 /// Move the textarea cursor by one word in `direction`. Operates on the
 /// current line only (no cross-line jumps).
 fn move_word(textarea: &mut TextArea<'static>, backward: bool) {
@@ -1605,17 +1645,23 @@ fn move_word(textarea: &mut TextArea<'static>, backward: bool) {
     let Some(line) = textarea.lines().get(row).cloned() else {
         return;
     };
+    // `cursor()` is character-wise; the word-break helpers take byte offsets.
+    let col_byte = col_char_to_byte(&line, col);
     let target_byte = if backward {
-        word_break_prev(&line, col)
+        word_break_prev(&line, col_byte)
     } else {
-        word_break_next(&line, col)
+        word_break_next(&line, col_byte)
     };
     // Count char positions: tui-textarea's Left/Right moves by grapheme,
     // which for our purposes is close enough to char-counted movement.
-    let cur_chars = line[..col].chars().count();
+    let cur_chars = line[..col_byte].chars().count();
     let tgt_chars = line[..target_byte].chars().count();
     let delta = cur_chars.abs_diff(tgt_chars);
-    let key_code = if backward { KeyCode::Left } else { KeyCode::Right };
+    let key_code = if backward {
+        KeyCode::Left
+    } else {
+        KeyCode::Right
+    };
     for _ in 0..delta {
         textarea.input(KeyEvent::new(key_code, KeyModifiers::NONE));
     }
@@ -1656,8 +1702,9 @@ fn read_line_fallback() -> io::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        complete, decode_history, echo_lines, encode_history_line, menu_accept_on_enter,
-        menu_window, suggest_command, CompletionContext, CompletionItem, History,
+        col_char_to_byte, complete, decode_history, echo_lines, encode_history_line,
+        menu_accept_on_enter, menu_window, move_word, suggest_command, textarea_from,
+        CompletionContext, CompletionItem, History,
     };
 
     /// A context with a few models, the three modes, and two sessions, so the
@@ -1922,7 +1969,11 @@ mod tests {
     #[test]
     fn history_prefix_search_partial_match() {
         let h = History {
-            entries: vec!["cargo build".into(), "cargo test".into(), "cargo run".into()],
+            entries: vec![
+                "cargo build".into(),
+                "cargo test".into(),
+                "cargo run".into(),
+            ],
             cursor: 3,
         };
         // "car" matches all three
@@ -2159,5 +2210,36 @@ mod tests {
     #[test]
     fn word_next_single_char() {
         assert_eq!(next_at("a", 0), 1);
+    }
+
+    #[test]
+    fn cursor_col_char_to_byte_maps_cjk() {
+        assert_eq!(col_char_to_byte("你好", 0), 0);
+        assert_eq!(col_char_to_byte("你好", 1), 3);
+        assert_eq!(col_char_to_byte("你好", 2), 6);
+        // Past the end clamps to the byte length instead of panicking.
+        assert_eq!(col_char_to_byte("你好", 9), 6);
+        assert_eq!(col_char_to_byte("abc", 2), 2);
+    }
+
+    #[test]
+    fn move_word_survives_cjk_before_cursor() {
+        // Regression: `cursor()` is character-wise; feeding the column
+        // straight into byte slicing panicked on any multi-byte char before
+        // the cursor (Ctrl+Left/Right with CJK input).
+        let mut textarea = textarea_from("你好world");
+        use tui_textarea::CursorMove;
+        textarea.move_cursor(CursorMove::End);
+        move_word(&mut textarea, true);
+        // Ctrl+Left from the end lands before "world" (after "你好").
+        assert_eq!(textarea.cursor(), (0, 2));
+
+        move_word(&mut textarea, true);
+        // Second jump lands at the start of the CJK run.
+        assert_eq!(textarea.cursor(), (0, 0));
+
+        move_word(&mut textarea, false);
+        // Ctrl+Right jumps forward by the 2-char CJK rule.
+        assert_eq!(textarea.cursor(), (0, 2));
     }
 }

@@ -1441,7 +1441,14 @@ fn view(app: &App, area: Rect, frame: &mut Frame, context_window: Option<usize>)
         // they're approaching a compaction cliff before the model starts
         // truncating context silently.
         if let Some(window) = context_window {
-            let total = usage.input_tokens.saturating_add(usage.output_tokens);
+            // Same accounting as the header's context budget above: all input
+            // (fresh + cache read + cache creation), excluding output. Using
+            // raw `input_tokens` alone misses cache hits, which dominate
+            // multi-turn sessions and would make the warning never fire.
+            let total = usage
+                .input_tokens
+                .saturating_add(usage.cache_read_input_tokens)
+                .saturating_add(usage.cache_creation_input_tokens);
             let pct = if window > 0 {
                 total as f64 / window as f64
             } else {
@@ -3079,6 +3086,32 @@ mod tests {
             rows[0].contains("[ctx 110%]"),
             "over-budget reads above 100%"
         );
+    }
+
+    #[test]
+    fn status_context_warning_uses_full_input_accounting() {
+        let mut shell = Shell::new();
+        shell.chrome = Chrome {
+            context_window: 1_000,
+            ..Chrome::default()
+        };
+        // Cache reads carry 85% of the window; raw `input_tokens` alone would
+        // read 10% and the warning would never fire. Output is excluded from
+        // the budget, so a large `output_tokens` must not inflate it either.
+        shell.section_mut().last_usage = Some(TokenUsage {
+            input_tokens: 100,
+            output_tokens: 900,
+            cache_read_input_tokens: 750,
+            cache_creation_input_tokens: 0,
+        });
+        // Wide enough that the status line's context readout isn't clipped.
+        let rows = render_rows(&shell, 160, 8);
+        let status = &rows[rows.len() - 1];
+        assert!(
+            status.contains("[context: 85%]"),
+            "status warns on input + cache, got: {status}"
+        );
+        assert!(!status.contains("near limit"), "85% is below the 90% cliff");
     }
 
     /// Render a single section's `view` into a test backend and return its rows.

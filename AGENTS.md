@@ -149,7 +149,7 @@ CI 只有两条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/
 
 ## 其他
 
-- **动手前若觉得某处「写法很脏」，先查 `hack.md`**：那是本仓**刻意为之、别去"修"**的丑写法清单（`build.rs` 扫盘找 `rc.exe`、`panic-ok` 标注的 7 处、锁污染恢复的 11 处与刻意保留的 3 处、只重试 `PermissionDenied` 的原子写、`taskkill /T` 取代 Job Object 等），每条都写了「为什么干净写法更差」和代价/边界；B 档另有本机构建/环境的坑（`reg.exe`/`wmic.exe` 黑名单、盘满报 `LNK1108`、`os error 5` 瞬时、同文件批量编辑会静默丢）。
+- **动手前若觉得某处「写法很脏」**：本仓有几类**刻意为之、别去"修"**的写法，理由就地写在代码里——`build.rs` 扫盘找 `rc.exe`、`panic-ok` 标注的 7 处（`api/retry.rs`×1、`runtime/bash.rs`×2、`runtime/redact.rs`×4，见 panic 预算一节）、锁污染恢复与刻意保留显式 `Err` 的收口（见「代码约定」）、只重试 `PermissionDenied` 的原子写、`taskkill /T` 取代 Job Object。本机构建/环境的坑：构建脚本黑名单 `reg.exe`/`wmic.exe`（会挂起等输入）、盘满报 `LNK1108`、`os error 5` 多为瞬时（重试即愈）、同文件批量编辑会静默丢改动（逐次写盘）。原 `hack.md`/`list.md` 清单已删（2fdf341），需要原文时查 git 历史。
 
 - `.gitignore` 忽略 `target/`、`.heartflow/`、`archive/`、`.history/`、`.trae/`，以及本地笔记 `openmemory.md`、`ref.md`、`error.md`。
 - 文档源在 `docs/src`（mdBook，输出 `docs/book/` 已忽略）；`scripts/gen-llms.sh` 按 llms.txt v2 从 `docs/src/SUMMARY.md` 生成仓库根 `llms.txt`/`llms-full.txt`，改文档后重跑（本机 PATH 的 `bash` 若非 GNU bash 会缺 `mapfile`，用 Git 的 bash）。GitHub Pages 由 `docs.yml` 发布。
