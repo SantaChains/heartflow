@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "heartflow"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "clap",
  "crossterm 0.28.1",
@@ -928,7 +928,7 @@ dependencies = [
 
 [[package]]
 name = "heartflow-api"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "reqwest",
  "serde",
@@ -939,14 +939,14 @@ dependencies = [
 
 [[package]]
 name = "heartflow-commands"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "heartflow-runtime",
 ]
 
 [[package]]
 name = "heartflow-mcp"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "reqwest",
  "serde_json",
@@ -955,7 +955,7 @@ dependencies = [
 
 [[package]]
 name = "heartflow-provider"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "heartflow-api",
  "heartflow-runtime",
@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "heartflow-runtime"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "chardetng",
  "encoding_rs",
@@ -991,7 +991,7 @@ dependencies = [
 
 [[package]]
 name = "heartflow-store"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "heartflow-runtime",
  "rusqlite",
@@ -1000,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "heartflow-tools"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "base64",
  "heartflow-runtime",
