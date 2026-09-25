@@ -38,7 +38,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Setup Pages
         id: pages
-        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
       - name: install mdbook
         # 钉死小版:mdBook 0.5.x 尚在演进,浮动 ^0.5 会让同一次提交在不同日子产出不同站点。
         run: cargo install mdbook --version "=0.5.4" --locked
