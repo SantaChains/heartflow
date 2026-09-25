@@ -40,7 +40,7 @@ provider = { workspace = true }
 # actually draws (no hand-rolled wrap counter to drift). The gate is
 # compile-time only: a ratatui upgrade that renames the feature breaks the build
 # visibly, never silently at runtime.
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 runtime = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
