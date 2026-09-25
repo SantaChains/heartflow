@@ -5,6 +5,7 @@
 /mode     [NAME] 显示或切换权限模式（read-only/workspace-write/full）
 /status   会话状态          /compact      手动强制压缩会话历史（忽略阈值）
 /pin      切换末条消息的永不压缩标记（跨 /compact 逐字存活）
+/focus    切换聚焦模式（隐藏 mascot 伴侣、收窄为最小 chrome）
 /save     立即持久化        /clear        开启新会话
 /sessions 列出已存会话      /open N       跳回第 N 个已存会话（同 /sessions 编号）
 /remember T 追加一条长期记忆到 ~/.heartflow/MEMORY.md（自动去重）

@@ -11,7 +11,8 @@
     "直接运行 hf(或 hf chat)进入交互式 REPL;hf doctor 诊断配置与提供方;hf --help 查看全部用法。",
     "配置治理: hf config export [config|theme|keymap|settings|provider] 导出该面生效配置为可编辑模板(不含密钥);hf config import 导入(自动备份);五面改后于回合边界热重载(config 重建 provider,theme/keymap/settings 就地生效,provider 重载模型目录)。",
     "模型目录: ~/.heartflow/provider.toml 是 provider/模型目录(非活动配置,选路仍由 config.toml 决定),内置国内常用 OpenAI 兼容供应商种子;hf models 自举与 /model 切换会回写并热更,REPL 里 /model 显示真实协议/base_url、其后敲空格弹出模型补全。",
-    "会话续接: hf --resume 重开历史会话。详见 https://github.com/SantaChains/heartflow"
+    "会话续接: hf --resume 重开历史会话。详见 https://github.com/SantaChains/heartflow",
+    "配置优先级: CLI 参数(--provider/--model)> -c/--config 显式文件 > 项目 .heartflow/config.toml > 用户 ~/.heartflow/config.toml > 内置 provider 表 > 环境变量; -c/--config 仅提升 config.toml 一面,不影响 theme/keymap/settings/provider。"
   ],
   "architecture": {
     "64bit": {

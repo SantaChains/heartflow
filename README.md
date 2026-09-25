@@ -89,6 +89,7 @@ hf --provider deepseek
 
 ```text
 hf [--provider NAME] [--model MODEL]              进入交互 REPL（等价 hf chat）
+hf -c|--config FILE ...                           全局参数，任何子命令皆可附加：把 FILE 作为最高优先级配置层合并（位于项目/用户 config.toml 之上，--provider/--model 仍胜出）；TOML，路径以 .json 结尾则按 JSON 解析
 hf [--provider NAME] [--model MODEL] prompt TEXT  单次提问，流式输出
 hf -p TEXT                                        prompt 的短写法（等价 hf prompt TEXT，stdin 语义相同）
 hf prompt -q|--quiet TEXT                         只打印答案（去掉进度/用量行，脚本友好）
@@ -114,6 +115,7 @@ hf -v | -V | --version                            打印版本号
 /mode     [NAME] 显示或切换权限模式（read-only/workspace-write/full）
 /status   会话状态          /compact      手动强制压缩会话历史（忽略阈值）
 /pin      切换末条消息的永不压缩标记（跨 /compact 逐字存活）
+/focus    切换聚焦模式（隐藏 mascot 伴侣、收窄为最小 chrome）
 /save     立即持久化        /clear        开启新会话
 /sessions 列出已存会话      /open N       跳回第 N 个已存会话（同 /sessions 编号）
 /remember T 追加一条长期记忆到 ~/.heartflow/MEMORY.md（自动去重）
@@ -148,7 +150,7 @@ hf search 中文笔记 --json | jq -r '.[].snippet'   # ≥ 3 码点走 FTS5 tri
 
 ## 配置
 
-优先级从高到低：CLI 参数 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量。同名字段逐项覆盖，坏字段跳过并告警，单条配置不阻断启动。
+优先级从高到低：CLI 参数（`--provider`/`--model`）> `-c`/`--config` 显式文件 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量。同名字段逐项覆盖，坏字段跳过并告警，单条配置不阻断启动。`-c`/`--config` 是一次性的最高文件层（不落盘、不影响其余面），适合临时切换 provider/密钥而不改动用户或项目配置。
 
 REPL 运行期间编辑并保存 `config.toml` / `theme.toml` / `keymap.toml` / `settings.toml` / `provider.toml` 任一，下一回合边界会自动热重载（`config` 重建 provider 并保留当前会话与权限模式，`theme`/`keymap`/`settings` 就地生效，`provider` 重载模型目录供 `/model` 与补全、绝不动活动传输）。环境异常可用 `hf doctor` 诊断，`hf doctor --fix` 应用安全修复。
 

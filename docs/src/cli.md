@@ -2,6 +2,7 @@
 
 ```text
 hf [--provider NAME] [--model MODEL]              进入交互 REPL（等价 hf chat）
+hf -c|--config FILE ...                           全局参数，任何子命令皆可附加：把 FILE 作为最高优先级配置层合并（位于项目/用户 config.toml 之上，--provider/--model 仍胜出）；TOML，路径以 .json 结尾则按 JSON 解析
 hf [--provider NAME] [--model MODEL] prompt TEXT  单次提问，流式输出
 hf -p TEXT                                        prompt 的短写法（等价 hf prompt TEXT，stdin 语义相同）
 hf prompt -q|--quiet TEXT                         只打印答案（去掉进度/用量行，脚本友好）

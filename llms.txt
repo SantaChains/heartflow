@@ -1,6 +1,6 @@
 # heartflow
 
-> Rust 实现的终端 AI agent,命令名 hf:流式多轮协作,双协议(Anthropic/OpenAI)、原生工具、MCP 客户端、任务环、SQLite FTS5 会话检索、上下文压缩。
+> Rust 实现的终端 AI agent,命令名 hf:流式多轮协作,三方言(Anthropic/OpenAI Chat/OpenAI Responses)、原生工具、MCP 客户端、任务环、SQLite FTS5 会话检索、上下文压缩。
 
 安装: `scoop bucket add heartflow https://github.com/SantaChains/heartflow && scoop install heartflow`(或 `cargo install heartflow`)。
 首次运行前设 `DEEPSEEK_API_KEY` 或 `ANTHROPIC_API_KEY`,`hf --provider deepseek` 进入 REPL。文档源在 `docs/src`,以 mdBook 构建;本文件由 `scripts/gen-llms.sh` 生成,链接均指向原始 markdown。
@@ -13,7 +13,7 @@
 - [CLI 用法](https://raw.githubusercontent.com/SantaChains/heartflow/main/docs/src/cli.md)
 - [REPL 命令](https://raw.githubusercontent.com/SantaChains/heartflow/main/docs/src/repl.md): 补全不止命令名：在 `/model `、`/mode `、`/open ` 后敲空格，会按命令弹出参数候选表格——分别是当前 provider 的目录模型（附上下文窗口与来源）、权限三档、近期会话序号。↑/↓ 选择，Tab 或 Enter 只补全当前参数位（不整行重置），Esc 取消高亮；候选多时表格随高亮滚动。
 - [管道与脚本](https://raw.githubusercontent.com/SantaChains/heartflow/main/docs/src/piping.md): hf 遵循 Unix 过滤工具约定：当 stdin 被管道或重定向（非交互终端）时自动读入全文，与命令行指令拼接为一个提示词（`指令\n\n<stdin>`）；`--quiet` 只输出回答正文，`--json` 输出 `{text, usage, session_id}`，便于与 `jq`、`Select-String`、`git` 等串联。每回合自动镜像进 SQLite 历史库，`hf search` 因此可在管道里非交互地检索历史。
-- [配置](https://raw.githubusercontent.com/SantaChains/heartflow/main/docs/src/configuration.md): 优先级从高到低：CLI 参数 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量。同名字段逐项覆盖，坏字段跳过并告警，单条配置不阻断启动。
+- [配置](https://raw.githubusercontent.com/SantaChains/heartflow/main/docs/src/configuration.md): 优先级从高到低：CLI 参数（`--provider`/`--model`）> `-c`/`--config` 显式文件 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量。同名字段逐项覆盖，坏字段跳过并告警，单条配置不阻断启动。`-c`/`--config` 是一次性的最高文件层（不落盘、只影响 `config.toml` 面，不影响 theme/keymap/settings/provider 其余四面），适合临时切换 provider/密钥而不改动用户或项目配置。
 - [会话与历史库](https://raw.githubusercontent.com/SantaChains/heartflow/main/docs/src/sessions.md): 对话以每会话一份 JSON 快照为权威存储写入 `~/.heartflow/sessions/<id>.json`（原子 temp+rename 覆盖同一文件，绝不留下截断转录）；同时 best-effort 镜像进系统级 SQLite 库 `~/.heartflow/heartflow.db`（镜像失败绝不阻断保存）。库采用 WAL、外键级联与 `user_version` 迁移，历史消息存于 `messages`、`messages_fts`（FTS5 trigram）供检索。中文、空格、Windows 全路径均按 UTF-8 正确处理。REPL 内 `/search <Q>` 与非交互 `hf search <Q>` 共用同一检索引擎；查询 ≥ 3 码点走 trigram 索引，更短的词回退到转义后的 `LIKE`。
 - [Agent 资产](https://raw.githubusercontent.com/SantaChains/heartflow/main/docs/src/agent-assets.md): 仓库指令文件以 `AGENTS.md`（含 `AGENTS.local.md`、逐级向上到仓库根）为主注入系统提示词；仅当同目录没有 `AGENTS.md` 时才回退读取旧名 `CLAUDE.md`（排他回退，避免双注入）；`hf init` / REPL `/init` 生成中性的 `AGENTS.md` 骨架。规则与技能分用户层与项目层，项目同名覆盖用户。
 - [环境变量](https://raw.githubusercontent.com/SantaChains/heartflow/main/docs/src/env-vars.md)
@@ -24,4 +24,4 @@
 ## Optional
 
 - [路线图](https://raw.githubusercontent.com/SantaChains/heartflow/main/docs/src/roadmap.md): 以下方向已明确规划但**尚未实现**，仅作路线记录：
-- [贡献与质量门](https://raw.githubusercontent.com/SantaChains/heartflow/main/docs/src/contributing.md): 日常迭代按效率优先：提交前保证下列四条绿。pedantic 级风格 clippy 仅作提示不阻断，但 `clippy::all` 正确性 lint 仍为阻断门。
+- [贡献与质量门](https://raw.githubusercontent.com/SantaChains/heartflow/main/docs/src/contributing.md): 贡献入口以仓库根的两份文件为权威，本文不再重复维护：

@@ -38,7 +38,7 @@ emit_item() { # file
 # ---- llms.txt ----
 {
   printf '# heartflow\n\n'
-  printf '> Rust 实现的终端 AI agent,命令名 hf:流式多轮协作,双协议(Anthropic/OpenAI)、原生工具、MCP 客户端、任务环、SQLite FTS5 会话检索、上下文压缩。\n\n'
+  printf '> Rust 实现的终端 AI agent,命令名 hf:流式多轮协作,三方言(Anthropic/OpenAI Chat/OpenAI Responses)、原生工具、MCP 客户端、任务环、SQLite FTS5 会话检索、上下文压缩。\n\n'
   printf '安装: `scoop bucket add heartflow https://github.com/SantaChains/heartflow && scoop install heartflow`(或 `cargo install heartflow`)。\n'
   printf '首次运行前设 `DEEPSEEK_API_KEY` 或 `ANTHROPIC_API_KEY`,`hf --provider deepseek` 进入 REPL。文档源在 `docs/src`,以 mdBook 构建;本文件由 `scripts/gen-llms.sh` 生成,链接均指向原始 markdown。\n'
   printf '\n## Documentation\n\n'

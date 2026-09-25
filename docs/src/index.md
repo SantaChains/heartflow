@@ -7,7 +7,7 @@ Rust 实现的终端 AI agent。二进制命令 `hf`，在 REPL 中通过流式�
 ## 它能做什么
 
 - **真流式**：SSE 增量经 mpsc 通道推送，思考与正文实时渲染，markdown 与代码高亮输出。
-- **双协议**：Anthropic 消息协议与 OpenAI Chat Completions 方言；内置 DeepSeek，自定义 provider 可接任意兼容端点。
+- **三方言**：Anthropic 消息协议、OpenAI Chat Completions 与 OpenAI Responses（`/v1/responses`）；内置 DeepSeek，自定义 provider 通过 `[provider.NAME]` 的 `protocol` 选方言，可接任意兼容端点。
 - **原生工具**：bash、read/write/edit_file、glob/grep/search_files、apply_patch、todo_write、ask_user、web_fetch（SSRF 防护）等。
 - **MCP 支持**：JSON-RPC 2.0 双传输——本地 stdio 与远程 Streamable-HTTP/SSE。
 - **任务自迭代**：todo_write 登记计划，未完成任务自动续推；Hermes 任务环逐任务在新鲜上下文里执行。

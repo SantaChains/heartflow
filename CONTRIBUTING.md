@@ -5,7 +5,7 @@
 ## 开发环境
 
 - Rust 工具链由 `rust-toolchain.toml` 钉定（1.93.1 + rustfmt/clippy），rustup 会自动按需安装；MSRV 为 1.88（下限来自依赖，声明在根 `Cargo.toml` 的 `[workspace.package] rust-version`）
-- 本仓库无每-push CI 质量门，全部检查在本地完成后再提交
+- 本仓库无每-push CI 质量门（作者自推不烧 Actions 额度，检查全部在本地完成后再提交），但外部 PR 会过 `.github/workflows/ci.yml`（只在 `pull_request` 上跑 fmt/clippy/test，不接任何 secrets）
 
 ```bash
 cargo build --release          # target/release/hf(.exe)

@@ -17,7 +17,7 @@ Rust 实现的终端 AI agent。二进制命令 `hf`，在 REPL 中通过流式�
 ## 它能做什么
 
 - **真流式**：SSE 增量经 mpsc 通道推送，思考与正文实时渲染，markdown 与代码高亮输出。
-- **双协议**：Anthropic 消息协议与 OpenAI Chat Completions 方言；内置 DeepSeek，自定义 provider 可接任意兼容端点。
+- **三方言**：Anthropic 消息协议、OpenAI Chat Completions 与 OpenAI Responses（`/v1/responses`）；内置 DeepSeek，自定义 provider 通过 `[provider.NAME]` 的 `protocol` 选方言，可接任意兼容端点。
 - **原生工具**：bash、read/write/edit_file、glob/grep/search_files、apply_patch、todo_write、ask_user、web_fetch（SSRF 防护）等。
 - **MCP 支持**：JSON-RPC 2.0 双传输——本地 stdio 与远程 Streamable-HTTP/SSE。
 - **任务自迭代**：todo_write 登记计划，未完成任务自动续推；Hermes 任务环逐任务在新鲜上下文里执行。
@@ -105,6 +105,7 @@ hf --provider deepseek
 
 ```text
 hf [--provider NAME] [--model MODEL]              进入交互 REPL（等价 hf chat）
+hf -c|--config FILE ...                           全局参数，任何子命令皆可附加：把 FILE 作为最高优先级配置层合并（位于项目/用户 config.toml 之上，--provider/--model 仍胜出）；TOML，路径以 .json 结尾则按 JSON 解析
 hf [--provider NAME] [--model MODEL] prompt TEXT  单次提问，流式输出
 hf -p TEXT                                        prompt 的短写法（等价 hf prompt TEXT，stdin 语义相同）
 hf prompt -q|--quiet TEXT                         只打印答案（去掉进度/用量行，脚本友好）
@@ -148,6 +149,7 @@ hf -v | -V | --version                            打印版本号
 /mode     [NAME] 显示或切换权限模式（read-only/workspace-write/full）
 /status   会话状态          /compact      手动强制压缩会话历史（忽略阈值）
 /pin      切换末条消息的永不压缩标记（跨 /compact 逐字存活）
+/focus    切换聚焦模式（隐藏 mascot 伴侣、收窄为最小 chrome）
 /save     立即持久化        /clear        开启新会话
 /sessions 列出已存会话      /open N       跳回第 N 个已存会话（同 /sessions 编号）
 /remember T 追加一条长期记忆到 ~/.heartflow/MEMORY.md（自动去重）
@@ -205,7 +207,7 @@ hf search 中文笔记 --json | jq -r '.[].snippet'   # ≥ 3 码点走 FTS5 tri
 
 # 配置
 
-优先级从高到低：CLI 参数 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量。同名字段逐项覆盖，坏字段跳过并告警，单条配置不阻断启动。
+优先级从高到低：CLI 参数（`--provider`/`--model`）> `-c`/`--config` 显式文件 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量。同名字段逐项覆盖，坏字段跳过并告警，单条配置不阻断启动。`-c`/`--config` 是一次性的最高文件层（不落盘、只影响 `config.toml` 面，不影响 theme/keymap/settings/provider 其余四面），适合临时切换 provider/密钥而不改动用户或项目配置。
 
 REPL 运行期间编辑并保存 `config.toml` / `theme.toml` / `keymap.toml` / `settings.toml` / `provider.toml` 任一，下一回合边界会自动热重载（`config` 重建 provider 并保留当前会话与权限模式，`theme`/`keymap`/`settings` 就地生效，`provider` 重载模型目录供 `/model` 与补全、绝不动活动传输；逐面上报，改 theme 不触发 config 重载）。环境异常可用 `hf doctor` 诊断，`hf doctor --fix` 应用安全修复。
 
@@ -546,22 +548,12 @@ cd wiki-checkout && git add -A && git commit -m "docs: seed wiki" && git push
 
 # 贡献与质量门
 
-日常迭代按效率优先：提交前保证下列四条绿。pedantic 级风格 clippy 仅作提示不阻断，但 `clippy::all` 正确性 lint 仍为阻断门。
+贡献入口以仓库根的两份文件为权威，本文不再重复维护：
 
-```bash
-cargo fmt --all -- --check
-cargo test --workspace
-cargo build --release
-cargo clippy --workspace --all-targets -- -D warnings -A clippy::pedantic   # 阻断正确性；pedantic 仅提示
-```
+- [CONTRIBUTING.md](https://github.com/SantaChains/heartflow/blob/main/CONTRIBUTING.md)：开发环境、本地质量门、panic 预算棘轮、提交规范与发版语义、PR 流程、接口面同步清单、架构边界
+- [AGENTS.md](https://github.com/SantaChains/heartflow/blob/main/AGENTS.md)：面向 agent 的完整仓库指令，两者冲突时以 AGENTS.md 为准
 
-## 提交规范
-
-版本语义由 git-cliff 从提交信息推导：`feat:` → minor，`fix:` → patch，`!` 或 `BREAKING CHANGE:` → major；`chore/docs/test/ci/style/build` 不触发发版。scope 用 crate 名，如 `feat(tools): ...`。
-
-## 文档
-
-改 README 里列出的 CLI/REPL 接口时，同步更新 `docs/src/` 对应章节与 `--help`。文档站构建见 [AI 文档集成](ai-integration.md)。
+一句话版本：提交前保证 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings -A clippy::pedantic`、`cargo test --workspace` 三条全绿，提交信息遵循 Conventional Commits（`feat:` 触发 minor、`fix:` 触发 patch，scope 用 crate 名），Issue 与 PR 使用仓库提供的模板。
 
 ## License
 

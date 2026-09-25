@@ -1,6 +1,6 @@
 # 配置
 
-优先级从高到低：CLI 参数 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量。同名字段逐项覆盖，坏字段跳过并告警，单条配置不阻断启动。
+优先级从高到低：CLI 参数（`--provider`/`--model`）> `-c`/`--config` 显式文件 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量。同名字段逐项覆盖，坏字段跳过并告警，单条配置不阻断启动。`-c`/`--config` 是一次性的最高文件层（不落盘、只影响 `config.toml` 面，不影响 theme/keymap/settings/provider 其余四面），适合临时切换 provider/密钥而不改动用户或项目配置。
 
 REPL 运行期间编辑并保存 `config.toml` / `theme.toml` / `keymap.toml` / `settings.toml` / `provider.toml` 任一，下一回合边界会自动热重载（`config` 重建 provider 并保留当前会话与权限模式，`theme`/`keymap`/`settings` 就地生效，`provider` 重载模型目录供 `/model` 与补全、绝不动活动传输；逐面上报，改 theme 不触发 config 重载）。环境异常可用 `hf doctor` 诊断，`hf doctor --fix` 应用安全修复。
 

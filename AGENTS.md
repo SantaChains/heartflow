@@ -40,39 +40,39 @@ cargo test --workspace         # 单测:cargo test -p <crate> <name>;重点 crat
 
 **第三方代码归属**：任何衍生/移植自外部项目的代码（脚本、片段、算法）须在根 `NOTICE` 追加版权声明与许可证全文，并在 `README.md` §致谢与第三方代码点名来源。当前唯一项：`scripts/check_panic_budget.py`（衍生自 MIT 许可的 jcode，Copyright (c) 2025 Jeremy Huang）。`archive/` 已在 `.gitignore` 中、**不随仓库分发**，所以归属信息不能只写在存档里。
 
-CI 只有两条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/**`/`scripts/gen-llms.sh` 变动才触发）；`ci.yml.bak` 是刻意停用的质量门，改名 `.bak` 后 GitHub 不识别。Actions 不跑代码检查。
+CI 有三条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/**`/`scripts/gen-llms.sh` 变动才触发）、`ci.yml`（**只在 `pull_request` 上跑的 fmt/clippy/test 质量门**，不接任何 secrets，不阻断写权限）；`ci.yml.bak` 是旧形态备份，GitHub 不识别 `.bak` 后缀。本仓库无每-push 质量门（作者自推不烧 Actions 额度，本地跑），但**外部 PR 会过 `ci.yml`**。Actions 不跑发布以外的代码检查。
 
 ## 接口面
 
 改下列任一公共契约，须同步 README、`docs/src`、根 `llms.txt`/`llms-full.txt`（`bash scripts/gen-llms.sh`）、`bucket/heartflow.json` 的 notes、`.devin/wiki.json`。
 
-### CLI（`crates/cli/src/main.rs:675` 起的 clap 结构）
+### CLI（`crates/cli/src/shell.rs` 的 `Cli`/`Command`，Phase 1 从 `main.rs` 拆出）
 
-全局：`--provider NAME`、`--model MODEL`、`--version`（`-v`，`-V` 为可见短别名；内建版本 flag 已禁用）、`--resume[=PATH]`（`require_equals`，裸形式进选择器）、`--run CMD`（`requires = "resume"`）。
+全局：`--provider NAME`、`--model MODEL`、`--version`（`-v`，`-V` 为可见短别名；内建版本 flag 已禁用）、`--resume[=PATH]`（`require_equals`，裸形式进选择器）、`--run CMD`（`requires = "resume"`）、`-c`/`--config PATH`（最高优先级文件层，见「配置键」节末尾的优先级说明）。
 
 子命令：`chat`、`prompt [TEXT...] [-q|--quiet] [--json]`、`search <QUERY...> [--limit N=20] [--json]`、`system-prompt [--cwd PATH] [--date YYYY-MM-DD]`、`config export [SURFACE=config|theme|keymap|settings|provider] [--output FILE]` / `config import FILE`、`doctor [--fix] [--ai]`、`init [--force]`、`models [--provider] [--model] [--balance]`。
 
 交互契约：无参数或 `hf chat` 进 REPL（唯一可弹确认的模式）；子命令永不阻塞等人。退出码 0 成功 / 1 运行时与 provider 错误 / 2 用法错误。
 
-### 权限策略（`crates/cli/src/main.rs:3708` `default_permission_mode`、`:3728` `permission_policy_for_mode`）
+### 权限策略（`crates/cli/src/permissions.rs:21` `default_permission_mode`、`:44` `permission_policy_for_mode`）
 
 默认模式：`HEARTFLOW_PERMISSION_MODE` 优先；未设时交互式 `workspace-write`、非交互 `full`。`/mode` 认 `read-only`/`workspace-write`/`full`（`auto` 归一为 `full`）；环境变量另外接受 `plan`，其硬门禁只允许写 `.heartflow/plans/*.md`。`read-only` 与 `plan` 两档把 `McpToolset::read_only_tool_names` 并入 Allow，使远程只读 MCP 可用。
 
-### REPL（`crates/cli/src/main.rs:1689` `dispatch_slash_command`）
+### REPL（`crates/cli/src/main.rs:962` `dispatch_slash_command`）
 
-`/help /status /model [NAME] /mode [NAME] /plan [GOAL|approve|end|status] /compact /pin /save /clear /sessions /open N /remember T /search Q /mcp /expand [ID] /queue [pop|clear] /guide TASK /init /restart /exit`（`/quit` 为别名），以及不走模型的 `!CMD` 前缀。
+`/help /status /model [NAME] /mode [NAME] /plan [GOAL|approve|end|status] /compact /pin /focus /save /clear /sessions /open N /remember T /search Q /mcp /expand [ID] /queue [pop|clear] /guide TASK /init /restart /exit`（`/quit` 为别名），以及不走模型的 `!CMD` 前缀。`/focus` 切换聚焦模式（隐藏 mascot 伴侣、收窄输入区为最小 chrome）。
 
 `/model`（无参）打印当前**真实**传输身份——`provider`（目录键，未命中则 `custom`）/ `protocol` / `base_url` / `model` / `known models`（目录中该 provider 的模型），取代旧的写死 DeepSeek 清单，使传输失败一眼可辨协议而非误读厂商（env-anthropic 路径显示 `provider: anthropic (env)`）；`/model NAME` 切换成功后把该模型记入 `~/.heartflow/provider.toml`（`source=user`）。REPL 补全不止命令名：`/model `、`/mode `、`/open ` 后跟空格按命令弹出参数候选表格（分别为目录中当前 provider 的模型 / 权限三档 / 会话序号），↑/↓ 选择、Tab 或 Enter 只补全当前参数位，Esc 取消高亮。
 
-### 原生工具（`crates/tools/src/lib.rs:137` 注册，`:362` `execute_tool` 分发）
+### 原生工具（`crates/tools/src/lib.rs:137` `mvp_tool_specs` 注册，`:366` `execute_tool` 分发）
 
-固定注册：`bash`、`read_file`、`write_file`、`edit_file`、`glob_search`、`grep_search`、`search_files`（nucleo 模糊路径检索）、`apply_patch`（先全量校验后写入的事务式多文件编辑）、`todo_write`（`crates/tools/src/todo.rs:156`）、`ask_user`、`verify_graphics`、`web_fetch`、`web_search`、`generate_image`。
+固定注册：`bash`、`read_file`、`write_file`、`edit_file`、`glob_search`、`grep_search`、`search_files`（nucleo 模糊路径检索）、`apply_patch`（先全量校验后写入的事务式多文件编辑）、`todo_write`（`crates/tools/src/todo.rs:158`）、`ask_user`、`verify_graphics`、`web_fetch`、`web_search`、`generate_image`。
 
-条件注册：`search_documents`，仅当外部 `rga`（ripgrep-all）在 PATH 上时下发（`crates/runtime/src/doc_search.rs:124` `rga_available`，装配点在 `crates/cli/src/main.rs:3424` `ToolExecutor::specs`），用于 zip/tar/docx/pdf/epub 内文本检索。
+条件注册：`search_documents`，仅当外部 `rga`（ripgrep-all）在 PATH 上时下发（`crates/runtime/src/doc_search.rs:165` `rga_available`，装配点在 `crates/cli/src/tool_exec.rs` 的 `ToolExecutor::specs`），用于 zip/tar/docx/pdf/epub 内文本检索。
 
 执行归属：`ask_user` 的实现留在 CLI 层（需真终端），`tools` crate 只持 wire spec；其余经 `execute_tool`。新增工具须同时补 spec、`execute_tool` 分支、`specs()` 装配与权限策略条目。`search_files`/`apply_patch` 的入参 schema 由 schemars 从输入类型派生，其余为手写 `json!`。
 
-并发调度：`crates/cli/src/main.rs:3462` `is_concurrent_safe` 决定哪些工具可批跑——只读类（read/glob/grep/search_files/search_documents/verify_graphics/web_fetch/web_search）并行，写类与交互类（bash/write/edit/apply_patch/generate_image/todo_write/ask_user 及非只读 MCP）严格串行。
+并发调度：`crates/cli/src/tool_exec.rs:128` `is_concurrent_safe` 决定哪些工具可批跑——只读类（read/glob/grep/search_files/search_documents/verify_graphics/web_fetch/web_search）并行，写类与交互类（bash/write/edit/apply_patch/generate_image/todo_write/ask_user 及非只读 MCP）严格串行。
 
 ### 环境变量
 
@@ -80,17 +80,17 @@ CI 只有两条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/
 |---------------------------------------------------------------------|---------------------------------------------------------------|-----------------------------------------------|
 | `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | 环境型 provider 的密钥与基址                                  | `crates/api/src/client.rs:159`、provider 解析 |
 | `DEEPSEEK_API_KEY`                                                  | 内置 `deepseek` provider 密钥（默认模型 `deepseek-v4-flash`） | `crates/provider/src/config.rs:105`           |
-| `HEARTFLOW_LOG`                                                     | tracing 过滤，默认 `warn`，仅 stderr                          | `crates/cli/src/main.rs:185`                  |
-| `HEARTFLOW_PERMISSION_MODE`                                         | 见权限策略                                                    | `crates/cli/src/main.rs:3711`                 |
-| `HEARTFLOW_SHELL`                                                   | 覆盖 bash 工具的 shell                                        | `crates/runtime/src/bash.rs:338`              |
-| `HEARTFLOW_AUTO_COMPACT_TOKENS`                                     | 模型窗口 tokens，优先级高于 `[provider] context_window`       | `crates/cli/src/main.rs:2126`                 |
-| `HEARTFLOW_REPLAY_VERBATIM_TAIL`                                    | 回放时逐字保留的近期 `tool_result` 条数，默认 12              | `crates/cli/src/main.rs:2170`                 |
+| `HEARTFLOW_LOG`                                                     | tracing 过滤，默认 `warn`，仅 stderr                          | `crates/cli/src/main.rs:233`                  |
+| `HEARTFLOW_PERMISSION_MODE`                                         | 见权限策略                                                    | `crates/cli/src/permissions.rs:22`            |
+| `HEARTFLOW_SHELL`                                                   | 覆盖 bash 工具的 shell                                        | `crates/runtime/src/bash.rs:599`              |
+| `HEARTFLOW_AUTO_COMPACT_TOKENS`                                     | 模型窗口 tokens，优先级高于 `[provider] context_window`       | `crates/cli/src/main.rs:1535`                 |
+| `HEARTFLOW_REPLAY_VERBATIM_TAIL`                                    | 回放时逐字保留的近期 `tool_result` 条数，默认 12              | `crates/cli/src/main.rs:1579`                 |
 | `HEARTFLOW_IMAGE_API_KEY` / `_BASE_URL` / `_MODEL` / `_SIZE`        | 启用并参数化 `generate_image`                                 | `crates/tools/src/image.rs:166`               |
-| `HEARTFLOW_COOKIE_JAR`                                              | 指定文件即开启 `web_fetch` 会话 cookie 复用                   | `crates/tools/src/web.rs:162`                 |
+| `HEARTFLOW_COOKIE_JAR`                                              | 指定文件即开启 `web_fetch` 会话 cookie 复用                   | `crates/tools/src/web.rs:253`                 |
 | `HEARTFLOW_CONFIG_HOME`                                             | 覆盖用户配置根（默认 `~/.heartflow`）                         | `crates/runtime/src/config.rs:69`             |
-| `HEARTFLOW_RESTART_DEPTH`                                           | `/restart` 链式重启深度守卫，勿手工设置                       | `crates/cli/src/main.rs:148`                  |
+| `HEARTFLOW_RESTART_DEPTH`                                           | `/restart` 链式重启深度守卫，勿手工设置                       | `crates/cli/src/main.rs:196`                  |
 
-### 配置键（`version` 当前为 1，`crates/provider/src/config.rs:12`）
+### 配置键（`version` 当前为 1，`crates/provider/src/config.rs:13`）
 
 `[provider]`：`name`、`protocol`（`anthropic` | `openai`/`openai-compatible`/`openai_compat` | `openai-responses`/`responses`/`openai_responses`）、`base_url`、`api_key_env`、`api_key`（内联明文，导出时永不写出）、`auth_token_env`、`model`、`max_tokens`、`reasoning_effort`、`context_window`（`crates/provider/src/config.rs:123-140`、`:165-181`）。字段全可选，未识别字段仅 debug 记录，坏字段跳过不阻断。缺省模型 `mimo-v2.5-pro`、缺省 `max_tokens` 4096（`crates/provider/src/config.rs:7-8`）。
 
@@ -106,7 +106,7 @@ CI 只有两条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/
 
 `hf config export [SURFACE]`（`config` 默认 / `theme` / `keymap` / `settings` / `provider`）导出该面生效值为可编辑模板，永不落密钥；`provider` 面导出合并后的目录（种子+用户+发现）作为可编辑模板。
 
-配置优先级：CLI 参数 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量；同名字段逐项覆盖。`ConfigWatcher`（`crates/cli/src/config.rs`）每回合边界按 mtime 逐面探测 config/theme/keymap/settings/provider 五面并热重载：`changed() -> ChangedSurfaces` 逐面上报，config 重建 runtime、theme 换入进程级调色板、keymap/settings 就地重载、provider 重载模型目录（仅供 `/model` 展示与补全，绝不重建 runtime 或改活动传输）（改 theme 绝不触发 config 重载）。
+配置优先级：CLI 参数（`--provider`/`--model`）> `-c`/`--config` 显式文件 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量；同名字段逐项覆盖。`-c`/`--config` 由 `crates/cli/src/main.rs` 在 `run()` 开头经 `provider::set_config_override`（`OnceLock`，首次写入即固定）录入绝对路径，`crates/provider/src/config.rs` 的 `config_file_paths` 将其拼在用户/项目两层之后作为最高层合并（仅影响 `config.toml` 这一面，不影响 theme/keymap/settings/provider 四面）；CLI 的 `--provider`/`--model` 仍优先于它。`ConfigWatcher`（`crates/cli/src/config.rs`）每回合边界按 mtime 逐面探测 config/theme/keymap/settings/provider 五面并热重载：`changed() -> ChangedSurfaces` 逐面上报，config 重建 runtime、theme 换入进程级调色板、keymap/settings 就地重载、provider 重载模型目录（仅供 `/model` 展示与补全，绝不重建 runtime 或改活动传输）（改 theme 绝不触发 config 重载）。
 
 ### 运行时可写路径
 
