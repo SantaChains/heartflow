@@ -26,7 +26,7 @@ commands = { workspace = true }
 # input, inquire owns during-turn prompts, so the two never drive the terminal
 # at once. P4-c.3 replaces inquire with ratatui overlays, after which the whole
 # binary converges on the single crossterm 0.28 backend.
-crossterm = "0.28"
+crossterm = "0.29"
 dirs = "7.0"
 inquire = "0.9"
 mcp = { workspace = true }
