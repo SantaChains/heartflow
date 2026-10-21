@@ -86,7 +86,17 @@ pub struct QueueEntry {
     pub text: String,
     pub source: QueueSource,
     pub state: QueueEntryState,
+    /// Named lane tag (D2.1, qoder 式引导 lane). MVP discipline: lanes are an
+    /// *observation and editing* dimension over one global FIFO — delivery
+    /// order stays arrival order regardless of lane, because per-section
+    /// delivery ordering needs the TUI work (P-C) and inventing cross-lane
+    /// interleaving rules offline would be guesswork. The tag is what the
+    /// per-section queue view filters on.
+    pub lane: String,
 }
+
+/// The implicit lane every plain send lands in.
+pub const MAIN_LANE: &str = "main";
 
 impl Default for FollowUpQueue {
     fn default() -> Self {
@@ -129,8 +139,16 @@ impl FollowUpQueue {
     /// blank or the pending queue is full. This is the manual "排队" path
     /// (`/queue send`) and the subagent absorption path.
     pub fn send(&mut self, text: &str, source: QueueSource) -> Option<u64> {
+        self.send_in_lane(MAIN_LANE, text, source)
+    }
+
+    /// Queue into a named lane (D2.1). Delivery order is still the global
+    /// arrival order (see [`QueueEntry::lane`]); the lane decides where the
+    /// entry shows up and how it is edited.
+    pub fn send_in_lane(&mut self, lane: &str, text: &str, source: QueueSource) -> Option<u64> {
+        let lane = lane.trim();
         let text = text.trim();
-        if text.is_empty() || self.pending.len() >= self.limit {
+        if lane.is_empty() || text.is_empty() || self.pending.len() >= self.limit {
             return None;
         }
         let id = self.next_id;
@@ -140,8 +158,27 @@ impl FollowUpQueue {
             text: text.to_string(),
             source,
             state: QueueEntryState::Pending,
+            lane: lane.to_string(),
         });
         Some(id)
+    }
+
+    /// Distinct lane names among pending entries, oldest-appearance first.
+    #[must_use]
+    pub fn lane_names(&self) -> Vec<String> {
+        let mut lanes: Vec<String> = Vec::new();
+        for entry in &self.pending {
+            if !lanes.contains(&entry.lane) {
+                lanes.push(entry.lane.clone());
+            }
+        }
+        lanes
+    }
+
+    /// Pending entries of one lane, arrival order (the per-lane queue view).
+    #[must_use]
+    pub fn items_in_lane(&self, lane: &str) -> Vec<&QueueEntry> {
+        self.pending.iter().filter(|entry| entry.lane == lane).collect()
     }
 
     #[must_use]
@@ -484,6 +521,29 @@ mod tests {
         assert!(merged.contains("2. second"));
         assert!(q.is_empty());
         assert!(q.drain_injection().is_none());
+    }
+
+    #[test]
+    fn lanes_tag_and_filter_without_touching_delivery_order() {
+        let mut q = FollowUpQueue::new();
+        // Plain sends land in the main lane.
+        let a = q.send("main work", QueueSource::User).expect("a");
+        let b = q.send_in_lane("guide", "guided task", QueueSource::Guide).expect("b");
+        let c = q.send("more main", QueueSource::User).expect("c");
+        assert_eq!(q.lane_names(), vec!["main", "guide"]);
+        assert_eq!(q.items_in_lane("main").iter().map(|e| e.id).collect::<Vec<_>>(), vec![a, c]);
+        assert_eq!(q.items_in_lane("guide").iter().map(|e| e.id).collect::<Vec<_>>(), vec![b]);
+        // Blank lane names are refused, same as blank text.
+        assert!(q.send_in_lane("   ", "x", QueueSource::User).is_none());
+        assert!(q.send_in_lane("real", "  ", QueueSource::User).is_none());
+        // Invariant: the lane is an observation dimension only — global
+        // delivery stays arrival order no matter which lane an entry is in.
+        let first = q.take_next().expect("first delivered");
+        assert_eq!(first.id, a, "arrival order crosses lanes");
+        let second = q.take_next().expect("second delivered");
+        assert_eq!(second.id, b);
+        // Withdraw reaches across lanes by id.
+        assert_eq!(q.withdraw(c).as_deref(), Some("more main"));
     }
 
     #[test]

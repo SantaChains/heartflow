@@ -492,13 +492,7 @@ impl JobRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&id)
-            .and_then(|handle| {
-                handle
-                    .record
-                    .lock()
-                    .ok()
-                    .map(|record| record.status)
-            })
+            .and_then(|handle| handle.record.lock().ok().map(|record| record.status))
     }
 
     fn terminalize(&self, id: u64, status: JobStatus, result_head: Option<String>) {
@@ -1001,7 +995,10 @@ mod tests {
             .find(|record: &JobRecord| record.id == id)
             .expect("record after unwind");
         assert_eq!(record.status, JobStatus::Stopped, "verdict is final");
-        assert!(record.result_head.is_none(), "timed-out results are discarded");
+        assert!(
+            record.result_head.is_none(),
+            "timed-out results are discarded"
+        );
         clear_jobs_root_for_test();
     }
 

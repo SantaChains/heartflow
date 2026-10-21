@@ -57,6 +57,7 @@ switch with: /model NAME
 
 - `/queue` 列出 pending（含 id 与来源）+ 最近终态台账（delivered/withdrawn/failed，上限 20 条，不丢条目）；
 - `/queue send <text>` 手动排队（空闲时也能入队，等当前回合完成后按序执行）；
+- `/queue send --lane <name> <text>` 打上**命名泳道**标签（D2.1，qoder 式引导 lane）：泳道是**观测与编辑维度**——`/queue lane <name>` 按泳道查看、列表里以 `@name` 标注；**递送顺序不变**（仍是全局到达序，跨泳道轮转等 TUI P-C 落地再定）；
 - `/queue edit <id> <text>` 改文本、`/queue remove <id>` 撤回任意条、`/queue move <id> up|down` 调序；
 - `/queue pop` 撤回最后一条（兼容旧语义）、`/queue clear` 清空（进台账可查）。
 
@@ -75,3 +76,25 @@ switch with: /model NAME
 - 墙钟超时：单个 running job 默认 30 分钟（`HEARTFLOW_JOB_TIMEOUT_SECS` 覆盖，`0` 关闭）——到期协作式停止，终态附注明示「wall-clock timeout … NOT finished」；计时从排队进入运行开始，排队等待不计费；首个终态裁决获胜，超时裁决不会被稍后 unwind 的工人结果覆写。
 
 **刻意不做**（诚实边界）：Steer 注入在飞回合（前置 = 在飞回合可被事件循环够到，路线图 P-D）、对话回滚、工人侧 spawn 面、`partial`/`paused` 状态（需回合预算）。
+
+## mission 账本（§1/§4 P-A，监工的耐久任务单元）
+
+mission = pi-subagents mission + kimi goal 的合体：一个带**显式完成判据 + 三轴预算（token/回合/墙钟）+ 四态（active/paused/blocked/complete）**的耐久任务单元，落盘 `~/.heartflow/sessions/missions/mission-<id>/`（state.json 原子写 + 256KiB 上限 + receipts 收据流，上限 50 条 + events.jsonl 全量）。反纪律不靠提示词靠代码：
+
+- **反过早完成**：`/mission complete <id>` 只有当**全部判据**过验才放行。机械判据（`cmd <命令>` 退出码 0、`file <路径> <正则>`）完成时**当场重验**；人工判据（`human`、`nodiag <scope>`）必须先 `/mission approve <id> <判据号> [证据]` 拿到收据；`free <主张>` 是唯一弱证据判据——**只有弱证据（或零判据）的 mission 永远拒绝完成**；
+- **反过早放弃**：`/mission blocked <id> <原因>` 连续 **3 次**（`BLOCKED_STREAK_NEEDED`）才翻转 blocked 态；中间任何一个 productive turn（`/mission turn <id> [tokens]`）都会清零连击；resume 也会清零；
+- **预算不杀**：任一轴 ≥90% 回合末提醒一次（`/mission turn` 的返回里）；耗尽后打上 `budget_exhausted` 标记、**停提醒但不关 mission**（大项目跨多次会话续命）；
+- 其余面：`/mission` 列表、`/mission show <id>`（判据勾选态 + 最近 5 条收据）、`/mission pause|resume <id>`、`/mission criterion <id> cmd|file|human|nodiag|free ...` 加判据。机械判据不许 approve（会自验，收据是伪证据）。
+
+**诚实边界**：turn 记账目前是手动面（`/mission turn`），每回合自动记账与提醒注入前置 P2 事件循环；跨进程文件锁未做（单进程 MVP）；`nodiag` 判据暂为人工批准（rust-analyzer 集成属另一量级）。
+
+## scheduled-runs（§1 pi-job #6，到期工作外部触发）
+
+`/schedule add <name> interval 30m <prompt>` 或 `/schedule add <name> once +1h <prompt>`（相对）注册定时任务；**无常驻 daemon**——REPL 启动、每回合边界与 `/schedule run-due` 三个时机把到期 schedule 作为**普通工人 job** 派发（read-only，与 `/jobs spawn` 默认同级）。
+
+- `overlap: skip` 是唯一重叠语义：上一个没跑完的周期这一跳直接 **skipped 且记入历史**（不排队、不并行、不静默吞）；
+- `catchUp`：错过的 once 默认 `none`（诚实记一条 skipped-catch-up 并消费掉，不会早上 9 点补跑凌晨的活）；`--quiet` 表示成功不唤醒监工（结果去 `/jobs log`，失败仍唤醒）；
+- `run_due` 先预订 `last_run_ms` 再派发——调用方中途死掉也不会导致同周期无限重 fire；spawn 被拒（积压满）记入历史为 failed，interval 下个周期重试；
+- `/schedule` 列表（含 due 标记）、`/schedule show <id>` 看运行历史、`/schedule pause|resume|delete <id>`；落盘 `~/.heartflow/sessions/schedules/schedules.json`（原子写 + 256KiB 上限，单文件损坏不崩溃、空表起步 + doctor 告警）。
+
+**诚实边界**：once 只支持相对（`+30m`）与 epoch 毫秒两种写法——本地 `HH:MM`/IANA 时区需引 chrono-tz（路线图依赖评估项），calendar 触发因此暂不可表达。

@@ -75,7 +75,10 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     execute_bash_inner(input, idle_ms.map(Duration::from_millis))
 }
 
-fn execute_bash_inner(input: BashCommandInput, idle: Option<Duration>) -> io::Result<BashCommandOutput> {
+fn execute_bash_inner(
+    input: BashCommandInput,
+    idle: Option<Duration>,
+) -> io::Result<BashCommandOutput> {
     let (program, args) = current_shell();
     let wrapped = wrap_command_for_encoding(&args, &input.command);
     if input.run_in_background.unwrap_or(false) {
@@ -584,7 +587,8 @@ async fn execute_bash_async(
     wrapped: String,
     idle: Option<Duration>,
 ) -> io::Result<BashCommandOutput> {
-    let mut command = build_shell_command(&wrapped, input.dangerously_disable_sandbox.unwrap_or(false));
+    let mut command =
+        build_shell_command(&wrapped, input.dangerously_disable_sandbox.unwrap_or(false));
 
     let timeout_ms = input
         .timeout
@@ -664,7 +668,9 @@ async fn execute_bash_async(
     // same way and downstream grouping sees one error class.
     if hung.load(std::sync::atomic::Ordering::Relaxed) {
         let (_status, stdout, stderr) = output;
-        let idle_ms = idle.map_or(timeout_ms, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let idle_ms = idle.map_or(timeout_ms, |d| {
+            u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+        });
         return Ok(killed_output(
             &input,
             stdout,
@@ -1298,7 +1304,11 @@ mod tests {
             Some("idle_timeout"),
             "the hang must be distinguishable from a wall-clock timeout"
         );
-        assert!(output.stderr.contains("no output for 500 ms"), "{:?}", output.stderr);
+        assert!(
+            output.stderr.contains("no output for 500 ms"),
+            "{:?}",
+            output.stderr
+        );
     }
 
     /// The watchdog must not false-positive on a command that is slow but
@@ -1323,7 +1333,10 @@ mod tests {
         )
         .expect("shell command should execute");
 
-        assert!(!output.interrupted, "a progressing command must finish: {output:?}");
+        assert!(
+            !output.interrupted,
+            "a progressing command must finish: {output:?}"
+        );
         assert_eq!(output.return_code_interpretation, None);
         assert!(output.stdout.contains("done"));
     }

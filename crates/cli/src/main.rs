@@ -854,6 +854,30 @@ async fn run_repl(
     if stale_repaired > 0 {
         println!("jobs: {stale_repaired} stale record(s) from a previous process marked stopped");
     }
+    // Mission ledger + schedule store (roadmap §1 P-A / scheduled-runs): load
+    // from disk first — "恢复优先于新动作" (a compressed/restarted session's
+    // first duty is to its durable state, not to new work).
+    runtime::set_missions_root(Some(sessions_dir().join("missions")));
+    let missions_root = sessions_dir().join("missions");
+    let missions = runtime::MissionLedger::load(&missions_root);
+    let corrupted_missions = missions.corrupted_on_load();
+    if !corrupted_missions.is_empty() {
+        println!(
+            "missions: {} state file(s) unreadable and skipped: {}",
+            corrupted_missions.len(),
+            corrupted_missions.iter().map(|id| format!("m{id}")).collect::<Vec<_>>().join(", ")
+        );
+    }
+    runtime::set_schedules_root(Some(sessions_dir().join("schedules")));
+    let schedules_root = sessions_dir().join("schedules");
+    let schedules = runtime::ScheduleStore::load(&schedules_root);
+    if schedules.corrupted_on_load() {
+        println!("schedules: schedules.json unreadable; starting from an empty store");
+    }
+    // job id → (schedule id, started ms, quiet): closed when the job turns
+    // terminal at the loop top, so schedule history reflects reality.
+    let mut schedule_links: std::collections::HashMap<u64, (u64, u64, bool)> =
+        std::collections::HashMap::new();
     // `/restart` confirmation unwinds the loop and reports upward so `main`
     // re-execs a fresh process; a plain quit leaves this false.
     let mut restart = false;
@@ -867,6 +891,20 @@ async fn run_repl(
         for message in jobs.poll() {
             match message.kind {
                 runtime::MessageKind::Result | runtime::MessageKind::NeedDecision => {
+                    // A quiet schedule's *success* must not wake the
+                    // supervisor (pi scheduled-runs `quiet`); failures and
+                    // decision needs always do.
+                    if message.kind == runtime::MessageKind::Result
+                        && schedule_links
+                            .get(&message.job_id)
+                            .is_some_and(|(_, _, quiet)| *quiet)
+                    {
+                        println!(
+                            "job #{} finished quietly (scheduled run); /jobs log {} to read it",
+                            message.job_id, message.job_id
+                        );
+                        continue;
+                    }
                     let text = format!(
                         "[subagent job #{} {}]\n{}",
                         message.job_id,
@@ -888,6 +926,18 @@ async fn run_repl(
                 runtime::MessageKind::Progress => {}
             }
         }
+        // Schedule bookkeeping: close history for terminal schedule-launched
+        // jobs, then hand out anything due (external-launcher form, no daemon).
+        reconcile_schedule_links(&schedules, &jobs, &mut schedule_links);
+        drain_due_schedules(
+            &schedules,
+            &jobs,
+            &mut schedule_links,
+            state,
+            &mut selection,
+            &runtime_handle,
+            runtime::DueReason::Timer,
+        );
         deliver_queued_injection(
             state,
             &mut runtime,
@@ -937,6 +987,9 @@ async fn run_repl(
                 &catalog,
                 &mut editor,
                 &jobs,
+                &missions,
+                &schedules,
+                &mut schedule_links,
                 &runtime_handle,
             )
             .await?
@@ -1089,6 +1142,9 @@ async fn dispatch_slash_command(
     catalog: &ProviderCatalog,
     editor: &mut editor::ReplEditor,
     jobs: &runtime::JobRegistry,
+    missions: &runtime::MissionLedger,
+    schedules: &runtime::ScheduleStore,
+    schedule_links: &mut std::collections::HashMap<u64, (u64, u64, bool)>,
     runtime_handle: &tokio::runtime::Handle,
 ) -> Result<LoopControl, Box<dyn std::error::Error>> {
     // Every arm yields the loop-level control directly; the match is wrapped in
@@ -1178,6 +1234,14 @@ async fn dispatch_slash_command(
             handle_jobs_command(trimmed, jobs, state, selection, runtime_handle);
             LoopControl::Continue
         }
+        _ if trimmed == "/mission" || trimmed.starts_with("/mission ") => {
+            handle_mission_command(trimmed, missions);
+            LoopControl::Continue
+        }
+        _ if trimmed == "/schedule" || trimmed.starts_with("/schedule ") => {
+            handle_schedule_command(trimmed, schedules, jobs, state, selection, runtime_handle, schedule_links);
+            LoopControl::Continue
+        }
         _ if trimmed == "/guide" || trimmed.starts_with("/guide ") => {
             handle_guide_command(state, runtime, model, *planning, prompter, editor, trimmed).await;
             LoopControl::Continue
@@ -1225,14 +1289,20 @@ fn handle_queue_command(input: &str, model: &mut HeartModel) {
                 println!("queue is empty (`/queue send <text>` queues a message for the next turn)");
                 return;
             }
+            let lanes = model.queue().lane_names();
             println!("{} queued (oldest first):", model.queue().len());
             for entry in model.queue().items() {
                 println!(
-                    "  #{} [{}] {}",
+                    "  #{} [{}{}{}] {}",
                     entry.id,
                     entry.source.label(),
+                    if entry.lane == core::MAIN_LANE { "" } else { "@" },
+                    if entry.lane == core::MAIN_LANE { "" } else { entry.lane.as_str() },
                     truncate_chars(&entry.text, 120)
                 );
+            }
+            if lanes.len() > 1 {
+                println!("lanes: {} (see `/queue lane <name>`)", lanes.join(", "));
             }
             let recent = model.queue().recent();
             if !recent.is_empty() {
@@ -1248,13 +1318,48 @@ fn handle_queue_command(input: &str, model: &mut HeartModel) {
             }
         }
         "send" => {
-            if rest.is_empty() {
-                println!("usage: /queue send <text>");
+            // `/queue send [--lane <name>] <text>` — a named lane keeps the
+            // entry visible/editable as a group (D2.1); delivery order is
+            // still global arrival order.
+            let (lane, text) = if let Some(rest) = rest.strip_prefix("--lane") {
+                let rest = rest.trim();
+                match rest.split_once(char::is_whitespace) {
+                    Some((lane, text)) => (lane, text.trim()),
+                    None => {
+                        println!("usage: /queue send [--lane <name>] <text>");
+                        return;
+                    }
+                }
+            } else {
+                (core::MAIN_LANE, rest)
+            };
+            if text.is_empty() {
+                println!("usage: /queue send [--lane <name>] <text>");
                 return;
             }
-            match model.queue_mut().send(rest, core::QueueSource::User) {
-                Some(id) => println!("queued #{id}; it runs as the next turn (deliver point: idle loop top)."),
+            match model.queue_mut().send_in_lane(lane, text, core::QueueSource::User) {
+                Some(id) => println!("queued #{id} (lane {lane}); it runs as the next turn."),
                 None => println!("queue is full or text is blank; nothing queued."),
+            }
+        }
+        "lane" => {
+            if rest.is_empty() {
+                println!("usage: /queue lane <name>   (lanes: {})", model.queue().lane_names().join(", "));
+                return;
+            }
+            let entries = model.queue().items_in_lane(rest);
+            if entries.is_empty() {
+                println!("lane {rest} has no pending entries.");
+                return;
+            }
+            println!("lane {rest} ({} pending):", entries.len());
+            for entry in entries {
+                println!(
+                    "  #{} [{}] {}",
+                    entry.id,
+                    entry.source.label(),
+                    truncate_chars(&entry.text, 120)
+                );
             }
         }
         "edit" => {
@@ -1325,7 +1430,7 @@ fn handle_queue_command(input: &str, model: &mut HeartModel) {
             );
         }
         other => println!(
-            "usage: /queue [send <text>|edit <id> <text>|remove <id>|move <id> up|down|merge|pop|clear] (`{other}` is not a subcommand)"
+            "usage: /queue [send [--lane <name>] <text>|lane <name>|edit <id> <text>|remove <id>|move <id> up|down|merge|pop|clear] (`{other}` is not a subcommand)"
         ),
     }
 }
@@ -1470,6 +1575,490 @@ fn handle_jobs_command(
         }
         other => println!("usage: /jobs [spawn [--write] <task>|stop <id>|log <id> [lines]] (`{other}` is not a subcommand)"),
     }
+}
+
+/// `/mission` — the durable mission ledger (roadmap §1/§4 P-A): the
+/// supervisor's long-lived task units. The disciplines (anti-early-complete,
+/// anti-early-give-up, budget-not-kill) are enforced in `runtime::mission`,
+/// not by prompt — this surface only translates them into messages.
+fn handle_mission_command(input: &str, missions: &runtime::MissionLedger) {
+    let arg = input.trim().strip_prefix("/mission").unwrap_or("").trim();
+    let mut tokens = arg.split_whitespace();
+    let sub = tokens.next().unwrap_or("");
+    let rest = arg.strip_prefix(sub).unwrap_or("").trim();
+    match sub {
+        "" => {
+            let all = missions.list();
+            if all.is_empty() {
+                println!("no missions yet (`/mission create <objective>` opens one)");
+                return;
+            }
+            for m in &all {
+                let turns = m.budget.turns.map_or(String::from("-"), |v| v.to_string());
+                let toks = m.budget.tokens.map_or(String::from("-"), |v| v.to_string());
+                println!(
+                    "  m{} [{}] {} - {}/{} turns, {}/{} tokens",
+                    m.id,
+                    m.status.label(),
+                    truncate_chars(&m.objective, 90),
+                    m.used.turns,
+                    turns,
+                    m.used.tokens,
+                    toks
+                );
+                if m.budget_exhausted {
+                    println!("        budget exhausted (reminders paused, mission stays open)");
+                }
+            }
+        }
+        "show" => {
+            let Ok(id) = rest.parse::<u64>() else {
+                println!("usage: /mission show <id>");
+                return;
+            };
+            let Some(m) = missions.get(id) else {
+                println!("no mission m{id}.");
+                return;
+            };
+            println!("m{} [{}] {}", m.id, m.status.label(), m.objective);
+            for (index, (criterion, state)) in m.criteria.iter().zip(&m.states).enumerate() {
+                let mark = match state {
+                    runtime::CriterionState::Pending => "[ ]",
+                    runtime::CriterionState::Satisfied { .. } => "[x]",
+                };
+                println!("  {mark} #{index} {}", criterion.describe());
+                if let runtime::CriterionState::Satisfied { evidence } = state {
+                    println!("        evidence: {evidence}");
+                }
+            }
+            if let Some(reason) = &m.blocked_reason {
+                println!(
+                    "  blocked claim {}/{}: {}",
+                    m.blocked_streak, runtime::BLOCKED_STREAK_NEEDED, reason
+                );
+            }
+            println!(
+                "  usage: {} turns / {} tokens / {} ms wall",
+                m.used.turns, m.used.tokens, m.wall_ms()
+            );
+            let receipts = m.receipts.iter().rev().take(5).collect::<Vec<_>>();
+            if !receipts.is_empty() {
+                println!("  recent receipts:");
+                for receipt in receipts.into_iter().rev() {
+                    println!("    [{}] {}: {}", receipt.kind, receipt.ts_ms, receipt.text);
+                }
+            }
+        }
+        "create" => {
+            if rest.is_empty() {
+                println!("usage: /mission create <objective>   (add criteria next: /mission criterion)");
+                return;
+            }
+            let made = missions.create(rest, Vec::new(), runtime::MissionBudget::default());
+            println!(
+                "opened m{}; completion needs at least one criterion (`/mission criterion {} cmd|file|human|nodiag|free ...`)",
+                made.id, made.id
+            );
+        }
+        "criterion" => {
+            let mut parts = rest.splitn(3, char::is_whitespace);
+            let (id_part, kind, value) = (
+                parts.next().unwrap_or(""),
+                parts.next().unwrap_or(""),
+                parts.next().unwrap_or("").trim(),
+            );
+            let Ok(id) = id_part.parse::<u64>() else {
+                println!("usage: /mission criterion <id> cmd|file|human|nodiag|free ...");
+                return;
+            };
+            let criterion = match kind {
+                "cmd" if !value.is_empty() => runtime::CompletionCriterion::CommandSucceeds {
+                    cmd: value.to_string(),
+                },
+                "file" => {
+                    let (path, pattern) = value.split_once(char::is_whitespace).unwrap_or((value, ""));
+                    if path.is_empty() || pattern.is_empty() {
+                        println!("usage: /mission criterion <id> file <path> <regex>");
+                        return;
+                    }
+                    runtime::CompletionCriterion::FileMatches {
+                        path: path.to_string(),
+                        pattern: pattern.to_string(),
+                    }
+                }
+                "human" => runtime::CompletionCriterion::HumanApproved,
+                "nodiag" if !value.is_empty() => runtime::CompletionCriterion::NoDiagnostics {
+                    scope: value.to_string(),
+                },
+                "free" if !value.is_empty() => runtime::CompletionCriterion::FreeText {
+                    check: value.to_string(),
+                },
+                _ => {
+                    println!(
+                        "usage: /mission criterion <id> cmd <command> | file <path> <regex> | human | nodiag <scope> | free <claim>\n        (free/human/nodiag need explicit approval; free alone never completes)"
+                    );
+                    return;
+                }
+            };
+            match missions.add_criterion(id, criterion) {
+                Ok((_, index)) => println!("criterion #{index} added to m{id}"),
+                Err(error) => println!("{error}"),
+            }
+        }
+        "approve" => {
+            let mut parts = rest.splitn(3, char::is_whitespace);
+            let (id_part, index_part, evidence) = (
+                parts.next().unwrap_or(""),
+                parts.next().unwrap_or(""),
+                parts.next().unwrap_or("").trim(),
+            );
+            let (Ok(id), Ok(index)) = (id_part.parse::<u64>(), index_part.parse::<usize>())
+            else {
+                println!("usage: /mission approve <id> <criterion-index> [evidence]");
+                return;
+            };
+            match missions.approve_criterion(id, index, evidence) {
+                Ok(_) => println!("criterion #{index} of m{id} approved"),
+                Err(error) => println!("{error}"),
+            }
+        }
+        "complete" => {
+            let Ok(id) = rest.parse::<u64>() else {
+                println!("usage: /mission complete <id>");
+                return;
+            };
+            match missions.complete(id) {
+                Ok(m) => println!("m{} complete; all criteria verified.", m.id),
+                Err(error) => println!("refused: {error}"),
+            }
+        }
+        "pause" | "resume" => {
+            let Ok(id) = rest.parse::<u64>() else {
+                println!("usage: /mission {sub} <id>");
+                return;
+            };
+            let result = if sub == "pause" {
+                missions.pause(id)
+            } else {
+                missions.resume(id)
+            };
+            match result {
+                Ok(m) => println!("m{} is now {}", m.id, m.status.label()),
+                Err(error) => println!("{error}"),
+            }
+        }
+        "blocked" => {
+            if rest.is_empty() {
+                println!("usage: /mission blocked <id> <reason>   (3 consecutive claims flip the status)");
+                return;
+            }
+            let (id_part, reason) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            let Ok(id) = id_part.parse::<u64>() else {
+                println!("usage: /mission blocked <id> <reason>");
+                return;
+            };
+            match missions.mark_blocked(id, reason) {
+                Ok((m, flipped)) => {
+                    if flipped {
+                        println!("m{} is now blocked: {}", m.id, reason);
+                    } else {
+                        println!(
+                            "blocked claim {}/{} recorded; a productive turn resets the streak",
+                            m.blocked_streak, runtime::BLOCKED_STREAK_NEEDED
+                        );
+                    }
+                }
+                Err(error) => println!("{error}"),
+            }
+        }
+        "turn" => {
+            let mut parts = rest.split_whitespace();
+            let (id_part, tokens_part) = (parts.next().unwrap_or(""), parts.next().unwrap_or("0"));
+            let (Ok(id), Ok(tokens_used)) = (id_part.parse::<u64>(), tokens_part.parse::<u64>())
+            else {
+                println!("usage: /mission turn <id> [tokens=0]   (accounts one productive turn)");
+                return;
+            };
+            match missions.record_turn(id, tokens_used) {
+                Ok((m, attention)) => {
+                    println!("m{} advanced to {} turns", m.id, m.used.turns);
+                    if let Some(reminder) = attention {
+                        println!("  ! {reminder}");
+                    }
+                }
+                Err(error) => println!("{error}"),
+            }
+        }
+        other => println!(
+            "usage: /mission [show <id>|create <objective>|criterion|approve|complete|pause|resume|blocked|turn] (`{other}` is not a subcommand)"
+        ),
+    }
+}
+
+/// `/schedule` — scheduled runs (roadmap §1 pi-job item 6): due schedules are
+/// handed out as normal subagent jobs by the loop-top drain or by an explicit
+/// `/schedule run-due`; there is no resident daemon by design.
+#[allow(clippy::too_many_arguments)]
+fn handle_schedule_command(
+    input: &str,
+    schedules: &runtime::ScheduleStore,
+    jobs: &runtime::JobRegistry,
+    state: &SessionShared,
+    selection: &mut ProviderSelection,
+    runtime_handle: &tokio::runtime::Handle,
+    links: &mut std::collections::HashMap<u64, (u64, u64, bool)>,
+) {
+    let arg = input.trim().strip_prefix("/schedule").unwrap_or("").trim();
+    let mut tokens = arg.split_whitespace();
+    let sub = tokens.next().unwrap_or("");
+    let rest = arg.strip_prefix(sub).unwrap_or("").trim();
+    match sub {
+        "" => {
+            let all = schedules.list();
+            if all.is_empty() {
+                println!(
+                    "no schedules yet (`/schedule add <name> interval 30m <prompt>` or `/schedule add <name> once +1h <prompt>`)"
+                );
+                return;
+            }
+            let now = schedule_now_ms();
+            for s in &all {
+                let state_mark = if s.enabled { " " } else { "!" };
+                let due_mark = if s.is_due(now) { " (due)" } else { "" };
+                println!(
+                    "  {state_mark}#{} {} [{}] {}{} - {}",
+                    s.id,
+                    s.name,
+                    describe_schedule_trigger(&s.trigger),
+                    if s.quiet { "quiet " } else { "" },
+                    due_mark,
+                    truncate_chars(&s.prompt, 80)
+                );
+            }
+        }
+        "add" => {
+            let mut parts = rest.splitn(4, char::is_whitespace);
+            let (name, kind, spec, tail) = (
+                parts.next().unwrap_or(""),
+                parts.next().unwrap_or(""),
+                parts.next().unwrap_or(""),
+                parts.next().unwrap_or("").trim(),
+            );
+            if name.is_empty() || tail.is_empty() {
+                println!(
+                    "usage: /schedule add <name> interval <spec> [--quiet] <prompt> | /schedule add <name> once <+spec|epoch-ms> [--quiet] <prompt>"
+                );
+                return;
+            }
+            let (quiet, prompt) = match tail.strip_prefix("--quiet ") {
+                Some(p) => (true, p.trim()),
+                None if tail == "--quiet" => (true, ""),
+                None => (false, tail),
+            };
+            if prompt.is_empty() {
+                println!("a schedule needs a prompt to run.");
+                return;
+            }
+            let result = match kind {
+                "interval" => runtime::parse_duration_spec(spec).map(|every_secs| {
+                    (
+                        runtime::ScheduleTrigger::Interval { every_secs },
+                        runtime::CatchUp::None,
+                    )
+                }),
+                "once" => {
+                    if let Some(relative) = spec.strip_prefix('+') {
+                        runtime::parse_duration_spec(relative).map(|secs| {
+                            (
+                                runtime::ScheduleTrigger::Once {
+                                    at_ms: schedule_now_ms() + secs.saturating_mul(1000),
+                                },
+                                runtime::CatchUp::None,
+                            )
+                        })
+                    } else if spec.chars().all(|c| c.is_ascii_digit()) && !spec.is_empty() {
+                        spec.parse::<u64>().map(|at_ms| {
+                            (
+                                runtime::ScheduleTrigger::Once { at_ms },
+                                runtime::CatchUp::None,
+                            )
+                        }).map_err(|_| runtime::ScheduleError::BadSpec(spec.to_string()))
+                    } else {
+                        Err(runtime::ScheduleError::BadSpec(spec.to_string()))
+                    }
+                }
+                _ => Err(runtime::ScheduleError::BadSpec(kind.to_string())),
+            };
+            match result.and_then(|(trigger, catch_up)| {
+                schedules.add(name, prompt, trigger, catch_up, quiet)
+            }) {
+                Ok(s) => println!(
+                    "schedule #{} `{}` added ({}){}",
+                    s.id,
+                    s.name,
+                    describe_schedule_trigger(&s.trigger),
+                    if quiet { "; success will not wake the supervisor" } else { "" }
+                ),
+                Err(error) => println!("{error}"),
+            }
+        }
+        "run-due" => {
+            let launched = drain_due_schedules(
+                schedules, jobs, links, state, selection, runtime_handle, runtime::DueReason::RunDue,
+            );
+            if launched == 0 {
+                println!("nothing due right now (`/schedule` marks due items).");
+            }
+        }
+        "show" => {
+            let Ok(id) = rest.parse::<u64>() else {
+                println!("usage: /schedule show <id>");
+                return;
+            };
+            let Some(s) = schedules.get(id) else {
+                println!("no schedule #{id}.");
+                return;
+            };
+            println!(
+                "#{} `{}` [{}] {} prompt: {}",
+                s.id,
+                s.name,
+                describe_schedule_trigger(&s.trigger),
+                if s.enabled { "enabled" } else { "paused" },
+                s.prompt
+            );
+            if s.history.is_empty() {
+                println!("  no runs yet.");
+                return;
+            }
+            println!("  recent runs:");
+            for run in s.history.iter().rev().take(10).collect::<Vec<_>>().into_iter().rev() {
+                let outcome = match &run.outcome {
+                    runtime::RunOutcome::Started => String::from("started"),
+                    runtime::RunOutcome::SkippedOverlap => String::from("skipped (overlap)"),
+                    runtime::RunOutcome::SkippedCatchUp => String::from("skipped (missed, catch-up none)"),
+                    runtime::RunOutcome::Complete => String::from("complete"),
+                    runtime::RunOutcome::Failed { error } => format!("failed: {error}"),
+                };
+                println!("    @{} {} ({})", run.started_ms, outcome, run.reason.label());
+            }
+        }
+        "pause" | "resume" | "delete" => {
+            let Ok(id) = rest.parse::<u64>() else {
+                println!("usage: /schedule {sub} <id>");
+                return;
+            };
+            let result = match sub {
+                "pause" => schedules.pause(id).map(|_| ()),
+                "resume" => schedules.resume(id).map(|_| ()),
+                _ => schedules.delete(id).map(|_| ()),
+            };
+            println!(
+                "{}",
+                match result {
+                    Ok(()) => format!("schedule #{id} {sub}d."),
+                    Err(error) => error.to_string(),
+                }
+            );
+        }
+        other => println!(
+            "usage: /schedule [add|run-due|show <id>|pause <id>|resume <id>|delete <id>] (`{other}` is not a subcommand)"
+        ),
+    }
+}
+
+fn schedule_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+fn describe_schedule_trigger(trigger: &runtime::ScheduleTrigger) -> String {
+    match trigger {
+        runtime::ScheduleTrigger::Once { at_ms } => format!("once @ epoch {at_ms}"),
+        runtime::ScheduleTrigger::Interval { every_secs } => format!("every {every_secs}s"),
+    }
+}
+
+/// Hand due schedules to the job system (the external-launcher form): each
+/// due schedule becomes a read-only worker job, exactly like `/jobs spawn`
+/// without `--write`. Scheduled work never runs with write access — a prompt
+/// that needs writes should be started deliberately, not by a timer.
+#[allow(clippy::too_many_arguments)]
+fn drain_due_schedules(
+    schedules: &runtime::ScheduleStore,
+    jobs: &runtime::JobRegistry,
+    links: &mut std::collections::HashMap<u64, (u64, u64, bool)>,
+    state: &SessionShared,
+    selection: &mut ProviderSelection,
+    runtime_handle: &tokio::runtime::Handle,
+    reason: runtime::DueReason,
+) -> usize {
+    let now = schedule_now_ms();
+    let due = schedules.run_due(now, reason);
+    let mut launched = 0;
+    for schedule in due {
+        let runner = WorkerRunner {
+            state: state.clone(),
+            selection: selection.clone(),
+            runtime_handle: runtime_handle.clone(),
+            write: false,
+        };
+        match jobs.spawn(&schedule.name, &schedule.prompt, Box::new(runner)) {
+            Ok(job_id) => {
+                schedules.record_launched(schedule.id, now, reason);
+                links.insert(job_id, (schedule.id, now, schedule.quiet));
+                launched += 1;
+                println!(
+                    "schedule `{}` (#{}{}) fired as job #{job_id}",
+                    schedule.name,
+                    schedule.id,
+                    if schedule.quiet { ", quiet" } else { "" }
+                );
+            }
+            Err(runtime::SpawnError::Saturated) => {
+                schedules.record_spawn_refused(schedule.id, "job backlog full");
+                println!(
+                    "schedule `{}` due but the job backlog is full; it retries after its period",
+                    schedule.name
+                );
+            }
+        }
+    }
+    launched
+}
+
+/// Close schedule history for schedule-launched jobs that reached a terminal
+/// state — "结果文件落盘 ≠ 退出证明" applies here too: the ledger records
+/// the job's actual terminal status, not the runner's optimism.
+fn reconcile_schedule_links(
+    schedules: &runtime::ScheduleStore,
+    jobs: &runtime::JobRegistry,
+    links: &mut std::collections::HashMap<u64, (u64, u64, bool)>,
+) {
+    if links.is_empty() {
+        return;
+    }
+    let records = jobs.list();
+    let now = schedule_now_ms();
+    links.retain(|job_id, (schedule_id, started_ms, _quiet)| {
+        match records.iter().find(|record| record.id == *job_id) {
+            Some(record) if record.status.is_terminal() => {
+                let outcome = match record.status {
+                    runtime::JobStatus::Complete => runtime::RunOutcome::Complete,
+                    runtime::JobStatus::Failed => runtime::RunOutcome::Failed {
+                        error: String::from("worker errored - see /jobs log"),
+                    },
+                    _ => runtime::RunOutcome::Failed {
+                        error: String::from("job stopped (user stop or wall-clock timeout)"),
+                    },
+                };
+                schedules.record_finished(*schedule_id, *started_ms, outcome, now);
+                false
+            }
+            _ => true,
+        }
+    });
 }
 
 /// `/guide <TASK>` — assemble the three-part guide draft (prior work, current

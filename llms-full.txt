@@ -201,6 +201,7 @@ switch with: /model NAME
 
 - `/queue` 列出 pending（含 id 与来源）+ 最近终态台账（delivered/withdrawn/failed，上限 20 条，不丢条目）；
 - `/queue send <text>` 手动排队（空闲时也能入队，等当前回合完成后按序执行）；
+- `/queue send --lane <name> <text>` 打上**命名泳道**标签（D2.1，qoder 式引导 lane）：泳道是**观测与编辑维度**——`/queue lane <name>` 按泳道查看、列表里以 `@name` 标注；**递送顺序不变**（仍是全局到达序，跨泳道轮转等 TUI P-C 落地再定）；
 - `/queue edit <id> <text>` 改文本、`/queue remove <id>` 撤回任意条、`/queue move <id> up|down` 调序；
 - `/queue pop` 撤回最后一条（兼容旧语义）、`/queue clear` 清空（进台账可查）。
 
@@ -219,6 +220,28 @@ switch with: /model NAME
 - 墙钟超时：单个 running job 默认 30 分钟（`HEARTFLOW_JOB_TIMEOUT_SECS` 覆盖，`0` 关闭）——到期协作式停止，终态附注明示「wall-clock timeout … NOT finished」；计时从排队进入运行开始，排队等待不计费；首个终态裁决获胜，超时裁决不会被稍后 unwind 的工人结果覆写。
 
 **刻意不做**（诚实边界）：Steer 注入在飞回合（前置 = 在飞回合可被事件循环够到，路线图 P-D）、对话回滚、工人侧 spawn 面、`partial`/`paused` 状态（需回合预算）。
+
+## mission 账本（§1/§4 P-A，监工的耐久任务单元）
+
+mission = pi-subagents mission + kimi goal 的合体：一个带**显式完成判据 + 三轴预算（token/回合/墙钟）+ 四态（active/paused/blocked/complete）**的耐久任务单元，落盘 `~/.heartflow/sessions/missions/mission-<id>/`（state.json 原子写 + 256KiB 上限 + receipts 收据流，上限 50 条 + events.jsonl 全量）。反纪律不靠提示词靠代码：
+
+- **反过早完成**：`/mission complete <id>` 只有当**全部判据**过验才放行。机械判据（`cmd <命令>` 退出码 0、`file <路径> <正则>`）完成时**当场重验**；人工判据（`human`、`nodiag <scope>`）必须先 `/mission approve <id> <判据号> [证据]` 拿到收据；`free <主张>` 是唯一弱证据判据——**只有弱证据（或零判据）的 mission 永远拒绝完成**；
+- **反过早放弃**：`/mission blocked <id> <原因>` 连续 **3 次**（`BLOCKED_STREAK_NEEDED`）才翻转 blocked 态；中间任何一个 productive turn（`/mission turn <id> [tokens]`）都会清零连击；resume 也会清零；
+- **预算不杀**：任一轴 ≥90% 回合末提醒一次（`/mission turn` 的返回里）；耗尽后打上 `budget_exhausted` 标记、**停提醒但不关 mission**（大项目跨多次会话续命）；
+- 其余面：`/mission` 列表、`/mission show <id>`（判据勾选态 + 最近 5 条收据）、`/mission pause|resume <id>`、`/mission criterion <id> cmd|file|human|nodiag|free ...` 加判据。机械判据不许 approve（会自验，收据是伪证据）。
+
+**诚实边界**：turn 记账目前是手动面（`/mission turn`），每回合自动记账与提醒注入前置 P2 事件循环；跨进程文件锁未做（单进程 MVP）；`nodiag` 判据暂为人工批准（rust-analyzer 集成属另一量级）。
+
+## scheduled-runs（§1 pi-job #6，到期工作外部触发）
+
+`/schedule add <name> interval 30m <prompt>` 或 `/schedule add <name> once +1h <prompt>`（相对）注册定时任务；**无常驻 daemon**——REPL 启动、每回合边界与 `/schedule run-due` 三个时机把到期 schedule 作为**普通工人 job** 派发（read-only，与 `/jobs spawn` 默认同级）。
+
+- `overlap: skip` 是唯一重叠语义：上一个没跑完的周期这一跳直接 **skipped 且记入历史**（不排队、不并行、不静默吞）；
+- `catchUp`：错过的 once 默认 `none`（诚实记一条 skipped-catch-up 并消费掉，不会早上 9 点补跑凌晨的活）；`--quiet` 表示成功不唤醒监工（结果去 `/jobs log`，失败仍唤醒）；
+- `run_due` 先预订 `last_run_ms` 再派发——调用方中途死掉也不会导致同周期无限重 fire；spawn 被拒（积压满）记入历史为 failed，interval 下个周期重试；
+- `/schedule` 列表（含 due 标记）、`/schedule show <id>` 看运行历史、`/schedule pause|resume|delete <id>`；落盘 `~/.heartflow/sessions/schedules/schedules.json`（原子写 + 256KiB 上限，单文件损坏不崩溃、空表起步 + doctor 告警）。
+
+**诚实边界**：once 只支持相对（`+30m`）与 epoch 毫秒两种写法——本地 `HH:MM`/IANA 时区需引 chrono-tz（路线图依赖评估项），calendar 触发因此暂不可表达。
 
 
 ---
@@ -805,9 +828,12 @@ pub struct QueueSet {
 - **pi job MVP（`runtime::jobs`）**：`JobRegistry` + `JobRunner` trait（执行与治理解耦，离线可脚本化测试）；状态集取上游 async-run 集与 agent 集**交集子集** `queued/running/complete/failed/stopped`（当日网络核验过两集并存）；并发槽位（默认 3）+ 积压上限（默认 20，满则拒绝）；磁盘 `status.json` + `events.jsonl` 追加流（写失败计数不阻断）；进程死亡对账（启动时 stale queued/running → stopped）；**终态附注纪律**（stopped/failed 的 note 明示「任务未完成」，防监工把截断当成功）；**reason 三分法**（Progress 不唤醒监工，Result/失败经队列注入成为下一回合）。
 - **job 墙钟超时（2026-10-21 调研批次补全，§8 业绩标准 #1）**：`DEFAULT_JOB_WALL_TIMEOUT`（30 分钟，对齐 counterpoint 的「30 分钟硬顶在启动时刻武装」与 codexmon WallSec 层）；`HEARTFLOW_JOB_TIMEOUT_SECS` 覆盖（`0` 关闭）；看门狗线程在 `Queued→Running` 翻转时武装（排队等待不计费）；`terminalize` 幂等化——**首个终态裁决获胜**，超时 Stopped 不可被协作 runner 稍后 unwind 出的 Ok/Err 覆写为 Complete/Stopped（测试钉死）；超时附注带 "wall-clock timeout … NOT finished"。
 - **监工-工人 MVP**：监工 = 主 REPL 会话；工人 = `/jobs spawn` 的隔离会话（独立 Session/client/权限面），默认 **read-only**（`--write` opt-in workspace-write，full 永不下发）；工人无 spawn 面（深度=1 结构护栏）；协作式 stop（在飞调用不中断，结果丢弃 + 附注）。
+- **mission 账本（2026-10-22 批次，§1/§4 P-A 落地）**：`runtime::mission`（`MissionLedger`）——四态 `Active/Paused/Blocked/Complete`（kimi `GoalStatus`）+ 三轴预算（token/turn/wall_ms，kimi `GoalBudgetLimits`）+ 判据五型（`CommandSucceeds`/`FileMatches` 机械型完成时**当场重验**，`HumanApproved`/`NoDiagnostics` 须显式 approve 收据，`FreeText` 唯一弱证据型）；**D1.1 反过早完成/反过早放弃是类型错误不是提示词**——complete 全判据过验才放行（弱证据-only 拒绝 `WeakOnly`）、blocked 需连续 3 次声明且 productive turn 清零连击；**D1.2 预算不杀**——≥90% 提醒一次、耗尽打标停提醒不关 mission；落盘 per-mission `state.json`（temp+rename 原子写 + 256KiB 拒写不截断 + 失败计数）+ receipts（上限 50）+ `events.jsonl`；锁污染一律 `PoisonError::into_inner` 恢复（本仓纪律，棘轮零 debt）。REPL `/mission` 家族 + doctor 磁盘级统计段。诚实边界：turn 手动记账（自动注入前置 P2）、跨进程文件锁未做、nodiag 暂人工批准。
+- **scheduled-runs（2026-10-22 批次，§1 pi-job #6 落地）**：`runtime::schedule`（`ScheduleStore`）——`once`/`interval` 两触发型（pi 九动作的 MVP 子集）、**overlap=skip 唯一重叠语义（skip 记入历史不静默吞）**、`catchUp none|latest`（none 错过即诚实记 skipped-consumed）、`--quiet` 成功不唤醒监工、history 上限 100；`run_due` **先预订 `last_run_ms` 再派发**（调用方崩溃也不无限重 fire）+ `record_spawn_refused`（积压满诚实记 failed，interval 下周期重试）；REPL 三个 drain 时机（启动/回合边界/`/schedule run-due`）把到期 schedule 派为**普通 read-only 工人 job**——调度零新增执行机制；job 终态经链接表对账回写 schedule 历史（「结果落盘 ≠ 退出证明」）；落盘单 `schedules.json`（原子写 + 256KiB + 损坏不崩溃）。诚实边界：once 只支持相对/epoch 毫秒（本地 HH:MM/IANA 需 chrono-tz，依赖评估项）、calendar 不可表达。
+- **队列命名泳道（2026-10-22 批次，D2.1 数据结构半边）**：`QueueEntry.lane` 标签 + `send_in_lane`/`lane_names`/`items_in_lane`；REPL `/queue send --lane <name>`、`/queue lane <name>`、列表 `@name` 标注。**纪律：泳道是观测与编辑维度，递送仍是全局到达序**——跨泳道轮转规则需要 TUI 侧（P-C）才有意义，离线拍脑袋定轮转属猜测。
 **落地状态（2026-10-21 第二批网络核验，Qoder 官方文档对照）**：Qoder 官方「排队 vs 插话」二分（docs.qoder.com conversation-input）与本仓 `FollowUp` vs `Steer`（P-D）**语义同构**——插话「在安全执行边界交给 Agent，不直接停止当前执行」正是本仓「明确不做强插打断」的官方版；排队消息管理面「插话 / 撤回到输入框编辑 / 移除 / 多条重排」= `/queue send/remove/move/edit` 已覆盖；「设置 → 运行中发送方式」= D2.3 默认 FollowUp；composer 在「压缩中 / 有待处理请求」时提示不支持插话 → TUI P-C 待做项。qoder 式「引导 = 结合当前消息、总结之前工作、明确后续任务后发送」= `/guide` 三段草稿 + 默认直接发送，已实现。生态侧：ACP `_session/steering` 扩展（Claude/Codex 已支持，agent-shell 0.78 的 RET=排队 / M-RET=插话）→ 若将来做 ACP server 可对齐；灵码（Qoder CN）的「消息排队 + 全自动执行模式带终端命令禁止名单」中，禁止名单与既有 `is_dangerous_command` 分级确认同族。
 
-- **待做**：P-C（TUI 队列编辑键位 + 引导 overlay——本仓铁律：TUI 派发不盲改，需真机冒烟）、P-D（Steer，前置 P2 并发模型）、命名 lane/多 section 队列（D2.1，随 P-C）、mission 账本（§4）、scheduled-runs（`hf jobs run-due` 外部触发形态）、`partial`/`paused` 状态（需回合预算）。
+- **待做**：P-C（TUI 队列编辑键位 + 引导 overlay——本仓铁律：TUI 派发不盲改，需真机冒烟）、P-D（Steer，前置 P2 并发模型）、per-section 泳道递送轮转（D2.1 的 TUI 半边；数据结构与 REPL 观测面已落地）、mission 回合自动记账与提醒注入（D1.3，前置 P2 事件循环）、跨进程 mission 文件锁（单进程 MVP 已够用，多进程时再做）。
 
 ## 2. 搜索与研究能力（web_search / web_fetch 增强）
 

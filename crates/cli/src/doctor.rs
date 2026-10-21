@@ -176,6 +176,47 @@ pub(crate) fn run_doctor(fix: bool) -> Result<Vec<String>, Box<dyn std::error::E
         println!("  ok   jobs: job records persisting");
     }
 
+    // §1 mission ledger + schedule store: disk-level reads (doctor runs in its
+    // own process, so process-local counters are meaningless here). A blocked
+    // mission or an unreadable state file is exactly the thing an operator
+    // wants surfaced before starting a session.
+    let missions_summary = runtime::summarize_on_disk(&crate::storage::sessions_dir().join("missions"));
+    if missions_summary.corrupted > 0 {
+        problems.push(format!(
+            "{} mission state file(s) unreadable - /mission will skip them; check ~/.heartflow/sessions/missions",
+            missions_summary.corrupted
+        ));
+    }
+    println!(
+        "  ok   missions: {} active, {} paused, {} blocked, {} complete{}",
+        missions_summary.active,
+        missions_summary.paused,
+        missions_summary.blocked,
+        missions_summary.complete,
+        if missions_summary.budget_exhausted > 0 {
+            format!(", {} over budget (open, reminders paused)", missions_summary.budget_exhausted)
+        } else {
+            String::new()
+        }
+    );
+    let schedule_store = runtime::ScheduleStore::load(&crate::storage::sessions_dir().join("schedules"));
+    if schedule_store.corrupted_on_load() {
+        problems.push(String::from(
+            "schedules.json is unreadable - schedules start empty; salvage or delete ~/.heartflow/sessions/schedules/schedules.json",
+        ));
+    } else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0_u64, |d| d.as_millis() as u64);
+        let all = schedule_store.list();
+        let due = all.iter().filter(|s| s.is_due(now)).count();
+        let paused = all.iter().filter(|s| !s.enabled).count();
+        println!(
+            "  ok   schedules: {} total, {due} due, {paused} paused (run-due drains them; no daemon)",
+            all.len()
+        );
+    }
+
     // The derived history database, if present, must be structurally sound.
     check_history_store(&mut problems);
 

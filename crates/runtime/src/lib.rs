@@ -8,9 +8,11 @@ mod diagnostics;
 mod doc_search;
 mod file_ops;
 mod jobs;
+mod mission;
 mod permissions;
 mod prompt;
 mod redact;
+mod schedule;
 mod schema;
 mod session;
 mod usage;
@@ -52,6 +54,13 @@ pub use jobs::{
     JobStatus, MessageKind, SpawnError, StopFlag, WorkerMessage, DEFAULT_JOB_SLOTS,
     DEFAULT_JOB_WALL_TIMEOUT, DEFAULT_MAX_PENDING,
 };
+pub use mission::{
+    budget_attention, command_succeeds, file_matches, mission_disk_write_failures,
+    set_missions_root, summarize_on_disk, CompletionCriterion, CriterionState, Mission,
+    MissionBudget, MissionError, MissionLedger, MissionStatus, MissionSummary, Receipt,
+    BLOCKED_STREAK_NEEDED, BUDGET_ATTENTION_FRACTION, CRITERION_COMMAND_TIMEOUT,
+    MISSION_STATE_LIMIT, RECEIPT_KEEP,
+};
 pub use permissions::{
     PermissionMode, PermissionOutcome, PermissionPolicy, PermissionPromptDecision,
     PermissionPrompter, PermissionRequest,
@@ -61,6 +70,11 @@ pub use prompt::{
     FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use redact::{redact_messages, redact_session, redact_text, REDACTED};
+pub use schedule::{
+    parse_duration_spec, schedule_disk_write_failures, set_schedules_root, CatchUp, DueReason,
+    RunOutcome, Schedule, ScheduleError, ScheduleRun, ScheduleStore, ScheduleTrigger, MAX_HISTORY,
+    MAX_SCHEDULES, SCHEDULES_FILE_LIMIT,
+};
 pub use schema::{normalize_tool_schema, validate_tool_input};
 pub use session::{
     ContentBlock, ConversationMessage, MessageRole, SegmentRead, Session, SessionError,

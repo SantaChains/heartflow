@@ -123,8 +123,10 @@ hf -v | -V | --version                            打印版本号
 /search Q 全文检索历史      /exit         退出（自动保存并打印 resume 命令，/quit 为别名）
 /init     生成 AGENTS.md 骨架  /expand [ID]  展开上次折叠的工具输出
 /guide T  零 token 组装“前情/现状/下一步”三段引导并直接作为下一回合发送（/guide draft 只打印、/guide queue 入队）
-/queue [sub]  逐条队列：send 排队 / edit 改文本 / remove 撤回 / move 调序 / merge 整队合并 / pop / clear（递送一条一回合，失败按条重排）
+/queue [sub]  逐条队列：send [--lane] 排队 / lane 按泳道查看 / edit 改文本 / remove 撤回 / move 调序 / merge 整队合并 / pop / clear（递送一条一回合，失败按条重排）
 /jobs [sub]  子代理工人：spawn [--write] 启动上下文隔离工人会话 / stop 协作停止 / log 看事件流（默认 read-only，结果作为下一回合注入）
+/mission [sub]  耐久任务账本：create 开任务 / criterion 加完成判据 / approve 人工判据 / complete（全判据过验才放行）/ pause|resume / blocked / turn（反过早完成与反过早放弃由代码强制）
+/schedule [sub]  定时任务：add interval|once 注册 / run-due 外部触发到期工作（无常驻 daemon，overlap=skip，--quiet 成功不唤醒监工）
 !CMD  不经模型直接跑一条 shell 命令取输出（Windows 走 pwsh，危险命令先确认，输出同工具一样可折叠/展开）
 /plan GOAL 规划先行（写仅门禁到 plans/）  /plan approve 逐任务新鲜上下文执行+收尾复盘  /plan end 退出规划
 /restart 以全新的配置与 MCP 装载重启进程（链式重启受深度上限约束）
