@@ -25,7 +25,7 @@ jobs:
     name: fmt / clippy / test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - name: Install toolchain from rust-toolchain.toml
         # `rustup show active-toolchain` reads rust-toolchain.toml and auto-installs
         # the pinned toolchain when missing (verified: "the missing active toolchain
