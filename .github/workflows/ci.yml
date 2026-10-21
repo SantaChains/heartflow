@@ -25,9 +25,14 @@ jobs:
     name: fmt / clippy / test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install toolchain from rust-toolchain.toml
-        run: rustup show active-toolchain --install
+        # `rustup show active-toolchain` reads rust-toolchain.toml and auto-installs
+        # the pinned toolchain when missing (verified: "the missing active toolchain
+        # ... has been auto-installed"). Do NOT add `--install`: current rustup
+        # rejects it ("unexpected argument '--install' found") and every PR run
+        # died at this step in 5s from 2026-10-12's runner image onward.
+        run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check

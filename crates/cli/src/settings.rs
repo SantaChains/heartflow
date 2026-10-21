@@ -180,12 +180,11 @@ fn opt_u16(table: &toml::Table, key: &str, source: &str) -> Option<u16> {
         warn!(file = %source, field = key, "setting must be an integer; skipped");
         return None;
     };
-    match u16::try_from(n) {
-        Ok(parsed) => Some(parsed),
-        Err(_) => {
-            warn!(file = %source, field = key, value = n, "setting out of range; skipped");
-            None
-        }
+    if let Ok(parsed) = u16::try_from(n) {
+        Some(parsed)
+    } else {
+        warn!(file = %source, field = key, value = n, "setting out of range; skipped");
+        None
     }
 }
 
@@ -197,12 +196,11 @@ fn opt_usize(table: &toml::Table, key: &str, source: &str) -> Option<usize> {
         warn!(file = %source, field = key, "setting must be an integer; skipped");
         return None;
     };
-    match usize::try_from(n) {
-        Ok(parsed) => Some(parsed),
-        Err(_) => {
-            warn!(file = %source, field = key, value = n, "setting out of range; skipped");
-            None
-        }
+    if let Ok(parsed) = usize::try_from(n) {
+        Some(parsed)
+    } else {
+        warn!(file = %source, field = key, value = n, "setting out of range; skipped");
+        None
     }
 }
 
@@ -214,24 +212,22 @@ fn opt_u64(table: &toml::Table, key: &str, source: &str) -> Option<u64> {
         warn!(file = %source, field = key, "setting must be an integer; skipped");
         return None;
     };
-    match u64::try_from(n) {
-        Ok(parsed) => Some(parsed),
-        Err(_) => {
-            warn!(file = %source, field = key, value = n, "setting out of range; skipped");
-            None
-        }
+    if let Ok(parsed) = u64::try_from(n) {
+        Some(parsed)
+    } else {
+        warn!(file = %source, field = key, value = n, "setting out of range; skipped");
+        None
     }
 }
 
 /// Extract one boolean setting, warning and skipping a wrong type.
 fn opt_bool(table: &toml::Table, key: &str, source: &str) -> Option<bool> {
     let value = table.get(key)?;
-    match value.as_bool() {
-        Some(parsed) => Some(parsed),
-        None => {
-            warn!(file = %source, field = key, "setting must be a boolean; skipped");
-            None
-        }
+    if let Some(parsed) = value.as_bool() {
+        Some(parsed)
+    } else {
+        warn!(file = %source, field = key, "setting must be a boolean; skipped");
+        None
     }
 }
 

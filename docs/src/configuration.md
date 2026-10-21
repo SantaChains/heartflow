@@ -42,6 +42,36 @@ read_only = true                       # 声明该 server 工具均只读：read
 - `anthropic`：Anthropic 协议，`api_key_env = "ANTHROPIC_API_KEY"`，基址可被 `ANTHROPIC_BASE_URL` 覆盖。
 - 任意 `[provider.NAME]` 表项即自定义 provider；都未命中且无内置名时回退到环境变量选路，此时默认模型为 `mimo-v2.5-pro`。
 
+## 传输代理（`[proxy]`）
+
+所有出站 HTTP（provider 传输、`web_fetch`/`web_search`、`generate_image`、Streamable-HTTP MCP）共用同一套代理解析。优先级从高到低：
+
+1. `config.toml` 的 `[proxy]` 表（用户层 → 项目层 → `-c` 文件，逐字段胜出）；
+2. `HEARTFLOW_PROXY` / `HEARTFLOW_PROXY_MODE` / `HEARTFLOW_NO_PROXY`；
+3. `HTTPS_PROXY` → `ALL_PROXY` → `HTTP_PROXY`（大小写两种拼写均可）+ `NO_PROXY`；
+4. Windows 系统代理（Clash/V2Ray「系统代理」开关写入的 WinINET 设置，含 `ProxyOverride` bypass 列表）；
+5. 直连。
+
+```toml
+[proxy]
+mode = "auto"                       # direct | auto | global
+address = "http://127.0.0.1:7890"   # 也接受 socks5:// / socks5h://；缺 scheme 时按 http 处理
+rules = [                          # Clash 风格规则，首条命中生效；仅 auto 模式使用
+  "DOMAIN-SUFFIX,google.com,PROXY",
+  "DOMAIN-SUFFIX,deepseek.com,DIRECT",
+  "IP-CIDR,10.0.0.0/8,DIRECT",
+  "MATCH,DIRECT",                  # MATCH 是兜底（无 VALUE）
+]
+no_proxy = ["internal.corp"]        # bypass：主机、.后缀、IP、CIDR、*
+```
+
+- `mode = "direct"` 是逃生开关：完全不走代理，**压过环境变量与系统代理**（代理变量过期时的解法）。
+- `mode = "global"`：全部走代理（minus bypass）。`mode = "auto"`：按 `rules` 匹配，**未命中且存在 rules 时走直连**；只给 `address` 不给 `rules` 时 `auto` 等价于 `global`。
+- 规则类型：`DOMAIN`（主机精确）、`DOMAIN-SUFFIX`（域及子域）、`DOMAIN-KEYWORD`（主机包含）、`IP-CIDR`（仅匹配字面 IP 主机，路由前不解析 DNS）、`REGEX`（匹配完整 URL）、`MATCH`（兜底）。动作 `PROXY`/`DIRECT`。
+- **回环与局域网主机永不走代理**（`localhost`、`127.0.0.0/8`、RFC1918、链路本地、IPv6 ULA）——本地 relay 或模型服务在系统代理开启时也必须可用。
+- 启动时对选中的代理做一次 TCP 探测（1 s 预算）：**连不上则整条决议降级为直连**并告警，不会每个请求都付一次 connect 超时。`hf doctor` 显示当前生效的代理、来源、模式与探测结果，以及被跳过的坏规则/坏字段告警。
+- `[proxy]` 字段全部可选，坏字段/坏规则跳过并告警，不阻断启动；`hf config export config` 导出时代理地址的凭据部分（`user:pass@`）会被打码。
+
 ## provider/模型目录（provider.toml）
 
 `~/.heartflow/provider.toml` 是 provider 与模型的**目录**（已知宇宙的注册表），**不是活动配置**：它从不决定某回合打哪个端点——那始终由 `config.toml`（或 `--provider`/环境变量）解析选定。目录只服务三件事：REPL `/model` 的状态行与参数补全、`/model` 切换后的模型留档，以及给 `hf --provider NAME` 一份可发现的候选。

@@ -122,8 +122,9 @@ hf -v | -V | --version                            打印版本号
 /mcp      列出 MCP 服务器与工具
 /search Q 全文检索历史      /exit         退出（自动保存并打印 resume 命令，/quit 为别名）
 /init     生成 AGENTS.md 骨架  /expand [ID]  展开上次折叠的工具输出
-/guide T  本地零 token 组装“前情/现状/下一步”三段引导草稿，供编辑后发送
-/queue [pop|clear]  查看/撤回回合运行期间排队的后续消息（入队注入随 TUI 事件循环上线）
+/guide T  零 token 组装“前情/现状/下一步”三段引导并直接作为下一回合发送（/guide draft 只打印、/guide queue 入队）
+/queue [sub]  逐条队列：send 排队 / edit 改文本 / remove 撤回 / move 调序 / merge 整队合并 / pop / clear（递送一条一回合，失败按条重排）
+/jobs [sub]  子代理工人：spawn [--write] 启动上下文隔离工人会话 / stop 协作停止 / log 看事件流（默认 read-only，结果作为下一回合注入）
 !CMD  不经模型直接跑一条 shell 命令取输出（Windows 走 pwsh，危险命令先确认，输出同工具一样可折叠/展开）
 /plan GOAL 规划先行（写仅门禁到 plans/）  /plan approve 逐任务新鲜上下文执行+收尾复盘  /plan end 退出规划
 /restart 以全新的配置与 MCP 装载重启进程（链式重启受深度上限约束）
@@ -269,6 +270,7 @@ AGENTS.md / CLAUDE.md    仓库指令（项目上下文，逐级向上聚合）
 | HEARTFLOW_LOG                                                 | 日志级别门，默认 warn，输出至 stderr                                                                                                                                                                       |
 | HEARTFLOW_PERMISSION_MODE                                     | read-only / workspace-write（交互式默认）/ full（非交互默认），另接受 plan 与 auto（=full）；REPL 内 /mode 热切换                                                                                          |
 | HEARTFLOW_SHELL                                               | 覆盖 bash 工具的 shell 程序                                                                                                                                                                                |
+| HEARTFLOW_PROXY / HEARTFLOW_PROXY_MODE / HEARTFLOW_NO_PROXY   | 传输代理：代理地址（如 http://127.0.0.1:7890）/ 模式（direct、global、auto）/ 绕过列表；未设时回退到系统代理（Windows 注册表）或直连，详见《配置说明》传输代理一节 |
 | HEARTFLOW_AUTO_COMPACT_TOKENS                                 | 模型上下文窗口 tokens；设后即启用回合内 `>50%` 预压缩（越过半窗 summarize-then-compact），未设则回退到 `config.toml` 的 `[provider] context_window`，两者皆无则关闭。用 `hf --provider NAME models` 查窗口 |
 | HEARTFLOW_REPLAY_VERBATIM_TAIL                                | 恢复回放时逐字保留的近期 tool_result 条数（默认 12）                                                                                                                                                       |
 | HEARTFLOW_IMAGE_API_KEY / _BASE_URL / _MODEL / _SIZE          | 配置后启用并参数化 generate_image（OpenAI 兼容图像端点）                                                                                                                                                   |
@@ -280,6 +282,7 @@ AGENTS.md / CLAUDE.md    仓库指令（项目上下文，逐级向上聚合）
 
 ```text
 crates/
+├── proxy     传输代理解析：env / 系统注册表 / [proxy] 规则链、回环 bypass、死代理探测降级
 ├── api       传输层：Anthropic / OpenAI Chat / OpenAI Responses 客户端、SSE 解析、重试
 ├── runtime   会话循环：流消费、工具调度、compact、系统提示词、权限、doc_search
 ├── tools     原生工具实现与注册

@@ -1,4 +1,4 @@
-//! Impact / stress tests for the SQLite history store.
+//! Impact / stress tests for the `SQLite` history store.
 //!
 //! `io_correctness.rs` proves single-connection *content* fidelity. This file
 //! attacks the dimension that matters for a *shared system database*: many
@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use runtime::ConversationMessage;
 use store::{Integrity, SessionMeta, Store};
 
-/// A self-deleting temp dir whose *path* carries spaces + CJK, so the SQLite
+/// A self-deleting temp dir whose *path* carries spaces + CJK, so the `SQLite`
 /// file (and its `-wal`/`-shm` sidecars) live under a nasty Windows path.
 struct Scratch(PathBuf);
 

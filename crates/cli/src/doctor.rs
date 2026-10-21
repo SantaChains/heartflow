@@ -86,6 +86,96 @@ pub(crate) fn run_doctor(fix: bool) -> Result<Vec<String>, Box<dyn std::error::E
         }
     }
 
+    // The effective transport proxy: source, mode, and probe verdict. A dead
+    // proxy is a warning, not a problem — it self-heals to direct.
+    let resolution = proxy::resolution();
+    if resolution.is_dead() {
+        println!("  warn proxy: {} (routing direct)", resolution.describe());
+    } else {
+        println!("  ok   proxy: {}", resolution.describe());
+    }
+    for warning in resolution.warnings() {
+        println!("       proxy warning: {warning}");
+    }
+
+    // Phase 0 compaction observation: durable counters written by every
+    // process that compacted or repaired an orphan. `repair_dropped > 0` is
+    // the evidence gate for the Phase 1 compaction rework (see roadmap §4).
+    let compaction = runtime::compaction_stats();
+    if compaction.count == 0 && compaction.repair_dropped == 0 {
+        println!("  ok   compaction: no events recorded yet");
+    } else {
+        println!(
+            "  ok   compaction: {} event(s) (window-half {}, absolute {}), {} message(s) summarized, {} orphan tool_result(s) repaired",
+            compaction.count,
+            compaction.window_half,
+            compaction.absolute,
+            compaction.removed_total,
+            compaction.repair_dropped
+        );
+        if compaction.repair_dropped > 0 {
+            println!(
+                "       orphan repairs observed: compaction cut alignment or a resumed session lost pairing (roadmap §4 evidence gate)"
+            );
+        }
+    }
+
+    // §6 checkpoints: a snapshot failure means a write-class tool mutated the
+    // project without a restore point. Degrade-but-count policy, surfaced here
+    // so a persistently broken git setup is visible instead of silent.
+    let failures = runtime::snapshot_failures();
+    if failures > 0 {
+        println!(
+            "  warn checkpoints: {failures} snapshot(s) failed this process - writes proceeded without a restore point (is git on PATH?)"
+        );
+        problems.push(format!(
+            "{failures} checkpoint snapshot(s) failed; write tools had no restore point"
+        ));
+    } else {
+        println!("  ok   checkpoints: no snapshot failures");
+    }
+
+    // §6 post-edit diagnostics: degradation ledger for skipped cargo checks.
+    // no-manifest is normal for non-Rust projects (display, not a problem);
+    // timeout/spawn errors mean a Rust project lost its check and are warned.
+    let ledger = runtime::diagnostics_ledger();
+    if ledger.no_manifest > 0 || ledger.no_cargo > 0 {
+        println!(
+            "  info diagnostics: {} skip(s) with no manifest, {} with no cargo binary - expected outside Rust projects",
+            ledger.no_manifest, ledger.no_cargo
+        );
+    }
+    if ledger.timeout > 0 || ledger.spawn_error > 0 {
+        let detail = runtime::diagnostics_degradation_detail();
+        println!(
+            "  warn diagnostics: {} timed-out and {} failed-to-spawn cargo check(s){}",
+            ledger.timeout,
+            ledger.spawn_error,
+            detail
+                .as_deref()
+                .map(|d| format!("; last: {d}"))
+                .unwrap_or_default()
+        );
+        problems.push(
+            "post-edit cargo checks degraded (timeout or spawn failure); Rust edits may lack compiler verdicts"
+                .to_string(),
+        );
+    } else {
+        println!("  ok   diagnostics: post-edit cargo checks healthy");
+    }
+
+    // §1 subagent jobs: the registry itself never blocks on disk, so a broken
+    // jobs root shows up only as a counted degradation (the in-memory record
+    // stays the source of truth). Any nonzero count is worth surfacing.
+    let job_failures = runtime::disk_write_failures();
+    if job_failures > 0 {
+        println!(
+            "  warn jobs: {job_failures} job record/event write(s) failed this process - /jobs still works from memory, disk records may be stale"
+        );
+    } else {
+        println!("  ok   jobs: job records persisting");
+    }
+
     // The derived history database, if present, must be structurally sound.
     check_history_store(&mut problems);
 

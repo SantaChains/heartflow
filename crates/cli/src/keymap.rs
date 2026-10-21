@@ -443,12 +443,9 @@ fn parse_key_value(value: &toml::Value, action: &str, source: &str) -> Vec<Bindi
         toml::Value::Array(items) => {
             let texts: Vec<&str> = items
                 .iter()
-                .filter_map(|item| match item.as_str() {
-                    Some(text) => Some(text),
-                    None => {
-                        warn!(file = %source, action = %action, "keymap entry must be a string; skipped");
-                        None
-                    }
+                .filter_map(|item| if let Some(text) = item.as_str() { Some(text) } else {
+                    warn!(file = %source, action = %action, "keymap entry must be a string; skipped");
+                    None
                 })
                 .collect();
             parse_keys(&texts, action, source)

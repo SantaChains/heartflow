@@ -312,7 +312,8 @@ pub fn generate_image(input: &GenerateImageInput) -> Result<GenerateImageReport,
 
     let client = reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
-        .timeout(REQUEST_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT);
+    let client = crate::web::apply_proxy(client)
         .build()
         .map_err(|error| ImageError::Http(error.to_string()))?;
     let endpoint = format!(

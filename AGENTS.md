@@ -12,13 +12,13 @@
 ## 依赖拓扑与发布顺序
 
 ```text
-cli ─→ {provider, runtime, api, tools, mcp, store, commands}
-provider ─→ {api, runtime}      tools ─→ runtime      store ─→ runtime      commands ─→ runtime
-runtime / api / mcp ─→ 无内部依赖
+cli ─→ {provider, runtime, api, tools, mcp, store, commands, proxy}
+provider ─→ {api, runtime, proxy}      tools ─→ {runtime, proxy}      store ─→ runtime      commands ─→ runtime
+api ─→ proxy      mcp ─→ proxy      runtime / proxy ─→ 无内部依赖
 ```
 
-`runtime`、`api`、`mcp` 无内部依赖，故 `scripts/release.sh` 按
-`heartflow-runtime → heartflow-api → heartflow-provider → heartflow-mcp → heartflow-tools → heartflow-store → heartflow-commands → heartflow` 逐个发。
+`proxy`、`runtime`、`api`、`mcp` 中仅 `proxy` 与 `runtime` 无内部依赖，故 `scripts/release.sh` 按
+`heartflow-proxy → heartflow-runtime → heartflow-api → heartflow-provider → heartflow-mcp → heartflow-tools → heartflow-store → heartflow-commands → heartflow` 逐个发。
 
 ## 构建与质量门
 
@@ -60,7 +60,7 @@ CI 有三条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/**`
 
 ### REPL（`crates/cli/src/main.rs:962` `dispatch_slash_command`）
 
-`/help /status /model [NAME] /mode [NAME] /plan [GOAL|approve|end|status] /compact /pin /focus /save /clear /sessions /open N /remember T /search Q /mcp /expand [ID] /queue [pop|clear] /guide TASK /init /restart /exit`（`/quit` 为别名），以及不走模型的 `!CMD` 前缀。`/focus` 切换聚焦模式（隐藏 mascot 伴侣、收窄输入区为最小 chrome）。
+`/help /status /model [NAME] /mode [NAME] /plan [GOAL|approve|end|status] /compact /pin /focus /save /clear /sessions /open N /remember T /search Q /mcp /expand [ID] /checkpoints /restore N [--purge] /queue [send|edit|remove|move|merge|pop|clear] /guide [TASK|draft T|queue T] /jobs [spawn [--write]|stop|log] /init /restart /exit`（`/quit` 为别名），以及不走模型的 `!CMD` 前缀。`/focus` 切换聚焦模式（隐藏 mascot 伴侣、收窄输入区为最小 chrome）。
 
 `/model`（无参）打印当前**真实**传输身份——`provider`（目录键，未命中则 `custom`）/ `protocol` / `base_url` / `model` / `known models`（目录中该 provider 的模型），取代旧的写死 DeepSeek 清单，使传输失败一眼可辨协议而非误读厂商（env-anthropic 路径显示 `provider: anthropic (env)`）；`/model NAME` 切换成功后把该模型记入 `~/.heartflow/provider.toml`（`source=user`）。REPL 补全不止命令名：`/model `、`/mode `、`/open ` 后跟空格按命令弹出参数候选表格（分别为目录中当前 provider 的模型 / 权限三档 / 会话序号），↑/↓ 选择、Tab 或 Enter 只补全当前参数位，Esc 取消高亮。
 
@@ -83,6 +83,7 @@ CI 有三条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/**`
 | `HEARTFLOW_LOG`                                                     | tracing 过滤，默认 `warn`，仅 stderr                          | `crates/cli/src/main.rs:233`                  |
 | `HEARTFLOW_PERMISSION_MODE`                                         | 见权限策略                                                    | `crates/cli/src/permissions.rs:22`            |
 | `HEARTFLOW_SHELL`                                                   | 覆盖 bash 工具的 shell                                        | `crates/runtime/src/bash.rs:599`              |
+| `HEARTFLOW_PROXY` / `HEARTFLOW_PROXY_MODE` / `HEARTFLOW_NO_PROXY`   | 传输代理：地址 / `direct`\|`global`\|`auto` / 绕过列表，优先级见 `crates/proxy/src/env.rs` | `crates/proxy/src/lib.rs`（`init_global` 于 `crates/cli/src/main.rs` 启动处调用） |
 | `HEARTFLOW_AUTO_COMPACT_TOKENS`                                     | 模型窗口 tokens，优先级高于 `[provider] context_window`       | `crates/cli/src/main.rs:1535`                 |
 | `HEARTFLOW_REPLAY_VERBATIM_TAIL`                                    | 回放时逐字保留的近期 `tool_result` 条数，默认 12              | `crates/cli/src/main.rs:1579`                 |
 | `HEARTFLOW_IMAGE_API_KEY` / `_BASE_URL` / `_MODEL` / `_SIZE`        | 启用并参数化 `generate_image`                                 | `crates/tools/src/image.rs:166`               |
@@ -93,6 +94,8 @@ CI 有三条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/**`
 ### 配置键（`version` 当前为 1，`crates/provider/src/config.rs:13`）
 
 `[provider]`：`name`、`protocol`（`anthropic` | `openai`/`openai-compatible`/`openai_compat` | `openai-responses`/`responses`/`openai_responses`）、`base_url`、`api_key_env`、`api_key`（内联明文，导出时永不写出）、`auth_token_env`、`model`、`max_tokens`、`reasoning_effort`、`context_window`（`crates/provider/src/config.rs:123-140`、`:165-181`）。字段全可选，未识别字段仅 debug 记录，坏字段跳过不阻断。缺省模型 `mimo-v2.5-pro`、缺省 `max_tokens` 4096（`crates/provider/src/config.rs:7-8`）。
+
+`[proxy]`：`mode`（`direct` | `global` | `auto`，默认 `auto`）、`address`（如 `http://127.0.0.1:7890`、`socks5://…`）、`rules`（Clash 风格 `TYPE,VALUE,ACTION` 行数组）、`no_proxy`（绕过列表）；解析归 `crates/proxy`（`ProxyConfig::from_table`），空表折叠为「无意见」。生效链：`[proxy]` config.toml（项目层盖用户层，字段级）> `HEARTFLOW_PROXY*` env > `HTTPS_PROXY→ALL_PROXY→HTTP_PROXY` + `NO_PROXY` > Windows WinINET 注册表（`crates/proxy/src/system.rs`，仅 Windows）> direct。回环/RFC1918/link-local/IPv6 ULA 永不走代理；启动时 1s TCP 探测，死代理降级 direct 并 `tracing::warn`。所有 reqwest 客户端构造点（`api/retry.rs`、`tools/web.rs`、`tools/image.rs`、`mcp/http.rs`）一律 `.no_proxy()` + `hfproxy::resolution()` 闭包，**禁止**裸 `Client::new()`。
 
 `[mcp.servers.NAME]`：`command`、`args`、`env`、`url`、`headers`（值支持 `${VAR}` 展开）、`bearer_token_env`、`read_only`。`url` 与 `command` 二选一，两者皆缺则跳过并告警；`url` 存在即走 Streamable-HTTP/SSE（`crates/cli/src/config.rs:12-29`、`:55-110`）。
 

@@ -1,5 +1,8 @@
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
+
+use proxy as hfproxy;
 
 use crate::error::ApiError;
 
@@ -13,14 +16,35 @@ const DEFAULT_MAX_RETRIES: u32 = 2;
 
 /// Shared HTTP client: bounded connect/read timeouts so a dead endpoint or a
 /// stalled stream can never hang the agent loop forever.
+///
+/// Proxy routing is explicit rather than reqwest's implicit environment read:
+/// `.no_proxy()` first (otherwise reqwest would silently re-add the env proxy
+/// this crate took over), then the process-global [`hfproxy`] decision as a
+/// per-URL `Proxy::custom` closure. With no proxy in force the result is a
+/// fully direct client.
 #[must_use]
 pub(crate) fn build_http() -> reqwest::Client {
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
+        .no_proxy();
+    builder = apply_proxy(builder, hfproxy::resolution());
+    builder
         .build()
         // panic-ok: only static timeouts are configured, so build() cannot fail
         .expect("static reqwest configuration must build")
+}
+
+fn apply_proxy(
+    builder: reqwest::ClientBuilder,
+    resolution: Arc<hfproxy::ProxyResolution>,
+) -> reqwest::ClientBuilder {
+    if resolution.address().is_none() || resolution.is_dead() {
+        return builder;
+    }
+    builder.proxy(reqwest::Proxy::custom(move |url| {
+        resolution.proxy_url_for(url)
+    }))
 }
 
 /// Status codes worth retrying: transient rate limits, timeouts, and

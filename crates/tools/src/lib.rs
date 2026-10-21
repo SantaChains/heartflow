@@ -398,20 +398,22 @@ fn run_read_file(input: ReadFileInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_write_file(input: WriteFileInput) -> Result<String, String> {
-    to_pretty_json(write_file(&input.path, &input.content).map_err(|e| io_to_string(&e))?)
+    let output = write_file(&input.path, &input.content).map_err(|e| io_to_string(&e))?;
+    let changed = vec![std::path::PathBuf::from(&input.path)];
+    attach_post_edit_diagnostics(output, &changed)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_edit_file(input: EditFileInput) -> Result<String, String> {
-    to_pretty_json(
-        edit_file(
-            &input.path,
-            &input.old_string,
-            &input.new_string,
-            input.replace_all.unwrap_or(false),
-        )
-        .map_err(|e| io_to_string(&e))?,
+    let output = edit_file(
+        &input.path,
+        &input.old_string,
+        &input.new_string,
+        input.replace_all.unwrap_or(false),
     )
+    .map_err(|e| io_to_string(&e))?;
+    let changed = vec![std::path::PathBuf::from(&input.path)];
+    attach_post_edit_diagnostics(output, &changed)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -442,6 +444,11 @@ fn run_search_documents(input: DocSearchInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_apply_patch(input: ApplyPatchInput) -> Result<String, String> {
+    let changed: Vec<std::path::PathBuf> = input
+        .changes
+        .iter()
+        .map(|change| std::path::PathBuf::from(&change.path))
+        .collect();
     let changes: Vec<PatchChange> = input
         .changes
         .into_iter()
@@ -452,7 +459,25 @@ fn run_apply_patch(input: ApplyPatchInput) -> Result<String, String> {
             replace_all: change.replace_all,
         })
         .collect();
-    to_pretty_json(apply_patch(&changes).map_err(|e| io_to_string(&e))?)
+    let output = apply_patch(&changes).map_err(|e| io_to_string(&e))?;
+    attach_post_edit_diagnostics(output, &changed)
+}
+
+/// Roadmap §6 "write-after diagnosis": on a Rust-relevant change, run
+/// `cargo check --message-format=short` and fold the verdict into the same
+/// tool result the model reads. A check that could not run is either absent
+/// (`None`, nothing to say) or reported under `degraded` - it never fails the
+/// tool call, and every skip lands in the bounded ledger `hf doctor` shows.
+fn attach_post_edit_diagnostics<T: serde::Serialize>(
+    output: T,
+    changed: &[std::path::PathBuf],
+) -> Result<String, String> {
+    let mut value = serde_json::to_value(&output).map_err(|error| error.to_string())?;
+    if let Some(diagnostics) = runtime::run_post_edit_diagnostics(changed) {
+        value["postEditDiagnostics"] =
+            serde_json::to_value(&diagnostics).map_err(|error| error.to_string())?;
+    }
+    serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
 }
 
 fn to_pretty_json<T: serde::Serialize>(value: T) -> Result<String, String> {

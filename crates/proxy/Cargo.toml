@@ -1,0 +1,25 @@
+[package]
+name = "heartflow-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+description = "Proxy resolution and routing for heartflow transports"
+publish.workspace = true
+
+[lib]
+name = "proxy"
+
+[dependencies]
+regex = "1"
+toml = "0.9"
+tracing = "0.1"
+url = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-registry = "0.5"
+
+[lints]
+workspace = true

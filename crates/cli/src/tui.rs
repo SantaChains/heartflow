@@ -1450,7 +1450,7 @@ fn view(app: &App, area: Rect, frame: &mut Frame, context_window: Option<usize>)
                 .saturating_add(usage.cache_read_input_tokens)
                 .saturating_add(usage.cache_creation_input_tokens);
             let pct = if window > 0 {
-                total as f64 / window as f64
+                f64::from(total) / window as f64
             } else {
                 0.0
             };
@@ -1906,7 +1906,7 @@ where
                         dirty = true;
                         if shell.sections.len() >= MAX_SECTIONS {
                             shell.section_mut().status_note =
-                                format!("section limit reached ({} max)", MAX_SECTIONS);
+                                format!("section limit reached ({MAX_SECTIONS} max)");
                         } else if let Ok((state, runtime)) = make_section() {
                             // Snapshot the fresh runtime's (empty) guide context
                             // before moving it into the parallel vector.
@@ -2311,7 +2311,11 @@ mod tests {
         );
         assert_eq!(app.model.queue().len(), 1);
         assert_eq!(
-            app.model.queue().items().front().map(String::as_str),
+            app.model
+                .queue()
+                .items()
+                .front()
+                .map(|entry| entry.text.as_str()),
             Some("later")
         );
         assert!(
@@ -2429,7 +2433,7 @@ mod tests {
         assert_eq!(app.model.queue().len(), 1);
         let queued = app.model.queue().items().front().expect("one queued");
         assert!(
-            queued.contains("[guide: next task]\nlater task"),
+            queued.text.contains("[guide: next task]\nlater task"),
             "the queued body is the full draft"
         );
     }
@@ -3057,7 +3061,7 @@ mod tests {
         let rows = render_rows(&shell, 60, 8);
         assert!(rows[0].contains("heartflow"), "header still tops the frame");
         assert!(
-            rows[1].contains("main") && rows[1].contains("2"),
+            rows[1].contains("main") && rows[1].contains('2'),
             "row 1 is the tab bar listing both sections"
         );
         assert!(

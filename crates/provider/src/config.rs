@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use proxy::ProxyConfig;
 use tracing::{debug, warn};
 
 pub const DEFAULT_MODEL: &str = "mimo-v2.5-pro";
@@ -138,6 +139,10 @@ pub struct ProviderSettings {
     /// Model context window in tokens for window-based compaction.
     pub context_window: Option<u32>,
     pub version: Option<u32>,
+    /// `[proxy]` table: transport proxy routing. Parsed by the `proxy` crate
+    /// so the resolution rules stay in one place; absent means "no opinion",
+    /// and the resolver falls through to env/registry.
+    pub proxy: Option<ProxyConfig>,
 }
 
 impl ProviderSettings {
@@ -156,9 +161,17 @@ impl ProviderSettings {
             }
         }
 
+        // An empty `[proxy]` table carries no opinion; fold it to `None` so the
+        // merge layer treats it as absent rather than an explicit reset.
+        let proxy = {
+            let parsed = ProxyConfig::from_table(table, source);
+            (!parsed.is_empty()).then_some(parsed)
+        };
+
         let Some(provider) = table.get("provider").and_then(toml::Value::as_table) else {
             return Self {
                 version,
+                proxy,
                 ..Self::default()
             };
         };
@@ -201,6 +214,7 @@ impl ProviderSettings {
             reasoning_effort: string_field(provider, "reasoning_effort", source),
             context_window: u32_field(provider, "context_window", source),
             version,
+            proxy,
         }
     }
 
@@ -239,6 +253,13 @@ impl ProviderSettings {
         if source.version.is_some() {
             self.version = source.version;
         }
+        if let Some(layer) = source.proxy {
+            if let Some(existing) = self.proxy.as_mut() {
+                existing.merge(layer);
+            } else {
+                self.proxy = Some(layer);
+            }
+        }
     }
 
     /// Render as canonical config.toml text (version header plus `[provider]`).
@@ -271,8 +292,48 @@ impl ProviderSettings {
         if let Some(effort) = &self.reasoning_effort {
             let _ = writeln!(out, "reasoning_effort = {}", quote_toml_string(effort));
         }
+        if let Some(proxy) = &self.proxy {
+            out.push_str("\n[proxy]\n");
+            if let Some(mode) = &proxy.mode {
+                let _ = writeln!(out, "mode = {}", quote_toml_string(mode));
+            }
+            if let Some(address) = &proxy.address {
+                let _ = writeln!(
+                    out,
+                    "address = {}",
+                    quote_toml_string(&redact_proxy_address(address))
+                );
+            }
+            if let Some(rules) = &proxy.rules {
+                let _ = writeln!(out, "rules = [{}]", quote_toml_array(rules));
+            }
+            if let Some(no_proxy) = &proxy.no_proxy {
+                let _ = writeln!(out, "no_proxy = [{}]", quote_toml_array(no_proxy));
+            }
+        }
         out
     }
+}
+
+/// Proxy URLs can embed credentials (`http://user:pass@host:port`), so export
+/// redacts the userinfo — the same discipline that keeps `api_key` out of the
+/// rendered text. An address without a parseable scheme is redacted whole.
+fn redact_proxy_address(address: &str) -> String {
+    let Some((_, host)) = address.rsplit_once('@') else {
+        return address.to_string();
+    };
+    match address.split_once("://") {
+        Some((scheme, _)) => format!("{scheme}://***@{host}"),
+        None => format!("***@{host}"),
+    }
+}
+
+fn quote_toml_array(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| quote_toml_string(value))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[must_use]
@@ -662,6 +723,72 @@ mod tests {
     }
 
     #[test]
+    fn proxy_table_parses_and_exports_with_redaction() {
+        let parsed = settings(concat!(
+            "[proxy]\n",
+            "mode = \"auto\"\n",
+            "address = \"http://user:pass@127.0.0.1:7890\"\n",
+            "rules = [\"DOMAIN-SUFFIX,google.com,PROXY\", \"MATCH,DIRECT\"]\n",
+            "no_proxy = [\"localhost\", \"10.0.0.0/8\"]\n"
+        ));
+        let proxy = parsed.proxy.as_ref().expect("proxy should parse");
+        assert_eq!(proxy.mode.as_deref(), Some("auto"));
+        assert_eq!(
+            proxy.address.as_deref(),
+            Some("http://user:pass@127.0.0.1:7890")
+        );
+        assert_eq!(proxy.rules.as_ref().map(Vec::len), Some(2));
+        assert_eq!(proxy.no_proxy.as_ref().map(Vec::len), Some(2));
+
+        let exported = parsed.to_toml_string();
+        assert!(
+            exported.contains("address = \"http://***@127.0.0.1:7890\""),
+            "export must redact credentials: {exported}"
+        );
+        assert!(
+            !exported.contains("user:pass"),
+            "export must never leak credentials: {exported}"
+        );
+        assert!(
+            exported.contains("rules = ["),
+            "export must carry rules: {exported}"
+        );
+    }
+
+    #[test]
+    fn empty_proxy_table_is_absent_not_an_override() {
+        assert_eq!(settings("[proxy]\n").proxy, None);
+        assert_eq!(
+            settings("[proxy]\nmode = \"direct\"\n")
+                .proxy
+                .as_ref()
+                .map(|p| p.mode.clone()),
+            Some(Some("direct".to_string()))
+        );
+    }
+
+    #[test]
+    fn proxy_merges_field_by_field() {
+        let mut merged = settings(concat!(
+            "[proxy]\n",
+            "address = \"http://127.0.0.1:7890\"\n",
+            "rules = [\"DOMAIN-SUFFIX,google.com,PROXY\"]\n"
+        ));
+        // A later layer that only names the mode keeps the earlier address/rules.
+        merged.merge(settings("[proxy]\nmode = \"auto\"\n"));
+        let proxy = merged.proxy.as_ref().expect("proxy should survive");
+        assert_eq!(proxy.mode.as_deref(), Some("auto"));
+        assert_eq!(proxy.address.as_deref(), Some("http://127.0.0.1:7890"));
+        assert_eq!(proxy.rules.as_ref().map(Vec::len), Some(1));
+        // And a later address still wins.
+        merged.merge(settings("[proxy]\naddress = \"socks5://127.0.0.1:1080\"\n"));
+        assert_eq!(
+            merged.proxy.as_ref().and_then(|p| p.address.clone()),
+            Some("socks5://127.0.0.1:1080".to_string())
+        );
+    }
+
+    #[test]
     fn project_file_overrides_user_file_and_flags_win_over_both() {
         let mut merged = settings(
             "[provider]\nname = \"deepseek\"\nmodel = \"deepseek-v4-pro\"\nmax_tokens = 16384\n",
@@ -954,6 +1081,7 @@ mod tests {
             reasoning_effort: Some("high".to_string()),
             context_window: Some(65536),
             version: Some(CONFIG_VERSION),
+            proxy: None,
         };
         let parsed = settings(&original.to_toml_string());
         assert_eq!(parsed, original);

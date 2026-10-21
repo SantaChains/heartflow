@@ -1,4 +1,212 @@
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+
+// ---------------------------------------------------------------------------
+// Phase 0 instrumentation (docs/src/roadmap.md §4 compaction 改造规格)
+//
+// Pure observation: no behavioral change. Compaction and orphan-repair events
+// are recorded as structured tracing events plus durable counters, so the
+// Phase 1 evidence gate ("did a repair actually drop content / does the
+// preserved tail outgrow the window") can be answered from data instead of
+// speculation. The counters live in a small JSON file next to the sessions
+// directory (path injected by the CLI assembly layer; without it only the
+// in-process tracing events remain).
+// ---------------------------------------------------------------------------
+
+/// Which threshold fired. `ContextWindowHalf` is the Hermes-style
+/// `window / 2` gate (window configured); `AbsoluteMax` is the fallback
+/// `max_estimated_tokens` gate (window unset, `window == 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThresholdKind {
+    ContextWindowHalf,
+    AbsoluteMax,
+}
+
+/// One compaction execution, emitted by `compact_session_in_place`.
+///
+/// `estimated_calibrated` carries the raw figure when recorded on the
+/// execution side: the calibration fit lives in the conversation runtime
+/// (provider-reported usage), which the free function cannot see. The
+/// raw-vs-calibrated comparison stays on the gate side (`TokenCalibration`
+/// observations), so the two numbers are never conflated here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactEvent {
+    pub trigger: ThresholdKind,
+    pub estimated_raw: usize,
+    pub estimated_calibrated: usize,
+    /// Configured context window (`0` = absolute-threshold mode).
+    pub window: usize,
+    /// Messages actually folded into the summary (pinned survivors excluded).
+    pub removed: usize,
+    /// Extra messages the boundary walkback pulled into the preserved tail so
+    /// it never opens on an orphaned `tool_result` (`0` when no walkback).
+    pub walkback_extra: usize,
+    /// Estimated tokens of the preserved tail (the verbatim part).
+    pub tail_tokens: usize,
+}
+
+/// Durable compaction counters, merged across processes from the stats file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompactionStats {
+    pub count: u64,
+    pub window_half: u64,
+    pub absolute: u64,
+    pub repair_dropped: u64,
+    pub removed_total: u64,
+}
+
+static COMPACT_COUNT: AtomicU64 = AtomicU64::new(0);
+static COMPACT_WINDOW_HALF: AtomicU64 = AtomicU64::new(0);
+static COMPACT_ABSOLUTE: AtomicU64 = AtomicU64::new(0);
+static REPAIR_DROPPED: AtomicU64 = AtomicU64::new(0);
+static REMOVED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Injected by the CLI assembly layer; `None` = tracing-only observation.
+/// A poisoned lock degrades to "no path" (counters stay in-process), never to
+/// a wrong value — same lock-poisoning rule as the rest of the workspace.
+static STATS_PATH: std::sync::RwLock<Option<std::path::PathBuf>> = std::sync::RwLock::new(None);
+static FLUSH_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Inject the durable stats file path (CLI assembly layer; typically
+/// `~/.heartflow/sessions/compaction-stats.json`). Without it, events remain
+/// visible through tracing only.
+pub fn set_compact_stats_path(path: std::path::PathBuf) {
+    if let Ok(mut guard) = STATS_PATH.write() {
+        *guard = Some(path);
+    }
+}
+
+fn stats_path() -> Option<std::path::PathBuf> {
+    STATS_PATH.read().ok()?.clone()
+}
+
+/// Process-local counters as a snapshot. Relaxed ordering: these are
+/// independent gauges with no cross-variable invariant to protect.
+fn process_counters() -> CompactionStats {
+    CompactionStats {
+        count: COMPACT_COUNT.load(Ordering::Relaxed),
+        window_half: COMPACT_WINDOW_HALF.load(Ordering::Relaxed),
+        absolute: COMPACT_ABSOLUTE.load(Ordering::Relaxed),
+        repair_dropped: REPAIR_DROPPED.load(Ordering::Relaxed),
+        removed_total: REMOVED_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
+/// Read the durable file, tolerating absence and corruption (a torn or
+/// hand-mangled file degrades to "no history", never to an error).
+fn read_stats_file(path: &std::path::Path) -> Option<CompactionStats> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let field = |name: &str| {
+        value
+            .get(name)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    Some(CompactionStats {
+        count: field("count"),
+        window_half: field("window_half"),
+        absolute: field("absolute"),
+        repair_dropped: field("repair_dropped"),
+        removed_total: field("removed_total"),
+    })
+}
+
+/// Current totals: durable file history plus this process's counters. The two
+/// sources are additive by construction — the file only ever holds other
+/// processes' deltas, since a process flushes `file + own counters` and never
+/// rewrites the file from its counters alone. Concurrent writers are
+/// last-one-wins; acceptable for Phase 0 observation.
+#[must_use]
+pub fn compaction_stats() -> CompactionStats {
+    let process = process_counters();
+    match stats_path().as_deref().and_then(read_stats_file) {
+        Some(file) => CompactionStats {
+            count: file.count + process.count,
+            window_half: file.window_half + process.window_half,
+            absolute: file.absolute + process.absolute,
+            repair_dropped: file.repair_dropped + process.repair_dropped,
+            removed_total: file.removed_total + process.removed_total,
+        },
+        None => process,
+    }
+}
+
+fn write_stats_file(path: &std::path::Path, stats: &CompactionStats) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = format!(
+        "{{\"version\":1,\"count\":{},\"window_half\":{},\"absolute\":{},\"repair_dropped\":{},\"removed_total\":{}}}\n",
+        stats.count, stats.window_half, stats.absolute, stats.repair_dropped, stats.removed_total
+    );
+    // Atomic replace: a torn file must never look like valid stats.
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, json)?;
+    std::fs::rename(&temp, path)
+}
+
+fn flush_stats() {
+    let Some(path) = stats_path() else { return };
+    let merged = compaction_stats();
+    if let Err(error) = write_stats_file(&path, &merged) {
+        // Warn once: a failing disk must not spam every turn (repair drops
+        // and compactions are rare, but a loop of them is not impossible).
+        if !FLUSH_FAILED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                target: "heartflow::compact",
+                path = %path.display(),
+                %error,
+                "could not persist compaction stats; counters stay in-process only"
+            );
+        }
+    }
+}
+
+/// Record one compaction execution: structured event + counters + durable
+/// flush (when a stats path is injected).
+pub fn record_compact_event(event: &CompactEvent) {
+    COMPACT_COUNT.fetch_add(1, Ordering::Relaxed);
+    match event.trigger {
+        ThresholdKind::ContextWindowHalf => {
+            COMPACT_WINDOW_HALF.fetch_add(1, Ordering::Relaxed);
+        }
+        ThresholdKind::AbsoluteMax => {
+            COMPACT_ABSOLUTE.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    REMOVED_TOTAL.fetch_add(event.removed as u64, Ordering::Relaxed);
+    tracing::info!(
+        target: "heartflow::compact",
+        trigger = ?event.trigger,
+        estimated_raw = event.estimated_raw,
+        estimated_calibrated = event.estimated_calibrated,
+        window = event.window,
+        removed = event.removed,
+        walkback_extra = event.walkback_extra,
+        tail_tokens = event.tail_tokens,
+        "compaction applied"
+    );
+    flush_stats();
+}
+
+/// Record orphan `tool_result` blocks dropped by `repair_tool_pairing`.
+/// Each drop is silent information loss on the wire path, so it is a warning
+/// (visible under the default `warn` filter) and a durable counter.
+pub fn record_repair_drops(tool_use_ids: &[String]) {
+    if tool_use_ids.is_empty() {
+        return;
+    }
+    REPAIR_DROPPED.fetch_add(tool_use_ids.len() as u64, Ordering::Relaxed);
+    for id in tool_use_ids {
+        tracing::warn!(
+            target: "heartflow::compact",
+            tool_use_id = %id,
+            "repair_tool_pairing dropped an orphan tool_result (no preceding tool_use advertised it)"
+        );
+    }
+    flush_stats();
+}
 
 /// Rough cost charged for one attached image while estimating context size.
 /// Providers bill by decoded pixels (~1 token per 750 px on a full-resolution
@@ -180,20 +388,47 @@ fn least_squares(samples: &[(usize, u32)]) -> Option<(f64, f64)> {
     Some((density, overhead))
 }
 
+/// Window-based soft-trigger policy (D4.1, roadmap §4). Only consulted when
+/// `context_window_tokens > 0`; the absolute `max_estimated_tokens` fallback
+/// is unaffected. Defaults to the Hermes-style half-window gate, which keeps
+/// the shipped behavior byte-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoftTrigger {
+    /// `estimated >= window / 2` — the current default. Compacts more often,
+    /// further away from a hard failure.
+    HalfWindow,
+    /// ds4-style late trigger (`misc/COMPACT.md`): `estimated >= 85% × window`
+    /// or `remaining <= min(8192, window / 4)`. The free-token floor is capped
+    /// at a quarter of small contexts so tiny test windows do not compact
+    /// after every short turn. Safe to run late because the calibrated
+    /// estimate's median error is ~-1.5% (was -57% before `TokenCalibration`).
+    Ds4,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionConfig {
     pub preserve_recent_messages: usize,
     pub max_estimated_tokens: usize,
     /// Model context window in tokens. When non-zero, compaction is triggered
-    /// as soon as the estimated session size crosses half of this window
-    /// (Hermes-style >50% pre-compaction). When zero, the absolute
-    /// `max_estimated_tokens` threshold governs, preserving old behavior.
+    /// by the [`SoftTrigger`] policy once the estimated session size crosses
+    /// it. When zero, the absolute `max_estimated_tokens` threshold governs,
+    /// preserving old behavior.
     pub context_window_tokens: usize,
     /// Trailing messages whose tool-result bodies are replayed verbatim to the
     /// provider; older dumps collapse to a stub (see `build_replay_messages`).
     /// A tunable proxy for "how many recent turns stay lossless" (~4 messages
     /// per turn, so 12 keeps roughly the last three turns intact).
     pub replay_verbatim_tail: usize,
+    /// Soft-trigger policy inside the window regime. Default is the shipped
+    /// half-window gate (rollback spec: new behavior is config-gated, defaults
+    /// reproduce the old behavior).
+    pub soft_trigger: SoftTrigger,
+    /// Token ceiling for the preserved tail (D4.3, roadmap §4). The cut starts
+    /// at `preserve_recent_messages` and walks forward — summarizing more —
+    /// while the tail outgrows this budget, so a few huge tool results can no
+    /// longer occupy the whole window by message count alone. `0` disables the
+    /// ceiling (current behavior; count-only cut).
+    pub tail_budget_tokens: usize,
 }
 
 impl Default for CompactionConfig {
@@ -203,6 +438,8 @@ impl Default for CompactionConfig {
             max_estimated_tokens: 10_000,
             context_window_tokens: 0,
             replay_verbatim_tail: 12,
+            soft_trigger: SoftTrigger::HalfWindow,
+            tail_budget_tokens: 0,
         }
     }
 }
@@ -240,6 +477,12 @@ pub fn should_compact(session: &Session, config: CompactionConfig) -> bool {
 
 /// [`should_compact`] for callers that already hold an estimate (the
 /// amortized-O(1) path): same thresholds, no re-scan of the session.
+///
+/// `estimated` is the *calibrated* figure at the conversation-runtime gate
+/// (`AgentRuntime::estimated_tokens`); the ds4 policy's late trigger leans on
+/// that calibration (~-1.5% median error), so callers feeding raw estimates
+/// should keep `SoftTrigger::HalfWindow` (the default) whose margin absorbs
+/// the raw error.
 #[must_use]
 pub fn should_compact_with_estimate(
     message_count: usize,
@@ -249,10 +492,21 @@ pub fn should_compact_with_estimate(
     if message_count <= config.preserve_recent_messages {
         return false;
     }
-    if config.context_window_tokens > 0 {
-        estimated >= config.context_window_tokens / 2
-    } else {
-        estimated >= config.max_estimated_tokens
+    if config.context_window_tokens == 0 {
+        return estimated >= config.max_estimated_tokens;
+    }
+    let window = config.context_window_tokens;
+    match config.soft_trigger {
+        SoftTrigger::HalfWindow => estimated >= window / 2,
+        SoftTrigger::Ds4 => {
+            // u128 keeps the percent math overflow-free for any usize input
+            // (`as` is lossless: usize is at most 64-bit).
+            if (estimated as u128) >= (window as u128) * 85 / 100 {
+                return true;
+            }
+            let free_floor = 8192.min(window / 4);
+            window.saturating_sub(estimated) <= free_floor
+        }
     }
 }
 
@@ -276,6 +530,7 @@ pub fn get_compact_continuation_message(
     summary: &str,
     suppress_follow_up_questions: bool,
     recent_messages_preserved: bool,
+    dropped_token_estimate: usize,
 ) -> String {
     let mut base = format!(
         "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n{}",
@@ -286,11 +541,74 @@ pub fn get_compact_continuation_message(
         base.push_str("\n\nRecent messages are preserved verbatim.");
     }
 
+    // D4.4 (kimi-code compactionHandoff): state how much was omitted so the
+    // model knows the middle of the conversation is gone, not merely distant.
+    // The figure is the heuristic estimate over the summarized region, so it
+    // is explicitly labeled as an estimate — the calibration fit lives in the
+    // conversation runtime and is not visible here.
+    if dropped_token_estimate > 0 {
+        base.push_str(&format!(
+            "\n\nRoughly {dropped_token_estimate} estimated tokens of older conversation were dropped here during compaction."
+        ));
+    }
+
     if suppress_follow_up_questions {
         base.push_str("\nContinue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, and do not preface with continuation text.");
     }
 
     base
+}
+
+/// Outcome of [`plan_compaction_cut`]: where the preserved tail starts and how
+/// many estimated tokens it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CutPlan {
+    pub keep_from: usize,
+    pub tail_tokens: usize,
+}
+
+/// Pure cut planner (D4.3, roadmap §4) — offline-testable with no session
+/// ownership. Count floor: the cut starts at `preserve_recent_messages` from
+/// the end. Token ceiling: while the tail outgrows `tail_budget_tokens`, the
+/// cut walks *forward* (summarizing more), swallowing an assistant `tool_use`
+/// together with its trailing results so the tail never opens on an orphan
+/// tool result. Finally the boundary walks backward over trailing tool
+/// results, which only ever keeps more messages than asked. The tail is never
+/// left empty; a single oversized message is kept and reported honestly via
+/// `tail_tokens` (the Phase 0 event makes the overflow observable).
+#[must_use]
+pub fn plan_compaction_cut(messages: &[ConversationMessage], config: &CompactionConfig) -> CutPlan {
+    let count = messages.len();
+    let mut keep_from = count.saturating_sub(config.preserve_recent_messages);
+
+    if config.tail_budget_tokens > 0 {
+        while keep_from < count
+            && estimate_tokens_from(&messages[keep_from..], 0, 0) > config.tail_budget_tokens
+        {
+            let next = keep_from + 1;
+            if next >= count {
+                break; // a single-message tail that still overflows: keep it
+            }
+            keep_from = next;
+            // Advancing past an assistant that advertised tool calls would
+            // strand its results at the tail head; swallow the results too.
+            while keep_from < count && messages[keep_from].role == MessageRole::Tool {
+                keep_from += 1;
+            }
+            if keep_from >= count {
+                keep_from = count - 1; // never return an empty tail
+                break;
+            }
+        }
+    }
+
+    while keep_from > 0 && messages[keep_from].role == MessageRole::Tool {
+        keep_from -= 1;
+    }
+    CutPlan {
+        keep_from,
+        tail_tokens: estimate_tokens_from(&messages[keep_from..], 0, 0),
+    }
 }
 
 /// Compact the session in place. Ownership over `session.messages` is taken
@@ -316,28 +634,43 @@ pub fn compact_session_in_place(
         };
     }
 
-    let mut keep_from = message_count.saturating_sub(config.preserve_recent_messages);
+    // Phase 0 observation: the raw estimate is re-scored here rather than
+    // trusted from the gate. Compaction is a rare O(n) path (one event per
+    // many turns), so the extra scan is free relative to the summary build,
+    // and it keeps `/compact` — which bypasses the gate entirely — observed.
+    let estimated_raw = estimate_session_tokens(session);
+
+    let naive_keep_from = message_count.saturating_sub(config.preserve_recent_messages);
     let mut messages = std::mem::take(&mut session.messages);
-    // Align the cut so the preserved tail never opens on an orphaned tool
-    // result: a `Tool` message answers a `tool_use` in the assistant message
-    // before it, and folding that assistant into the summary would leave the
-    // result with no matching call. Providers reject such a message outright
-    // (OpenAI 400 "role 'tool' must be a response to a preceding message with
-    // 'tool_calls'"), so walk the boundary back over any trailing tool results
-    // to pull their assistant into the preserved window. This only ever keeps
-    // more, never fewer, messages than `preserve_recent_messages` asked for.
-    while keep_from > 0 && messages[keep_from].role == MessageRole::Tool {
-        keep_from -= 1;
-    }
+    let plan = plan_compaction_cut(&messages, &config);
+    let keep_from = plan.keep_from;
     let preserved = messages.split_off(keep_from);
+    let tail_tokens = plan.tail_tokens;
 
     // A pinned message inside the would-be-summarized window is never folded
     // into the summary: it survives verbatim, placed after the continuation
     // header and before the recent tail. Only unpinned history is condensed.
+    //
+    // A pinned assistant that advertises `tool_use` drags its results along:
+    // the results immediately follow the ad, so if the ad survives and they
+    // were summarized, the rebuilt transcript would carry a dangling tool_use
+    // the provider rejects (Anthropic/OpenAI both 400 on an unanswered call).
+    // While tools keep coming after a pinned ad, each one is pinned too.
     let mut pinned = Vec::new();
     let mut to_summarize = Vec::new();
+    let mut pin_following = false;
     for message in messages {
-        if message.pinned {
+        let advertises = message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+        let pin_this = message.pinned || (pin_following && message.role == MessageRole::Tool);
+        pin_following = if message.role == MessageRole::Tool {
+            pin_this // keep pulling while further results trail the pinned ad
+        } else {
+            message.pinned && advertises
+        };
+        if pin_this {
             pinned.push(message);
         } else {
             to_summarize.push(message);
@@ -345,10 +678,15 @@ pub fn compact_session_in_place(
     }
 
     let summary = summarize_messages(&to_summarize);
+    // D4.4 omission declaration: the estimate covers the summarized region
+    // only — pinned survivors stay verbatim and are excluded.
+    let pinned_tokens = estimate_tokens_from(&pinned, 0, 0);
+    let dropped_token_estimate = estimated_raw.saturating_sub(tail_tokens + pinned_tokens);
     let continuation = get_compact_continuation_message(
         &summary,
         true,
         !preserved.is_empty() || !pinned.is_empty(),
+        dropped_token_estimate,
     );
 
     let mut compacted_messages = vec![ConversationMessage {
@@ -363,9 +701,52 @@ pub fn compact_session_in_place(
 
     // Only messages actually folded into the summary count as removed;
     // pinned survivors stay in the transcript.
-    CompactionResult {
+    let result = CompactionResult {
         summary,
         removed_message_count: to_summarize.len(),
+    };
+
+    record_compact_event(&compact_event_for(
+        estimated_raw,
+        config,
+        naive_keep_from,
+        keep_from,
+        tail_tokens,
+        result.removed_message_count,
+    ));
+
+    result
+}
+
+/// Build the observation event for one compaction from values captured
+/// before the transcript was rebuilt (the session is owned and mutated by
+/// then, so nothing can be re-derived at the call site). Split out of
+/// `compact_session_in_place` so every field is unit-testable without a
+/// tracing capture. `estimated_calibrated` mirrors the raw figure because
+/// the calibration fit lives in the conversation runtime and this free
+/// function cannot see it — the raw-vs-calibrated comparison stays on the
+/// gate side, so the two figures are never conflated.
+#[must_use]
+fn compact_event_for(
+    estimated_raw: usize,
+    config: CompactionConfig,
+    naive_keep_from: usize,
+    keep_from: usize,
+    tail_tokens: usize,
+    removed: usize,
+) -> CompactEvent {
+    CompactEvent {
+        trigger: if config.context_window_tokens > 0 {
+            ThresholdKind::ContextWindowHalf
+        } else {
+            ThresholdKind::AbsoluteMax
+        },
+        estimated_raw,
+        estimated_calibrated: estimated_raw,
+        window: config.context_window_tokens,
+        removed,
+        walkback_extra: naive_keep_from.saturating_sub(keep_from),
+        tail_tokens,
     }
 }
 
@@ -533,8 +914,11 @@ fn collapse_blank_lines(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_session_in_place, estimate_session_tokens, estimate_text_tokens,
-        format_compact_summary, should_compact, CompactionConfig, TokenCalibration,
+        compact_event_for, compact_session_in_place, compaction_stats, estimate_session_tokens,
+        estimate_text_tokens, format_compact_summary, get_compact_continuation_message,
+        plan_compaction_cut, read_stats_file, record_compact_event, record_repair_drops,
+        set_compact_stats_path, should_compact, should_compact_with_estimate, CompactEvent,
+        CompactionConfig, SoftTrigger, ThresholdKind, TokenCalibration,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
@@ -642,6 +1026,7 @@ mod tests {
             max_estimated_tokens: raw + 1_000,
             context_window_tokens: 0,
             replay_verbatim_tail: 12,
+            ..CompactionConfig::default()
         };
         assert!(!should_compact(&session, config));
 
@@ -767,6 +1152,184 @@ mod tests {
             &session.messages[1].blocks[0],
             ContentBlock::ToolUse { id, .. } if id == "call_1"
         ));
+    }
+
+    #[test]
+    fn soft_trigger_default_reproduces_the_half_window_gate() {
+        // Rollback spec: the default `SoftTrigger::HalfWindow` must be
+        // byte-equivalent to the pre-D4.1 `estimated >= window / 2` check.
+        let config = CompactionConfig {
+            preserve_recent_messages: 4,
+            context_window_tokens: 1_000,
+            ..CompactionConfig::default()
+        };
+        assert!(!should_compact_with_estimate(10, 499, config));
+        assert!(should_compact_with_estimate(10, 500, config));
+    }
+
+    #[test]
+    fn soft_trigger_ds4_fires_late_by_percent_or_free_floor() {
+        // 32k window: free floor = min(8192, 8_000) = 8_000, so the floor
+        // branch fires at remaining <= 8_000 (estimated >= 24_000) — before
+        // the 85% line at 27_200. Both branches are exercised in binding
+        // order.
+        let config = CompactionConfig {
+            preserve_recent_messages: 4,
+            context_window_tokens: 32_000,
+            soft_trigger: SoftTrigger::Ds4,
+            ..CompactionConfig::default()
+        };
+        assert!(!should_compact_with_estimate(10, 23_999, config));
+        assert!(should_compact_with_estimate(10, 24_000, config));
+        assert!(should_compact_with_estimate(10, 27_200, config));
+    }
+
+    #[test]
+    fn soft_trigger_ds4_caps_the_free_floor_for_small_contexts() {
+        // ds4's motivation: a tiny test window must not compact after every
+        // short turn. window = 2_000 caps the 8192 floor at window/4 = 500,
+        // so the floor branch fires only at estimated >= 1_500.
+        let config = CompactionConfig {
+            preserve_recent_messages: 1,
+            context_window_tokens: 2_000,
+            soft_trigger: SoftTrigger::Ds4,
+            ..CompactionConfig::default()
+        };
+        assert!(!should_compact_with_estimate(10, 1_200, config));
+        assert!(should_compact_with_estimate(10, 1_500, config));
+    }
+
+    #[test]
+    fn tail_budget_walks_the_cut_forward_without_orphaning_results() {
+        // preserve=4 naively keeps [assistant(tool_use), huge result, u4, u5],
+        // whose tail alone outgrows the budget. The cut must walk forward,
+        // swallowing the ad+result pair whole, and end on a non-Tool head.
+        let big_result = "y".repeat(40_000);
+        let messages = vec![
+            ConversationMessage::user_text("early filler ".repeat(40)),
+            ConversationMessage::user_text("filler two ".repeat(40)),
+            ConversationMessage::user_text("filler three ".repeat(40)),
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "call_big".to_string(),
+                name: "bash".to_string(),
+                input: "{}".to_string(),
+            }]),
+            ConversationMessage::tool_result("call_big", "bash", &big_result, false),
+            ConversationMessage::user_text("recent one ".repeat(40)),
+            ConversationMessage::user_text("recent two ".repeat(40)),
+        ];
+        let config = CompactionConfig {
+            preserve_recent_messages: 4,
+            tail_budget_tokens: 2_000,
+            ..CompactionConfig::default()
+        };
+
+        let plan = plan_compaction_cut(&messages, &config);
+
+        // The oversized pair is summarized together; the tail is the two
+        // recent user messages and opens on a User message, not a Tool.
+        assert_eq!(plan.keep_from, 5);
+        assert!(plan.tail_tokens <= 2_000);
+        assert_eq!(messages[plan.keep_from].role, MessageRole::User);
+
+        // Parity: without a budget the cut is the pure count cut (D4.3
+        // rollback default), keeping the oversized pair verbatim.
+        let plan_without = plan_compaction_cut(
+            &messages,
+            &CompactionConfig {
+                preserve_recent_messages: 4,
+                ..CompactionConfig::default()
+            },
+        );
+        assert_eq!(plan_without.keep_from, 3);
+    }
+
+    #[test]
+    fn tail_budget_never_yields_an_empty_or_orphaned_tail() {
+        // A single oversized ad+result pair that cannot fit any budget: the
+        // plan keeps it (never an empty tail), and the backward alignment
+        // keeps the pair together instead of opening on the orphan result.
+        let messages = vec![
+            ConversationMessage::user_text("old context ".repeat(40)),
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "call_huge".to_string(),
+                name: "bash".to_string(),
+                input: "{}".to_string(),
+            }]),
+            ConversationMessage::tool_result("call_huge", "bash", "y".repeat(40_000), false),
+        ];
+        let plan = plan_compaction_cut(
+            &messages,
+            &CompactionConfig {
+                preserve_recent_messages: 1,
+                tail_budget_tokens: 100,
+                ..CompactionConfig::default()
+            },
+        );
+        assert_eq!(plan.keep_from, 1, "the pair is kept whole");
+        assert!(plan.tail_tokens > 100, "overflow is reported honestly");
+        assert_ne!(messages[plan.keep_from].role, MessageRole::Tool);
+    }
+
+    #[test]
+    fn continuation_message_declares_omitted_tokens() {
+        let without = get_compact_continuation_message("summary body", true, true, 0);
+        assert!(!without.contains("estimated tokens"));
+
+        let with = get_compact_continuation_message("summary body", true, true, 1_234);
+        assert!(with.contains("Roughly 1234 estimated tokens of older conversation"));
+        assert!(with.contains("preserved verbatim"));
+    }
+
+    #[test]
+    fn pinned_assistant_keeps_its_tool_results_verbatim() {
+        // /pin can land on an assistant tool_use message. If its result fell
+        // into the summarized region, the surviving ad would dangle on the
+        // wire (provider 400), so compaction must pull the results along.
+        let mut session = Session {
+            version: 1,
+            messages: vec![
+                ConversationMessage::user_text("old context ".repeat(80)),
+                ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                    id: "call_pinned".to_string(),
+                    name: "bash".to_string(),
+                    input: "{}".to_string(),
+                }])
+                .with_pinned(true),
+                ConversationMessage::tool_result("call_pinned", "bash", "ok", false),
+                ConversationMessage::user_text("recent filler ".repeat(80)),
+                ConversationMessage::user_text("newest".to_string()),
+            ],
+        };
+
+        let result = compact_session_in_place(
+            &mut session,
+            CompactionConfig {
+                preserve_recent_messages: 1,
+                max_estimated_tokens: 1,
+                ..CompactionConfig::default()
+            },
+        );
+
+        // The pinned ad and its result both survive verbatim and adjacent;
+        // only the old user context and the recent filler are summarized.
+        let surviving_tool_use = session.messages.iter().any(|m| {
+            m.role == MessageRole::Assistant
+                && m.blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolUse { id, .. } if id == "call_pinned"))
+        });
+        let surviving_result = session.messages.iter().any(|m| {
+            m.role == MessageRole::Tool
+                && m.blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_pinned"))
+        });
+        assert!(
+            surviving_tool_use && surviving_result,
+            "pair survives together"
+        );
+        assert_eq!(result.removed_message_count, 2);
     }
 
     #[test]
@@ -919,5 +1482,134 @@ mod tests {
         assert_eq!(estimate_text_tokens(&"a".repeat(100)), 25);
         // Mixed text adds both contributions.
         assert_eq!(estimate_text_tokens("abcd字"), 1 + 1);
+    }
+
+    // --- Phase 0 instrumentation (roadmap §4 compaction 改造规格) ---
+
+    #[test]
+    fn compact_event_fields_mirror_the_execution() {
+        let window_config = CompactionConfig {
+            context_window_tokens: 200_000,
+            ..CompactionConfig::default()
+        };
+        let event = compact_event_for(9_000, window_config, 6, 5, 1_200, 3);
+        assert_eq!(event.trigger, ThresholdKind::ContextWindowHalf);
+        assert_eq!(event.window, 200_000);
+        assert_eq!(event.estimated_raw, 9_000);
+        // Execution-side events carry no calibration fit: the two figures are
+        // identical by construction, never a silent guess.
+        assert_eq!(event.estimated_calibrated, 9_000);
+        assert_eq!(event.walkback_extra, 1);
+        assert_eq!(event.tail_tokens, 1_200);
+        assert_eq!(event.removed, 3);
+
+        // Window unset: the absolute-threshold gate is what fired.
+        let absolute = compact_event_for(500, CompactionConfig::default(), 4, 4, 80, 1);
+        assert_eq!(absolute.trigger, ThresholdKind::AbsoluteMax);
+        assert_eq!(absolute.window, 0);
+        assert_eq!(absolute.walkback_extra, 0, "no boundary walkback");
+    }
+
+    #[test]
+    fn compaction_counters_track_events_by_trigger() {
+        // Process-global counters are shared across tests, so assert deltas
+        // (other tests only ever add).
+        let before = compaction_stats();
+        record_compact_event(&CompactEvent {
+            trigger: ThresholdKind::ContextWindowHalf,
+            estimated_raw: 1,
+            estimated_calibrated: 1,
+            window: 10,
+            removed: 2,
+            walkback_extra: 0,
+            tail_tokens: 3,
+        });
+        record_compact_event(&CompactEvent {
+            trigger: ThresholdKind::AbsoluteMax,
+            estimated_raw: 1,
+            estimated_calibrated: 1,
+            window: 0,
+            removed: 1,
+            walkback_extra: 0,
+            tail_tokens: 3,
+        });
+        let after = compaction_stats();
+        assert!(after.count >= before.count + 2);
+        assert!(after.window_half > before.window_half);
+        assert!(after.absolute > before.absolute);
+        assert!(after.removed_total >= before.removed_total + 3);
+    }
+
+    #[test]
+    fn stats_file_roundtrips_and_tolerates_corruption() {
+        let path =
+            std::env::temp_dir().join(format!("hf-compact-stats-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        set_compact_stats_path(path.clone());
+
+        let before = compaction_stats();
+        record_compact_event(&CompactEvent {
+            trigger: ThresholdKind::ContextWindowHalf,
+            estimated_raw: 10,
+            estimated_calibrated: 10,
+            window: 20,
+            removed: 5,
+            walkback_extra: 1,
+            tail_tokens: 30,
+        });
+        // The durable file holds the merged totals, so the observed event is
+        // visible to another process (e.g. `hf doctor`).
+        let on_disk = read_stats_file(&path).expect("stats file written");
+        assert!(on_disk.count >= 1);
+        assert!(on_disk.removed_total >= 5);
+        assert!(compaction_stats().count > before.count);
+
+        // A torn or hand-mangled file degrades to "no history" — never an
+        // error, never a panic.
+        std::fs::write(&path, "{not json").expect("write corrupt file");
+        assert_eq!(read_stats_file(&path), None);
+        let _ = compaction_stats();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn repair_drops_are_counted() {
+        let before = compaction_stats();
+        record_repair_drops(&["call_orphan".to_string(), "call_orphan_2".to_string()]);
+        let after = compaction_stats();
+        assert!(after.repair_dropped >= before.repair_dropped + 2);
+        // Empty input is a no-op, not a zero-drop event.
+        record_repair_drops(&[]);
+        assert_eq!(compaction_stats().repair_dropped, after.repair_dropped);
+    }
+
+    #[test]
+    fn real_compaction_feeds_the_counters() {
+        // End-to-end through the public entry point: a session past the
+        // threshold, compacted, moves the window-half counter.
+        let mut session = Session {
+            version: 1,
+            messages: vec![
+                ConversationMessage::user_text("old context ".repeat(200)),
+                ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "older reply ".repeat(200),
+                }]),
+                ConversationMessage::user_text("recent".to_string()),
+            ],
+        };
+        let before = compaction_stats();
+        let result = compact_session_in_place(
+            &mut session,
+            CompactionConfig {
+                preserve_recent_messages: 1,
+                max_estimated_tokens: 1,
+                ..CompactionConfig::default()
+            },
+        );
+        assert!(result.removed_message_count >= 1);
+        let after = compaction_stats();
+        assert!(after.count > before.count);
+        assert!(after.removed_total >= before.removed_total + result.removed_message_count as u64);
+        assert!(estimate_session_tokens(&session) > 0);
     }
 }

@@ -216,7 +216,6 @@ impl TerminalRenderer {
 #[cfg(test)]
 mod tests {
     use super::{Spinner, TerminalRenderer};
-    use unicode_width::UnicodeWidthStr;
 
     fn strip_ansi(input: &str) -> String {
         let mut output = String::new();
@@ -309,7 +308,7 @@ mod tests {
         let grid_lines: Vec<usize> = plain
             .lines()
             .filter(|line| line.contains('│') || line.contains('─'))
-            .map(|line| line.width())
+            .map(unicode_width::UnicodeWidthStr::width)
             .collect();
         assert!(
             grid_lines.windows(2).all(|w| w[0] == w[1]),

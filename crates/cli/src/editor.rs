@@ -857,13 +857,10 @@ impl ReplEditor {
                                 .search_prefix_backward(&prefix, self.history.len())
                         }
                     };
-                    match next_idx {
-                        Some(idx) => {
-                            *prefix_search = Some((prefix, idx));
-                        }
-                        None => {
-                            // No match — keep existing state if any, noop.
-                        }
+                    if let Some(idx) = next_idx {
+                        *prefix_search = Some((prefix, idx));
+                    } else {
+                        // No match — keep existing state if any, noop.
                     }
                     false
                 }
@@ -979,10 +976,8 @@ impl ReplEditor {
                                 if let Some(suffix) = entry.strip_prefix(prefix.as_str()) {
                                     // Only accept up to end of the first line of
                                     // the match (input is single-line here).
-                                    let first_line_suffix = suffix
-                                        .split_once('\n')
-                                        .map(|(first, _)| first)
-                                        .unwrap_or(suffix);
+                                    let first_line_suffix =
+                                        suffix.split_once('\n').map_or(suffix, |(first, _)| first);
                                     textarea.insert_str(first_line_suffix);
                                     true
                                 } else {
@@ -1357,7 +1352,7 @@ fn blank_textarea() -> TextArea<'static> {
 
 /// Character classification for subword-aware word motion. The categories are
 /// deliberately coarse — enough to distinguish code identifiers (camelCase,
-/// snake_case, kebab-case, digit transitions) from punctuation and whitespace,
+/// `snake_case`, kebab-case, digit transitions) from punctuation and whitespace,
 /// plus a CJK bucket that advances two ideographs at a time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CharClass {
@@ -1408,10 +1403,10 @@ fn is_cjk_ideograph(c: char) -> bool {
 ///
 /// Subword boundaries match what code editors do:
 ///   camelCaseWord → camel|Case|Word
-///   snake_case    → snake|_|case
+///   `snake_case`    → snake|_|case
 ///   kebab-case    → kebab|-|case
 ///   foo123bar     → foo|123|bar
-///   HTTPRequest   → HTTP|Request
+///   `HTTPRequest`   → HTTP|Request
 ///   CJK ideographs → 2 chars per jump
 ///   whitespace    → one jump per contiguous run
 ///   punctuation   → one jump per contiguous run

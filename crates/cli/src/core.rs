@@ -8,16 +8,24 @@ use std::fmt::Write as _;
 
 use runtime::{ContentBlock, ConversationMessage, MessageRole};
 
-/// FIFO of user messages submitted while a turn is running.
+/// FIFO of messages waiting to become the next turn. Roadmap §1 P-A: the old
+/// string FIFO became an *entry* queue — every item carries an id, a source
+/// and a lifecycle state, which is what per-item delivery (P-B), the queue
+/// editing surface and subagent-result absorption all need.
 ///
 /// Semantics locked with the operator (Claude Code queue model): a queued
-/// message never interrupts the running turn; once the turn finishes, the
-/// whole queue is merged into *one* user message injected in arrival order.
+/// message never interrupts the running turn; once the turn finishes, entries
+/// are delivered one at a time in arrival order (pi steering per-item model,
+/// D2.2) — the old whole-queue merge survives as an opt-in (`set_merged`)
+/// because it is a context-size optimization, not a semantic.
 /// Queued items are deliberately kept out of the command history so they can
 /// never reappear there while still pending.
 #[derive(Debug)]
 pub struct FollowUpQueue {
-    items: VecDeque<String>,
+    pending: VecDeque<QueueEntry>,
+    recent: VecDeque<QueueEntry>,
+    next_id: u64,
+    merged: bool,
     limit: usize,
 }
 
@@ -25,10 +33,68 @@ pub struct FollowUpQueue {
 /// the queue refuses instead of growing without bounds.
 pub const DEFAULT_QUEUE_LIMIT: usize = 32;
 
+/// Terminal-state ledger cap (pi steering keeps a recent-20 window; anything
+/// older drops off so `/queue` cannot grow forever).
+pub const RECENT_LEDGER_CAP: usize = 20;
+
+/// Where a queued entry came from. `Mission` lands with the roadmap §1
+/// mission ledger; `Subagent` entries are worker results absorbed by the
+/// supervisor loop (the "监工收到消息才工作" wake path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueSource {
+    User,
+    Guide,
+    Subagent,
+}
+
+impl QueueSource {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            QueueSource::User => "user",
+            QueueSource::Guide => "guide",
+            QueueSource::Subagent => "subagent",
+        }
+    }
+}
+
+/// Lifecycle of one entry. Every id ends in exactly one terminal state in the
+/// `recent` ledger (the "条目不丢" invariant the tests pin).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueEntryState {
+    Pending,
+    Delivered,
+    Withdrawn,
+    Failed,
+}
+
+impl QueueEntryState {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            QueueEntryState::Pending => "pending",
+            QueueEntryState::Delivered => "delivered",
+            QueueEntryState::Withdrawn => "withdrawn",
+            QueueEntryState::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueEntry {
+    pub id: u64,
+    pub text: String,
+    pub source: QueueSource,
+    pub state: QueueEntryState,
+}
+
 impl Default for FollowUpQueue {
     fn default() -> Self {
         Self {
-            items: VecDeque::new(),
+            pending: VecDeque::new(),
+            recent: VecDeque::new(),
+            next_id: 1,
+            merged: false,
             limit: DEFAULT_QUEUE_LIMIT,
         }
     }
@@ -44,53 +110,177 @@ impl FollowUpQueue {
     #[must_use]
     pub fn with_limit(limit: usize) -> Self {
         Self {
-            items: VecDeque::new(),
+            pending: VecDeque::new(),
+            recent: VecDeque::new(),
+            next_id: 1,
+            merged: false,
             limit: limit.max(1),
         }
     }
 
-    /// Enqueue one message. Empty lines are rejected; returns `false` when the
-    /// queue is full so the caller can tell the user instead of dropping.
+    /// Enqueue one message (compat shim over [`Self::send`], TUI path).
+    /// Empty lines are rejected; returns `false` when the queue is full so
+    /// the caller can tell the user instead of dropping.
     pub fn push(&mut self, text: &str) -> bool {
+        self.send(text, QueueSource::User).is_some()
+    }
+
+    /// Queue one entry explicitly; returns its id, or `None` when the text is
+    /// blank or the pending queue is full. This is the manual "排队" path
+    /// (`/queue send`) and the subagent absorption path.
+    pub fn send(&mut self, text: &str, source: QueueSource) -> Option<u64> {
         let text = text.trim();
-        if text.is_empty() || self.items.len() >= self.limit {
-            return false;
+        if text.is_empty() || self.pending.len() >= self.limit {
+            return None;
         }
-        self.items.push_back(text.to_string());
-        true
+        let id = self.next_id;
+        self.next_id += 1;
+        self.pending.push_back(QueueEntry {
+            id,
+            text: text.to_string(),
+            source,
+            state: QueueEntryState::Pending,
+        });
+        Some(id)
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.items.len()
+        self.pending.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.pending.is_empty()
     }
 
-    /// Pending messages in arrival order, for the status listing.
+    /// Pending entries in arrival order, for the status listing.
     #[must_use]
-    pub fn items(&self) -> &VecDeque<String> {
-        &self.items
+    pub fn items(&self) -> &VecDeque<QueueEntry> {
+        &self.pending
+    }
+
+    /// Terminal-state ledger, newest first, bounded.
+    #[must_use]
+    pub fn recent(&self) -> &VecDeque<QueueEntry> {
+        &self.recent
+    }
+
+    #[must_use]
+    pub fn is_merged(&self) -> bool {
+        self.merged
+    }
+
+    /// Opt-in whole-queue merge at the delivery point (D2.2: merge is a
+    /// context optimization, not the default semantic).
+    pub fn set_merged(&mut self, merged: bool) {
+        self.merged = merged;
+    }
+
+    /// Take the oldest pending entry out for delivery. The caller either
+    /// finishes it with [`Self::finish_entry`] or hands it back with
+    /// [`Self::requeue_front`] — between the two, no entry can be lost.
+    pub fn take_next(&mut self) -> Option<QueueEntry> {
+        self.pending.pop_front()
+    }
+
+    /// Mark a taken entry delivered (or failed) and file it in the ledger.
+    pub fn finish_entry(&mut self, mut entry: QueueEntry, state: QueueEntryState) {
+        entry.state = state;
+        self.file_recent(entry);
+    }
+
+    /// Put a taken entry back at the head (delivery failed; per-item retry
+    /// instead of the old whole-queue re-queue).
+    pub fn requeue_front(&mut self, entry: QueueEntry) {
+        if self.pending.len() >= self.limit {
+            self.file_recent(QueueEntry {
+                state: QueueEntryState::Failed,
+                ..entry
+            });
+            return;
+        }
+        self.pending.push_front(entry);
+    }
+
+    /// Replace the text of a pending entry (queue editing, D2.4).
+    pub fn edit(&mut self, id: u64, new_text: &str) -> bool {
+        let new_text = new_text.trim();
+        if new_text.is_empty() {
+            return false;
+        }
+        for entry in &mut self.pending {
+            if entry.id == id {
+                entry.text = new_text.to_string();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Withdraw any pending entry (supersedes `cancel_last`'s last-only
+    /// reach); returns the text so the caller can restore it to the input.
+    pub fn withdraw(&mut self, id: u64) -> Option<String> {
+        let position = self.pending.iter().position(|entry| entry.id == id)?;
+        let mut entry = self.pending.remove(position)?;
+        entry.state = QueueEntryState::Withdrawn;
+        let text = entry.text.clone();
+        self.file_recent(entry);
+        Some(text)
+    }
+
+    /// Move a pending entry one slot up (towards earlier delivery) or down.
+    pub fn move_entry(&mut self, id: u64, up: bool) -> bool {
+        let Some(position) = self.pending.iter().position(|entry| entry.id == id) else {
+            return false;
+        };
+        let target = if up {
+            match position.checked_sub(1) {
+                Some(target) => target,
+                None => return false,
+            }
+        } else {
+            let next = position + 1;
+            if next >= self.pending.len() {
+                return false;
+            }
+            next
+        };
+        self.pending.swap(position, target);
+        true
     }
 
     /// Withdraw the most recently queued message (Esc-on-queued semantics);
     /// returns it so the caller can restore it into the input buffer.
     pub fn cancel_last(&mut self) -> Option<String> {
-        self.items.pop_back()
+        let last = self.pending.back().map(|entry| entry.id)?;
+        self.withdraw(last)
     }
 
-    /// Drain every pending message into one injected user message, oldest
-    /// first, leaving the queue empty. Returns `None` when nothing is queued.
+    /// Drain every pending entry into one injected user message, oldest
+    /// first, leaving the queue empty (compat: TUI turn boundary + merged
+    /// mode). Delivered entries land in the ledger.
     pub fn drain_injection(&mut self) -> Option<String> {
-        if self.items.is_empty() {
+        if self.pending.is_empty() {
             return None;
         }
-        let merged = merge_injection(&self.items.iter().map(String::as_str).collect::<Vec<_>>());
-        self.items.clear();
+        let merged = merge_injection(
+            &self
+                .pending
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+        );
+        for mut entry in std::mem::take(&mut self.pending) {
+            entry.state = QueueEntryState::Delivered;
+            self.file_recent(entry);
+        }
         Some(merged)
+    }
+
+    fn file_recent(&mut self, entry: QueueEntry) {
+        self.recent.push_front(entry);
+        self.recent.truncate(RECENT_LEDGER_CAP);
     }
 }
 
@@ -276,7 +466,7 @@ pub fn guide_draft(context: &GuideContext, task: &str) -> String {
 mod tests {
     use super::{
         build_guide, guide_context, guide_draft, FollowUpQueue, GuideContext, GuideSections,
-        HeartModel,
+        HeartModel, QueueEntryState, QueueSource,
     };
 
     #[test]
@@ -304,6 +494,87 @@ mod tests {
         assert!(!q.push("c"), "third must be refused at the cap");
         assert_eq!(q.cancel_last().as_deref(), Some("b"));
         assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn per_item_delivery_every_id_reaches_a_terminal_state() {
+        let mut q = FollowUpQueue::with_limit(4);
+        let a = q.send("a", QueueSource::User).expect("a");
+        let b = q.send("b", QueueSource::Guide).expect("b");
+        assert_ne!(a, b, "ids are unique");
+
+        // Take a, deliver it; take b, fail it back, then deliver on retry.
+        let taken = q.take_next().expect("first take");
+        assert_eq!(taken.id, a, "oldest first");
+        q.finish_entry(taken, QueueEntryState::Delivered);
+        let taken = q.take_next().expect("second take");
+        assert_eq!(taken.id, b);
+        q.requeue_front(taken);
+        assert_eq!(q.len(), 1, "failed entry returns to pending");
+        let taken = q.take_next().expect("third take");
+        q.finish_entry(taken, QueueEntryState::Delivered);
+
+        // 条目不丢 + 递送必终态化: every id lives in recent with a terminal
+        // state, nothing remains pending.
+        assert!(q.is_empty());
+        let recent_ids: std::collections::HashSet<u64> =
+            q.recent().iter().map(|entry| entry.id).collect();
+        assert!(recent_ids.contains(&a) && recent_ids.contains(&b));
+        assert!(q
+            .recent()
+            .iter()
+            .all(|entry| entry.state != QueueEntryState::Pending));
+        // Newest-first ledger ordering.
+        assert_eq!(q.recent().front().map(|entry| entry.id), Some(b));
+    }
+
+    #[test]
+    fn queue_edit_withdraw_and_reorder_target_any_entry() {
+        let mut q = FollowUpQueue::with_limit(4);
+        let a = q.send("alpha", QueueSource::User).expect("a");
+        let b = q.send("beta", QueueSource::User).expect("b");
+        let c = q.send("gamma", QueueSource::User).expect("c");
+
+        assert!(q.edit(b, "beta v2"), "edit any pending entry");
+        assert!(q
+            .items()
+            .iter()
+            .any(|entry| entry.id == b && entry.text == "beta v2"));
+        assert!(!q.edit(999, "nope"), "unknown id refuses");
+        assert!(!q.edit(c, "   "), "blank replacement refuses");
+
+        // move b up: order becomes b, a, c.
+        assert!(q.move_entry(b, true));
+        let order: Vec<u64> = q.items().iter().map(|entry| entry.id).collect();
+        assert_eq!(order, vec![b, a, c]);
+        assert!(!q.move_entry(b, true), "head cannot move up");
+        assert!(q.move_entry(b, false));
+
+        // Withdraw the middle entry by id (not just the last).
+        assert_eq!(q.withdraw(a).as_deref(), Some("alpha"));
+        assert_eq!(q.len(), 2);
+        assert!(
+            q.recent()
+                .iter()
+                .any(|entry| entry.id == a && entry.state == QueueEntryState::Withdrawn),
+            "withdraw files the terminal state"
+        );
+    }
+
+    #[test]
+    fn requeue_front_at_capacity_files_failed_not_lost() {
+        let mut q = FollowUpQueue::with_limit(1);
+        let a = q.send("a", QueueSource::User).expect("a");
+        let taken = q.take_next().expect("take");
+        assert_eq!(taken.id, a);
+        let _b = q.send("b", QueueSource::User).expect("b fills the slot");
+        // Re-delivery of `a` fails while the queue is full: it must land in
+        // the ledger as Failed, never silently vanish.
+        q.requeue_front(taken);
+        assert!(q
+            .recent()
+            .iter()
+            .any(|entry| entry.id == a && entry.state == QueueEntryState::Failed));
     }
 
     #[test]

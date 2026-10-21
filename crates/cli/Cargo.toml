@@ -34,6 +34,7 @@ mimalloc = "0.1"
 os_info = "3"
 pulldown-cmark = "0.13"
 provider = { workspace = true }
+proxy = { workspace = true }
 # `unstable-rendered-line-info` exposes `Paragraph::line_count`, which runs the
 # *same* WordWrapper the renderer uses. Measuring wrapped row heights with the
 # renderer's own composer keeps the transcript's scroll math exact against what

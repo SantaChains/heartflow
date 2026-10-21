@@ -252,6 +252,28 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
             env::current_dir().map_or_else(|_| path.clone(), |cwd| cwd.join(&path))
         }
     }));
+    // Resolve the transport proxy once, before any client is built: config
+    // `[proxy]` > `HEARTFLOW_PROXY*` > `HTTPS_PROXY`/`ALL_PROXY`/`HTTP_PROXY` >
+    // Windows system proxy > direct, with a one-shot liveness probe so a dead
+    // proxy degrades to direct instead of burning a connect timeout per
+    // request. Every transport reads the process-global resolution.
+    let home = home_dir();
+    let cwd = env::current_dir().unwrap_or_default();
+    proxy::init_global(
+        provider::config::load_merged_settings(&cwd, &home)
+            .proxy
+            .as_ref(),
+    );
+    // Phase 0 compaction observation: durable counters next to the sessions
+    // directory so `hf doctor` (a separate process) can report what the
+    // conversation processes recorded. Without this the events stay visible
+    // through tracing only.
+    runtime::set_compact_stats_path(sessions_dir().join("compaction-stats.json"));
+    // §6 checkpoints: a private shadow git repo per project under the config
+    // root; write-class tools snapshot into it before mutating anything, and
+    // `/restore` brings tracked files back. Tests and library consumers keep
+    // checkpointing off by default.
+    runtime::set_checkpoint_root(Some(home.join(".heartflow").join("checkpoints")));
     // One conversation's mutable state (persistence, mirror, folded-output
     // stash); instance-scoped so a future parallel section owns its own.
     let state = new_session_state();
@@ -266,35 +288,33 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         } => {
             // Bare `-r`/`--resume` restores the most recent session; `list_sessions`
             // is mtime-descending, so its head is the last one touched.
-            match session_path.or_else(|| list_sessions().into_iter().next()) {
-                Some(session_path) => {
-                    if let Some(command) = command {
-                        // One-shot slash command run against the saved session, then exit.
-                        resume_session(&session_path, &command);
-                        return Ok(false);
-                    }
-                    // No --run: reopen the interactive REPL with the conversation restored.
-                    let session = load_saved_session(&session_path)
-                        .map_err(|error| format!("failed to restore session: {error}"))?;
-                    // Continue this transcript in place: adopt its id so later
-                    // turns overwrite the same file and update the same row.
-                    adopt_session_path(&state, &session_path);
-                    let selection = resolve_selection(provider.as_deref(), model.as_deref())?;
-                    println!(
-                        "Restored session from {} ({} messages).",
-                        session_path.display(),
-                        session.messages.len()
-                    );
-                    restart = run_repl(&state, selection, session).await?;
+            if let Some(session_path) = session_path.or_else(|| list_sessions().into_iter().next())
+            {
+                if let Some(command) = command {
+                    // One-shot slash command run against the saved session, then exit.
+                    resume_session(&session_path, &command);
+                    return Ok(false);
                 }
-                None => {
-                    if command.is_some() {
-                        return Err("no saved session to run --run against".to_string().into());
-                    }
-                    eprintln!("no saved session to resume; starting a fresh REPL");
-                    let selection = resolve_selection(provider.as_deref(), model.as_deref())?;
-                    restart = run_repl(&state, selection, Session::new()).await?;
+                // No --run: reopen the interactive REPL with the conversation restored.
+                let session = load_saved_session(&session_path)
+                    .map_err(|error| format!("failed to restore session: {error}"))?;
+                // Continue this transcript in place: adopt its id so later
+                // turns overwrite the same file and update the same row.
+                adopt_session_path(&state, &session_path);
+                let selection = resolve_selection(provider.as_deref(), model.as_deref())?;
+                println!(
+                    "Restored session from {} ({} messages).",
+                    session_path.display(),
+                    session.messages.len()
+                );
+                restart = run_repl(&state, selection, session).await?;
+            } else {
+                if command.is_some() {
+                    return Err("no saved session to run --run against".to_string().into());
                 }
+                eprintln!("no saved session to resume; starting a fresh REPL");
+                let selection = resolve_selection(provider.as_deref(), model.as_deref())?;
+                restart = run_repl(&state, selection, Session::new()).await?;
             }
         }
         Action::Prompt {
@@ -802,6 +822,38 @@ async fn run_repl(
     // empty until P4-c wires keyboard polling; the injection point below is
     // already the final one.
     let mut model = HeartModel::new();
+    // §1 subagent jobs: the supervisor (this REPL session) owns a registry of
+    // context-isolated worker jobs. Slots/pending caps come from env with the
+    // roadmap defaults; job records persist under sessions/jobs and any
+    // record still marked queued/running from a dead process is reconciled
+    // to Stopped on startup (a dead process is not live work).
+    let job_slots = env::var("HEARTFLOW_JOB_SLOTS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(runtime::DEFAULT_JOB_SLOTS);
+    let job_max_pending = env::var("HEARTFLOW_JOB_MAX_PENDING")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(runtime::DEFAULT_MAX_PENDING);
+    // Wall-clock cap on a running worker: a hung job must reach a terminal
+    // state, not hold a slot forever. `0` disables; the default (30 min)
+    // matches the research-batch launch-time cap discipline.
+    let job_wall_timeout = env::var("HEARTFLOW_JOB_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map_or(
+            Some(runtime::DEFAULT_JOB_WALL_TIMEOUT),
+            |secs| if secs == 0 { None } else { Some(std::time::Duration::from_secs(secs)) },
+        );
+    runtime::set_jobs_root(Some(sessions_dir().join("jobs")));
+    let stale_repaired = runtime::reconcile_stale_records();
+    let jobs = runtime::JobRegistry::with_wall_timeout(job_slots, job_max_pending, job_wall_timeout);
+    let runtime_handle = tokio::runtime::Handle::current();
+    if stale_repaired > 0 {
+        println!("jobs: {stale_repaired} stale record(s) from a previous process marked stopped");
+    }
     // `/restart` confirmation unwinds the loop and reports upward so `main`
     // re-execs a fresh process; a plain quit leaves this false.
     let mut restart = false;
@@ -809,6 +861,33 @@ async fn run_repl(
     print_repl_preamble();
 
     loop {
+        // Supervisor wake discipline (pi reason 三分法): worker Progress
+        // messages never wake a turn (they live in /jobs log); a Result or a
+        // NeedDecision lands in the queue as the next supervisor turn.
+        for message in jobs.poll() {
+            match message.kind {
+                runtime::MessageKind::Result | runtime::MessageKind::NeedDecision => {
+                    let text = format!(
+                        "[subagent job #{} {}]\n{}",
+                        message.job_id,
+                        if message.kind == runtime::MessageKind::Result {
+                            "result"
+                        } else {
+                            "needs decision"
+                        },
+                        message.text
+                    );
+                    match model.queue_mut().send(&text, core::QueueSource::Subagent) {
+                        Some(id) => println!("job #{} finished; queued as queue entry #{id}", message.job_id),
+                        None => println!(
+                            "job #{} finished but the queue is full; /jobs log {} to read the result",
+                            message.job_id, message.job_id
+                        ),
+                    }
+                }
+                runtime::MessageKind::Progress => {}
+            }
+        }
         deliver_queued_injection(
             state,
             &mut runtime,
@@ -857,6 +936,8 @@ async fn run_repl(
                 &cwd,
                 &catalog,
                 &mut editor,
+                &jobs,
+                &runtime_handle,
             )
             .await?
         } else if trimmed.starts_with('!') {
@@ -932,25 +1013,60 @@ async fn deliver_queued_injection(
     prompter: &mut CliPermissionPrompter,
     editor: &mut editor::ReplEditor,
 ) {
-    let Some(injection) = model.queue_mut().drain_injection() else {
+    // Merged mode (opt-in, D2.2): the legacy whole-queue injection. Kept
+    // because combining N related follow-ups into one turn saves context.
+    if model.queue().is_merged() {
+        let Some(injection) = model.queue_mut().drain_injection() else {
+            return;
+        };
+        model.begin_turn();
+        let delivery = if planning {
+            run_turn_interactive(state, runtime, &injection, Some(&mut BlockPrompter)).await
+        } else {
+            run_turn_interactive(state, runtime, &injection, Some(prompter)).await
+        };
+        model.end_turn();
+        match delivery {
+            Ok(outcome) => {
+                maybe_auto_compact(state, runtime);
+                editor.note_turn(outcome.ok);
+            }
+            Err(error) => {
+                println!("queued delivery failed: {error}");
+                editor.note_turn(false);
+                let _ = model.enqueue(&injection);
+            }
+        }
+        return;
+    }
+    // Per-item delivery (default, pi steering model): one entry becomes one
+    // turn; a failed turn re-queues *that entry* at the head instead of the
+    // old whole-queue blob, and every id ends in a terminal ledger state.
+    let Some(entry) = model.queue_mut().take_next() else {
         return;
     };
     model.begin_turn();
     let delivery = if planning {
-        run_turn_interactive(state, runtime, &injection, Some(&mut BlockPrompter)).await
+        run_turn_interactive(state, runtime, &entry.text, Some(&mut BlockPrompter)).await
     } else {
-        run_turn_interactive(state, runtime, &injection, Some(prompter)).await
+        run_turn_interactive(state, runtime, &entry.text, Some(prompter)).await
     };
     model.end_turn();
     match delivery {
         Ok(outcome) => {
             maybe_auto_compact(state, runtime);
             editor.note_turn(outcome.ok);
+            let state = if outcome.ok {
+                core::QueueEntryState::Delivered
+            } else {
+                core::QueueEntryState::Failed
+            };
+            model.queue_mut().finish_entry(entry, state);
         }
         Err(error) => {
-            println!("queued delivery failed: {error}");
+            println!("queued delivery failed for #{}: {error}", entry.id);
             editor.note_turn(false);
-            let _ = model.enqueue(&injection);
+            model.queue_mut().requeue_front(entry);
         }
     }
 }
@@ -972,6 +1088,8 @@ async fn dispatch_slash_command(
     cwd: &Path,
     catalog: &ProviderCatalog,
     editor: &mut editor::ReplEditor,
+    jobs: &runtime::JobRegistry,
+    runtime_handle: &tokio::runtime::Handle,
 ) -> Result<LoopControl, Box<dyn std::error::Error>> {
     // Every arm yields the loop-level control directly; the match is wrapped in
     // `Ok` once so each arm stays one statement shorter.
@@ -1016,6 +1134,14 @@ async fn dispatch_slash_command(
             handle_pin_command(state, runtime);
             LoopControl::Continue
         }
+        "/checkpoints" => {
+            handle_checkpoints_command();
+            LoopControl::Continue
+        }
+        _ if trimmed == "/restore" || trimmed.starts_with("/restore ") => {
+            handle_restore_command(trimmed);
+            LoopControl::Continue
+        }
         "/focus" => {
             let focused = editor.toggle_focus();
             println!(
@@ -1048,8 +1174,12 @@ async fn dispatch_slash_command(
             handle_queue_command(trimmed, model);
             LoopControl::Continue
         }
+        _ if trimmed == "/jobs" || trimmed.starts_with("/jobs ") => {
+            handle_jobs_command(trimmed, jobs, state, selection, runtime_handle);
+            LoopControl::Continue
+        }
         _ if trimmed == "/guide" || trimmed.starts_with("/guide ") => {
-            handle_guide_command(trimmed, runtime);
+            handle_guide_command(state, runtime, model, *planning, prompter, editor, trimmed).await;
             LoopControl::Continue
         }
         "/init" => {
@@ -1086,50 +1216,330 @@ async fn dispatch_slash_command(
 /// `/queue` — inspect and edit the pending follow-up messages.
 fn handle_queue_command(input: &str, model: &mut HeartModel) {
     let arg = input.trim().strip_prefix("/queue").unwrap_or("").trim();
-    match arg {
+    let mut tokens = arg.split_whitespace();
+    let sub = tokens.next().unwrap_or("");
+    let rest = arg.strip_prefix(sub).unwrap_or("").trim();
+    match sub {
         "" => {
             if model.queue().is_empty() {
-                println!("queue is empty (messages sent during a running turn wait here)");
+                println!("queue is empty (`/queue send <text>` queues a message for the next turn)");
                 return;
             }
-            println!("{} queued:", model.queue().len());
-            for (index, text) in model.queue().items().iter().enumerate() {
-                println!("  {}. {}", index + 1, truncate_chars(text, 120));
+            println!("{} queued (oldest first):", model.queue().len());
+            for entry in model.queue().items() {
+                println!(
+                    "  #{} [{}] {}",
+                    entry.id,
+                    entry.source.label(),
+                    truncate_chars(&entry.text, 120)
+                );
             }
+            let recent = model.queue().recent();
+            if !recent.is_empty() {
+                println!("recent ({} shown of {}):", recent.len().min(5), recent.len());
+                for entry in recent.iter().take(5) {
+                    println!(
+                        "  #{} [{}] {}",
+                        entry.id,
+                        entry.state.label(),
+                        truncate_chars(&entry.text, 80)
+                    );
+                }
+            }
+        }
+        "send" => {
+            if rest.is_empty() {
+                println!("usage: /queue send <text>");
+                return;
+            }
+            match model.queue_mut().send(rest, core::QueueSource::User) {
+                Some(id) => println!("queued #{id}; it runs as the next turn (deliver point: idle loop top)."),
+                None => println!("queue is full or text is blank; nothing queued."),
+            }
+        }
+        "edit" => {
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let (id_part, text) = (parts.next().unwrap_or(""), parts.next().unwrap_or("").trim());
+            let Ok(id) = id_part.parse::<u64>() else {
+                println!("usage: /queue edit <id> <new text>");
+                return;
+            };
+            if model.queue_mut().edit(id, text) {
+                println!("entry #{id} updated.");
+            } else {
+                println!("no pending entry #{id} (see /queue) or new text is blank.");
+            }
+        }
+        "remove" => {
+            let Ok(id) = rest.parse::<u64>() else {
+                println!("usage: /queue remove <id>");
+                return;
+            };
+            match model.queue_mut().withdraw(id) {
+                Some(text) => println!("withdrawd #{id}:\n{text}"),
+                None => println!("no pending entry #{id}."),
+            }
+        }
+        "move" => {
+            let mut parts = rest.split_whitespace();
+            let (id_part, dir) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+            let Ok(id) = id_part.parse::<u64>() else {
+                println!("usage: /queue move <id> up|down");
+                return;
+            };
+            let moved = match dir {
+                "up" => model.queue_mut().move_entry(id, true),
+                "down" => model.queue_mut().move_entry(id, false),
+                _ => {
+                    println!("usage: /queue move <id> up|down");
+                    return;
+                }
+            };
+            println!(
+                "{}",
+                if moved { format!("entry #{id} moved.") } else { format!("cannot move #{id} in that direction.") }
+            );
+        }
+        "merge" => {
+            let merged = !model.queue().is_merged();
+            model.queue_mut().set_merged(merged);
+            println!(
+                "merged delivery {} - pending entries are injected as {}.",
+                if merged { "on" } else { "off" },
+                if merged { "one combined message" } else { "separate turns" }
+            );
         }
         "pop" => match model.queue_mut().cancel_last() {
             Some(text) => println!("withdrawd last queued message:\n{text}"),
             None => println!("queue is empty"),
         },
         "clear" => {
-            let drained = model.queue_mut().drain_injection();
-            match drained {
-                Some(_) => println!("queue cleared."),
-                None => println!("queue is empty"),
+            let mut withdrawn = 0;
+            while let Some(entry) = model.queue_mut().take_next() {
+                model.queue_mut().finish_entry(entry, core::QueueEntryState::Withdrawn);
+                withdrawn += 1;
+            }
+            println!(
+                "{}",
+                if withdrawn > 0 { format!("{withdrawn} pending entry(ies) withdrawn (visible under /queue recent).") } else { "queue is empty".to_string() }
+            );
+        }
+        other => println!(
+            "usage: /queue [send <text>|edit <id> <text>|remove <id>|move <id> up|down|merge|pop|clear] (`{other}` is not a subcommand)"
+        ),
+    }
+}
+
+/// Worker job executor: builds a *fresh, context-isolated* runtime per job
+/// (own `Session`, own client) and runs one prompt through it on a blocking
+/// thread via the shared multi-thread tokio runtime.
+///
+/// Permission posture: workers default to `read-only` (scout/research role —
+/// they cannot touch files while the operator works); `--write` opts into
+/// `workspace-write`. `full` is never granted to a background worker: an
+/// unattended agent with unrestricted writes is a hazard, not a feature.
+struct WorkerRunner {
+    state: SessionShared,
+    selection: ProviderSelection,
+    runtime_handle: tokio::runtime::Handle,
+    write: bool,
+}
+
+impl runtime::JobRunner for WorkerRunner {
+    fn run(
+        &mut self,
+        prompt: &str,
+        _stop: &runtime::StopFlag,
+        emit: &mut dyn FnMut(runtime::MessageKind, &str),
+    ) -> Result<String, String> {
+        let state = self.state.clone();
+        let selection = self.selection.clone();
+        let write = self.write;
+        let handle = self.runtime_handle.clone();
+        handle.block_on(async move {
+            emit(runtime::MessageKind::Progress, "worker session starting");
+            let mode = if write {
+                "workspace-write"
+            } else {
+                "read-only"
+            };
+            let mut worker = build_runtime(&state, Session::new(), selection, false, mode)
+                .map_err(|error| format!("worker runtime build failed: {error}"))?;
+            let (text, _usage) = run_turn_capture(&mut worker, prompt)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(text)
+        })
+    }
+}
+
+/// `/jobs` — subagent job control: list, spawn, stop, log.
+#[allow(clippy::too_many_arguments)]
+fn handle_jobs_command(
+    input: &str,
+    jobs: &runtime::JobRegistry,
+    state: &SessionShared,
+    selection: &ProviderSelection,
+    runtime_handle: &tokio::runtime::Handle,
+) {
+    let arg = input.trim().strip_prefix("/jobs").unwrap_or("").trim();
+    let mut tokens = arg.split_whitespace();
+    let sub = tokens.next().unwrap_or("");
+    let rest = arg.strip_prefix(sub).unwrap_or("").trim();
+    match sub {
+        "" => {
+            let records = jobs.list();
+            if records.is_empty() {
+                println!("no jobs yet (`/jobs spawn <task>` starts a context-isolated worker)");
+                return;
+            }
+            for record in &records {
+                println!(
+                    "  #{} [{}] {} - {}",
+                    record.id,
+                    record.status.label(),
+                    record.label,
+                    truncate_chars(&record.prompt_head, 90)
+                );
+                if let Some(head) = &record.result_head {
+                    println!("        result: {}", truncate_chars(head, 120));
+                }
+                if let Some(note) = &record.note {
+                    println!("        note: {note}");
+                }
             }
         }
-        other => println!("usage: /queue [pop|clear] (`{other}` is not a subcommand)"),
+        "spawn" => {
+            let (write, task) = if let Some(rest) = rest.strip_prefix("--write") {
+                (true, rest.trim())
+            } else {
+                (false, rest)
+            };
+            if task.is_empty() {
+                println!("usage: /jobs spawn [--write] <task>   (workers run read-only unless --write)");
+                return;
+            }
+            let runner = WorkerRunner {
+                state: state.clone(),
+                selection: selection.clone(),
+                runtime_handle: runtime_handle.clone(),
+                write,
+            };
+            let label: String = task.trim().chars().take(24).collect();
+            match jobs.spawn(&label, task, Box::new(runner)) {
+                Ok(id) => println!(
+                    "spawned worker job #{id} ({}): it runs on its own isolated context; results arrive as the next supervisor turn.",
+                    if write { "workspace-write" } else { "read-only" }
+                ),
+                Err(runtime::SpawnError::Saturated) => println!(
+                    "job backlog is full ({} queued+running cap); stop or wait for one to finish",
+                    env::var("HEARTFLOW_JOB_MAX_PENDING").as_deref().unwrap_or("20")
+                ),
+            }
+        }
+        "stop" => {
+            let Ok(id) = rest.parse::<u64>() else {
+                println!("usage: /jobs stop <id>");
+                return;
+            };
+            println!(
+                "{}",
+                if jobs.stop(id) {
+                    format!("stop requested for job #{id}; the in-flight call finishes, its result is discarded.")
+                } else {
+                    format!("no active job #{id}.")
+                }
+            );
+        }
+        "log" => {
+            let mut parts = rest.split_whitespace();
+            let (id_part, n_part) = (parts.next().unwrap_or(""), parts.next().unwrap_or("10"));
+            let Ok(id) = id_part.parse::<u64>() else {
+                println!("usage: /jobs log <id> [lines=10]");
+                return;
+            };
+            let lines = n_part.parse::<usize>().unwrap_or(10).min(100);
+            let tail = jobs.log_tail(id, lines);
+            if tail.is_empty() {
+                println!("no events for job #{id}.");
+                return;
+            }
+            for line in tail {
+                println!("  {line}");
+            }
+        }
+        other => println!("usage: /jobs [spawn [--write] <task>|stop <id>|log <id> [lines]] (`{other}` is not a subcommand)"),
     }
 }
 
 /// `/guide <TASK>` — assemble the three-part guide draft (prior work, current
 /// state, next task) locally with zero token spend, mirroring Qoder's
-/// guidance flow; the operator edits the printed draft and resends it.
-fn handle_guide_command(input: &str, runtime: &AgentRuntime) {
-    let task = input.trim().strip_prefix("/guide").unwrap_or("").trim();
+/// guidance flow. D2.5 引导直接发送: the default is to *run* the assembled
+/// draft as the next turn immediately; `/guide draft` keeps the old
+/// print-and-edit flow; `/guide queue` files it as the next queued turn.
+#[allow(clippy::too_many_arguments)]
+async fn handle_guide_command(
+    state: &SessionShared,
+    runtime: &mut AgentRuntime,
+    model: &mut HeartModel,
+    planning: bool,
+    prompter: &mut CliPermissionPrompter,
+    editor: &mut editor::ReplEditor,
+    input: &str,
+) {
+    let arg = input.trim().strip_prefix("/guide").unwrap_or("").trim();
+    let (mode, task) = if let Some(rest) = arg.strip_prefix("draft ") {
+        ("draft", rest.trim())
+    } else if let Some(rest) = arg.strip_prefix("queue ") {
+        ("queue", rest.trim())
+    } else if arg == "draft" || arg == "queue" {
+        ("draft", "")
+    } else {
+        ("send", arg)
+    };
     if task.is_empty() {
-        println!("usage: /guide <下一步任务描述>");
+        println!("usage: /guide <task> (run now) | /guide draft <task> (print for editing) | /guide queue <task> (queue for next turn)");
         return;
     }
     // Assembly lives in `core` so the ratatui Ctrl+G overlay builds the exact
-    // same draft; this command only prints it.
+    // same draft; this command only assembles and routes it.
     let context = guide_context(
         &runtime.session().messages,
         runtime.executor().todo_ledger().pending_tasks(),
     );
     let draft = guide_draft(&context, task);
-    println!("guide draft (edit and resend, or paste into the next message):\n");
-    println!("{draft}\n");
+    match mode {
+        "draft" => {
+            println!("guide draft (edit and resend, or paste into the next message):\n");
+            println!("{draft}\n");
+        }
+        "queue" => match model.queue_mut().send(&draft, core::QueueSource::Guide) {
+            Some(id) => println!("guide queued as #{id}; it runs as the next turn."),
+            None => println!("queue is full; nothing queued."),
+        },
+        _ => {
+            // Direct send: the guide IS the next user message, assembled from
+            // live transcript context so the model re-enters with anchored
+            // state instead of a bare task line.
+            model.begin_turn();
+            let delivery = if planning {
+                run_turn_interactive(state, runtime, &draft, Some(&mut BlockPrompter)).await
+            } else {
+                run_turn_interactive(state, runtime, &draft, Some(prompter)).await
+            };
+            model.end_turn();
+            match delivery {
+                Ok(outcome) => {
+                    maybe_auto_compact(state, runtime);
+                    editor.note_turn(outcome.ok);
+                }
+                Err(error) => {
+                    println!("guide delivery failed: {error}");
+                    editor.note_turn(false);
+                }
+            }
+        }
+    }
 }
 
 /// `!<cmd>` — run a shell command directly through the same bash tool path the
@@ -1383,10 +1793,10 @@ fn handle_model_command(
     }
 }
 
-/// `/model` with no argument: report the provider/protocol/base_url that is
+/// `/model` with no argument: report the `provider/protocol/base_url` that is
 /// *actually* active (so a transport failure is never misread as the wrong
 /// vendor), the current model, and the catalog's known models for that
-/// provider. Replaces the old hardcoded DeepSeek shortlist: the list now tracks
+/// provider. Replaces the old hardcoded `DeepSeek` shortlist: the list now tracks
 /// the resolved transport and grows from `hf models` discovery and hand-edits.
 fn print_model_status(selection: &ProviderSelection, catalog: &ProviderCatalog) {
     match selection {
@@ -1520,6 +1930,9 @@ fn reload_config(
             Ok(rebuilt) => {
                 *runtime = rebuilt;
                 *selection = next;
+                // The proxy resolution is process-global; re-init it so an
+                // edited `[proxy]` table takes effect without a restart.
+                proxy::init_global(load_merged_settings(cwd, &home_dir()).proxy.as_ref());
                 println!("config reloaded (model={})", selection.model());
             }
             Err(error) => println!("config changed but reload failed: {error}"),
@@ -1564,11 +1977,39 @@ fn compaction_profile(protocol: Option<ProviderProtocol>) -> (usize, usize) {
     }
 }
 
+/// Soft-trigger policy override (D4.1): `ds4` selects the late ds4-style gate
+/// (85% of window or <= min(8192, window/4) free), anything else keeps the
+/// shipped half-window gate. Window regime only.
+fn env_soft_trigger() -> Option<runtime::SoftTrigger> {
+    match env::var("HEARTFLOW_COMPACT_TRIGGER")
+        .ok()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "ds4" => Some(runtime::SoftTrigger::Ds4),
+        "half-window" => Some(runtime::SoftTrigger::HalfWindow),
+        _ => None,
+    }
+}
+
+/// Token ceiling for the preserved tail (D4.3). Unset or 0 keeps the current
+/// count-only cut.
+fn env_tail_budget() -> usize {
+    env::var("HEARTFLOW_COMPACT_TAIL_BUDGET")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
 /// The shared compaction policy for one provider: `preserve_recent_messages`
 /// recent turns are kept verbatim, and the trigger is half of
 /// `context_window_tokens` (a zero window falls back to the absolute
 /// threshold). The window comes from the resolved profile (env override wins);
 /// the preserve/replay counts come from the provider's compaction profile.
+/// The soft-trigger policy and the tail token ceiling default to the shipped
+/// behavior and are opt-in via env (rollback spec: new behavior is
+/// config-gated, defaults reproduce the old behavior).
 fn compaction_config(selection: &ProviderSelection) -> CompactionConfig {
     let context_window = resolve_context_window(selection);
     let protocol = match selection {
@@ -1587,6 +2028,8 @@ fn compaction_config(selection: &ProviderSelection) -> CompactionConfig {
         preserve_recent_messages,
         context_window_tokens: context_window,
         replay_verbatim_tail,
+        soft_trigger: env_soft_trigger().unwrap_or(runtime::SoftTrigger::HalfWindow),
+        tail_budget_tokens: env_tail_budget(),
         ..CompactionConfig::default()
     }
 }
@@ -1631,6 +2074,115 @@ fn force_compact(state: &SessionShared, runtime: &mut AgentRuntime) {
             "Compacted {} messages into a resumable summary.",
             result.removed_message_count
         );
+    }
+}
+
+/// List the shadow-git snapshots recorded for this project (§6 checkpoints).
+/// The listing is what `/restore` indexes into; newest snapshot is 1.
+fn handle_checkpoints_command() {
+    let cwd = match env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            println!("cannot resolve the project directory: {error}");
+            return;
+        }
+    };
+    match runtime::list_snapshots(&cwd) {
+        Ok(snapshots) if snapshots.is_empty() => {
+            println!("no checkpoints yet - they are recorded before each write_file/edit_file/apply_patch.");
+        }
+        Ok(snapshots) => {
+            println!("checkpoints (newest first; restore with /restore <number>):");
+            for (index, snapshot) in snapshots.iter().enumerate() {
+                println!(
+                    "  {:>2}. {}  {}  {}",
+                    index + 1,
+                    &snapshot.sha[..8.min(snapshot.sha.len())],
+                    snapshot.time,
+                    snapshot.subject
+                );
+            }
+        }
+        Err(error) => println!("cannot list checkpoints: {error}"),
+    }
+}
+
+/// `/restore <number|sha>`: bring the project's tracked files back to a
+/// snapshot recorded before a write-class tool ran. Files created *after*
+/// the snapshot are deliberately kept (the MVP refuses to run a git clean
+/// over the user's project); the output says so explicitly.
+fn handle_restore_command(input: &str) {
+    let arg = input.trim().strip_prefix("/restore").unwrap_or("").trim();
+    if arg.is_empty() {
+        println!("usage: /restore <number|sha> [--purge] - list candidates with /checkpoints");
+        return;
+    }
+    // `--purge` is the explicit opt-in to also remove files created after the
+    // target snapshot; without it, restore keeps them in place.
+    let mut tokens = arg.split_whitespace();
+    let revision_arg = tokens.next().unwrap_or("");
+    let purge = tokens.next() == Some("--purge");
+    if tokens.next().is_some() {
+        println!("usage: /restore <number|sha> [--purge]");
+        return;
+    }
+    let cwd = match env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            println!("cannot resolve the project directory: {error}");
+            return;
+        }
+    };
+    // Resolve a numeric index against the listing so the two commands share
+    // one ordering; anything non-numeric is treated as a revision directly.
+    let revision = match revision_arg.parse::<usize>() {
+        Ok(index) => match runtime::list_snapshots(&cwd) {
+            Ok(snapshots) if index >= 1 && index <= snapshots.len() => {
+                snapshots[index - 1].sha.clone()
+            }
+            Ok(snapshots) => {
+                println!("no checkpoint {index} (1..={} exist)", snapshots.len());
+                return;
+            }
+            Err(error) => {
+                println!("cannot list checkpoints: {error}");
+                return;
+            }
+        },
+        Err(_) => revision_arg.to_string(),
+    };
+    match runtime::restore_snapshot(&cwd, &revision) {
+        Ok(file_count) => {
+            println!("restored {file_count} tracked file(s) to snapshot {revision}.");
+        }
+        Err(error) => {
+            println!("restore failed: {error}");
+            return;
+        }
+    }
+    if !purge {
+        println!("note: files created after that snapshot are kept in place - rerun with `--purge` to remove them (a backup snapshot is taken first).");
+        return;
+    }
+    match runtime::purge_new_files_since(&cwd, &revision) {
+        Ok(report) => {
+            println!(
+                "purge backup snapshot: {} (rerun /restore {} to undo the purge)",
+                &report.backup_sha[..report.backup_sha.len().min(12)],
+                &report.backup_sha[..report.backup_sha.len().min(12)]
+            );
+            println!(
+                "removed {} file(s) created after the snapshot.",
+                report.removed.len()
+            );
+            for path in &report.removed {
+                println!("  - {path}");
+            }
+            for failure in &report.failed {
+                println!("  ! {failure}");
+            }
+        }
+        Err(error) => println!("purge failed (restore already applied): {error}"),
     }
 }
 
@@ -1923,6 +2475,8 @@ fn print_repl_help() {
     println!("  /plan <GOAL>   Plan first (writes gated to .heartflow/plans), then /plan approve to execute");
     println!("  /compact       Compact session history");
     println!("  /pin           Toggle never-compacted on the last message (survives /compact)");
+    println!("  /checkpoints   List shadow-git snapshots taken before write-class tools");
+    println!("  /restore <N>   Restore tracked files to checkpoint N (see /checkpoints)");
     println!("  /focus         Toggle focus mode (hide mascot, minimal chrome)");
     println!("  /save          Persist the session now");
     println!("  /clear         Start a fresh session");
@@ -1932,8 +2486,11 @@ fn print_repl_help() {
     println!("  /search <Q>    Full-text search saved conversation history");
     println!("  /mcp           List connected MCP servers and tools");
     println!("  /expand [ID]   Re-show a folded tool output (default: latest)");
-    println!("  /queue [pop|clear]  Inspect/withdraw follow-ups queued during a turn");
-    println!("  /guide <TASK>  Assemble a prior-work/current-state/task draft to send");
+    println!("  /queue [sub]   Queue control: send/edit/remove/move/merge/pop/clear");
+    println!("  /guide <TASK>  Assemble a prior-work/current-state/task draft and run it now");
+    println!("                 (/guide draft / /guide queue keep it editable or queued)");
+    println!("  /jobs [sub]    Subagent workers: spawn [--write]/stop/log - results arrive as");
+    println!("                 the next supervisor turn (workers run read-only without --write)");
     println!(
         "  !<CMD>         Run a shell command directly (no model); output folds like a tool result"
     );

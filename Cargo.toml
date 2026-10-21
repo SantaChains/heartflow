@@ -20,6 +20,7 @@ publish = true
 api = { package = "heartflow-api", version = "1.2.0", path = "crates/api" }
 commands = { package = "heartflow-commands", version = "1.2.0", path = "crates/commands" }
 mcp = { package = "heartflow-mcp", version = "1.2.0", path = "crates/mcp" }
+proxy = { package = "heartflow-proxy", version = "1.2.0", path = "crates/proxy" }
 provider = { package = "heartflow-provider", version = "1.2.0", path = "crates/provider" }
 runtime = { package = "heartflow-runtime", version = "1.2.0", path = "crates/runtime" }
 store = { package = "heartflow-store", version = "1.2.0", path = "crates/store" }

@@ -360,10 +360,10 @@ fn build_replay_messages(
 /// Drop tool results whose matching `tool_use` never appears earlier in the
 /// transcript, so the wire request stays provider-valid.
 ///
-/// A `tool_result` (OpenAI `role:tool`, Anthropic `tool_result` block) must
+/// A `tool_result` (`OpenAI` `role:tool`, Anthropic `tool_result` block) must
 /// answer a preceding tool call; an orphan makes the provider reject the whole
-/// request (OpenAI 400 "Messages with role 'tool' must be a response to a
-/// preceding message with 'tool_calls'"). Compaction now aligns its cut to
+/// request (`OpenAI` 400 "Messages with role 'tool' must be a response to a
+/// preceding message with '`tool_calls`'"). Compaction now aligns its cut to
 /// avoid creating these, but a resumed or interrupted session can still carry
 /// one, so this is the protocol-agnostic safety net applied to every request.
 /// Scanning in order, a result survives only once an earlier assistant message
@@ -371,7 +371,12 @@ fn build_replay_messages(
 #[must_use]
 fn repair_tool_pairing(messages: Vec<ConversationMessage>) -> Vec<ConversationMessage> {
     let mut advertised: HashSet<String> = HashSet::new();
-    messages
+    // Orphans are not silently swallowed: each drop is surfaced (warning +
+    // durable counter, see `compact::record_repair_drops`) because losing a
+    // tool result the model never saw answered is information loss on the
+    // wire path, not a cosmetic cleanup.
+    let mut dropped: Vec<String> = Vec::new();
+    let repaired = messages
         .into_iter()
         .filter_map(|message| match message.role {
             MessageRole::Assistant => {
@@ -383,22 +388,23 @@ fn repair_tool_pairing(messages: Vec<ConversationMessage>) -> Vec<ConversationMe
                 Some(message)
             }
             MessageRole::Tool => {
-                let blocks: Vec<ContentBlock> = message
-                    .blocks
-                    .into_iter()
-                    .filter(|block| match block {
-                        ContentBlock::ToolResult { tool_use_id, .. } => {
-                            advertised.contains(tool_use_id)
+                let mut kept: Vec<ContentBlock> = Vec::with_capacity(message.blocks.len());
+                for block in message.blocks {
+                    match &block {
+                        ContentBlock::ToolResult { tool_use_id, .. }
+                            if !advertised.contains(tool_use_id) =>
+                        {
+                            dropped.push(tool_use_id.clone());
                         }
-                        _ => true,
-                    })
-                    .collect();
-                if blocks.is_empty() {
+                        _ => kept.push(block),
+                    }
+                }
+                if kept.is_empty() {
                     None
                 } else {
                     Some(ConversationMessage {
                         role: message.role,
-                        blocks,
+                        blocks: kept,
                         usage: message.usage,
                         pinned: message.pinned,
                     })
@@ -406,7 +412,11 @@ fn repair_tool_pairing(messages: Vec<ConversationMessage>) -> Vec<ConversationMe
             }
             MessageRole::System | MessageRole::User => Some(message),
         })
-        .collect()
+        .collect();
+    if !dropped.is_empty() {
+        crate::compact::record_repair_drops(&dropped);
+    }
+    repaired
 }
 
 pub struct ConversationRuntime<C, T> {
@@ -1137,6 +1147,145 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn compaction_pipeline_preserves_tool_pairing_for_random_well_formed_sessions() {
+        // Phase 4 invariant property (roadmap §4): a random well-formed
+        // session (mixed tool_use ads + results, pinned turns) pushed through
+        // `compact_session_in_place` + `build_replay_messages` +
+        // `repair_tool_pairing` must satisfy the pairing invariants on the
+        // wire projection — every result answers an earlier ad, every ad is
+        // answered later, and no tail opens on an orphan result. The xorshift
+        // seed is fixed so any failure reproduces exactly.
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        for case in 0..200 {
+            let mut messages: Vec<ConversationMessage> = Vec::new();
+            let mut call_counter: usize = 0;
+            let turns = 10 + (next() % 40) as usize;
+            for _ in 0..turns {
+                match next() % 4 {
+                    0 => {
+                        let pinned = next() % 8 == 0;
+                        messages.push(
+                            ConversationMessage::user_text(format!(
+                                "user-{case} {}",
+                                "x".repeat((next() % 300) as usize)
+                            ))
+                            .with_pinned(pinned),
+                        );
+                    }
+                    1 => {
+                        let pinned = next() % 8 == 0;
+                        messages.push(
+                            ConversationMessage::assistant(vec![ContentBlock::Text {
+                                text: format!(
+                                    "assistant-{case} {}",
+                                    "y".repeat((next() % 300) as usize)
+                                ),
+                            }])
+                            .with_pinned(pinned),
+                        );
+                    }
+                    2 => {
+                        // An ad set immediately answered by its results — the
+                        // well-formed shape the pipeline must never break.
+                        let ad_count = 1 + (next() % 2) as usize;
+                        let first_call = call_counter + 1;
+                        call_counter += ad_count;
+                        let blocks = (first_call..=call_counter)
+                            .map(|i| ContentBlock::ToolUse {
+                                id: format!("call_{i}"),
+                                name: "bash".to_string(),
+                                input: "{}".to_string(),
+                            })
+                            .collect();
+                        messages.push(ConversationMessage::assistant(blocks));
+                        for i in first_call..=call_counter {
+                            messages.push(ConversationMessage::tool_result(
+                                format!("call_{i}"),
+                                "bash",
+                                format!("result-{i} {}", "z".repeat((next() % 200) as usize)),
+                                false,
+                            ));
+                        }
+                    }
+                    _ => messages.push(ConversationMessage::assistant(vec![ContentBlock::Text {
+                        text: "thinking out loud".to_string(),
+                    }])),
+                }
+            }
+
+            let config = CompactionConfig {
+                preserve_recent_messages: 1 + (next() % 4) as usize,
+                max_estimated_tokens: 1,
+                tail_budget_tokens: match next() % 3 {
+                    0 => 0,
+                    1 => 800,
+                    _ => 6_000,
+                },
+                ..CompactionConfig::default()
+            };
+            let mut session = Session {
+                version: 1,
+                messages,
+            };
+            let result = compact_session_in_place(&mut session, config);
+            if result.removed_message_count == 0 {
+                continue;
+            }
+
+            // Invariant 1: the rebuilt transcript never opens on an orphan.
+            assert_ne!(
+                session.messages[1].role,
+                MessageRole::Tool,
+                "case {case}: tail opens on an orphan tool result"
+            );
+
+            let replay = build_replay_messages(&session.messages, config.replay_verbatim_tail);
+            let repaired = repair_tool_pairing(replay);
+
+            let mut advertised = std::collections::HashSet::new();
+            let mut answered = std::collections::HashSet::new();
+            let mut ads: Vec<String> = Vec::new();
+            for message in &repaired {
+                match message.role {
+                    MessageRole::Assistant => {
+                        for block in &message.blocks {
+                            if let ContentBlock::ToolUse { id, .. } = block {
+                                advertised.insert(id.clone());
+                                ads.push(id.clone());
+                            }
+                        }
+                    }
+                    MessageRole::Tool => {
+                        for block in &message.blocks {
+                            if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                                assert!(
+                                    advertised.contains(tool_use_id),
+                                    "case {case}: orphan result {tool_use_id} reached the wire"
+                                );
+                                answered.insert(tool_use_id.clone());
+                            }
+                        }
+                    }
+                    MessageRole::System | MessageRole::User => {}
+                }
+            }
+            for id in &ads {
+                assert!(
+                    answered.contains(id),
+                    "case {case}: dangling tool_use {id} reached the wire"
+                );
+            }
+        }
+    }
 
     #[test]
     fn repair_drops_a_leading_orphan_and_keeps_the_advertised_pair() {
@@ -2401,6 +2550,7 @@ mod tests {
             max_estimated_tokens: 10_000,
             context_window_tokens: 128_000,
             replay_verbatim_tail: 12,
+            ..CompactionConfig::default()
         };
         let literals = vec!["sk-live-credential".to_string()];
         println!("tool result = {TOOL_RESULT_BYTES} B, image = 4 MiB base64");

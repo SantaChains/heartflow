@@ -179,7 +179,7 @@ impl TableBuilder {
 /// - `ENABLE_MATH` reads `$…$` as inline math and prints the body without its
 ///   delimiters, so ordinary prose with prices can quietly lose its `$`.
 ///
-/// What remains is the subset a terminal coding agent actually draws: CommonMark
+/// What remains is the subset a terminal coding agent actually draws: `CommonMark`
 /// core (headings, paragraphs, emphasis, lists, block quotes, code, links,
 /// images, rules, HTML passthrough) plus tables and task-list markers. Everything
 /// else is passed through as literal text — the honest rendering, since the
@@ -309,7 +309,7 @@ pub fn parse(markdown: &str) -> Vec<Node> {
             }
             // Both row ends commit: the header may or may not be wrapped in an
             // explicit `TableRow` depending on the parser path.
-            Event::End(TagEnd::TableRow) | Event::End(TagEnd::TableHead) => {
+            Event::End(TagEnd::TableRow | TagEnd::TableHead) => {
                 if let Some(builder) = table.as_mut() {
                     builder.end_row();
                 }
@@ -663,7 +663,7 @@ fn render_table_ratatui(rows: &[Vec<String>], theme: &AppTheme) -> Vec<Line<'sta
     if rows.is_empty() {
         return out;
     }
-    let cols = rows.iter().map(|row| row.len()).max().unwrap_or(0);
+    let cols = rows.iter().map(std::vec::Vec::len).max().unwrap_or(0);
     if cols == 0 {
         return out;
     }
@@ -739,7 +739,7 @@ fn table_row_ratatui(
 ) -> Line<'static> {
     let mut spans = vec![Span::styled(glyphs::TBL_V, border)];
     for (index, width) in widths.iter().enumerate() {
-        let cell = cells.get(index).map(String::as_str).unwrap_or("");
+        let cell = cells.get(index).map_or("", String::as_str);
         let pad = width.saturating_sub(cell.width());
         let body = if header { head } else { RtStyle::default() };
         spans.push(Span::styled(" ", body));
@@ -757,7 +757,7 @@ fn render_table(rows: &[Vec<String>], theme: &ColorTheme, out: &mut String) {
     if rows.is_empty() {
         return;
     }
-    let cols = rows.iter().map(|row| row.len()).max().unwrap_or(0);
+    let cols = rows.iter().map(std::vec::Vec::len).max().unwrap_or(0);
     if cols == 0 {
         return;
     }
@@ -831,7 +831,7 @@ fn table_row(
     let mut line = String::new();
     line.push_str(&format!("{}", glyphs::TBL_V.with(border)));
     for (index, width) in widths.iter().enumerate() {
-        let cell = cells.get(index).map(String::as_str).unwrap_or("");
+        let cell = cells.get(index).map_or("", String::as_str);
         let pad = width.saturating_sub(cell.width());
         let styled = format!("{}", cell.bold().with(head));
         let text = if header { &styled } else { cell };

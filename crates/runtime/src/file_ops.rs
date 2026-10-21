@@ -280,6 +280,10 @@ fn decode_text(bytes: &[u8]) -> String {
 }
 
 pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
+    // Checkpoint before the first mutation (roadmap §6): runs only after the
+    // permission gate approved this call, so the snapshot always captures the
+    // last approved state. Failure never blocks the write.
+    crate::checkpoint::maybe_snapshot_cwd("write_file");
     let absolute_path = normalize_path_allow_missing(path)?;
     // Read bytes, not `read_to_string`: a non-UTF-8 file *exists* and is being
     // replaced whole, and reporting that as a "create" would tell the caller
@@ -314,6 +318,7 @@ pub fn edit_file(
     new_string: &str,
     replace_all: bool,
 ) -> io::Result<EditFileOutput> {
+    crate::checkpoint::maybe_snapshot_cwd("edit_file");
     let absolute_path = normalize_path(path)?;
     // `fs::read` first so a non-UTF-8 file produces a message that names the
     // file and the way out, not a bare `read_to_string` decoding error.
@@ -431,6 +436,9 @@ pub fn apply_patch(changes: &[PatchChange]) -> io::Result<ApplyPatchOutput> {
     if changes.is_empty() {
         return Err(invalid_input("no changes supplied"));
     }
+    // One snapshot covers the whole batch (roadmap §6); restore brings every
+    // touched file back in one step.
+    crate::checkpoint::maybe_snapshot_cwd("apply_patch");
 
     let mut order: Vec<PathBuf> = Vec::new();
     let mut by_path: HashMap<PathBuf, PreparedFile> = HashMap::new();
@@ -882,8 +890,7 @@ fn grep_search_once(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let output_mode = input
         .output_mode
         .as_deref()
-        .map(str::trim)
-        .unwrap_or("files_with_matches")
+        .map_or("files_with_matches", str::trim)
         .to_owned();
     // Validate the mode instead of letting anything unrecognised fall through to
     // `files_with_matches`: a caller that asked for `count` and mistyped it got a

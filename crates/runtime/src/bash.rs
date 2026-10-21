@@ -3,6 +3,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -60,6 +61,21 @@ pub struct BashCommandOutput {
 }
 
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
+    // Foreground no-output watchdog (2026-10-21 research batch): a command
+    // that emits nothing on either stream for this long is killed as hung.
+    // Off by default — a legitimately quiet build would be a false positive —
+    // enabled with `HEARTFLOW_BASH_IDLE_TIMEOUT_MS`. The background path is
+    // deliberately exempt: a quiet long runner is exactly what
+    // run_in_background exists for, and its sidecar already reports terminal
+    // state.
+    let idle_ms = env::var("HEARTFLOW_BASH_IDLE_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0);
+    execute_bash_inner(input, idle_ms.map(Duration::from_millis))
+}
+
+fn execute_bash_inner(input: BashCommandInput, idle: Option<Duration>) -> io::Result<BashCommandOutput> {
     let (program, args) = current_shell();
     let wrapped = wrap_command_for_encoding(&args, &input.command);
     if input.run_in_background.unwrap_or(false) {
@@ -67,7 +83,7 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     }
 
     let runtime = Builder::new_current_thread().enable_all().build()?;
-    runtime.block_on(execute_bash_async(input, wrapped))
+    runtime.block_on(execute_bash_async(input, wrapped, idle))
 }
 
 /// Foreground-command timeout ceiling; the model may override it per call.
@@ -80,10 +96,65 @@ const MAX_TIMEOUT_MS: u64 = 600_000;
 /// model at precise tools (`grep`/`read_file`) instead of raw replay.
 const MAX_STREAM_BYTES: usize = 512 * 1024;
 
+/// Millis since the epoch, saturated at 0 on a clock step backwards; the
+/// idle watchdog only ever subtracts these, so saturation is the safe
+/// direction (a bogus 0 makes silence look enormous only until the next beat).
+fn now_ms() -> u64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs().saturating_mul(1000) + u64::from(d.subsec_millis()),
+        Err(_) => 0,
+    }
+}
+
+/// Arm the idle watchdog: a task that polls the silence window and, on
+/// expiry, flips `hung` and kills the child by pid. Returns the shared state
+/// (`beat` stamped by the stream readers, `hung` consumed after the join).
+/// Poll runs at a quarter of the threshold, clamped to a sane floor/ceiling,
+/// so detection latency stays a fraction of the configured silence window
+/// (the reference implementation trips a 41s idle within ~5s).
+fn arm_idle_watchdog(
+    idle: Duration,
+    pid: u32,
+) -> (
+    Arc<std::sync::atomic::AtomicU64>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    let beat = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
+    let hung = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let poll = idle
+        .mul_f64(0.25)
+        .clamp(Duration::from_millis(50), Duration::from_secs(1));
+    let beat_task = Arc::clone(&beat);
+    let hung_task = Arc::clone(&hung);
+    let threshold_ms = u64::try_from(idle.as_millis()).unwrap_or(u64::MAX);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(poll).await;
+            if hung_task.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let silent_ms =
+                now_ms().saturating_sub(beat_task.load(std::sync::atomic::Ordering::Relaxed));
+            if silent_ms >= threshold_ms {
+                hung_task.store(true, std::sync::atomic::Ordering::Relaxed);
+                terminate_by_pid(pid);
+                return;
+            }
+        }
+    });
+    (beat, hung)
+}
+
 /// Read one child stream up to [`MAX_STREAM_BYTES`], then keep draining and
 /// counting the rest. Draining is required: a stalled pipe would block the
-/// child forever and turn the timeout into the only exit.
-async fn read_stream_bounded<S: tokio::io::AsyncRead + Unpin>(mut stream: S) -> (Vec<u8>, u64) {
+/// child forever and turn the timeout into the only exit. Every arriving
+/// chunk stamps `beat` — the liveness signal the idle watchdog consumes
+/// (`codexmon` / IdleWatchdog pattern: a process being alive is not liveness;
+/// arrival of output is).
+async fn read_stream_bounded<S: tokio::io::AsyncRead + Unpin>(
+    mut stream: S,
+    beat: &std::sync::atomic::AtomicU64,
+) -> (Vec<u8>, u64) {
     let mut buf = Vec::with_capacity(64 * 1024);
     let mut dropped: u64 = 0;
     let mut chunk = [0u8; 8192];
@@ -92,6 +163,7 @@ async fn read_stream_bounded<S: tokio::io::AsyncRead + Unpin>(mut stream: S) -> 
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
+        beat.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
         if buf.len() < MAX_STREAM_BYTES {
             let take = (MAX_STREAM_BYTES - buf.len()).min(n);
             buf.extend_from_slice(&chunk[..take]);
@@ -116,6 +188,8 @@ fn with_truncation_note(text: String, dropped: u64) -> String {
 /// Background tasks tee stdout/stderr into a shared log file (returned as
 /// `raw_output_path`) instead of discarding them, so the agent can read
 /// progress later with `read_file` and stop the task by PID with bash.
+/// Deliberately exempt from the idle watchdog: a quiet long runner is exactly
+/// what `run_in_background` exists for.
 fn spawn_background(
     program: &str,
     args: &[&str],
@@ -434,26 +508,83 @@ fn kill_process_tree(pid: u32) {
 #[cfg(not(windows))]
 fn kill_process_tree(_pid: u32) {}
 
-async fn execute_bash_async(
-    input: BashCommandInput,
-    wrapped: String,
-) -> io::Result<BashCommandOutput> {
+/// Kill a process by pid from the idle watchdog, which holds no `Child`
+/// handle. Windows sweeps the tree with `taskkill /T`; elsewhere `kill -9`
+/// reaches the direct child — the same direct-child-only limitation the
+/// timeout path already documents for Unix. Both are external processes, so
+/// the workspace's `unsafe_code = "forbid"` stays intact.
+fn terminate_by_pid(pid: u32) {
+    #[cfg(windows)]
+    kill_process_tree(pid);
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// Terminal output for a command the runtime killed (wall-clock timeout or
+/// idle hang). The kill paths must not drift apart in their observable
+/// fields, so both go through this constructor: `interrupted` plus a distinct
+/// `return_code_interpretation` is the contract the model reacts to, and any
+/// output emitted before the kill is preserved as partial evidence.
+fn killed_output(
+    input: &BashCommandInput,
+    stdout: String,
+    stderr: String,
+    interpretation: &str,
+) -> BashCommandOutput {
+    BashCommandOutput {
+        stdout,
+        stderr,
+        raw_output_path: None,
+        interrupted: true,
+        is_image: None,
+        background_task_id: None,
+        background_status_path: None,
+        backgrounded_by_user: None,
+        assistant_auto_backgrounded: None,
+        dangerously_disable_sandbox: input.dangerously_disable_sandbox,
+        return_code_interpretation: Some(String::from(interpretation)),
+        no_output_expected: Some(true),
+        structured_content: None,
+        persisted_output_path: None,
+        persisted_output_size: None,
+    }
+}
+
+/// Assemble the tokio shell command for `wrapped`: shell resolution, UTF-8
+/// wrapping, orphan protection, credential scrubbing and console suppression.
+fn build_shell_command(wrapped: &str, disable_sandbox: bool) -> TokioCommand {
     let (program, args) = current_shell();
     let mut command = TokioCommand::new(&program);
     for arg in args {
         command.arg(arg);
     }
-    command.arg(&wrapped);
+    command.arg(wrapped);
     // A timed-out or dropped future must not leave an orphaned child running.
     command.kill_on_drop(true);
     // Credentials stay out of the child's environment, and no console window
     // flashes when the agent itself has no console. An explicit sandbox opt-out
     // is also the opt-out from scrubbing: a workflow that genuinely needs the
     // variable (e.g. `gh pr create` with `GITHUB_TOKEN`) stays reachable.
-    if !input.dangerously_disable_sandbox.unwrap_or(false) {
+    if !disable_sandbox {
         scrub_credential_env(command.as_std_mut());
     }
     hide_console_window(command.as_std_mut());
+    command
+}
+
+async fn execute_bash_async(
+    input: BashCommandInput,
+    wrapped: String,
+    idle: Option<Duration>,
+) -> io::Result<BashCommandOutput> {
+    let mut command = build_shell_command(&wrapped, input.dangerously_disable_sandbox.unwrap_or(false));
 
     let timeout_ms = input
         .timeout
@@ -472,15 +603,30 @@ async fn execute_bash_async(
     // is only *dropped*, and dropping a borrow does not drop the child, so the
     // parent is still alive when the tree sweep below needs its descendants.
     let child_pid = child.id();
+    // Idle-watchdog state: `beat` is stamped by every arriving chunk on both
+    // streams; `hung` flips when the watchdog decides the command is stuck.
+    let (beat, hung) = match (idle, child_pid) {
+        (Some(idle), Some(pid)) => arm_idle_watchdog(idle, pid),
+        _ => (
+            Arc::new(std::sync::atomic::AtomicU64::new(now_ms())),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ),
+    };
     // Boxed once: the join! state machine plus Child exceed clippy's
     // large-future threshold and poll() never inspects them anyway.
     let collected = timeout(
         Duration::from_millis(timeout_ms),
         Box::pin(async {
-            // panic-ok: spawned with Stdio::piped() above; take() runs once here
-            let stdout = read_stream_bounded(child.stdout.take().expect("piped stdout"));
-            // panic-ok: spawned with Stdio::piped() above; take() runs once here
-            let stderr = read_stream_bounded(child.stderr.take().expect("piped stderr"));
+            let stdout = read_stream_bounded(
+                // panic-ok: spawned with Stdio::piped() above; take() runs once here
+                child.stdout.take().expect("piped stdout"),
+                &beat,
+            );
+            let stderr = read_stream_bounded(
+                // panic-ok: spawned with Stdio::piped() above; take() runs once here
+                child.stderr.take().expect("piped stderr"),
+                &beat,
+            );
             let wait = child.wait();
             let (status_res, (out_bytes, out_dropped), (err_bytes, err_dropped)) =
                 tokio::join!(wait, stdout, stderr);
@@ -495,33 +641,40 @@ async fn execute_bash_async(
         }),
     )
     .await;
-    let (output, interrupted) = match collected {
-        Ok(triple) => (triple, false),
-        Err(_) => {
-            // Sweep the whole tree before `child` is dropped: kill_on_drop
-            // reaps only the shell, leaving anything it spawned behind.
-            if let Some(pid) = child_pid {
-                kill_process_tree(pid);
-            }
-            return Ok(BashCommandOutput {
-                stdout: String::new(),
-                stderr: format!("Command exceeded timeout of {timeout_ms} ms"),
-                raw_output_path: None,
-                interrupted: true,
-                is_image: None,
-                background_task_id: None,
-                background_status_path: None,
-                backgrounded_by_user: None,
-                assistant_auto_backgrounded: None,
-                dangerously_disable_sandbox: input.dangerously_disable_sandbox,
-                return_code_interpretation: Some(String::from("timeout")),
-                no_output_expected: Some(true),
-                structured_content: None,
-                persisted_output_path: None,
-                persisted_output_size: None,
-            });
+    let (output, interrupted) = if let Ok(triple) = collected {
+        (triple, false)
+    } else {
+        // Sweep the whole tree before `child` is dropped: kill_on_drop
+        // reaps only the shell, leaving anything it spawned behind.
+        if let Some(pid) = child_pid {
+            kill_process_tree(pid);
         }
+        return Ok(killed_output(
+            &input,
+            String::new(),
+            format!("Command exceeded timeout of {timeout_ms} ms"),
+            "timeout",
+        ));
     };
+
+    // The idle watchdog fired: the process was killed mid-flight, so whatever
+    // output arrived before the silence is partial. Report the hang honestly
+    // through the same fields the wall-clock timeout uses — `interrupted`
+    // plus a distinct interpretation — so the model can react to both the
+    // same way and downstream grouping sees one error class.
+    if hung.load(std::sync::atomic::Ordering::Relaxed) {
+        let (_status, stdout, stderr) = output;
+        let idle_ms = idle.map_or(timeout_ms, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        return Ok(killed_output(
+            &input,
+            stdout,
+            format!(
+                "{stderr}\nCommand produced no output for {idle_ms} ms and was \
+                 killed as hung (idle timeout)"
+            ),
+            "idle_timeout",
+        ));
+    }
 
     let (status, stdout, stderr) = output;
     let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
@@ -892,16 +1045,17 @@ mod tests {
             .build()
             .unwrap();
         let payload = vec![b'x'; super::MAX_STREAM_BYTES + 10_000];
-        let (buf, dropped) =
-            runtime.block_on(super::read_stream_bounded(std::io::Cursor::new(payload)));
+        let (buf, dropped) = runtime.block_on(super::read_stream_bounded(
+            std::io::Cursor::new(payload),
+            &std::sync::atomic::AtomicU64::new(0),
+        ));
         assert_eq!(buf.len(), super::MAX_STREAM_BYTES);
         assert_eq!(dropped, 10_000);
 
-        let (buf, dropped) =
-            runtime.block_on(super::read_stream_bounded(std::io::Cursor::new(vec![
-                b'y';
-                100
-            ])));
+        let (buf, dropped) = runtime.block_on(super::read_stream_bounded(
+            std::io::Cursor::new(vec![b'y'; 100]),
+            &std::sync::atomic::AtomicU64::new(0),
+        ));
         assert_eq!(buf.len(), 100);
         assert_eq!(dropped, 0);
     }
@@ -1113,6 +1267,65 @@ mod tests {
 
         assert_eq!(output.stdout.trim(), "hello");
         assert!(!output.interrupted);
+    }
+
+    /// The idle watchdog must kill a command that goes silent past the
+    /// threshold, and the result must read as an honest hang (interrupted +
+    /// `idle_timeout`), not a normal completion. The output emitted *before*
+    /// the silence is preserved: it is partial, but it is evidence.
+    #[test]
+    fn idle_watchdog_kills_a_command_that_goes_silent() {
+        let command = if cfg!(windows) {
+            String::from("Write-Output 'starting'; Start-Sleep -Seconds 30")
+        } else {
+            String::from("echo starting; sleep 30")
+        };
+        let output = super::execute_bash_inner(
+            BashCommandInput {
+                command,
+                timeout: Some(60_000),
+                description: None,
+                run_in_background: Some(false),
+                dangerously_disable_sandbox: Some(false),
+            },
+            Some(Duration::from_millis(500)),
+        )
+        .expect("the hang path should still return an output");
+
+        assert!(output.interrupted, "a hung command must be interrupted");
+        assert_eq!(
+            output.return_code_interpretation.as_deref(),
+            Some("idle_timeout"),
+            "the hang must be distinguishable from a wall-clock timeout"
+        );
+        assert!(output.stderr.contains("no output for 500 ms"), "{:?}", output.stderr);
+    }
+
+    /// The watchdog must not false-positive on a command that is slow but
+    /// producing output: silence is measured from the last chunk, not from
+    /// spawn, so a chatty long command survives a short idle threshold.
+    #[test]
+    fn idle_watchdog_lets_a_progressing_command_finish() {
+        let command = if cfg!(windows) {
+            String::from("1..3 | ForEach-Object { Write-Output ('tick' + $_); Start-Sleep -Milliseconds 300 }; Write-Output done")
+        } else {
+            String::from("for i in 1 2 3; do echo \"tick$i\"; sleep 0.3; done; echo done")
+        };
+        let output = super::execute_bash_inner(
+            BashCommandInput {
+                command,
+                timeout: Some(60_000),
+                description: None,
+                run_in_background: Some(false),
+                dangerously_disable_sandbox: Some(false),
+            },
+            Some(Duration::from_millis(2_000)),
+        )
+        .expect("shell command should execute");
+
+        assert!(!output.interrupted, "a progressing command must finish: {output:?}");
+        assert_eq!(output.return_code_interpretation, None);
+        assert!(output.stdout.contains("done"));
     }
 
     #[test]

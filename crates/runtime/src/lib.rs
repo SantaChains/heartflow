@@ -1,10 +1,13 @@
 mod agent_assets;
 mod bash;
+mod checkpoint;
 mod compact;
 mod config;
 mod conversation;
+mod diagnostics;
 mod doc_search;
 mod file_ops;
+mod jobs;
 mod permissions;
 mod prompt;
 mod redact;
@@ -14,11 +17,16 @@ mod usage;
 
 pub use agent_assets::{discover_rules, discover_skills, RuleFile, SkillSummary};
 pub use bash::{execute_bash, is_dangerous_command, BashCommandInput, BashCommandOutput};
+pub use checkpoint::{
+    list_snapshots, purge_new_files_since, restore_snapshot, set_checkpoint_root,
+    snapshot_failures, PurgeReport, Snapshot,
+};
 pub use compact::estimate_tokens_from;
 pub use compact::{
-    compact_session_in_place, estimate_session_tokens, format_compact_summary,
-    get_compact_continuation_message, should_compact, truncate_chars, CompactionConfig,
-    CompactionResult, TokenCalibration,
+    compact_session_in_place, compaction_stats, estimate_session_tokens, format_compact_summary,
+    get_compact_continuation_message, plan_compaction_cut, set_compact_stats_path, should_compact,
+    truncate_chars, CompactEvent, CompactionConfig, CompactionResult, CompactionStats, CutPlan,
+    SoftTrigger, ThresholdKind, TokenCalibration,
 };
 pub use config::{
     ConfigEntry, ConfigError, ConfigLoader, ConfigSource, RuntimeConfig,
@@ -28,12 +36,21 @@ pub use conversation::{
     AgentEvent, ApiClient, ApiRequest, ConversationRuntime, RuntimeError, StaticToolExecutor,
     ToolError, ToolExecutor, ToolSpec, TurnStream, TurnSummary,
 };
+pub use diagnostics::{
+    diagnostics_degradation_detail, diagnostics_ledger, run_post_edit_diagnostics, DiagnosticItem,
+    DiagnosticsLedger, PostEditDiagnostics,
+};
 pub use doc_search::{rga_available, search_documents, DocSearchInput, DocSearchOutput};
 pub use file_ops::{
     apply_patch, edit_file, escapes_workspace, glob_search, grep_search, read_file, search_files,
     write_file, ApplyPatchOutput, EditFileOutput, GlobSearchOutput, GrepSearchInput,
     GrepSearchOutput, PatchChange, PatchFileResult, ReadFileOutput, SearchFilesOutput,
     StructuredPatchHunk, TextFilePayload, WriteFileOutput,
+};
+pub use jobs::{
+    disk_write_failures, reconcile_stale_records, set_jobs_root, JobRecord, JobRegistry, JobRunner,
+    JobStatus, MessageKind, SpawnError, StopFlag, WorkerMessage, DEFAULT_JOB_SLOTS,
+    DEFAULT_JOB_WALL_TIMEOUT, DEFAULT_MAX_PENDING,
 };
 pub use permissions::{
     PermissionMode, PermissionOutcome, PermissionPolicy, PermissionPromptDecision,

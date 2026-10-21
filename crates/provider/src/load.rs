@@ -330,7 +330,7 @@ fn seed_provider(
     }
 }
 
-/// The compiled-in seed: common domestic (plus OpenAI) OpenAI-compatible
+/// The compiled-in seed: common domestic (plus `OpenAI`) OpenAI-compatible
 /// providers, refreshed against each vendor's official model list as of
 /// 2026-09. Endpoints and `api_key_env` names are stable; model ids are the
 /// current, officially-documented ones (retired ids are dropped, never kept as
@@ -338,7 +338,7 @@ fn seed_provider(
 /// exact token count and left `None` otherwise rather than guessed from a
 /// marketing "1M"/"200K" figure (the plan's "要准不是全"). Providers whose ids
 /// churn fast or whose exact ids we cannot confirm from a primary source
-/// (aggregators, Doubao, StepFun, MiniMax, Yi, Baichuan, SiliconFlow) are seeded
+/// (aggregators, Doubao, `StepFun`, `MiniMax`, Yi, Baichuan, `SiliconFlow`) are seeded
 /// as scaffolding with an empty model list, to be filled accurately by
 /// `hf models` discovery rather than risk a wrong id.
 #[must_use]
@@ -508,7 +508,7 @@ fn read_catalog_file(path: &Path) -> ProviderCatalog {
 /// Record one model into the on-disk catalog under the provider that owns
 /// `base_url`. Re-reads the persisted layer first so a concurrent hand-edit is
 /// never clobbered, resolves the key against the *merged* catalog (so a recorded
-/// DeepSeek model lands under the seed `deepseek` key, not a host-derived
+/// `DeepSeek` model lands under the seed `deepseek` key, not a host-derived
 /// duplicate), then writes atomically. Errors are non-fatal to the caller.
 pub fn persist_model(
     home: &Path,

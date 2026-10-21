@@ -110,10 +110,19 @@ fn run_worker(
 }
 
 fn build_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    use proxy as hfproxy;
+    let mut builder = reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
-        .build()
-        .unwrap_or_default()
+        // Own the proxy decision: reqwest's implicit env/system read would
+        // otherwise resurrect a proxy the resolver rejected.
+        .no_proxy();
+    let resolution = hfproxy::resolution();
+    if resolution.address().is_some() && !resolution.is_dead() {
+        builder = builder.proxy(reqwest::Proxy::custom(move |url| {
+            resolution.proxy_url_for(url)
+        }));
+    }
+    builder.build().unwrap_or_default()
 }
 
 async fn post_once(

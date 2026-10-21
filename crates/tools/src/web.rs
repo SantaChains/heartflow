@@ -6,6 +6,7 @@ use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use proxy as hfproxy;
 use serde::{Deserialize, Serialize};
 
 /// Maximum response bytes pulled off the wire; bounds memory and tokens.
@@ -16,6 +17,23 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// A current Chrome/Windows x64 UA: many sites 403 bare or custom agents, so
 /// `web_fetch` impersonates a mainstream browser to get the real page.
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+
+/// Route a blocking client through the process-global proxy decision.
+///
+/// `.no_proxy()` runs first so reqwest's implicit environment read cannot
+/// re-add a proxy the resolver already rejected (e.g. a dead one); the
+/// per-URL closure then applies rules, `no_proxy`, and LAN bypass.
+pub(crate) fn apply_proxy(
+    builder: reqwest::blocking::ClientBuilder,
+) -> reqwest::blocking::ClientBuilder {
+    let resolution = hfproxy::resolution();
+    if resolution.address().is_none() || resolution.is_dead() {
+        return builder;
+    }
+    builder.proxy(reqwest::Proxy::custom(move |url| {
+        resolution.proxy_url_for(url)
+    }))
+}
 
 #[derive(Debug, Deserialize)]
 pub struct WebFetchInput {
@@ -73,7 +91,8 @@ pub fn web_fetch(input: &WebFetchInput) -> Result<WebFetchReport, WebError> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(REQUEST_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(reqwest::redirect::Policy::limited(5));
+    let client = apply_proxy(client)
         .build()
         .map_err(|error| WebError::Http(error.to_string()))?;
 

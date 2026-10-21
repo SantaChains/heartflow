@@ -99,13 +99,13 @@ fn measures_estimator_error_against_real_usage() {
         let mut errors: Vec<f64> = predicted
             .iter()
             .zip(&actuals)
-            .map(|(p, a)| (*p as f64 - *a as f64).abs() / *a as f64)
+            .map(|(p, a)| (*p as f64 - f64::from(*a)).abs() / f64::from(*a))
             .collect();
         errors.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
         let bias: f64 = predicted
             .iter()
             .zip(&actuals)
-            .map(|(p, a)| (*p as f64 - *a as f64) / *a as f64)
+            .map(|(p, a)| (*p as f64 - f64::from(*a)) / f64::from(*a))
             .sum::<f64>()
             / actuals.len() as f64;
         let mean = errors.iter().sum::<f64>() / errors.len() as f64;
