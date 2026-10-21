@@ -1,5 +1,5 @@
 {
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Terminal-native coding agent in Rust (binary: hf).",
   "homepage": "https://github.com/SantaChains/heartflow",
   "license": "Apache-2.0",
@@ -16,8 +16,8 @@
   ],
   "architecture": {
     "64bit": {
-      "url": "https://github.com/SantaChains/heartflow/releases/download/v1.2.0/heartflow-1.2.0-win-amd64.zip",
-      "hash": "f8300fb4aa400f522e79e8df9c4eacaa258e049770dac11fa3ea1f6e7dded6a0"
+      "url": "https://github.com/SantaChains/heartflow/releases/download/v1.3.0/heartflow-1.3.0-win-amd64.zip",
+      "hash": "bad632d9b9c94bba98d0059895b1b6d06e5bc68da81bfeb113b2c77a63dd0dfb"
     }
   },
   "bin": "hf.exe",
