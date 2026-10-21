@@ -6,33 +6,12 @@ use std::process::Command;
 use crate::agent_assets::{discover_rules, discover_skills, RuleFile, SkillSummary};
 use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PromptBuildError {
-    Io(std::io::Error),
-    Config(ConfigError),
-}
-
-impl std::fmt::Display for PromptBuildError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(error) => write!(f, "{error}"),
-            Self::Config(error) => write!(f, "{error}"),
-        }
-    }
-}
-
-impl std::error::Error for PromptBuildError {}
-
-impl From<std::io::Error> for PromptBuildError {
-    fn from(value: std::io::Error) -> Self {
-        Self::Io(value)
-    }
-}
-
-impl From<ConfigError> for PromptBuildError {
-    fn from(value: ConfigError) -> Self {
-        Self::Config(value)
-    }
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Config(#[from] ConfigError),
 }
 
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";

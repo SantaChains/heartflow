@@ -188,12 +188,15 @@ fn mode_parsing_names_the_offending_value() {
     );
     assert!(CassetteMode::parse("wat:/tmp/a.json")
         .expect_err("bad mode")
+        .to_string()
         .contains("`record` or `replay`"));
     assert!(CassetteMode::parse("record:")
         .expect_err("empty path")
+        .to_string()
         .contains("empty path"));
     assert!(CassetteMode::parse("nonsense")
         .expect_err("no separator")
+        .to_string()
         .contains("record:<path>"));
     // Splitting on the first colon only is what keeps a drive letter intact.
     assert_eq!(

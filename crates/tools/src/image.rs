@@ -195,28 +195,19 @@ pub struct GenerateImageReport {
     pub size: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ImageError {
+    #[error("image tool not configured: {0}")]
     NotConfigured(String),
+    #[error("invalid request: {0}")]
     Invalid(String),
+    #[error("image request failed: {0}")]
     Http(String),
+    #[error("provider returned no image data")]
     NoImage,
+    #[error("file error: {0}")]
     Io(String),
 }
-
-impl std::fmt::Display for ImageError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotConfigured(msg) => write!(f, "image tool not configured: {msg}"),
-            Self::Invalid(msg) => write!(f, "invalid request: {msg}"),
-            Self::Http(msg) => write!(f, "image request failed: {msg}"),
-            Self::NoImage => write!(f, "provider returned no image data"),
-            Self::Io(msg) => write!(f, "file error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for ImageError {}
 
 /// Wire shape of an OpenAI-compatible image response. Providers return either
 /// base64 (`b64_json`) or a hosted `url`; both are handled.

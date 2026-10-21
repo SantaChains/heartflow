@@ -1117,6 +1117,7 @@ dependencies = [
  "heartflow-proxy",
  "reqwest",
  "serde_json",
+ "thiserror 2.0.20",
  "tokio",
 ]
 
@@ -1129,6 +1130,7 @@ dependencies = [
  "heartflow-runtime",
  "serde",
  "serde_json",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "toml 0.9.12+spec-1.1.0",
@@ -1165,6 +1167,7 @@ dependencies = [
  "simd-json",
  "similar",
  "strsim",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1177,6 +1180,7 @@ dependencies = [
  "heartflow-runtime",
  "rusqlite",
  "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1193,6 +1197,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

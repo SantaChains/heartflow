@@ -168,24 +168,14 @@ impl Schedule {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ScheduleError {
+    #[error("no schedule #{0}")]
     NotFound(u64),
+    #[error("schedule store is full ({MAX_SCHEDULES}); delete one with /schedule delete")]
     Full,
+    #[error("bad trigger spec `{0}`")]
     BadSpec(String),
-}
-
-impl std::fmt::Display for ScheduleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ScheduleError::NotFound(id) => write!(f, "no schedule #{id}"),
-            ScheduleError::Full => write!(
-                f,
-                "schedule store is full ({MAX_SCHEDULES}); delete one with /schedule delete"
-            ),
-            ScheduleError::BadSpec(raw) => write!(f, "bad trigger spec `{raw}`"),
-        }
-    }
 }
 
 static SCHEDULES_ROOT: RwLock<Option<PathBuf>> = RwLock::new(None);

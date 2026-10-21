@@ -1,6 +1,5 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashSet};
-use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -166,7 +165,8 @@ pub trait ToolExecutor: Send + Sync + 'static {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
 pub struct ToolError {
     message: String,
 }
@@ -180,15 +180,8 @@ impl ToolError {
     }
 }
 
-impl Display for ToolError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl std::error::Error for ToolError {}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
 pub struct RuntimeError {
     message: String,
     hint: Option<String>,
@@ -217,14 +210,6 @@ impl RuntimeError {
         self.hint.as_deref()
     }
 }
-
-impl Display for RuntimeError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl std::error::Error for RuntimeError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnSummary {

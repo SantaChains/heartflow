@@ -77,7 +77,10 @@ impl NativeToolExecutor {
 impl ToolExecutor for NativeToolExecutor {
     fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
         if tool_name == "todo_write" {
-            return self.todo.write(input).map_err(ToolError::new);
+            return self
+                .todo
+                .write(input)
+                .map_err(|e| ToolError::new(e.to_string()));
         }
         if tool_name == "ask_user" {
             return self.run_ask_user(input);
@@ -144,7 +147,9 @@ impl ToolExecutor for NativeToolExecutor {
     }
 
     fn seed_plan(&self, input: &str) -> Result<String, ToolError> {
-        self.todo.write(input).map_err(ToolError::new)
+        self.todo
+            .write(input)
+            .map_err(|e| ToolError::new(e.to_string()))
     }
 }
 

@@ -1,4 +1,3 @@
-use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -25,27 +24,12 @@ pub struct RuntimeConfig {
     loaded_entries: Vec<ConfigEntry>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    Io(std::io::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
     Parse(String),
-}
-
-impl Display for ConfigError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(error) => write!(f, "{error}"),
-            Self::Parse(error) => write!(f, "{error}"),
-        }
-    }
-}
-
-impl std::error::Error for ConfigError {}
-
-impl From<std::io::Error> for ConfigError {
-    fn from(value: std::io::Error) -> Self {
-        Self::Io(value)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -65,12 +65,14 @@ use std::time::{Duration, Instant};
 pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why a [`with_exclusive`] call gave up without running its closure.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum LockError {
     /// The lock was still held elsewhere after the timeout elapsed.
+    #[error("file lock timed out: another holder did not release within the budget")]
     Timeout,
     /// Opening or locking the sidecar file failed (permissions, full disk,
     /// antivirus interference, ...).
+    #[error("file lock error: {0}")]
     Io(std::io::Error),
 }
 

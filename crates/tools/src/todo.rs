@@ -7,6 +7,13 @@ use crate::ToolSpec;
 
 const MAX_TODOS: usize = 64;
 
+/// Error returned by [`TodoLedger::write`]; the message is the user-facing
+/// reason the write was rejected (bad JSON, empty content, unknown status, or
+/// over the per-ledger cap).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct TodoError(String);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TodoStatus {
     Pending,
@@ -43,12 +50,12 @@ impl TodoLedger {
 
     /// Replace the whole list; the model always writes the full plan.
     /// Returns a compact transcript summary.
-    pub fn write(&self, input: &str) -> Result<String, String> {
-        let parsed: TodoWriteInput =
-            serde_json::from_str(input).map_err(|error| format!("invalid todo input: {error}"))?;
+    pub fn write(&self, input: &str) -> Result<String, TodoError> {
+        let parsed: TodoWriteInput = serde_json::from_str(input)
+            .map_err(|error| TodoError(format!("invalid todo input: {error}")))?;
         let items = parsed.into_items()?;
         if items.len() > MAX_TODOS {
-            return Err(format!("todo list exceeds {MAX_TODOS} items"));
+            return Err(TodoError(format!("todo list exceeds {MAX_TODOS} items")));
         }
         let summary = render_summary(&items);
         *self.lock() = items;
@@ -99,20 +106,20 @@ struct TodoEntry {
 }
 
 impl TodoWriteInput {
-    fn into_items(self) -> Result<Vec<TodoItem>, String> {
+    fn into_items(self) -> Result<Vec<TodoItem>, TodoError> {
         self.todos
             .into_iter()
             .enumerate()
             .map(|(index, entry)| {
                 let content = entry.content.trim().to_string();
                 if content.is_empty() {
-                    return Err(String::from("todo content must not be empty"));
+                    return Err(TodoError("todo content must not be empty".to_string()));
                 }
                 let status = match entry.status.as_str() {
                     "pending" => TodoStatus::Pending,
                     "in_progress" => TodoStatus::InProgress,
                     "completed" => TodoStatus::Completed,
-                    other => return Err(format!("unknown todo status: {other}")),
+                    other => return Err(TodoError(format!("unknown todo status: {other}"))),
                 };
                 // Prefer a supplied id; otherwise derive a stable positional one
                 // so the task-loop orchestrator can track the same task across
@@ -243,12 +250,12 @@ mod tests {
         let error = ledger
             .write(r#"{"todos":[{"content":"x","status":"done"}]}"#)
             .expect_err("unknown status should be rejected");
-        assert!(error.contains("unknown todo status"));
+        assert!(error.to_string().contains("unknown todo status"));
 
         let error = ledger
             .write(r#"{"todos":[{"content":"   ","status":"pending"}]}"#)
             .expect_err("blank content should be rejected");
-        assert!(error.contains("must not be empty"));
+        assert!(error.to_string().contains("must not be empty"));
     }
 
     #[test]

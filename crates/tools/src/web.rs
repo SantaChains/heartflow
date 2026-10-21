@@ -60,24 +60,15 @@ pub struct WebFetchReport {
     pub cookie_jar_warning: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum WebError {
+    #[error("invalid url: {0}")]
     InvalidUrl(String),
+    #[error("blocked host for safety: {0}")]
     BlockedHost(String),
+    #[error("fetch failed: {0}")]
     Http(String),
 }
-
-impl std::fmt::Display for WebError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidUrl(message) => write!(f, "invalid url: {message}"),
-            Self::BlockedHost(host) => write!(f, "blocked host for safety: {host}"),
-            Self::Http(message) => write!(f, "fetch failed: {message}"),
-        }
-    }
-}
-
-impl std::error::Error for WebError {}
 
 /// Fetch `url` over HTTP(S) and return extracted text. Guards against SSRF by
 /// allowing only http/https, rejecting loopback/private/link-local/metadata

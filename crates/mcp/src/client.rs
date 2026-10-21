@@ -1,4 +1,3 @@
-use std::fmt::{Display, Formatter};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -15,27 +14,12 @@ use crate::transport::Transport;
 /// Upper bound for one JSON-RPC round trip; servers must stay responsive.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum McpError {
-    Io(io::Error),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error("{0}")]
     Protocol(String),
-}
-
-impl Display for McpError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(error) => write!(f, "{error}"),
-            Self::Protocol(message) => write!(f, "{message}"),
-        }
-    }
-}
-
-impl std::error::Error for McpError {}
-
-impl From<io::Error> for McpError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
 }
 
 /// Server identity captured during the `initialize` handshake.

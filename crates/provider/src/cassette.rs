@@ -50,6 +50,12 @@ const FORMAT_VERSION: u32 = 1;
 /// as a direct stream would, rather than letting the queue grow unbounded.
 const RELAY_CAPACITY: usize = 64;
 
+/// Error parsing [`CASSETTE_ENV`]; the message carries the offending value so a
+/// caller can report it verbatim rather than guessing what was meant.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct CassetteError(String);
+
 /// What a [`CassetteClient`] does with each turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CassetteMode {
@@ -71,21 +77,23 @@ impl CassetteMode {
     /// # Errors
     /// Returns the offending value in the message so a caller can report it
     /// verbatim rather than guessing what was meant.
-    pub fn parse(raw: &str) -> Result<Self, String> {
+    pub fn parse(raw: &str) -> Result<Self, CassetteError> {
         let Some((kind, path)) = raw.split_once(':') else {
-            return Err(format!(
+            return Err(CassetteError(format!(
                 "{CASSETTE_ENV} must be `record:<path>` or `replay:<path>`, got `{raw}`"
-            ));
+            )));
         };
         if path.trim().is_empty() {
-            return Err(format!("{CASSETTE_ENV} has an empty path in `{raw}`"));
+            return Err(CassetteError(format!(
+                "{CASSETTE_ENV} has an empty path in `{raw}`"
+            )));
         }
         match kind.trim() {
             "record" => Ok(Self::Record(PathBuf::from(path))),
             "replay" => Ok(Self::Replay(PathBuf::from(path))),
-            other => Err(format!(
+            other => Err(CassetteError(format!(
                 "{CASSETTE_ENV} mode must be `record` or `replay`, got `{other}`"
-            )),
+            ))),
         }
     }
 
@@ -94,7 +102,7 @@ impl CassetteMode {
     /// # Errors
     /// A malformed value is an error rather than a silent `Off`: a typo'd path
     /// that quietly disables recording is worse than a hard stop at startup.
-    pub fn from_env() -> Result<Option<Self>, String> {
+    pub fn from_env() -> Result<Option<Self>, CassetteError> {
         match std::env::var(CASSETTE_ENV) {
             Ok(raw) if !raw.trim().is_empty() => Self::parse(&raw).map(Some),
             _ => Ok(None),
