@@ -1059,7 +1059,7 @@ dependencies = [
 
 [[package]]
 name = "heartflow"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "clap",
  "crossterm",
@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "heartflow-api"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "heartflow-proxy",
  "reqwest",
@@ -1105,14 +1105,14 @@ dependencies = [
 
 [[package]]
 name = "heartflow-commands"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "heartflow-runtime",
 ]
 
 [[package]]
 name = "heartflow-mcp"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "heartflow-proxy",
  "reqwest",
@@ -1123,7 +1123,7 @@ dependencies = [
 
 [[package]]
 name = "heartflow-provider"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "heartflow-api",
  "heartflow-proxy",
@@ -1139,7 +1139,7 @@ dependencies = [
 
 [[package]]
 name = "heartflow-proxy"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "regex",
  "toml 0.9.12+spec-1.1.0",
@@ -1150,7 +1150,7 @@ dependencies = [
 
 [[package]]
 name = "heartflow-runtime"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "chardetng",
  "encoding_rs",
@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "heartflow-store"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "heartflow-runtime",
  "rusqlite",
@@ -1185,7 +1185,7 @@ dependencies = [
 
 [[package]]
 name = "heartflow-tools"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "base64 0.23.1",
  "heartflow-proxy",
