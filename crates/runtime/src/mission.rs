@@ -33,7 +33,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 /// Per-mission state file cap (pi-subagents `missions.md:24`). A mission that
 /// cannot fit is a modeling bug (receipts are bounded), so persisting refuses

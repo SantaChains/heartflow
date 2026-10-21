@@ -32,12 +32,53 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
-use tui_textarea::{CursorMove, TextArea};
+use tui_textarea::{CursorMove, Input, Key, TextArea};
 use unicode_width::UnicodeWidthChar;
 
 use crate::mascot::Mascot;
 use crate::theme::{glyphs, Theme};
 use crate::viewport_term::CompanionTerminal;
+
+/// Map a crossterm key event onto tui-textarea's backend-agnostic [`Input`].
+///
+/// tui-textarea's `crossterm` feature carries its own `crossterm 0.28`
+/// dependency, which would fork crossterm inside this binary (ratatui 0.30 and
+/// inquire already share 0.29). The `no-backend` feature drops that module and
+/// this function replaces it, mirroring upstream `input/crossterm.rs`
+/// semantics exactly so behavior is unchanged.
+#[must_use]
+pub(crate) fn tui_input(key: KeyEvent) -> Input {
+    if key.kind == KeyEventKind::Release {
+        // Windows reports key-release events; upstream ignores them
+        // (tui-textarea #14) and so must we, or every keypress enters the
+        // buffer twice. `Key::Null` is always ignored by `TextArea`.
+        return Input::default();
+    }
+    let mapped = match key.code {
+        KeyCode::Char(c) => Key::Char(c),
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        KeyCode::Esc => Key::Esc,
+        KeyCode::F(n) => Key::F(n),
+        _ => Key::Null,
+    };
+    Input {
+        key: mapped,
+        ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
+        alt: key.modifiers.contains(KeyModifiers::ALT),
+        shift: key.modifiers.contains(KeyModifiers::SHIFT),
+    }
+}
 
 /// REPL slash commands surfaced by completion and the "did you mean" hint.
 /// Kept in sync with `print_repl_help` in main.rs; add new commands to both.
@@ -888,7 +929,7 @@ impl ReplEditor {
                     false
                 }
                 _ => {
-                    textarea.input(key);
+                    textarea.input(tui_input(key));
                     *completion_idx = None;
                     *prefix_search = None;
                     false
@@ -943,7 +984,7 @@ impl ReplEditor {
                             *textarea = textarea_from(entry);
                         }
                     } else {
-                        textarea.input(key);
+                        textarea.input(tui_input(key));
                     }
                     *prefix_search = None;
                     false
@@ -957,7 +998,7 @@ impl ReplEditor {
                             None => blank_textarea(),
                         };
                     } else {
-                        textarea.input(key);
+                        textarea.input(tui_input(key));
                     }
                     *prefix_search = None;
                     false
@@ -996,14 +1037,14 @@ impl ReplEditor {
                         *prefix_search = None;
                         *completion_idx = None;
                     } else {
-                        textarea.input(key);
+                        textarea.input(tui_input(key));
                         *prefix_search = None;
                         *completion_idx = None;
                     }
                     false
                 }
                 _ => {
-                    textarea.input(key);
+                    textarea.input(tui_input(key));
                     // Editing the token invalidates the offered completion so the
                     // hint recomputes next frame.
                     *completion_idx = None;
@@ -1658,7 +1699,7 @@ fn move_word(textarea: &mut TextArea<'static>, backward: bool) {
         KeyCode::Right
     };
     for _ in 0..delta {
-        textarea.input(KeyEvent::new(key_code, KeyModifiers::NONE));
+        textarea.input(tui_input(KeyEvent::new(key_code, KeyModifiers::NONE)));
     }
 }
 

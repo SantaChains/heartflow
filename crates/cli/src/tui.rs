@@ -76,7 +76,7 @@ use runtime::{
 
 use crate::config::ConfigWatcher;
 use crate::core::{guide_context, guide_draft, GuideContext, HeartModel};
-use crate::editor::History;
+use crate::editor::{History, tui_input};
 use crate::keymap::{Action, Keymap};
 use crate::markdown;
 use crate::settings::Settings;
@@ -465,7 +465,7 @@ impl App {
                 if self.history_nav(key) {
                     true
                 } else {
-                    self.input.input(key)
+                    self.input.input(tui_input(key))
                 }
             }
         }

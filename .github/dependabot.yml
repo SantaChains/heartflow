@@ -10,6 +10,13 @@ updates:
         update-types:
           - "minor"
           - "patch"
+    # ratatui/crossterm 已收敛到单拷贝(ratatui 0.30 + crossterm 0.29),依赖
+    # tui-textarea 的 git rev 钉版(crate 上 0.7.0 仍钉 ratatui ^0.29,直接 bump
+    # 会在二进制里分叉出双拷贝——dependabot 机械 bump 已实证会这样)。等
+    # tui-textarea 0.7.1 发布后解除本 ignore。
+    ignore:
+      - dependency-name: "ratatui"
+      - dependency-name: "crossterm"
     commit-message:
       prefix: "chore"
     labels: ["dependencies"]

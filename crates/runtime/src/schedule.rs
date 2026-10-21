@@ -27,7 +27,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
-use std::time::SystemTime;
 
 /// Per-schedule history cap (pi `MAX_HISTORY=100`).
 pub const MAX_HISTORY: usize = 100;

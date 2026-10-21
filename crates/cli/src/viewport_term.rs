@@ -11,7 +11,10 @@
 //! non-slash path — this behaves exactly like a fixed 2-row inline
 //! viewport, so the day-to-day input experience is byte-for-byte what it was.
 //!
-//! Built only from ratatui 0.29's public [`Backend`] / [`Buffer`] surface; the
+//! Built only from ratatui 0.30's public [`Backend`] / [`Buffer`] surface (the
+//! `Backend` trait gained an associated `Error` in 0.30; every implementation
+//! we use — `CrosstermBackend`, `TestBackend` — reports `io::Error`, which the
+//! impl bounds below encode explicitly). The
 //! initial placement mirrors `Terminal::with_options` inline construction so the
 //! first frame lands where the stock terminal would put it.
 
@@ -22,7 +25,9 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect, Size};
 
 /// An inline viewport terminal whose visible height may change between frames.
-pub struct CompanionTerminal<B: Backend> {
+/// `Backend::Error` gained its associated type in ratatui 0.30; every backend
+/// used here reports `io::Error`, so the bound lives on the struct.
+pub struct CompanionTerminal<B: Backend<Error = io::Error>> {
     backend: B,
     buffers: [Buffer; 2],
     current: usize,
@@ -36,7 +41,7 @@ pub struct CompanionTerminal<B: Backend> {
     parked_at: Option<Position>,
 }
 
-impl<B: Backend> CompanionTerminal<B> {
+impl<B: Backend<Error = io::Error>> CompanionTerminal<B> {
     /// Create an inline viewport of `height` rows anchored at the current cursor,
     /// reserving screen room exactly like `ratatui::Terminal` does at construction.
     pub fn with_inline(mut backend: B, height: u16) -> io::Result<Self> {
@@ -208,7 +213,7 @@ impl<B: Backend> CompanionTerminal<B> {
     }
 }
 
-impl<B: Backend> Drop for CompanionTerminal<B> {
+impl<B: Backend<Error = io::Error>> Drop for CompanionTerminal<B> {
     fn drop(&mut self) {
         if self.hidden_cursor {
             // Best-effort: the terminal is going away, so a failure is ignored.
@@ -220,7 +225,7 @@ impl<B: Backend> Drop for CompanionTerminal<B> {
 /// Replicates ratatui 0.29's inline construction: place the viewport top at the
 /// current cursor row, appending blank lines for the rows that hang below, and
 /// pull the top up if those rows would run past the screen.
-fn compute_inline_size<B: Backend>(
+fn compute_inline_size<B: Backend<Error = io::Error>>(
     backend: &mut B,
     height: u16,
     size: Size,
@@ -248,7 +253,73 @@ fn compute_inline_size<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
+    use ratatui::backend::{TestBackend, WindowSize};
+    use ratatui::buffer::Cell;
+
+    /// `TestBackend` reports `Infallible` (ratatui-core 0.1), but
+    /// `CompanionTerminal` requires an io-reporting backend like the real
+    /// `CrosstermBackend`. This adapter lifts the (impossible) error into
+    /// `io::Error` for the tests; the `unwrap`s are on infallible results.
+    struct IoTestBackend(TestBackend);
+
+    impl Backend for IoTestBackend {
+        type Error = io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            self.0.draw(content).unwrap();
+            Ok(())
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            self.0.hide_cursor().unwrap();
+            Ok(())
+        }
+
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.0.show_cursor().unwrap();
+            Ok(())
+        }
+
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            Ok(self.0.get_cursor_position().unwrap())
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            self.0.set_cursor_position(position).unwrap();
+            Ok(())
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+            self.0.clear_region(clear_type).unwrap();
+            Ok(())
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            self.0.clear().unwrap();
+            Ok(())
+        }
+
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            Ok(self.0.window_size().unwrap())
+        }
+
+        fn append_lines(&mut self, n: u16) -> io::Result<()> {
+            self.0.append_lines(n).unwrap();
+            Ok(())
+        }
+
+        fn size(&self) -> io::Result<Size> {
+            Ok(self.0.size().unwrap())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush().unwrap();
+            Ok(())
+        }
+    }
 
     fn blank(_: &mut Buffer, _: Rect) -> Option<Position> {
         None
@@ -257,7 +328,7 @@ mod tests {
     #[test]
     fn inline_viewport_starts_at_requested_height() {
         let backend = TestBackend::new(40, 12);
-        let mut term = CompanionTerminal::with_inline(backend, 2).unwrap();
+        let mut term = CompanionTerminal::with_inline(IoTestBackend(backend), 2).unwrap();
         assert_eq!(term.viewport_area().height, 2);
         assert_eq!(term.viewport_area().width, 40);
         // A draw at the same height must not move the viewport.
@@ -269,7 +340,7 @@ mod tests {
     #[test]
     fn growing_then_shrinking_restores_height() {
         let backend = TestBackend::new(40, 20);
-        let mut term = CompanionTerminal::with_inline(backend, 2).unwrap();
+        let mut term = CompanionTerminal::with_inline(IoTestBackend(backend), 2).unwrap();
         term.draw(2, blank).unwrap();
         term.draw(6, blank).unwrap();
         assert_eq!(term.viewport_area().height, 6);
@@ -282,7 +353,7 @@ mod tests {
     #[test]
     fn height_is_clamped_to_screen() {
         let backend = TestBackend::new(40, 5);
-        let mut term = CompanionTerminal::with_inline(backend, 2).unwrap();
+        let mut term = CompanionTerminal::with_inline(IoTestBackend(backend), 2).unwrap();
         term.draw(100, blank).unwrap();
         assert!(term.viewport_area().height <= 5);
     }
@@ -290,7 +361,7 @@ mod tests {
     #[test]
     fn render_receives_full_viewport_area() {
         let backend = TestBackend::new(30, 10);
-        let mut term = CompanionTerminal::with_inline(backend, 4).unwrap();
+        let mut term = CompanionTerminal::with_inline(IoTestBackend(backend), 4).unwrap();
         let mut seen = Rect::ZERO;
         term.draw(4, |_, area| {
             seen = area;
@@ -308,7 +379,7 @@ mod tests {
         // exercises compute_inline_size's `missing_lines` pull-up path.
         let mut backend = TestBackend::new(40, 12);
         backend.set_cursor_position(Position::new(0, 11)).unwrap();
-        let term = CompanionTerminal::with_inline(backend, 4).unwrap();
+        let term = CompanionTerminal::with_inline(IoTestBackend(backend), 4).unwrap();
         let area = term.viewport_area();
         assert_eq!(area.height, 4);
         assert!(
@@ -324,7 +395,7 @@ mod tests {
         // viewport still fits — the set_inline_height grow+clamp path.
         let mut backend = TestBackend::new(40, 10);
         backend.set_cursor_position(Position::new(0, 8)).unwrap();
-        let mut term = CompanionTerminal::with_inline(backend, 2).unwrap();
+        let mut term = CompanionTerminal::with_inline(IoTestBackend(backend), 2).unwrap();
         term.draw(6, blank).unwrap();
         let area = term.viewport_area();
         assert_eq!(area.height, 6);
@@ -340,7 +411,7 @@ mod tests {
         // the next draw must re-anchor the viewport at the cursor instead of
         // painting the frame in one place and parking the cursor in another.
         let backend = TestBackend::new(40, 12);
-        let mut term = CompanionTerminal::with_inline(backend, 2).unwrap();
+        let mut term = CompanionTerminal::with_inline(IoTestBackend(backend), 2).unwrap();
         term.backend
             .set_cursor_position(Position::new(0, 6))
             .unwrap();
