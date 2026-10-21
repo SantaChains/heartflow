@@ -254,8 +254,12 @@ impl FollowUpQueue {
         self.limit
     }
 
-    /// Atomic temp+rename write of the whole queue. Synchronous and cheap:
-    /// the file is bounded by `limit` + the 20-entry ledger.
+    /// Atomic temp+rename write of the whole queue, under the cross-process
+    /// sidecar lock (two `hf` processes sharing a state dir would otherwise
+    /// interleave their `tmp` writes and rename each other's bytes).
+    /// Synchronous and cheap: the file is bounded by `limit` + the 20-entry
+    /// ledger. A lock timeout counts like a write failure — skipping the
+    /// persist is the honest degradation, writing unguarded is not an option.
     fn persist(&mut self) {
         let Some(path) = self.path.clone() else {
             return;
@@ -268,14 +272,21 @@ impl FollowUpQueue {
             pending: self.pending.iter().cloned().collect(),
             recent: self.recent.iter().cloned().collect(),
         };
+        let tmp = path.with_extension("json.tmp");
         let write = || -> std::io::Result<()> {
             let bytes = serde_json::to_vec(&file)
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "queue encode"))?;
-            let tmp = path.with_extension("json.tmp");
             std::fs::write(&tmp, bytes)?;
             std::fs::rename(&tmp, &path)
         };
-        if write().is_err() {
+        let outcome = runtime::with_exclusive(
+            &runtime::lock_path(&path),
+            runtime::DEFAULT_LOCK_TIMEOUT,
+            write,
+        );
+        if !matches!(outcome, Ok(Ok(()))) {
+            // Lock timeout or failed write: drop any partial tmp, count it.
+            let _ = std::fs::remove_file(&tmp);
             self.persist_failures += 1;
         }
     }

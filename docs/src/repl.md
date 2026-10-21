@@ -88,7 +88,7 @@ mission = pi-subagents mission + kimi goal 的合体：一个带**显式完成�
 - **预算不杀**：任一轴 ≥90% 回合末提醒一次（`/mission turn` 的返回里）；耗尽后打上 `budget_exhausted` 标记、**停提醒但不关 mission**（大项目跨多次会话续命）；
 - 其余面：`/mission` 列表、`/mission show <id>`（判据勾选态 + 最近 5 条收据）、`/mission pause|resume <id>`、`/mission criterion <id> cmd|file|human|nodiag|free ...` 加判据。机械判据不许 approve（会自验，收据是伪证据）。
 
-**诚实边界**：turn 记账目前是手动面（`/mission turn`），每回合自动记账与提醒注入前置 P2 事件循环；跨进程文件锁未做（单进程 MVP）；`nodiag` 判据暂为人工批准（rust-analyzer 集成属另一量级）。
+**诚实边界**：turn 记账目前是手动面（`/mission turn`），每回合自动记账与提醒注入前置 P2 事件循环；`nodiag` 判据暂为人工批准（rust-analyzer 集成属另一量级）。state.json 与 events.jsonl 的落盘已并入跨进程文件锁（见停机安全章）。
 
 ## scheduled-runs（§1 pi-job #6，到期工作外部触发）
 
@@ -99,11 +99,24 @@ mission = pi-subagents mission + kimi goal 的合体：一个带**显式完成�
 - `run_due` 先预订 `last_run_ms` 再派发——调用方中途死掉也不会导致同周期无限重 fire；spawn 被拒（积压满）记入历史为 failed，interval 下个周期重试；
 - `/schedule` 列表（含 due 标记）、`/schedule show <id>` 看运行历史、`/schedule pause|resume|delete <id>`；落盘 `~/.heartflow/sessions/schedules/schedules.json`（原子写 + 256KiB 上限，单文件损坏不崩溃、空表起步 + doctor 告警）。
 
-**诚实边界**：once 只支持相对（`+30m`）与 epoch 毫秒两种写法——本地 `HH:MM`/IANA 时区需引 chrono-tz（路线图依赖评估项），calendar 触发因此暂不可表达。
+**诚实边界**：once 只支持相对（`+30m`）与 epoch 毫秒两种写法——本地 `HH:MM`/IANA 时区的依赖评估已完成（`iana-time-zone` + `chrono-tz`，可行但编译期/二进制成本待真实需求再付，见路线图），calendar 触发因此暂不可表达。
 
 ## 停机安全（§4，长期运行三保证之一）
 
 - **退出即对账**：EOF（Ctrl+D）、`/exit`、`/restart` 三条退出路径都会立刻把仍在 queued/running 的 job 终态化为 Stopped 并附「宿主退出，输出为部分」note 落盘——**首个终态裁决获胜**，稍后 unwind 出的工人结果不可覆写；不必等下次启动的 stale reconcile 才知道真相。
 - **协作式停止的边界**：在飞回合不可中断（double-Ctrl+C 取消属 P2 前置项，见路线图）；job 的 stop 在工具调用边界生效，LLM 调用期内天然等待。
 - **崩溃面**：队列落盘（见队列章）、mission/schedule 单文件损坏不崩溃（corrupted 计数 + doctor 告警）、job 记录启动对账。混沌测试钉死：垃圾/截断/错类型/错形状四类损坏全部跳过计数、健康邻存不受染、`next_id` 不回退。
-- **诚实边界**：非 UTF-8 的 state 文件按损坏计数（曾修复过「静默跳过导致永久不可见」的真缺陷）；跨进程文件锁未做（单写者纪律由「一个会话一个实例」约定承担，单写者 World 是 P2）。
+- **诚实边界**：非 UTF-8 的 state 文件按损坏计数（曾修复过「静默跳过导致永久不可见」的真缺陷）。
+
+## 跨进程文件锁（§4，多 `hf` 进程共存的基础卫生）
+
+所有耐久 store（`schedules.json`、`mission-*/state.json`、`job-*/status.json`、`queue.json`）的写入都经 `runtime::filelock::with_exclusive`——sidecar `<数据文件>.lock` + OS 建议性锁（Windows `LockFileEx` / Unix `flock`，平台 unsafe 收在 `fd-lock` 内，本仓 `unsafe_code = forbid`）：
+
+- **为什么必须锁**：temp+rename 只保证单次写原子；两进程交错「写 tmp → 截断 tmp → rename」会把对方的字节 rename 成自己的名字（双方还共用同一个 `.tmp` 路径）；
+- **为什么锁 sidecar 而非数据文件**：rename 会替换数据文件本体，锁在旧文件对象上等于没锁；
+- **失败语义**：bounded 等待 5s（1ms→50ms 退避），超时**跳过写并计入磁盘失败**（doctor 可见）——绝不无锁裸写；锁在持有者进程死亡时由内核释放，无 stale-lock 问题；
+- **读者不取锁**：rename 快照读本就原子，陈旧快照（at-least-once）优于启动阻塞；
+- **同线程禁止嵌套**：内层无法区分「自己进程持有」与「别的进程持有」；
+- 顺带修复：job `status.json` 从裸 `fs::write` 升级为锁内 temp+rename（裸写崩溃留撕裂文件，破坏启动对账）。
+
+诚实边界：这只序列化写，不是多写者数据库——各进程内存仍是事实源，并发写是「最后落盘者胜」；真正的单写者 World 仍是 P2。job id 是进程本地序号，两进程共用 `JOBS_ROOT` 会逻辑互踩（schema 级遗留，见路线图）。测试含真跨进程互斥与双线程 RMW 序列化两条硬证明。

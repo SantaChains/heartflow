@@ -183,8 +183,12 @@ fn job_dir(root: &Path, id: u64) -> PathBuf {
     root.join(format!("job-{id}"))
 }
 
-/// Best-effort disk write; a failed write is counted (doctor-visible) and
-/// never blocks the job — the in-memory record is the source of truth.
+/// Best-effort disk write under the cross-process sidecar lock; a failed
+/// write (or a lock timeout) is counted (doctor-visible) and never blocks
+/// the job — the in-memory record is the source of truth. The write is
+/// temp+rename: a bare `fs::write` here used to leave a torn `status.json`
+/// behind if the process died mid-write, which then breaks reload-time
+/// reconciliation.
 fn persist(root: &Option<PathBuf>, id: u64, status_json: &str) {
     let Some(root) = root else { return };
     let dir = job_dir(root, id);
@@ -192,8 +196,23 @@ fn persist(root: &Option<PathBuf>, id: u64, status_json: &str) {
         DISK_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    if std::fs::write(dir.join("status.json"), status_json).is_err() {
-        DISK_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+    let final_path = dir.join("status.json");
+    let tmp_path = dir.join("status.json.tmp");
+    let write = || -> std::io::Result<()> {
+        std::fs::write(&tmp_path, status_json)?;
+        let _ = std::fs::remove_file(&final_path);
+        std::fs::rename(&tmp_path, &final_path)
+    };
+    match crate::filelock::with_exclusive(
+        &crate::filelock::lock_path(&final_path),
+        crate::filelock::DEFAULT_LOCK_TIMEOUT,
+        write,
+    ) {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) | Err(_) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            DISK_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -208,19 +227,22 @@ fn append_event(root: &Option<PathBuf>, id: u64, kind: &str, text: &str) {
         "{{\"ts\":{nanos},\"kind\":\"{kind}\",\"text\":{}}}\n",
         serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string())
     );
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        Ok(mut file) => {
-            if file.write_all(line.as_bytes()).is_err() {
-                DISK_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        Err(_) => {
-            DISK_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
-        }
+    // Append under the cross-process lock (see mission.rs append_event):
+    // unlocked appends from two processes can interleave mid-line.
+    let appended = crate::filelock::with_exclusive(
+        &crate::filelock::lock_path(&path),
+        crate::filelock::DEFAULT_LOCK_TIMEOUT,
+        || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut file| file.write_all(line.as_bytes()))
+                .is_ok()
+        },
+    );
+    if !matches!(appended, Ok(true)) {
+        DISK_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
     }
 }
 

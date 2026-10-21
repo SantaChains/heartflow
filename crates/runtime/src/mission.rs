@@ -721,16 +721,25 @@ impl MissionLedger {
         }
         let final_path = dir.join("state.json");
         let tmp_path = dir.join("state.json.tmp");
-        let write_ok = std::fs::write(&tmp_path, json.as_bytes())
-            .and_then(|()| {
-                // Windows rename fails onto an existing file; clear first.
-                let _ = std::fs::remove_file(&final_path);
-                std::fs::rename(&tmp_path, &final_path)
-            })
-            .is_ok();
-        if !write_ok {
-            let _ = std::fs::remove_file(&tmp_path);
-            DISK_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        let write_ok = crate::filelock::with_exclusive(
+            &crate::filelock::lock_path(&final_path),
+            crate::filelock::DEFAULT_LOCK_TIMEOUT,
+            || {
+                std::fs::write(&tmp_path, json.as_bytes()).and_then(|()| {
+                    // Windows rename fails onto an existing file; clear first.
+                    let _ = std::fs::remove_file(&final_path);
+                    std::fs::rename(&tmp_path, &final_path)
+                })
+            },
+        );
+        match write_ok {
+            Ok(Ok(())) => {}
+            // Either the lock timed out (closure never ran) or the write
+            // itself failed inside the lock; clean the tmp either way.
+            Ok(Err(_)) | Err(_) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                DISK_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -742,12 +751,24 @@ impl MissionLedger {
             now_ms(),
             serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string())
         );
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = file.write_all(line.as_bytes());
+        // Append under the cross-process lock: two processes appending to
+        // the same events.jsonl may otherwise interleave mid-line. A timed
+        // out append is counted like any other disk failure — the ledger is
+        // observability, the in-memory mission stays authoritative.
+        let appended = crate::filelock::with_exclusive(
+            &crate::filelock::lock_path(&path),
+            crate::filelock::DEFAULT_LOCK_TIMEOUT,
+            || {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .and_then(|mut file| file.write_all(line.as_bytes()))
+                    .is_ok()
+            },
+        );
+        if !matches!(appended, Ok(true)) {
+            DISK_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
         }
     }
 }

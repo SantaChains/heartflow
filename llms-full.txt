@@ -232,7 +232,7 @@ mission = pi-subagents mission + kimi goal 的合体：一个带**显式完成�
 - **预算不杀**：任一轴 ≥90% 回合末提醒一次（`/mission turn` 的返回里）；耗尽后打上 `budget_exhausted` 标记、**停提醒但不关 mission**（大项目跨多次会话续命）；
 - 其余面：`/mission` 列表、`/mission show <id>`（判据勾选态 + 最近 5 条收据）、`/mission pause|resume <id>`、`/mission criterion <id> cmd|file|human|nodiag|free ...` 加判据。机械判据不许 approve（会自验，收据是伪证据）。
 
-**诚实边界**：turn 记账目前是手动面（`/mission turn`），每回合自动记账与提醒注入前置 P2 事件循环；跨进程文件锁未做（单进程 MVP）；`nodiag` 判据暂为人工批准（rust-analyzer 集成属另一量级）。
+**诚实边界**：turn 记账目前是手动面（`/mission turn`），每回合自动记账与提醒注入前置 P2 事件循环；`nodiag` 判据暂为人工批准（rust-analyzer 集成属另一量级）。state.json 与 events.jsonl 的落盘已并入跨进程文件锁（见停机安全章）。
 
 ## scheduled-runs（§1 pi-job #6，到期工作外部触发）
 
@@ -243,14 +243,27 @@ mission = pi-subagents mission + kimi goal 的合体：一个带**显式完成�
 - `run_due` 先预订 `last_run_ms` 再派发——调用方中途死掉也不会导致同周期无限重 fire；spawn 被拒（积压满）记入历史为 failed，interval 下个周期重试；
 - `/schedule` 列表（含 due 标记）、`/schedule show <id>` 看运行历史、`/schedule pause|resume|delete <id>`；落盘 `~/.heartflow/sessions/schedules/schedules.json`（原子写 + 256KiB 上限，单文件损坏不崩溃、空表起步 + doctor 告警）。
 
-**诚实边界**：once 只支持相对（`+30m`）与 epoch 毫秒两种写法——本地 `HH:MM`/IANA 时区需引 chrono-tz（路线图依赖评估项），calendar 触发因此暂不可表达。
+**诚实边界**：once 只支持相对（`+30m`）与 epoch 毫秒两种写法——本地 `HH:MM`/IANA 时区的依赖评估已完成（`iana-time-zone` + `chrono-tz`，可行但编译期/二进制成本待真实需求再付，见路线图），calendar 触发因此暂不可表达。
 
 ## 停机安全（§4，长期运行三保证之一）
 
 - **退出即对账**：EOF（Ctrl+D）、`/exit`、`/restart` 三条退出路径都会立刻把仍在 queued/running 的 job 终态化为 Stopped 并附「宿主退出，输出为部分」note 落盘——**首个终态裁决获胜**，稍后 unwind 出的工人结果不可覆写；不必等下次启动的 stale reconcile 才知道真相。
 - **协作式停止的边界**：在飞回合不可中断（double-Ctrl+C 取消属 P2 前置项，见路线图）；job 的 stop 在工具调用边界生效，LLM 调用期内天然等待。
 - **崩溃面**：队列落盘（见队列章）、mission/schedule 单文件损坏不崩溃（corrupted 计数 + doctor 告警）、job 记录启动对账。混沌测试钉死：垃圾/截断/错类型/错形状四类损坏全部跳过计数、健康邻存不受染、`next_id` 不回退。
-- **诚实边界**：非 UTF-8 的 state 文件按损坏计数（曾修复过「静默跳过导致永久不可见」的真缺陷）；跨进程文件锁未做（单写者纪律由「一个会话一个实例」约定承担，单写者 World 是 P2）。
+- **诚实边界**：非 UTF-8 的 state 文件按损坏计数（曾修复过「静默跳过导致永久不可见」的真缺陷）。
+
+## 跨进程文件锁（§4，多 `hf` 进程共存的基础卫生）
+
+所有耐久 store（`schedules.json`、`mission-*/state.json`、`job-*/status.json`、`queue.json`）的写入都经 `runtime::filelock::with_exclusive`——sidecar `<数据文件>.lock` + OS 建议性锁（Windows `LockFileEx` / Unix `flock`，平台 unsafe 收在 `fd-lock` 内，本仓 `unsafe_code = forbid`）：
+
+- **为什么必须锁**：temp+rename 只保证单次写原子；两进程交错「写 tmp → 截断 tmp → rename」会把对方的字节 rename 成自己的名字（双方还共用同一个 `.tmp` 路径）；
+- **为什么锁 sidecar 而非数据文件**：rename 会替换数据文件本体，锁在旧文件对象上等于没锁；
+- **失败语义**：bounded 等待 5s（1ms→50ms 退避），超时**跳过写并计入磁盘失败**（doctor 可见）——绝不无锁裸写；锁在持有者进程死亡时由内核释放，无 stale-lock 问题；
+- **读者不取锁**：rename 快照读本就原子，陈旧快照（at-least-once）优于启动阻塞；
+- **同线程禁止嵌套**：内层无法区分「自己进程持有」与「别的进程持有」；
+- 顺带修复：job `status.json` 从裸 `fs::write` 升级为锁内 temp+rename（裸写崩溃留撕裂文件，破坏启动对账）。
+
+诚实边界：这只序列化写，不是多写者数据库——各进程内存仍是事实源，并发写是「最后落盘者胜」；真正的单写者 World 仍是 P2。job id 是进程本地序号，两进程共用 `JOBS_ROOT` 会逻辑互踩（schema 级遗留，见路线图）。测试含真跨进程互斥与双线程 RMW 序列化两条硬证明。
 
 
 ---
@@ -837,12 +850,12 @@ pub struct QueueSet {
 - **pi job MVP（`runtime::jobs`）**：`JobRegistry` + `JobRunner` trait（执行与治理解耦，离线可脚本化测试）；状态集取上游 async-run 集与 agent 集**交集子集** `queued/running/complete/failed/stopped`（当日网络核验过两集并存）；并发槽位（默认 3）+ 积压上限（默认 20，满则拒绝）；磁盘 `status.json` + `events.jsonl` 追加流（写失败计数不阻断）；进程死亡对账（启动时 stale queued/running → stopped）；**终态附注纪律**（stopped/failed 的 note 明示「任务未完成」，防监工把截断当成功）；**reason 三分法**（Progress 不唤醒监工，Result/失败经队列注入成为下一回合）。
 - **job 墙钟超时（2026-10-21 调研批次补全，§8 业绩标准 #1）**：`DEFAULT_JOB_WALL_TIMEOUT`（30 分钟，对齐 counterpoint 的「30 分钟硬顶在启动时刻武装」与 codexmon WallSec 层）；`HEARTFLOW_JOB_TIMEOUT_SECS` 覆盖（`0` 关闭）；看门狗线程在 `Queued→Running` 翻转时武装（排队等待不计费）；`terminalize` 幂等化——**首个终态裁决获胜**，超时 Stopped 不可被协作 runner 稍后 unwind 出的 Ok/Err 覆写为 Complete/Stopped（测试钉死）；超时附注带 "wall-clock timeout … NOT finished"。
 - **监工-工人 MVP**：监工 = 主 REPL 会话；工人 = `/jobs spawn` 的隔离会话（独立 Session/client/权限面），默认 **read-only**（`--write` opt-in workspace-write，full 永不下发）；工人无 spawn 面（深度=1 结构护栏）；协作式 stop（在飞调用不中断，结果丢弃 + 附注）。
-- **mission 账本（2026-10-22 批次，§1/§4 P-A 落地）**：`runtime::mission`（`MissionLedger`）——四态 `Active/Paused/Blocked/Complete`（kimi `GoalStatus`）+ 三轴预算（token/turn/wall_ms，kimi `GoalBudgetLimits`）+ 判据五型（`CommandSucceeds`/`FileMatches` 机械型完成时**当场重验**，`HumanApproved`/`NoDiagnostics` 须显式 approve 收据，`FreeText` 唯一弱证据型）；**D1.1 反过早完成/反过早放弃是类型错误不是提示词**——complete 全判据过验才放行（弱证据-only 拒绝 `WeakOnly`）、blocked 需连续 3 次声明且 productive turn 清零连击；**D1.2 预算不杀**——≥90% 提醒一次、耗尽打标停提醒不关 mission；落盘 per-mission `state.json`（temp+rename 原子写 + 256KiB 拒写不截断 + 失败计数）+ receipts（上限 50）+ `events.jsonl`；锁污染一律 `PoisonError::into_inner` 恢复（本仓纪律，棘轮零 debt）。REPL `/mission` 家族 + doctor 磁盘级统计段。诚实边界：turn 手动记账（自动注入前置 P2）、跨进程文件锁未做、nodiag 暂人工批准。
-- **scheduled-runs（2026-10-22 批次，§1 pi-job #6 落地）**：`runtime::schedule`（`ScheduleStore`）——`once`/`interval` 两触发型（pi 九动作的 MVP 子集）、**overlap=skip 唯一重叠语义（skip 记入历史不静默吞）**、`catchUp none|latest`（none 错过即诚实记 skipped-consumed）、`--quiet` 成功不唤醒监工、history 上限 100；`run_due` **先预订 `last_run_ms` 再派发**（调用方崩溃也不无限重 fire）+ `record_spawn_refused`（积压满诚实记 failed，interval 下周期重试）；REPL 三个 drain 时机（启动/回合边界/`/schedule run-due`）把到期 schedule 派为**普通 read-only 工人 job**——调度零新增执行机制；job 终态经链接表对账回写 schedule 历史（「结果落盘 ≠ 退出证明」）；落盘单 `schedules.json`（原子写 + 256KiB + 损坏不崩溃）。诚实边界：once 只支持相对/epoch 毫秒（本地 HH:MM/IANA 需 chrono-tz，依赖评估项）、calendar 不可表达。
+- **mission 账本（2026-10-22 批次，§1/§4 P-A 落地）**：`runtime::mission`（`MissionLedger`）——四态 `Active/Paused/Blocked/Complete`（kimi `GoalStatus`）+ 三轴预算（token/turn/wall_ms，kimi `GoalBudgetLimits`）+ 判据五型（`CommandSucceeds`/`FileMatches` 机械型完成时**当场重验**，`HumanApproved`/`NoDiagnostics` 须显式 approve 收据，`FreeText` 唯一弱证据型）；**D1.1 反过早完成/反过早放弃是类型错误不是提示词**——complete 全判据过验才放行（弱证据-only 拒绝 `WeakOnly`）、blocked 需连续 3 次声明且 productive turn 清零连击；**D1.2 预算不杀**——≥90% 提醒一次、耗尽打标停提醒不关 mission；落盘 per-mission `state.json`（temp+rename 原子写 + 256KiB 拒写不截断 + 失败计数）+ receipts（上限 50）+ `events.jsonl`；锁污染一律 `PoisonError::into_inner` 恢复（本仓纪律，棘轮零 debt）。REPL `/mission` 家族 + doctor 磁盘级统计段。诚实边界：turn 手动记账（自动注入前置 P2）、nodiag 暂人工批准（rust-analyzer 集成属另一量级）；落盘已并入 §4 跨进程文件锁。
+- **scheduled-runs（2026-10-22 批次，§1 pi-job #6 落地）**：`runtime::schedule`（`ScheduleStore`）——`once`/`interval` 两触发型（pi 九动作的 MVP 子集）、**overlap=skip 唯一重叠语义（skip 记入历史不静默吞）**、`catchUp none|latest`（none 错过即诚实记 skipped-consumed）、`--quiet` 成功不唤醒监工、history 上限 100；`run_due` **先预订 `last_run_ms` 再派发**（调用方崩溃也不无限重 fire）+ `record_spawn_refused`（积压满诚实记 failed，interval 下周期重试）；REPL 三个 drain 时机（启动/回合边界/`/schedule run-due`）把到期 schedule 派为**普通 read-only 工人 job**——调度零新增执行机制；job 终态经链接表对账回写 schedule 历史（「结果落盘 ≠ 退出证明」）；落盘单 `schedules.json`（原子写 + 256KiB + 损坏不崩溃）。诚实边界：once 只支持相对/epoch 毫秒、calendar 不可表达。**chrono-tz 依赖评估（2026-10-22，结论：可行、缓做）**：本地 `HH:MM`/IANA 触发需要「本地时区名 + 规则库」两件——`iana-time-zone`（极小，取本机 IANA 名）+ `chrono-tz`（内嵌全量 IANA 数据库，编译期 +10s 级、二进制 +~1MiB）；本仓无 chrono，引它即连 chrono 一并进树。DST 边界（不存在的时间、重复时间）是 chrono-tz 的成熟处理面，自研 TZif 解析不划算。裁决：epoch-ms + 相对偏移已覆盖调度自动化场景，等真实本地定时需求出现再引，避免为不存在的功能付编译期税。
 - **队列命名泳道（2026-10-22 批次，D2.1 数据结构半边）**：`QueueEntry.lane` 标签 + `send_in_lane`/`lane_names`/`items_in_lane`；REPL `/queue send --lane <name>`、`/queue lane <name>`、列表 `@name` 标注。**纪律：泳道是观测与编辑维度，递送仍是全局到达序**——跨泳道轮转规则需要 TUI 侧（P-C）才有意义，离线拍脑袋定轮转属猜测。
 **落地状态（2026-10-21 第二批网络核验，Qoder 官方文档对照）**：Qoder 官方「排队 vs 插话」二分（docs.qoder.com conversation-input）与本仓 `FollowUp` vs `Steer`（P-D）**语义同构**——插话「在安全执行边界交给 Agent，不直接停止当前执行」正是本仓「明确不做强插打断」的官方版；排队消息管理面「插话 / 撤回到输入框编辑 / 移除 / 多条重排」= `/queue send/remove/move/edit` 已覆盖；「设置 → 运行中发送方式」= D2.3 默认 FollowUp；composer 在「压缩中 / 有待处理请求」时提示不支持插话 → TUI P-C 待做项。qoder 式「引导 = 结合当前消息、总结之前工作、明确后续任务后发送」= `/guide` 三段草稿 + 默认直接发送，已实现。生态侧：ACP `_session/steering` 扩展（Claude/Codex 已支持，agent-shell 0.78 的 RET=排队 / M-RET=插话）→ 若将来做 ACP server 可对齐；灵码（Qoder CN）的「消息排队 + 全自动执行模式带终端命令禁止名单」中，禁止名单与既有 `is_dangerous_command` 分级确认同族。
 
-- **待做**：P-C（TUI 队列编辑键位 + 引导 overlay——本仓铁律：TUI 派发不盲改，需真机冒烟）、P-D（Steer，前置 P2 并发模型）、per-section 泳道递送轮转（D2.1 的 TUI 半边；数据结构与 REPL 观测面已落地）、mission 回合自动记账与提醒注入（D1.3，前置 P2 事件循环）、跨进程 mission 文件锁（单进程 MVP 已够用，多进程时再做）。
+- **待做**：P-C（TUI 队列编辑键位 + 引导 overlay——本仓铁律：TUI 派发不盲改，需真机冒烟）、P-D（Steer，前置 P2 并发模型）、per-section 泳道递送轮转（D2.1 的 TUI 半边；数据结构与 REPL 观测面已落地）、mission 回合自动记账与提醒注入（D1.3，前置 P2 事件循环）。跨进程文件锁已落地（§4，2026-10-22 批次）。
 
 ## 2. 搜索与研究能力（web_search / web_fetch 增强）
 
@@ -891,7 +904,8 @@ pub struct QueueSet {
 - **队列耐久化**：pending + 终态台账同步落盘 `sessions/queue.json`（原子写、每次变更即写）；恢复时 `next_id` 从条目重建、limit 钳 1..=4096、pending 超限诚实截断保最老；**投递中途崩溃 = 重投（at-least-once）**，绝不 at-most-once 丢失；损坏降级空队 + 明示 + doctor 告警，绝不拒绝启动。混沌测试钉死（roundtrip/损坏/防回退/重投/钳制/截断 6 条）。
 - **退出即对账**：EOF/`/exit`/`/restart` 三路径统一收口 `JobRegistry::finalize_on_shutdown`——非终态 job 立即 Stopped + 「宿主退出，输出为部分」note 落盘，首个终态获胜不可被 late completion 覆写（测试钉死）；不必等下次启动 reconcile。
 - **抗损坏台账闭环**：mission load/summarize 对非 UTF-8 state 文件从「静默跳过（永久不可见）」改为「计入 corrupted 台账」——混沌测试抓出的真缺陷；垃圾/截断/错类型/错形状/缺文件五类损坏全部跳过计数、健康邻存不受染、`next_id` 不回退、doctor 可见。
-- **待做**（依赖排序）：在飞回合取消（double-Ctrl+C，前置 P2 事件循环可够到在飞回合）、跨进程文件锁（单写者 World 前置 P2）、cassette 录制扩展为 ds4 式「模型加载/提示渲染/工具调用/会话状态」集成测试、发布 QA 清单落成仓库内可勾选文档（ds4 `QA_BEFORE_RELEASES.md` 纪律）。
+- **跨进程文件锁（2026-10-22 批次）**：`runtime::filelock`（`with_exclusive` + `lock_path`）——sidecar `<data>.lock` + OS 建议性锁（Windows `LockFileEx` / Unix `flock`，经 `fd-lock` 封装：本仓 `unsafe_code = forbid`，平台 unsafe 收在实战检验的依赖内，锁语义自持）。**为什么必须锁**：temp+rename 只保证单次写原子，两进程交错 `写 tmp → 截断 tmp → rename` 会把对方的字节 rename 成自己的名字；**为什么锁 sidecar**：rename 会替换数据文件本体，锁在旧文件对象上等于没锁。设计纪律：bounded 等待 5s（1ms→50ms 退避）超时**跳过写并计数**（绝不无锁裸写）、锁失败与写失败同入 `DISK_WRITE_FAILURES`（doctor 可见）、读者不取锁（rename 快照读本就原子，陈旧快照优于启动阻塞）、**同线程禁止嵌套**（内层无法区分自持与外占）。接入面：schedules/mission `state.json`/job `status.json`/queue.json 四处 persist + mission/job 两处 `events.jsonl` append；顺带把 job `status.json` 从裸 `fs::write` 升级为锁内 temp+rename（裸写崩溃留撕裂文件，破坏启动对账）。测试 7 条含**真跨进程互斥**（重执行测试二进制为持锁子进程，父进程 bounded 尝试必超时、子进程退出后内核释放锁可获取）与双线程 RMW 序列化（无锁必丢更新）。诚实边界：这只序列化写，不是多写者数据库——各进程内存仍是事实源，并发写世界仍是「最后落盘者胜」；真正的单写者 World 仍是 P2。**遗留记录**：job id 是进程本地序号，两进程共用 `JOBS_ROOT` 会逻辑互踩（schema 级问题，job 目录需带 pid/会话命名空间，另行处理）。
+- **待做**（依赖排序）：在飞回合取消（double-Ctrl+C，前置 P2 事件循环可够到在飞回合）、cassette 录制扩展为 ds4 式「模型加载/提示渲染/工具调用/会话状态」集成测试、发布 QA 清单落成仓库内可勾选文档（ds4 `QA_BEFORE_RELEASES.md` 纪律）。
 
 目标：让 heartflow 能**维持大项目的持续运行**，现在只记录设计，不执行。
 

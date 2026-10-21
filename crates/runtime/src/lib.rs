@@ -7,6 +7,7 @@ mod conversation;
 mod diagnostics;
 mod doc_search;
 mod file_ops;
+mod filelock;
 mod jobs;
 mod mission;
 mod permissions;
@@ -49,6 +50,7 @@ pub use file_ops::{
     GrepSearchOutput, PatchChange, PatchFileResult, ReadFileOutput, SearchFilesOutput,
     StructuredPatchHunk, TextFilePayload, WriteFileOutput,
 };
+pub use filelock::{lock_path, with_exclusive, LockError, DEFAULT_LOCK_TIMEOUT};
 pub use jobs::{
     disk_write_failures, reconcile_stale_records, set_jobs_root, JobRecord, JobRegistry, JobRunner,
     JobStatus, MessageKind, SpawnError, StopFlag, WorkerMessage, DEFAULT_JOB_SLOTS,

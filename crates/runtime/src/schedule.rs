@@ -475,8 +475,11 @@ impl ScheduleStore {
         schedule.history.drain(..keep_from);
     }
 
-    /// Whole-store atomic write (temp + rename), size-capped, failures
-    /// counted — the in-memory map is the source of truth.
+    /// Whole-store atomic write (temp + rename) under the cross-process
+    /// sidecar lock, size-capped, failures counted — the in-memory map is
+    /// the source of truth. A lock timeout is counted like a write failure:
+    /// skipping the write is the honest degradation, writing unguarded is
+    /// not an option.
     fn persist(&self) {
         let Some(root) = schedules_root() else { return };
         if std::fs::create_dir_all(&root).is_err() {
@@ -502,15 +505,24 @@ impl ScheduleStore {
         }
         let final_path = root.join("schedules.json");
         let tmp_path = root.join("schedules.json.tmp");
-        let write_ok = std::fs::write(&tmp_path, json.as_bytes())
-            .and_then(|()| {
-                let _ = std::fs::remove_file(&final_path);
-                std::fs::rename(&tmp_path, &final_path)
-            })
-            .is_ok();
-        if !write_ok {
-            let _ = std::fs::remove_file(&tmp_path);
-            DISK_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        let write_ok = crate::filelock::with_exclusive(
+            &crate::filelock::lock_path(&final_path),
+            crate::filelock::DEFAULT_LOCK_TIMEOUT,
+            || {
+                std::fs::write(&tmp_path, json.as_bytes()).and_then(|()| {
+                    let _ = std::fs::remove_file(&final_path);
+                    std::fs::rename(&tmp_path, &final_path)
+                })
+            },
+        );
+        match write_ok {
+            Ok(Ok(())) => {}
+            // Either the lock timed out (closure never ran) or the write
+            // itself failed inside the lock; clean the tmp either way.
+            Ok(Err(_)) | Err(_) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                DISK_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
