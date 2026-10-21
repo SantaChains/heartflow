@@ -670,7 +670,7 @@ mod tests {
     #[test]
     fn reservation_survives_a_missing_record_launched() {
         let _guard = root_guard();
-        let (store, id) = interval_store(60);
+        let (store, _id) = interval_store(60);
         assert_eq!(store.run_due(0, DueReason::Timer).len(), 1);
         // Caller crashed before record_launched: the last_run stamp still
         // prevents an every-tick refire.

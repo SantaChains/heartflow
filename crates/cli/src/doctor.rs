@@ -217,6 +217,29 @@ pub(crate) fn run_doctor(fix: bool) -> Result<Vec<String>, Box<dyn std::error::E
         );
     }
 
+    // Queue durability file (§4 停机安全): pending queued messages are the
+    // user's typed work; a corrupt queue file silently becomes an empty
+    // queue at next start, so surface it here while repair is still possible.
+    let queue_path = crate::storage::sessions_dir().join("queue.json");
+    if queue_path.exists() {
+        let sound = std::fs::read(&queue_path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+            .is_some_and(|value| value.get("version").and_then(|v| v.as_u64()) == Some(1));
+        if !sound {
+            problems.push(String::from(
+                "queue.json is unreadable - pending queued messages will be dropped at next start; salvage or delete ~/.heartflow/sessions/queue.json",
+            ));
+        } else {
+            let pending = std::fs::read(&queue_path)
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+                .and_then(|value| value.get("pending").and_then(|p| p.as_array()).map(Vec::len))
+                .unwrap_or(0);
+            println!("  ok   queue: durable queue file sound, {pending} pending");
+        }
+    }
+
     // The derived history database, if present, must be structurally sound.
     check_history_store(&mut problems);
 

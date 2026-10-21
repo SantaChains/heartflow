@@ -538,6 +538,35 @@ impl JobRegistry {
         append_event(&jobs_root(), id, status.label(), "");
     }
 
+    /// Shutdown honesty (roadmap §4 停机安全): terminalize every
+    /// non-terminal job with an explicit shutdown note, so a restart — or the
+    /// operator reading `status.json` directly — sees the truth immediately
+    /// instead of waiting for next-start reconciliation. Idempotent by way of
+    /// [`Self::terminalize_note`]'s first-verdict-wins discipline: a worker
+    /// finishing microseconds after the host decided to exit cannot overwrite
+    /// the shutdown verdict. Returns how many jobs were finalized.
+    #[must_use]
+    pub fn finalize_on_shutdown(&self, note: &str) -> usize {
+        let ids: Vec<u64> = match self.inner.jobs.lock() {
+            Ok(jobs) => jobs
+                .iter()
+                .filter_map(|(id, handle)| {
+                    let non_terminal = handle
+                        .record
+                        .lock()
+                        .map(|record| !record.status.is_terminal())
+                        .unwrap_or(false);
+                    non_terminal.then_some(*id)
+                })
+                .collect(),
+            Err(_) => return 0,
+        };
+        for id in &ids {
+            self.terminalize_note(*id, JobStatus::Stopped, None, Some(note.to_string()));
+        }
+        ids.len()
+    }
+
     /// Non-blocking drain of worker messages. The caller (supervisor loop)
     /// decides what wakes a turn: only `Result`/`NeedDecision` do (progress
     /// updates are already in events.jsonl).
@@ -895,6 +924,66 @@ mod tests {
         assert!(
             record.result_head.is_none(),
             "stopped results are discarded"
+        );
+        clear_jobs_root_for_test();
+    }
+
+    /// Shutdown honesty: finalize_on_shutdown retires a mid-run job with the
+    /// shutdown note, is idempotent, and the verdict survives a late
+    /// completion (first-verdict-wins — the host decided to exit; a worker
+    /// unwinding microseconds later may not claim Complete afterwards).
+    #[test]
+    fn finalize_on_shutdown_honest_and_unoverwriteable() {
+        set_jobs_root_for_test("shutdown");
+        let registry = JobRegistry::new(2, DEFAULT_MAX_PENDING);
+        let gate = gate();
+        let started = Arc::new(AtomicUsize::new(0));
+        let id = registry
+            .spawn(
+                "long",
+                "long task",
+                Box::new(GateRunner {
+                    gate: gate.clone(),
+                    started: started.clone(),
+                }),
+            )
+            .expect("spawn");
+        assert!(drain_until(&registry, id, JobStatus::Running));
+        assert_eq!(
+            registry.finalize_on_shutdown("session exited while the job was running"),
+            1,
+            "one running job finalized"
+        );
+        // Idempotent: the second call finds nothing non-terminal.
+        assert_eq!(registry.finalize_on_shutdown("again"), 0);
+        let record = registry
+            .list()
+            .into_iter()
+            .find(|record: &JobRecord| record.id == id)
+            .expect("record");
+        assert_eq!(record.status, JobStatus::Stopped);
+        assert_eq!(
+            record.note.as_deref(),
+            Some("session exited while the job was running"),
+            "shutdown note must be the custom one"
+        );
+        // The "late completion": the runner actually finished after the host
+        // wrote its verdict. First verdict wins — status stays Stopped.
+        release(&gate);
+        drain_until(&registry, id, JobStatus::Complete);
+        let record = registry
+            .list()
+            .into_iter()
+            .find(|record: &JobRecord| record.id == id)
+            .expect("record");
+        assert_eq!(
+            record.status,
+            JobStatus::Stopped,
+            "a shutdown verdict may not be overwritten by a late completion"
+        );
+        assert_eq!(
+            record.note.as_deref(),
+            Some("session exited while the job was running")
         );
         clear_jobs_root_for_test();
     }

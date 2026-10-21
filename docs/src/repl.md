@@ -61,6 +61,8 @@ switch with: /model NAME
 - `/queue edit <id> <text>` 改文本、`/queue remove <id>` 撤回任意条、`/queue move <id> up|down` 调序；
 - `/queue pop` 撤回最后一条（兼容旧语义）、`/queue clear` 清空（进台账可查）。
 
+**队列耐久化（§4 停机安全）**：pending 与台账同步落盘到 `~/.heartflow/sessions/queue.json`（temp+rename 原子写，每次变更即写）——排队消息是用户亲手输入的工作，崩溃/断电/重启**不丢**。恢复规则：`next_id` 从条目重建（防 id 回退碰撞）、limit 钳制到 1..=4096、pending 超限诚实截断（保留最老）；**投递中途崩溃 = 重投**（at-least-once，快照在 take 时仍标 pending），绝不 at-most-once 丢失。损坏的 queue.json 降级为空队并明示（`hf doctor` 也会报），绝不拒绝启动。
+
 ## 引导（/guide 三态，§1 D2.5）
 
 `/guide <task>`：从 transcript 与 todo 台账零 token 组装三段草稿（prior work / current state / next task），**默认直接作为下一回合发送**——qoder 式「结合现在的消息、总结之前工作、明确后续任务」的直接发送版。`/guide draft <task>` 只打印草稿供编辑（旧行为），`/guide queue <task>` 入队为下一回合。
@@ -98,3 +100,10 @@ mission = pi-subagents mission + kimi goal 的合体：一个带**显式完成�
 - `/schedule` 列表（含 due 标记）、`/schedule show <id>` 看运行历史、`/schedule pause|resume|delete <id>`；落盘 `~/.heartflow/sessions/schedules/schedules.json`（原子写 + 256KiB 上限，单文件损坏不崩溃、空表起步 + doctor 告警）。
 
 **诚实边界**：once 只支持相对（`+30m`）与 epoch 毫秒两种写法——本地 `HH:MM`/IANA 时区需引 chrono-tz（路线图依赖评估项），calendar 触发因此暂不可表达。
+
+## 停机安全（§4，长期运行三保证之一）
+
+- **退出即对账**：EOF（Ctrl+D）、`/exit`、`/restart` 三条退出路径都会立刻把仍在 queued/running 的 job 终态化为 Stopped 并附「宿主退出，输出为部分」note 落盘——**首个终态裁决获胜**，稍后 unwind 出的工人结果不可覆写；不必等下次启动的 stale reconcile 才知道真相。
+- **协作式停止的边界**：在飞回合不可中断（double-Ctrl+C 取消属 P2 前置项，见路线图）；job 的 stop 在工具调用边界生效，LLM 调用期内天然等待。
+- **崩溃面**：队列落盘（见队列章）、mission/schedule 单文件损坏不崩溃（corrupted 计数 + doctor 告警）、job 记录启动对账。混沌测试钉死：垃圾/截断/错类型/错形状四类损坏全部跳过计数、健康邻存不受染、`next_id` 不回退。
+- **诚实边界**：非 UTF-8 的 state 文件按损坏计数（曾修复过「静默跳过导致永久不可见」的真缺陷）；跨进程文件锁未做（单写者纪律由「一个会话一个实例」约定承担，单写者 World 是 P2）。

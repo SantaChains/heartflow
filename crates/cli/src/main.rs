@@ -821,7 +821,21 @@ async fn run_repl(
     // editor the model is running only inside a turn, so the queue stays
     // empty until P4-c wires keyboard polling; the injection point below is
     // already the final one.
-    let mut model = HeartModel::new();
+    // Queue durability (§4 停机安全): the pending queue is the user's typed
+    // work — restore it from disk before anything can queue new entries.
+    // Corruption degrades to an empty queue (honest note), never a refusal
+    // to start.
+    let (restored_queue, queue_load) = core::FollowUpQueue::load(sessions_dir().join("queue.json"));
+    match queue_load {
+        core::QueueLoad::Restored { pending, .. } => {
+            println!("queue: restored {pending} pending message(s) from the previous session");
+        }
+        core::QueueLoad::Corrupt => {
+            println!("queue: queue.json unreadable; starting from an empty queue");
+        }
+        core::QueueLoad::Fresh => {}
+    }
+    let mut model = HeartModel::with_queue(restored_queue);
     // §1 subagent jobs: the supervisor (this REPL session) owns a registry of
     // context-isolated worker jobs. Slots/pending caps come from env with the
     // roadmap defaults; job records persist under sessions/jobs and any
@@ -1024,6 +1038,28 @@ async fn run_repl(
                 break;
             }
         }
+    }
+    // Shutdown honesty (§4 停机安全): every job still queued/running gets an
+    // explicit shutdown verdict with a partial-output note right now, instead
+    // of waiting for next-start reconciliation. Covers all three exits
+    // (EOF / /exit / /restart); the queue itself needs no flush here — every
+    // mutation already persisted synchronously.
+    let finalized = jobs.finalize_on_shutdown(if restart {
+        "session restarted while the job was running - output is partial"
+    } else {
+        "session exited while the job was running - output is partial"
+    });
+    if finalized > 0 {
+        println!("{finalized} job(s) still running at exit; marked stopped with a partial-output note");
+    }
+    // Queue durability honesty: synchronous writes should never fail on a
+    // healthy filesystem; a nonzero count means crash-protection was
+    // degraded during the session and the user deserves to know now.
+    let queue_write_failures = model.queue().persistence_failures();
+    if queue_write_failures > 0 {
+        println!(
+            "warn queue: {queue_write_failures} queue persistence write(s) failed this session - a crash in that window could have lost queued messages"
+        );
     }
     Ok(restart)
 }

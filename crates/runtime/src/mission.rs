@@ -304,8 +304,22 @@ impl MissionLedger {
                 continue;
             };
             let state_path = entry.path().join("state.json");
-            let Ok(raw) = std::fs::read_to_string(&state_path) else {
-                continue;
+            // A non-UTF-8 file is corrupt, not absent — count it in the
+            // ledger so the operator can find and fix it (a silent skip here
+            // once made a broken state file permanently invisible).
+            let raw = match std::fs::read(&state_path) {
+                Ok(raw) => match String::from_utf8(raw) {
+                    Ok(raw) => raw,
+                    Err(_) => {
+                        ledger
+                            .corrupted_on_load
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(id);
+                        continue;
+                    }
+                },
+                Err(_) => continue,
             };
             match serde_json::from_str::<Mission>(&raw) {
                 Ok(mission) => {
@@ -847,8 +861,16 @@ pub fn summarize_on_disk(root: &Path) -> MissionSummary {
     };
     for entry in entries.flatten() {
         let state = entry.path().join("state.json");
-        let Ok(raw) = std::fs::read_to_string(&state) else {
-            continue;
+        // Same rule as load(): non-UTF-8 is corrupt, not absent.
+        let raw = match std::fs::read(&state) {
+            Ok(raw) => match String::from_utf8(raw) {
+                Ok(raw) => raw,
+                Err(_) => {
+                    summary.corrupted += 1;
+                    continue;
+                }
+            },
+            Err(_) => continue,
         };
         match serde_json::from_str::<Mission>(&raw) {
             Ok(mission) => match mission.status {
@@ -931,6 +953,67 @@ mod tests {
         // Next id continues after the max, so a reload never reissues ids.
         let third = reloaded.create("third", vec![], MissionBudget::default());
         assert!(third.id > second.id);
+        drop_root(&root);
+        set_missions_root(None);
+    }
+
+    /// Chaos: every flavor of on-disk corruption (garbage, truncation
+    /// mid-write, wrong types, valid-JSON-wrong-shape) must be skipped and
+    /// counted — never crash the session, never poison a healthy sibling,
+    /// never regress `next_id` past surviving missions.
+    #[test]
+    fn corrupt_state_files_are_skipped_and_counted_not_crashes() {
+        let _guard = root_guard();
+        let root = temp_root("chaos");
+        set_missions_root(Some(root.clone()));
+        // A healthy mission survives alongside the broken ones.
+        let ledger = MissionLedger::new();
+        let healthy = ledger.create("healthy", vec![], MissionBudget::default());
+        drop(ledger);
+        // mission-11: plain garbage.
+        let dir = root.join("mission-11");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("state.json"), b"\x00\xff not json at all").expect("garbage");
+        // mission-12: truncated mid-write (power loss during temp+rename-less
+        // writer; our own writer is atomic but the disk format must tolerate
+        // what other tools did).
+        let dir = root.join("mission-12");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("state.json"), r#"{"id":12,"objective":"tru"#).expect("truncated");
+        // mission-13: wrong types where u64/string are expected.
+        let dir = root.join("mission-13");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(
+            dir.join("state.json"),
+            r#"{"id":"thirteen","objective":42,"status":[]}"#,
+        )
+        .expect("wrong types");
+        // mission-14: valid JSON, wrong shape entirely.
+        let dir = root.join("mission-14");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("state.json"), "[1,2,3]").expect("array not object");
+        // Non-UTF-8 bytes in a directory name that parses as an id: skipped.
+        // mission-15: state.json missing entirely.
+        std::fs::create_dir_all(root.join("mission-15")).expect("dir");
+
+        let reloaded = MissionLedger::load(&root);
+        let mut corrupted = reloaded.corrupted_on_load();
+        corrupted.sort_unstable();
+        assert_eq!(
+            corrupted,
+            vec![11, 12, 13, 14],
+            "garbage/truncated/wrong-type/wrong-shape all counted"
+        );
+        assert!(
+            reloaded.get(healthy.id).is_some(),
+            "a healthy sibling must survive the chaos"
+        );
+        // next_id stays past the healthy mission regardless of corrupt ids.
+        let next = reloaded.create("next", vec![], MissionBudget::default());
+        assert!(next.id > healthy.id);
+        // summarize_on_disk sees the corrupt files instead of lying.
+        let summary = summarize_on_disk(&root);
+        assert_eq!(summary.corrupted, 4);
         drop_root(&root);
         set_missions_root(None);
     }

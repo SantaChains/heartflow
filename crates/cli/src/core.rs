@@ -27,6 +27,12 @@ pub struct FollowUpQueue {
     next_id: u64,
     merged: bool,
     limit: usize,
+    /// Where the queue persists itself after every mutation (`None` in tests
+    /// and TUI-less contexts). Mutations persist synchronously: the queue is
+    /// small (≤ limit entries), and the crash window shrinks to nothing.
+    path: Option<std::path::PathBuf>,
+    /// Count of failed disk writes since construction; surfaced by doctor.
+    persist_failures: u64,
 }
 
 /// Hard cap on pending messages; overflowing the cap is a UI bug source, so
@@ -40,7 +46,8 @@ pub const RECENT_LEDGER_CAP: usize = 20;
 /// Where a queued entry came from. `Mission` lands with the roadmap §1
 /// mission ledger; `Subagent` entries are worker results absorbed by the
 /// supervisor loop (the "监工收到消息才工作" wake path).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum QueueSource {
     User,
     Guide,
@@ -60,7 +67,8 @@ impl QueueSource {
 
 /// Lifecycle of one entry. Every id ends in exactly one terminal state in the
 /// `recent` ledger (the "条目不丢" invariant the tests pin).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum QueueEntryState {
     Pending,
     Delivered,
@@ -80,7 +88,7 @@ impl QueueEntryState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QueueEntry {
     pub id: u64,
     pub text: String,
@@ -98,6 +106,42 @@ pub struct QueueEntry {
 /// The implicit lane every plain send lands in.
 pub const MAIN_LANE: &str = "main";
 
+/// On-disk snapshot of the queue (long-run stability §4: a queued message
+/// must survive a crash — the user typed it, the machine lost power, and the
+/// message is the user's work). Atomic temp+rename write, same discipline as
+/// the mission/schedule stores in `runtime`.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct QueueFile {
+    version: u32,
+    next_id: u64,
+    limit: usize,
+    merged: bool,
+    pending: Vec<QueueEntry>,
+    recent: Vec<QueueEntry>,
+}
+
+const QUEUE_FILE_VERSION: u32 = 1;
+
+/// Hard ceiling on a restored queue limit so a corrupt `limit` cannot make
+/// the queue unbounded after a restart.
+const QUEUE_LIMIT_CEILING: usize = 4096;
+
+/// Outcome of loading a persisted queue; the caller surfaces `Corrupt`
+/// honestly instead of failing to start (degraded-not-wrong rule).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueLoad {
+    /// No file (first run) or unreadable directory — fresh empty queue.
+    Fresh,
+    /// Restored from disk; carries the restored pending/recent counts.
+    Restored {
+        pending: usize,
+        recent: usize,
+    },
+    /// File existed but was corrupt (truncated write, wrong shape) — the
+    /// queue starts empty and the file is left in place for inspection.
+    Corrupt,
+}
+
 impl Default for FollowUpQueue {
     fn default() -> Self {
         Self {
@@ -106,6 +150,8 @@ impl Default for FollowUpQueue {
             next_id: 1,
             merged: false,
             limit: DEFAULT_QUEUE_LIMIT,
+            path: None,
+            persist_failures: 0,
         }
     }
 }
@@ -125,6 +171,112 @@ impl FollowUpQueue {
             next_id: 1,
             merged: false,
             limit: limit.max(1),
+            path: None,
+            persist_failures: 0,
+        }
+    }
+
+    /// Load a persisted queue from `path`. Corruption degrades to an empty
+    /// queue (the corrupt file is kept for inspection) — a crash must never
+    /// make the REPL unstartable. Restores are sanitized: ids never go
+    /// backwards (`next_id` is rebuilt from the entries), an out-of-range
+    /// `limit` is clamped, pending overflow is truncated honestly.
+    #[must_use]
+    pub fn load(path: std::path::PathBuf) -> (Self, QueueLoad) {
+        let mut queue = Self {
+            path: Some(path.clone()),
+            ..Self::default()
+        };
+        let raw = match std::fs::read(&path) {
+            Ok(raw) => raw,
+            // Missing file is the normal first-run path; unreadable directory
+            // degrades the same way (persist failures are counted later).
+            Err(_) => return (queue, QueueLoad::Fresh),
+        };
+        let file: QueueFile = match serde_json::from_slice(&raw) {
+            Ok(file) => file,
+            Err(_) => return (queue, QueueLoad::Corrupt),
+        };
+        if file.version != QUEUE_FILE_VERSION {
+            return (queue, QueueLoad::Corrupt);
+        }
+        // Sanitize: pending entries must actually be pending (a mid-delivery
+        // crash can leave a taken entry in either state — at-least-once
+        // redelivery is the chosen failure mode, never at-most-once loss).
+        let mut pending: VecDeque<QueueEntry> = file
+            .pending
+            .into_iter()
+            .filter(|entry| entry.state == QueueEntryState::Pending)
+            .collect();
+        let mut recent: VecDeque<QueueEntry> = file.recent.into_iter().collect();
+        recent.truncate(RECENT_LEDGER_CAP);
+        let restored_pending = pending.len();
+        let restored_recent = recent.len();
+        pending.truncate(pending.len().min(file.limit.clamp(1, QUEUE_LIMIT_CEILING)));
+        let next_id = file
+            .next_id
+            .max(pending.back().map_or(1, |entry| entry.id + 1))
+            .max(recent.front().map_or(1, |entry| entry.id + 1))
+            .max(1);
+        queue.pending = pending;
+        queue.recent = recent;
+        queue.next_id = next_id;
+        queue.merged = file.merged;
+        queue.limit = file.limit.clamp(1, QUEUE_LIMIT_CEILING);
+        let outcome = if restored_pending + restored_recent == 0 {
+            QueueLoad::Fresh
+        } else {
+            QueueLoad::Restored {
+                pending: restored_pending,
+                recent: restored_recent,
+            }
+        };
+        (queue, outcome)
+    }
+
+    /// Failed synchronous disk writes since construction (doctor surfaces
+    /// this; nonzero means crash-protection is degraded, not absent — the
+    /// in-memory queue keeps working).
+    #[must_use]
+    pub fn persistence_failures(&self) -> u64 {
+        self.persist_failures
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn next_id_probe(&self) -> u64 {
+        self.next_id
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn capacity_probe(&self) -> usize {
+        self.limit
+    }
+
+    /// Atomic temp+rename write of the whole queue. Synchronous and cheap:
+    /// the file is bounded by `limit` + the 20-entry ledger.
+    fn persist(&mut self) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let file = QueueFile {
+            version: QUEUE_FILE_VERSION,
+            next_id: self.next_id,
+            limit: self.limit,
+            merged: self.merged,
+            pending: self.pending.iter().cloned().collect(),
+            recent: self.recent.iter().cloned().collect(),
+        };
+        let write = || -> std::io::Result<()> {
+            let bytes = serde_json::to_vec(&file)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "queue encode"))?;
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, bytes)?;
+            std::fs::rename(&tmp, &path)
+        };
+        if write().is_err() {
+            self.persist_failures += 1;
         }
     }
 
@@ -160,6 +312,7 @@ impl FollowUpQueue {
             state: QueueEntryState::Pending,
             lane: lane.to_string(),
         });
+        self.persist();
         Some(id)
     }
 
@@ -212,11 +365,15 @@ impl FollowUpQueue {
     /// context optimization, not the default semantic).
     pub fn set_merged(&mut self, merged: bool) {
         self.merged = merged;
+        self.persist();
     }
 
     /// Take the oldest pending entry out for delivery. The caller either
     /// finishes it with [`Self::finish_entry`] or hands it back with
     /// [`Self::requeue_front`] — between the two, no entry can be lost.
+    /// Deliberately *no* persist here: the on-disk snapshot still shows the
+    /// entry as pending, so a crash mid-delivery redelivers it
+    /// (at-least-once) instead of losing it.
     pub fn take_next(&mut self) -> Option<QueueEntry> {
         self.pending.pop_front()
     }
@@ -238,6 +395,7 @@ impl FollowUpQueue {
             return;
         }
         self.pending.push_front(entry);
+        self.persist();
     }
 
     /// Replace the text of a pending entry (queue editing, D2.4).
@@ -249,6 +407,7 @@ impl FollowUpQueue {
         for entry in &mut self.pending {
             if entry.id == id {
                 entry.text = new_text.to_string();
+                self.persist();
                 return true;
             }
         }
@@ -284,6 +443,7 @@ impl FollowUpQueue {
             next
         };
         self.pending.swap(position, target);
+        self.persist();
         true
     }
 
@@ -318,6 +478,7 @@ impl FollowUpQueue {
     fn file_recent(&mut self, entry: QueueEntry) {
         self.recent.push_front(entry);
         self.recent.truncate(RECENT_LEDGER_CAP);
+        self.persist();
     }
 }
 
@@ -351,6 +512,16 @@ impl HeartModel {
         Self {
             running: false,
             queue: FollowUpQueue::new(),
+        }
+    }
+
+    /// Construct with a queue restored from disk (queue durability: the
+    /// pending queue is the user's typed work and must survive a crash).
+    #[must_use]
+    pub fn with_queue(queue: FollowUpQueue) -> Self {
+        Self {
+            running: false,
+            queue,
         }
     }
 
@@ -503,7 +674,7 @@ pub fn guide_draft(context: &GuideContext, task: &str) -> String {
 mod tests {
     use super::{
         build_guide, guide_context, guide_draft, FollowUpQueue, GuideContext, GuideSections,
-        HeartModel, QueueEntryState, QueueSource,
+        HeartModel, QueueEntryState, QueueLoad, QueueSource,
     };
 
     #[test]
@@ -521,6 +692,127 @@ mod tests {
         assert!(merged.contains("2. second"));
         assert!(q.is_empty());
         assert!(q.drain_injection().is_none());
+    }
+
+    // ---- durability (long-run stability §4) --------------------------------
+
+    /// Unique per-test file; queue tests touch distinct paths so they stay
+    /// parallel-safe without a global lock.
+    fn queue_tmp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("hf-queue-{}-{tag}.json", std::process::id()))
+    }
+
+    #[test]
+    fn queue_roundtrip_survives_restart() {
+        let path = queue_tmp("roundtrip");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut q = FollowUpQueue::load(path.clone()).0;
+            assert_eq!(q.send("用户消息 ✅ emoji", QueueSource::User), Some(1));
+            assert_eq!(q.send_in_lane("review", "lane entry", QueueSource::Guide), Some(2));
+            assert!(q.move_entry(2, true));
+        }
+        let (restored, outcome) = FollowUpQueue::load(path.clone());
+        assert_eq!(
+            outcome,
+            QueueLoad::Restored {
+                pending: 2,
+                recent: 0
+            }
+        );
+        let texts: Vec<_> = restored.items().iter().map(|entry| entry.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["lane entry", "用户消息 ✅ emoji"],
+            "move_entry reordered"
+        );
+        assert_eq!(restored.items()[0].lane, "review");
+        assert_eq!(restored.next_id_probe(), 3, "ids continue after restart");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn queue_corrupt_file_degrades_to_empty_not_crash() {
+        let path = queue_tmp("corrupt");
+        std::fs::write(&path, b"{\"version\":1,\"pending\":[trunc").expect("write garbage");
+        let (mut q, outcome) = FollowUpQueue::load(path.clone());
+        assert_eq!(outcome, QueueLoad::Corrupt);
+        assert!(q.is_empty());
+        assert!(q.send("still usable", QueueSource::User).is_some());
+        // The corrupt file is left in place for inspection until the next
+        // successful persist overwrites it.
+        assert!(path.exists());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn queue_next_id_never_regresses_past_entries() {
+        let path = queue_tmp("next-id");
+        // Hand-forged file where next_id is behind the entry ids (a torn
+        // write of an older generation): restore must rebuild from entries.
+        std::fs::write(
+            &path,
+            r#"{"version":1,"next_id":2,"limit":8,"merged":false,
+                "pending":[{"id":5,"text":"a","source":"user","state":"pending","lane":"main"}],
+                "recent":[]}"#,
+        )
+        .expect("write fixture");
+        let (mut q, outcome) = FollowUpQueue::load(path.clone());
+        assert!(matches!(outcome, QueueLoad::Restored { pending: 1, .. }));
+        assert_eq!(q.send("b", QueueSource::User), Some(6), "no id collision");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn queue_mid_delivery_crash_redelivers_at_least_once() {
+        let path = queue_tmp("mid-delivery");
+        {
+            let mut q = FollowUpQueue::load(path.clone()).0;
+            q.send("in flight", QueueSource::User);
+        }
+        // take_next deliberately does not persist: a crash between take and
+        // finish means the snapshot still shows the entry as pending.
+        {
+            let mut q = FollowUpQueue::load(path.clone()).0;
+            let taken = q.take_next().expect("entry present");
+            drop(q); // "crash" before finish_entry
+            assert_eq!(taken.text, "in flight");
+        }
+        let (mut q, outcome) = FollowUpQueue::load(path);
+        assert!(matches!(outcome, QueueLoad::Restored { pending: 1, .. }));
+        assert!(q.take_next().is_some(), "redelivered, never lost");
+    }
+
+    #[test]
+    fn queue_limit_restored_clamped() {
+        let path = queue_tmp("limit");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"next_id":1,"limit":999999,"merged":false,"pending":[],"recent":[]}"#,
+        )
+        .expect("write fixture");
+        let (q, _) = FollowUpQueue::load(path);
+        assert!(q.capacity_probe() <= 4096, "absurd limit clamped");
+    }
+
+    #[test]
+    fn queue_pending_overflow_truncated_on_restore() {
+        let path = queue_tmp("overflow");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"next_id":9,"limit":2,"merged":false,
+                "pending":[
+                  {"id":1,"text":"a","source":"user","state":"pending","lane":"main"},
+                  {"id":2,"text":"b","source":"user","state":"pending","lane":"main"},
+                  {"id":3,"text":"c","source":"user","state":"pending","lane":"main"},
+                  {"id":4,"text":"d","source":"user","state":"delivered","lane":"main"}],
+                "recent":[]}"#,
+        )
+        .expect("write fixture");
+        let (q, outcome) = FollowUpQueue::load(path);
+        assert!(matches!(outcome, QueueLoad::Restored { pending: 3, .. }));
+        assert_eq!(q.len(), 2, "pending truncated to restored limit");
+        assert_eq!(q.items().back().map(|entry| entry.id), Some(2), "oldest kept");
     }
 
     #[test]
