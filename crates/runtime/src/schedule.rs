@@ -515,11 +515,7 @@ impl ScheduleStore {
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
-}
+use crate::epoch_ms as now_ms;
 
 /// Parse a duration spec for the CLI: `90` / `90s` / `30m` / `2h` / `1d`,
 /// or a relative `+30m` for `Once`. Returns seconds.
@@ -579,10 +575,64 @@ mod tests {
         (store, made.id)
     }
 
+    /// Boundary arithmetic at the edges of u64 (chaos/limit discipline): a
+    /// zero-period interval must be permanently not-due (otherwise "every 0
+    /// seconds" would flood every tick forever), and epoch-zero / u64::MAX
+    /// timestamps must saturate instead of overflowing.
+    #[test]
+    fn trigger_arithmetic_saturates_at_u64_boundaries() {
+        let _guard = root_guard();
+        // every_secs = 0: never fires, forever.
+        let (store, id) = interval_store(0);
+        assert!(
+            !store.get(id).expect("present").trigger_due(u64::MAX),
+            "zero-period interval must never fire"
+        );
+        // Once at the epoch: due from now = 0.
+        let store = ScheduleStore::new();
+        let made = store
+            .add(
+                "epoch",
+                "p",
+                ScheduleTrigger::Once { at_ms: 0 },
+                CatchUp::None,
+                false,
+            )
+            .expect("add");
+        assert!(store.get(made.id).expect("present").trigger_due(0));
+        // Once at u64::MAX: fires exactly at the boundary, never before.
+        let store = ScheduleStore::new();
+        let made = store
+            .add(
+                "far",
+                "p",
+                ScheduleTrigger::Once { at_ms: u64::MAX },
+                CatchUp::None,
+                false,
+            )
+            .expect("add");
+        assert!(!store
+            .get(made.id)
+            .expect("present")
+            .trigger_due(u64::MAX - 1));
+        assert!(store.get(made.id).expect("present").trigger_due(u64::MAX));
+        // A huge interval books once at u64::MAX and the saturating
+        // subtraction keeps it honest afterwards (no overflow, no refire).
+        let (store, id) = interval_store(u64::MAX / 1000 - 1);
+        assert_eq!(
+            store.run_due(u64::MAX, DueReason::Timer).len(),
+            1,
+            "first tick at the boundary fires"
+        );
+        assert!(
+            store.run_due(u64::MAX, DueReason::Timer).is_empty(),
+            "saturating arithmetic must not refire a huge period"
+        );
+    }
+
     #[test]
     fn interval_fires_once_per_period_and_records_history() {
-        let _guard = root_guard();
-        let (store, id) = interval_store(60);
+        let _guard = root_guard();        let (store, id) = interval_store(60);
         // Nothing due at t=0 (first tick fires immediately: last_run is None).
         let due = store.run_due(0, DueReason::Timer);
         assert_eq!(due.len(), 1);

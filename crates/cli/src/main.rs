@@ -1857,7 +1857,7 @@ fn handle_schedule_command(
                 );
                 return;
             }
-            let now = schedule_now_ms();
+            let now = runtime::epoch_ms();
             for s in &all {
                 let state_mark = if s.enabled { " " } else { "!" };
                 let due_mark = if s.is_due(now) { " (due)" } else { "" };
@@ -1907,7 +1907,7 @@ fn handle_schedule_command(
                         runtime::parse_duration_spec(relative).map(|secs| {
                             (
                                 runtime::ScheduleTrigger::Once {
-                                    at_ms: schedule_now_ms() + secs.saturating_mul(1000),
+                                    at_ms: runtime::epoch_ms() + secs.saturating_mul(1000),
                                 },
                                 runtime::CatchUp::None,
                             )
@@ -2003,12 +2003,6 @@ fn handle_schedule_command(
     }
 }
 
-fn schedule_now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
-}
-
 fn describe_schedule_trigger(trigger: &runtime::ScheduleTrigger) -> String {
     match trigger {
         runtime::ScheduleTrigger::Once { at_ms } => format!("once @ epoch {at_ms}"),
@@ -2030,7 +2024,7 @@ fn drain_due_schedules(
     runtime_handle: &tokio::runtime::Handle,
     reason: runtime::DueReason,
 ) -> usize {
-    let now = schedule_now_ms();
+    let now = runtime::epoch_ms();
     let due = schedules.run_due(now, reason);
     let mut launched = 0;
     for schedule in due {
@@ -2076,7 +2070,7 @@ fn reconcile_schedule_links(
         return;
     }
     let records = jobs.list();
-    let now = schedule_now_ms();
+    let now = runtime::epoch_ms();
     links.retain(|job_id, (schedule_id, started_ms, _quiet)| {
         match records.iter().find(|record| record.id == *job_id) {
             Some(record) if record.status.is_terminal() => {

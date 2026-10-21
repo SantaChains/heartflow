@@ -80,3 +80,17 @@ pub use session::{
     ContentBlock, ConversationMessage, MessageRole, SegmentRead, Session, SessionError,
 };
 pub use usage::{TokenUsage, UsageTracker};
+
+/// Milliseconds since the Unix epoch, saturated at 0 if the clock steps
+/// backwards past the epoch. The single clock for every durable-store
+/// timestamp (jobs, missions, schedules, queue) and the idle watchdog —
+/// one place documents the `u128 → u64` cast: `as_millis` cannot exceed
+/// u64 until year ~292 million, and saturation is the safe direction for
+/// the subtraction-only consumers (a bogus 0 makes elapsed look enormous
+/// for one tick, never negative).
+#[must_use]
+pub fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}

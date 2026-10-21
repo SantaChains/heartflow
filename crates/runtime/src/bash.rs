@@ -99,15 +99,7 @@ const MAX_TIMEOUT_MS: u64 = 600_000;
 /// model at precise tools (`grep`/`read_file`) instead of raw replay.
 const MAX_STREAM_BYTES: usize = 512 * 1024;
 
-/// Millis since the epoch, saturated at 0 on a clock step backwards; the
-/// idle watchdog only ever subtracts these, so saturation is the safe
-/// direction (a bogus 0 makes silence look enormous only until the next beat).
-fn now_ms() -> u64 {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => d.as_secs().saturating_mul(1000) + u64::from(d.subsec_millis()),
-        Err(_) => 0,
-    }
-}
+use crate::epoch_ms as now_ms;
 
 /// Arm the idle watchdog: a task that polls the silence window and, on
 /// expiry, flips `hung` and kills the child by pid. Returns the shared state
@@ -152,7 +144,7 @@ fn arm_idle_watchdog(
 /// counting the rest. Draining is required: a stalled pipe would block the
 /// child forever and turn the timeout into the only exit. Every arriving
 /// chunk stamps `beat` — the liveness signal the idle watchdog consumes
-/// (`codexmon` / IdleWatchdog pattern: a process being alive is not liveness;
+/// (`codexmon` / `IdleWatchdog` pattern: a process being alive is not liveness;
 /// arrival of output is).
 async fn read_stream_bounded<S: tokio::io::AsyncRead + Unpin>(
     mut stream: S,

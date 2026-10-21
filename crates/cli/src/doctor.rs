@@ -205,9 +205,7 @@ pub(crate) fn run_doctor(fix: bool) -> Result<Vec<String>, Box<dyn std::error::E
             "schedules.json is unreadable - schedules start empty; salvage or delete ~/.heartflow/sessions/schedules/schedules.json",
         ));
     } else {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0_u64, |d| d.as_millis() as u64);
+        let now = runtime::epoch_ms();
         let all = schedule_store.list();
         let due = all.iter().filter(|s| s.is_due(now)).count();
         let paused = all.iter().filter(|s| !s.enabled).count();

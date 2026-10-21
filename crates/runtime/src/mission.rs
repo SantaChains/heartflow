@@ -261,11 +261,7 @@ fn missions_root() -> Option<PathBuf> {
     MISSIONS_ROOT.read().ok().and_then(|slot| slot.clone())
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
-}
+use crate::epoch_ms as now_ms;
 
 /// In-process ledger. `Mutex` over the map is the single writer (roadmap §4
 /// ds4 single-writer discipline at mission granularity).
@@ -1014,6 +1010,37 @@ mod tests {
         // summarize_on_disk sees the corrupt files instead of lying.
         let summary = summarize_on_disk(&root);
         assert_eq!(summary.corrupted, 4);
+        drop_root(&root);
+        set_missions_root(None);
+    }
+
+    /// A runaway worker reporting `u64::MAX` tokens must saturate the
+    /// accounting (never overflow-panic mid-session) and exhaust the budget
+    /// honestly; repeat turns stay saturated at the boundary.
+    #[test]
+    fn budget_accounting_saturates_at_u64_max() {
+        let _guard = root_guard();
+        let root = temp_root("saturation");
+        set_missions_root(Some(root.clone()));
+        let ledger = MissionLedger::new();
+        let made = ledger.create(
+            "soak",
+            vec![],
+            MissionBudget {
+                tokens: Some(1),
+                turns: None,
+                wall_ms: None,
+            },
+        );
+        let (mission, _) = ledger
+            .record_turn(made.id, u64::MAX)
+            .expect("first turn ok");
+        assert_eq!(mission.used.tokens, u64::MAX, "saturating, not wrapping");
+        assert!(mission.budget_exhausted, "1-token budget is exhausted");
+        let (mission, _) = ledger
+            .record_turn(made.id, u64::MAX)
+            .expect("later turns still accepted");
+        assert_eq!(mission.used.tokens, u64::MAX, "stays at the boundary");
         drop_root(&root);
         set_missions_root(None);
     }
