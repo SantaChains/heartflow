@@ -79,7 +79,13 @@ jobs:
 
   windows-zip:
     name: win-amd64 便携 zip(scoop 供包)
-    needs: [plan, publish]
+    # 与 publish job 解耦:二进制 zip 只依赖 tag 已落地,不依赖 crates.io 上传成功与否。
+    # 历史缺陷:二进制 heartflow 依赖 git 源 tui-textarea,cargo publish 必失败 → publish
+    # job 挂 → 本 job 被 SKIP → GitHub Release 变空壳(零资产)。现 release.sh 已对 git/path
+    # 依赖包优雅 skip(publish 不再挂),此处再去掉对 publish 的硬依赖:即使 crates.io 上传侧
+    # 有任何问题,用户能下载的二进制 zip 仍随 Release 落地。tag 由 publish job 创建,故先
+    # checkout 默认 ref、轮询等待 tag 出现再切过去(保证构建的是带正确版本号的发布提交)。
+    needs: [plan]
     if: needs.plan.outputs.released == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
@@ -94,8 +100,26 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.plan.outputs.tag }}
-          fetch-depth: 1
+          fetch-depth: 0
+      - name: wait for release tag
+        shell: bash
+        run: |
+          tag="${{ needs.plan.outputs.tag }}"
+          for i in $(seq 1 60); do
+            if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null 2>&1; then
+              echo "tag ${tag} present locally"
+              break
+            fi
+            echo "waiting for tag ${tag} (attempt ${i}/60)..."
+            git fetch --depth=1 origin "refs/tags/${tag}:refs/tags/${tag}" 2>/dev/null || true
+            sleep 10
+          done
+          git rev-parse -q --verify "refs/tags/${tag}" >/dev/null 2>&1 || {
+            echo "tag ${tag} never appeared; aborting zip build"
+            exit 1
+          }
+      - name: checkout release tag
+        run: git checkout "refs/tags/${{ needs.plan.outputs.tag }}"
       # 工具链版本只认仓库根的 rust-toolchain.toml:workflow 里不写死版本,否则 runner
       # 上的 stable 与本地开发用的编译器会分叉,同一个 tag 不再可复现。
       - name: install toolchain(rust-toolchain.toml 为唯一版本源)

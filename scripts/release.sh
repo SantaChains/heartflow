@@ -36,12 +36,43 @@ emit_output() { # key value —— CI 写 $GITHUB_OUTPUT,本地直接打印
   fi
 }
 
+crate_publishable() { # crate —— 能否发 crates.io?带 git/path 依赖的包(典型:二进制 heartflow
+  # 依赖 git 源的 tui-textarea)cargo publish 必在 manifest 校验阶段失败,且既不是
+  # "already published" 也不是 429,会被下面重试循环误判为"全部失败"→ 整个 publish job
+  # 挂掉、windows-zip 被 SKIP、GitHub Release 变空壳。本项目二进制走 scoop/zip 分发,
+  # 不靠 cargo install,故这类包直接 skip、不计入失败。--dry-run --no-verify 只跑本地
+  # manifest 校验(不构建、manifest 检查先于联网,断网也能命中),命中即判不可发。
+  local crate=$1 out
+  if out="$(cargo publish -p "$crate" --dry-run --no-verify 2>&1)"; then
+    return 0
+  fi
+  if grep -qiE "all dependencies must have a version requirement|does not specify a version|git (or path )?dependencies? (are )?not (allowed|supported)" <<<"$out"; then
+    return 1
+  fi
+  # 其他未知错误(dry-run 下少见):打印真实输出,交给上层按可发布路径正常重试
+  note "publish ${crate}: dry-run unexpected output (treat as publishable):"
+  note "${out}"
+  return 0
+}
+
 publish_retry() { # crate —— 退避重试:sparse index 传播延迟(秒级)与 crates.io 新crate限流(429,分钟级窗口)
   local crate=$1 attempt out
+  # 预检:二进制 heartflow 等带 git/path 依赖的包无法发 crates.io,直接 skip(见 crate_publishable)。
+  # 项目二进制本就经 scoop/zip 分发,不需要 cargo install;该分支判 0 不拖挂 publish job,
+  # 也不再触发 windows-zip 被 SKIP 的空壳 Release。tui-textarea 一旦发 0.7.1(crates.io 源),
+  # 此预检会自动放行二进制发布,无需回改本脚本。
+  if ! crate_publishable "$crate"; then
+    note "publish ${crate}: NOT publishable to crates.io (git/path dependency in closure) — skip; distributed via GitHub Release zip"
+    return 0
+  fi
   for attempt in 1 2 3 4 5; do
     if out="$(cargo publish -p "$crate" 2>&1)"; then return 0; fi
     if grep -qiE "already (uploaded|published|exists)" <<<"$out"; then
       note "publish ${crate}: already on crates.io, skip"
+      return 0
+    fi
+    if grep -qiE "all dependencies must have a version requirement|does not specify a version" <<<"$out"; then
+      note "publish ${crate}: blocked by git/path dependency — skip (distributed via zip)"
       return 0
     fi
     if grep -q "429 Too Many Requests" <<<"$out"; then
@@ -164,6 +195,8 @@ do_publish() {
   # proxy/runtime 无内部依赖排最前;api/mcp 依赖 proxy、provider 依赖 proxy/api/runtime,必须排在其后:
   # 先发依赖,否则 cargo publish 解析不到对应版本
   # (registry 里没有的路径依赖会被判 no matching package,连发第一个包就挂)
+  # 末位 heartflow 为二进制:若其依赖闭包含 git/path 依赖(如 tui-textarea),
+  # publish_retry 经 crate_publishable 预检自动 skip,不计入失败、不拖挂 job。
   for crate in heartflow-proxy heartflow-runtime heartflow-api heartflow-provider heartflow-mcp heartflow-tools heartflow-store heartflow-commands heartflow; do
     note "publishing ${crate} to crates.io"
     publish_retry "$crate"
