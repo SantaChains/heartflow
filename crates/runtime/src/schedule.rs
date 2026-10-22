@@ -633,7 +633,8 @@ mod tests {
 
     #[test]
     fn interval_fires_once_per_period_and_records_history() {
-        let _guard = root_guard();        let (store, id) = interval_store(60);
+        let _guard = root_guard();
+        let (store, id) = interval_store(60);
         // Nothing due at t=0 (first tick fires immediately: last_run is None).
         let due = store.run_due(0, DueReason::Timer);
         assert_eq!(due.len(), 1);

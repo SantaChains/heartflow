@@ -329,6 +329,16 @@ heartflow 落点：`edit_file` / `apply_patch` 后回注诊断（Rust 项目先�
 - **要改的大代码**：把 turn driver 从「内联 await 停住循环」改为「可被事件循环 pump 的任务」；live-turn 守卫改为非阻塞轮询；TUI 事件循环拆为「输入采集 / turn 驱动 / 渲染」三相。涉及 `cli/src/tui.rs` 事件循环 + `cli/src/main.rs` `run_one_turn` + `runtime` World 所有权（单写者，§9 事件循环调度）。
 - **解锁项（全部挂在它后面）**：P-D Steer、mission 回合自动记账（D1.3）、在飞回合取消（double-Ctrl+C，§4）、§7.2 优雅停机交接、codexmon 工具卡死超时（§8.1）、子代理看门狗（§8.4）、§10.2 每回合 ephemeral + session resume、§10.4 `agent_settled` 真终态（修 `run_one_turn` 终态判据）。
 - **风险**：TUI 交互式，本环境无法真机冒烟，须用户陪测；改动前先录 cassette。
+- **落地状态（2026-10-22，循环结构已重构，待真机陪测）**：
+  - **三相事件循环 ✅**：`drive_loop`（`tui.rs`）拆为 Phase R（脏则渲染）/ Phase T（回合驱动：出队输入、同步 `begin_turn` + `Msg::TurnStarted`、take runtime+prompter 组装回合）/ Phase I（biased `select!`：回合完成臂优先 settle，共享 Msg 通道臂处理导航/reducer/权限/取消/提交）。回合在飞时循环照常迭代，§11.0 根因（内联 await 停住循环）已消除——回归测试 `keys_reach_the_reducer_while_a_turn_is_live` 锁定。
+  - **所有权反转 ✅**：回合 future 改为 `'static` 盒装 future（`Pin<Box<dyn Future<Output = TurnResult<C,T>>>>`），**自持有**该回合的 runtime 与 prompter，结束时经 `TurnResult` 交还；循环持 `Vec<Option<ConversationRuntime>>` 槽位（None ⇔ 该 section 回合在飞）。回合中新建 section 不再与借用冲突，且 future 已具 spawn 条件（本次仍就地 poll，未 `tokio::spawn`——下一步可选）。
+  - **`run_one_turn` 已溶解 ✅**：原函数整体并入三相，无遗留外壳。
+  - **`TurnSaver` seam ✅**（`storage.rs`）：`DiskSaver` 生产实现 + 测试用 `RecordingSaver`，settle 持久化不再耦合真实磁盘路径。
+  - **`guide_snapshot` 泛型化 ✅**：改走 trait 级 `executor().pending_tasks()`，不再下钻具体 executor 类型。
+  - **在飞取消接线 ✅**：double-Ctrl+C 经 `CancellationToken` 取消在飞回合，settle 仍持久化（`double_interrupt_cancels_the_live_turn` 锁定）。
+  - **验证**：`cargo test --workspace` 654 通过 / 0 失败（含 6 个循环级测试：回合完整跑通并持久化、回合中按键达 reducer、follow-up 合并进下一回合、double-Ctrl+C 取消、回合中禁导航、空闲新建 section 独立跑回合）；clippy `-D clippy::all` 干净；panic 棘轮 debt=0；fmt 干净。
+  - **诚实边界（未做）**：① future 仍未真正 `tokio::spawn`（就地 poll，跨线程并发留给 P2 下一步）；② **真机冒烟未做**（本环境无 TTY）——须用户按下方陪测清单逐项验证后才算闭合；③ 流式路径本体（runtime）未动，未录 cassette 不阻塞本项，但后续 §11.5 流式改动仍须先录。
+  - **真机陪测清单**：正常多轮对话与 follow-up 合并；回合中 PageUp/PageDown 滚动与按键响应；double-Ctrl+C 取消在飞回合（transcript 出现取消痕迹且会话已保存）；回合中 Ctrl+PgUp/PgDn 被拦（出现 "finish or cancel" 守卫提示）；Ctrl+N 新建 section 并独立跑回合；权限弹窗（Allow/Deny）在回合中正常往返；退出（idle 双击 Ctrl+C / 回合中取消后退出）无卡死、无 panic。
 
 #### 11.1 TUI 升级（用户点名，真机冒烟陪测）
 

@@ -133,10 +133,7 @@ pub enum QueueLoad {
     /// No file (first run) or unreadable directory — fresh empty queue.
     Fresh,
     /// Restored from disk; carries the restored pending/recent counts.
-    Restored {
-        pending: usize,
-        recent: usize,
-    },
+    Restored { pending: usize, recent: usize },
     /// File existed but was corrupt (truncated write, wrong shape) — the
     /// queue starts empty and the file is left in place for inspection.
     Corrupt,
@@ -274,8 +271,9 @@ impl FollowUpQueue {
         };
         let tmp = path.with_extension("json.tmp");
         let write = || -> std::io::Result<()> {
-            let bytes = serde_json::to_vec(&file)
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "queue encode"))?;
+            let bytes = serde_json::to_vec(&file).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "queue encode")
+            })?;
             std::fs::write(&tmp, bytes)?;
             std::fs::rename(&tmp, &path)
         };
@@ -342,7 +340,10 @@ impl FollowUpQueue {
     /// Pending entries of one lane, arrival order (the per-lane queue view).
     #[must_use]
     pub fn items_in_lane(&self, lane: &str) -> Vec<&QueueEntry> {
-        self.pending.iter().filter(|entry| entry.lane == lane).collect()
+        self.pending
+            .iter()
+            .filter(|entry| entry.lane == lane)
+            .collect()
     }
 
     #[must_use]
@@ -720,7 +721,10 @@ mod tests {
         {
             let mut q = FollowUpQueue::load(path.clone()).0;
             assert_eq!(q.send("用户消息 ✅ emoji", QueueSource::User), Some(1));
-            assert_eq!(q.send_in_lane("review", "lane entry", QueueSource::Guide), Some(2));
+            assert_eq!(
+                q.send_in_lane("review", "lane entry", QueueSource::Guide),
+                Some(2)
+            );
             assert!(q.move_entry(2, true));
         }
         let (restored, outcome) = FollowUpQueue::load(path.clone());
@@ -731,7 +735,11 @@ mod tests {
                 recent: 0
             }
         );
-        let texts: Vec<_> = restored.items().iter().map(|entry| entry.text.as_str()).collect();
+        let texts: Vec<_> = restored
+            .items()
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect();
         assert_eq!(
             texts,
             vec!["lane entry", "用户消息 ✅ emoji"],
@@ -823,7 +831,11 @@ mod tests {
         let (q, outcome) = FollowUpQueue::load(path);
         assert!(matches!(outcome, QueueLoad::Restored { pending: 3, .. }));
         assert_eq!(q.len(), 2, "pending truncated to restored limit");
-        assert_eq!(q.items().back().map(|entry| entry.id), Some(2), "oldest kept");
+        assert_eq!(
+            q.items().back().map(|entry| entry.id),
+            Some(2),
+            "oldest kept"
+        );
     }
 
     #[test]
@@ -831,11 +843,25 @@ mod tests {
         let mut q = FollowUpQueue::new();
         // Plain sends land in the main lane.
         let a = q.send("main work", QueueSource::User).expect("a");
-        let b = q.send_in_lane("guide", "guided task", QueueSource::Guide).expect("b");
+        let b = q
+            .send_in_lane("guide", "guided task", QueueSource::Guide)
+            .expect("b");
         let c = q.send("more main", QueueSource::User).expect("c");
         assert_eq!(q.lane_names(), vec!["main", "guide"]);
-        assert_eq!(q.items_in_lane("main").iter().map(|e| e.id).collect::<Vec<_>>(), vec![a, c]);
-        assert_eq!(q.items_in_lane("guide").iter().map(|e| e.id).collect::<Vec<_>>(), vec![b]);
+        assert_eq!(
+            q.items_in_lane("main")
+                .iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>(),
+            vec![a, c]
+        );
+        assert_eq!(
+            q.items_in_lane("guide")
+                .iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>(),
+            vec![b]
+        );
         // Blank lane names are refused, same as blank text.
         assert!(q.send_in_lane("   ", "x", QueueSource::User).is_none());
         assert!(q.send_in_lane("real", "  ", QueueSource::User).is_none());

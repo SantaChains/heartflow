@@ -655,11 +655,18 @@ cd wiki-checkout && git add -A && git commit -m "docs: seed wiki" && git push
 
 # 路线图
 
-以下方向已明确规划但**尚未实现**，仅作路线记录。2026-10-19 批次新增 §1–§6 六条主线，2026-10-21 批次新增 §7（推理引擎生态深研）、§8（bash job 监控 / job 超时 / 挂起检测）并续批扩写 §1（多子代理 spawn 面 / pi 的 job 系统 / 队列三件套设计规格——源自 `archive/pi-research/pi-subagents` 源码实证与 `openmemory.md.bak` 的队列需求回溯），全部来自外部项目调研，本地研究副本均**不入库**：pi-subagents/MergeSearch 在 `archive/pi-research/`；ds4（antirez DwarfStar 推理引擎）、easy-llm-cli（Gemini-CLI 派生 agentic CLI）、kimi-code（`MoonshotAI/kimi-code`，MIT © 2026 Moonshot AI，agent-core-v2 已源码核实）、DeepInfer（deepseek-ai，Apache 2.0）与 deepseek-recipe（deepseek-ai，MIT，纯 Rust）在 `.workbuddy/`。当前**不执行**，只锁定设计判据与借鉴对象。
+以下方向已明确规划但**尚未实现**，仅作路线记录。2026-10-19 批次新增 §1–§6 六条主线，2026-10-21 批次新增 §7（推理引擎生态深研）、§8（bash job 监控 / job 超时 / 挂起检测）并续批扩写 §1（多子代理 spawn 面 / pi 的 job 系统 / 队列三件套设计规格——源自 `archive/pi-research/pi-subagents` 源码实证与 `openmemory.md.bak` 的队列需求回溯），全部来自外部项目调研，本地研究副本均**不入库**：pi-subagents/MergeSearch 在 `archive/pi-research/`；ds4（antirez DwarfStar 推理引擎）、easy-llm-cli（Gemini-CLI 派生 agentic CLI）、kimi-code（`MoonshotAI/kimi-code`，MIT © 2026 Moonshot AI，agent-core-v2 已源码核实）、DeepInfer（deepseek-ai，Apache 2.0）与 deepseek-recipe（deepseek-ai，MIT，纯 Rust）在 `.workbuddy/`。当前**不执行**，只锁定设计判据与借鉴对象。2026-10-22 批次新增 §10（PandaCode / pi / codex / claude 设计借鉴与取舍——源自 `archive/pandacode` 浅克隆源码实证，聚焦 mcp 与 code-mode 升级取舍），聚焦「采纳 / 改造 / 不做」三档结论。
 
 > **kimi-code 自研度结论（源码核实）**：agent 核心 `packages/agent-core-v2` 是**一方自研包**，**非 gemini-cli / claude-code / codex 二改**（grep 三家零命中）；仅 TUI 层源自外部 `pi-tui`（入库为 `@moonshot-ai/pi-tui`，README 致谢），并采纳行业开放协议 MCP/ACP 与 Agent Skills 约定。另有一方包可对标 heartflow：`@moonshot-ai/kosong`（"LLM abstraction layer"，直接包 `@anthropic-ai/sdk` + `openai` SDK ≈ heartflow `api`+`provider`）、`@moonshot-ai/kimi-telemetry`（一方遥测）、`acp-server`。**下面标注「源码实证」的条目均已对照 `.workbuddy/kimi-code` 当前 HEAD 核实行号。**
 
-## 1. 双 Agent 架构：监工 / 工人
+
+> **分组索引（2026-10-22 重排）**：本文按性质分三组——**A. 执行路线图**（要改 heartflow 自身代码的硬骨头，按依赖排序，含 §1/§4/§6 落地方向与 §11 执行序列）、**B. 外部调研与借鉴**（只记录不执行，§2/§3/§5/§7/§8/§9/§10）、**C. 功能增强候选**（轻量待评估，原有小项）。原 §1–§11 编号保留作交叉引用锚点，组内子标题整体降级一级。
+
+## A. 执行路线图（要改 heartflow 代码的硬骨头，按依赖排序）
+
+> A 组为落地任务：双 Agent 架构（§1）、工程稳定性与持久性（§4）、编辑后反馈（§6）三方向的设计规格与已落地状态，以及把「要动大代码」条目抽出的执行序列（§11）。B 组调研是 A 组的依据来源。
+
+### 1. 双 Agent 架构：监工 / 工人
 
 **现状（代码实证）**：全仓 grep 无 `subagent` / `supervisor` / `delegate` 任何概念，工具面是单会话单循环（`crates/tools/src/lib.rs:137` 固定注册 + `execute_tool` 分发）。这是绿地设计。交互面已有单 FIFO 跟随队列（`crates/cli/src/core.rs:19`）与 Hermes 任务环（`crates/cli/src/plan.rs:249`），但**无 job 系统、无多子代理 spawn 面**——本节末尾三节（多子代理 / pi 的 job / 队列三件套）分别补齐。
 
@@ -679,7 +686,7 @@ cd wiki-checkout && git add -A && git commit -m "docs: seed wiki" && git push
 
 **不同点（不要照抄）**：pi 是 TS 扩展 + 独立 runner 进程，heartflow 应在 `runtime` 层加「子会话 + 消息总线」，工人可以是同进程 agent loop 实例（快、可流式）或子进程（隔离、抗崩溃），由任务类型决定。**明确不做**：不做通用多 agent 平台、不做跨机器编排。
 
-### 借鉴点子（pi-subagents 深度研读，设计/架构级，待落地）
+#### 借鉴点子（pi-subagents 深度研读，设计/架构级，待落地）
 
 从 `src/intercom/native-supervisor-channel.ts` 与 `src/shared/parent-wake.ts` 提炼七条可直接照搬的协议级模式：
 
@@ -693,7 +700,7 @@ cd wiki-checkout && git add -A && git commit -m "docs: seed wiki" && git push
 
 唤醒契约（`parent-wake.ts`）：仅 idle 父会话才真正触发回合（`PARENT_WAKE_TEXT` 限定监工被唤醒时「不重跑已完成工作、不越权、只在本授权内答复」），busy 只 append；10s pending 上限，过则视为放弃（notice 已在会话里，仅丢回合，:3-6/:57-78）。reload 不丢 reservation、真 shutdown 才清（:92-94）。
 
-### 借鉴点子（kimi-code：Goal 模式 + 状态机 ReAct，源码实证，待落地 §1/§4）
+#### 借鉴点子（kimi-code：Goal 模式 + 状态机 ReAct，源码实证，待落地 §1/§4）
 
 1. **Goal 模式 = mission 完成定义 + 三轴预算 + 四态状态机 + 续跑驱动器（源码实证，`packages/agent-core-v2/src/features/goal/`）**：goal 功能四工具 `CreateGoalTool` / `GetGoalTool` / `SetGoalBudgetTool` / `UpdateGoalTool`（`goalFeature.ts:27-41`）；`GoalSnapshot`（`types.ts:24-34`）= `objective` + **`completionCriterion`**（完成判据，即 mission 的「验收标准」；粘贴稿所谓 "rubric" 的源码实际术语）+ `status` + `turnsUsed/tokensUsed/wallClockMs` + `budget`；`GoalStatus = active|paused|blocked|complete` 四态（`types.ts:1`）；**三轴预算** `GoalBudgetLimits = tokenBudget|turnBudget|wallClockBudgetMs` + `GoalBudgetReport` 剩余/达成/超支（`types.ts:5-22`，比 §4 pi-subagents 纯 token 预算更细）。
    - **UpdateGoalTool 的完成/阻塞纪律（`tools/update-goal/update-goal.md`，可直接抄的提示词工程）**：`complete` 仅当「目标满足且所有显式验证通过」——**弱/间接证据不算完成、预算将尽或想停不算完成、只出了计划/首遍/部分结果不算**；`blocked` 需**同一阻塞连续 ≥3 个 goal 回合**才可标记（防一遇阻就弃），且「工作大/难/慢/不确定/待验证」都不构成 blocked；「**多数活跃 goal 回合不应调此工具**，做完一个有用切片且仍有实质工作就正常结束回合，**runtime 会在下一 goal 回合提示继续**」——即 `goal_continue` 由 runtime 驱动而非模型自觉；「状态是机器可读信号，完成摘要/阻塞解释由模型在下一句写」——机器信号与人话分离。
@@ -701,7 +708,7 @@ cd wiki-checkout && git add -A && git commit -m "docs: seed wiki" && git push
    - → heartflow 落点：这是 §1 监工 mission「**何时算干完 + 预算 + 状态 + 谁驱动续跑**」的完整范本——mission 应带 `completionCriterion` + 三轴预算 + 四态，并把 UpdateGoal 的「反过早完成 / 反过早放弃」纪律写进 mission 系统提示；runtime 自动续跑 goal 回合 = §1「回合串联」的驱动器（比单纯 `goal_continue` 注入更强：默认就续，除非显式 complete/blocked）。
 2. **事件驱动状态机 ReAct（源码实证，对照 kimi `human/agent/turn.ts`）**：经典 ReAct while 循环的外部介入是「纸条 + 轮询」——循环只能在**迭代边界**看到 abort，LLM 调用期间是**死区**，Esc 白花一整次调用；状态机把介入点变成**图上的边**。已核实的结构：`{ type: 'turn.abort' }` 事件类型（:199）与 `invoke`(LLM 调用) 态（:460/:492）**并列**，abort 直达进行中的调用（迁移 :470/:706/:723/:803/:817/:865 → `#turn.aborted` :812）；`llm.done` 的 guard「`toolCalls.length > 0`→acting / 否则 done」**就是 ReAct 本身**（:575）；`retrying` 是**带定时器的状态**（`after: { retryDelay: 'thinking' }` :719-720，等待期间 abort 依然可达、定时器随状态迁移一起清除）；`mailbox + run-to-completion` = 零锁并发；`snapshot()` 让状态成为外部可读的**数据**（`loopService.ts`）。→ heartflow 落点：`runtime` agent loop（P1 已异步化、P2 并发模型规划中）应把「回合」建模为状态机，使 (a) abort 能打断**在飞**的 LLM/工具调用（对应 §4 ds4 cooperative interruption + easy-llm-cli `execute(AbortSignal)`，修本仓「abort 只在回合边界生效」的隐患）；(b) 「等待/重试」是一等状态而非 try/except 嵌套（对应 `crates/api/src/retry.rs` 重试路径）；(c) `snapshot()` 供 §4 可观测性与 §1 监工观测工人状态。同进程工人循环直接复用这台小机器（mailbox 语义天然适配 §1 消息总线）。
 
-### 设计规格：mission 完成判据 + 三轴预算（kimi-code Goal 范本，待落地 §1，仅记录）
+#### 设计规格：mission 完成判据 + 三轴预算（kimi-code Goal 范本，待落地 §1，仅记录）
 
 范本已源码核实（`.workbuddy/kimi-code/packages/agent-core-v2/src/features/goal/`，详见 §1 上文条目）。本规格把它落成 heartflow 的数据结构与推进相。
 
@@ -740,7 +747,7 @@ enum CompletionCriterion {
 
 **明确不做**：通用任务平台、跨机器编排、**自动批准**（pi-subagents settle 纪律「Do not auto-approve」明文保留——监工绝不代工人越权）。
 
-### 多子代理：spawn 面、并行组与容量治理（pi-subagents 源码实证，待落地）
+#### 多子代理：spawn 面、并行组与容量治理（pi-subagents 源码实证，待落地）
 
 **现状（代码实证）**：工具面是单会话单循环——`crates/tools/src/lib.rs:366` `execute_tool` 固定分发 15+ 工具，`AgentRuntime` 一实例持有 `session()` + `executor()`（`crates/runtime/src/conversation.rs:1039-1079`，另有 `reset_for_task`/`seed_plan` 供任务环换新鲜上下文）。**没有 spawn 面**：模型无法让「另一个自己」并行做事，§1 的监工/工人因此还缺执行体。
 
@@ -755,7 +762,7 @@ enum CompletionCriterion {
 
 **落点**：新工具 `subagent`（`execute_tool` 加分支，tools crate）或 runtime 层 `spawn_worker(objective, budget, capability_ceiling)`；worker = 同进程 `AgentRuntime` 实例（默认，快、可流式、共享 MCP 连接）或子进程（隔离，由参数决定）。**明确不做**：通用多 agent 平台、跨机器编排、worker 自建工具（工具面仍由宿主注册表单点分发）。
 
-### pi 的 job：异步任务系统（pi-subagents 源码实证，待落地 §1/§4）
+#### pi 的 job：异步任务系统（pi-subagents 源码实证，待落地 §1/§4）
 
 job = 「提交后不必原地等」的任务单元。pi-subagents 把这套做成了完整契约；heartflow 现在**只有**回合内队列（见下节），没有任何跨回合/跨会话的任务存活机制。
 
@@ -772,7 +779,7 @@ job = 「提交后不必原地等」的任务单元。pi-subagents 把这套做�
 
 **明确不做**：常驻 daemon（run-due 外部触发即可）、分布式编排、workflow DAG（pi 的 scripted workflow 是另一层，记录不搬）。
 
-### 设计规格：heartflow 队列三件套（排队 / 引导直接发送 / 队列编辑）
+#### 设计规格：heartflow 队列三件套（排队 / 引导直接发送 / 队列编辑）
 
 **需求回溯（`openmemory.md.bak`，用户原话）**：L226「队列模式,是在运行是发送新聊天,排在队列,等任务完成进行.还有借鉴qoder,引导功能:结合现在的消息,总结之前工作,明确后续任务后发送给ai」；L428「队列(多个队列也要支持和兼容.还有类似qoder的引导机制,但是默认是等上个任务完成,开启后一个)和多窗口会话」；L180「队列模式,当前工作时切换另一个section」。UI 计划侧：L445（T5 回合内输入与多队列——drain 要区分「注入当前回合」与「作为下一个任务开启」）、L446（T6 引导 overlay = 可编辑确认的两栏视图）。
 
@@ -857,48 +864,8 @@ pub struct QueueSet {
 
 - **待做**：P-C（TUI 队列编辑键位 + 引导 overlay——本仓铁律：TUI 派发不盲改，需真机冒烟）、P-D（Steer，前置 P2 并发模型）、per-section 泳道递送轮转（D2.1 的 TUI 半边；数据结构与 REPL 观测面已落地）、mission 回合自动记账与提醒注入（D1.3，前置 P2 事件循环）。跨进程文件锁已落地（§4，2026-10-22 批次）。
 
-## 2. 搜索与研究能力（web_search / web_fetch 增强）
 
-**现状（代码实证）**：`crates/tools/src/web.rs:857` `web_search` 只有 DuckDuckGo HTML 单引擎、keyless；`web_fetch` 浏览器 UA + 5 跳重定向 + SSRF 护栏（`ensure_public`，`:409`）。无爬虫、无深度研究、无 provider 链。
-
-**借鉴 MergeSearch（shaonianG，本地副本 `archive/pi-research/MergeSearch`，Python）**：
-
-- 多平台聚合 MCP 服务四工具：`search` / `fetch` / `crawl` / `research`——**crawl 与 research 是 heartflow 缺的两档**；
-- Key 池化 + 平台间 failover/轮询/随机 + 失败 Key 拉黑 5 分钟；
-- `proxy_router.py` 是完整可移植的 Clash 风格分流引擎（`DOMAIN` / `DOMAIN-SUFFIX` / `DOMAIN-KEYWORD` / `IP-CIDR` / `REGEX` / `MATCH`，direct/auto/global 三模式）——**直接对应 §3 代理条目**；
-- 用量统计持久化（`stats.json`）。
-
-**借鉴 pi-web-access（nicobailon）**：
-
-- 30+ provider 统一抽象 + `searchRouting` 有序路由 + `fallbackOn` 条件（如 `invalid-response`）；explicit-only provider 不进 auto 链；
-- `maxInlineContentChars`（30K）结果预算——**搜索结果的「进上下文体量」必须是个显式预算，不是副产品**；
-- 内容协商优先取 Markdown、`redirects: "same-origin"` 选项、`data:` URI 消毒（防 base64 图片占满上下文）；
-- 凭证安全范式：错误信息脱敏、跨源重定向剥密钥、SSRF 全局防护。
-
-**落点**：provider 链 + fallback（DeepSeek 服务端搜索已有协议口子，见原路线图）、`crawl` 工具（有界深度/页数）、结果预算参数。**明确不做**：视频理解、YouTube、浏览器渲染（归 browser use 条目）。
-
-## 3. 代理体系优化
-
-**现状（代码实证）**：`crates/api/src/retry.rs:17` `build_http()` 只设 `connect_timeout(15s)` / `read_timeout(300s)`，**无任何代理配置**——reqwest 隐式读 env 代理（`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`），不可见、不可控、doctor 无法展示。`crates/tools/src/web.rs:73` 与 `crates/tools/src/image.rs:313` 各自另建 blocking client，同样裸奔。
-
-**四类必须处理的场景**：
-
-1. **幽灵代理**：env 设了 `HTTPS_PROXY` 但代理没开——现状每次请求先吃 15s connect timeout × 3 次重试 ≈ **45s/请求**才失败。必须启动时（或首请求前）对 proxy host:port 做 TCP 探测，失败则 warning + 降级直连；
-2. **Windows 系统代理**：Clash/V2Ray「系统代理」按钮写的是 WinINET 注册表（`HKCU\...\Internet Settings` 的 `ProxyEnable`/`ProxyServer`/`ProxyOverride`），reqwest 不读——本机主力场景，必须自己读（`windows-sys` 已在依赖树）；
-3. **按目标分流**：NO_PROXY 之外无规则。国内 API（DeepSeek）走代理反而慢/被风控，Google/GitHub 需要代理——直接移植 MergeSearch `proxy_router.py` 的规则引擎到 Rust（`api` crate，纯函数、离线可测）；
-4. **fail 语义**：借鉴 pi-web-access 的 **fail-closed**（代理配置解析失败时拒绝请求而非静默绕过）；CLI 场景默认应对立成 fail-open 到 direct + 显著 warning，做成开关。
-
-**解析顺序（设计）**：显式配置（`[proxy]` 节 / `HEARTFLOW_PROXY`）> env > Windows 系统代理 > direct。要显式化：`Client::builder().no_proxy()` 关掉 reqwest 隐式行为，自解析后 `.proxy(Proxy::all(...))`，这样顺序可控、`hf doctor` 可打印当前生效代理与判定理由。 socks5 由 reqwest  socks feature 覆盖，探测时按 scheme 分支。
-
-**实现对照 MergeSearch `proxy_router.py`（heartflow-proxy 已落地，以下为差异判据）**：
-
-- 规则引擎特征完全同构：`DOMAIN`/`DOMAIN-SUFFIX`/`DOMAIN-KEYWORD`/`IP-CIDR`/`REGEX`/`MATCH`，首条命中生效，闭包按目标分流（MergeSearch `proxy_router.py:13-107`，heartflow `crates/proxy/src/rules.rs:94-143`）；REGEX 两方都匹配**整 URL**（MergeSearch `:58` ↔ heartflow `rules.rs:86`），语义一致；
-- **一处发散需定夺**：MergeSearch `auto` 未命中规则时回退 `auto_default`（默认 `direct`，可配，`proxy_router.py:78/:101`）；heartflow 取「有 rules 未命中→直连、无 rules→全局」。两方案均可，heartflow 当前选「无 rules 即全局」因为 `[proxy]` 显式地址本身即表达「要用代理」，空规则表罕见；若将来想让 `auto` 默认保守直连，加 `auto_default` 旋钮即可与 MergeSearch 对齐；
-- MergeSearch 兼容旧写法（`*.domain` / 裸域名 / `re:` 前缀，`:62-71`）并预留 `GEOIP,CN`（忽略，:59）；heartflow 严格只认 `TYPE,VALUE,ACTION`，未知类型报错（更显式 fail-closed）。地理分流（GEOIP）作为未来可选项记录。
-
-**与 easy-llm-cli 的沙箱出口代理正交**：easy-llm-cli 的 `GEMINI_SANDBOX_PROXY_COMMAND`（`docs/examples/proxy-script.md`，一个只允许 `example.com:443` 的 CONNECT allow-list 代理）管控的是**沙箱内部进程的网络出口**，与 heartflow §3 的「API 出站代理」是两层不同语义：§3 是 host→API 的 egress 选择，沙箱代理是 sandbox→egress 的 allow-list。若将来做 §4 沙箱，网络出口管控可复用此「用户自带 allow-list 代理脚本」模式，二者不冲突、可叠加。
-
-## 4. 工程稳定性与持久性（大项目持续运行）
+### 4. 工程稳定性与持久性（大项目持续运行）
 
 **部分落地（2026-10-22 批次：停机安全 + 长期运行）**：
 - **队列耐久化**：pending + 终态台账同步落盘 `sessions/queue.json`（原子写、每次变更即写）；恢复时 `next_id` 从条目重建、limit 钳 1..=4096、pending 超限诚实截断保最老；**投递中途崩溃 = 重投（at-least-once）**，绝不 at-most-once 丢失；损坏降级空队 + 明示 + doctor 告警，绝不拒绝启动。混沌测试钉死（roundtrip/损坏/防回退/重投/钳制/截断 6 条）。
@@ -921,7 +888,7 @@ pub struct QueueSet {
 
 **ds4 对 heartflow 的总体判断**：它是本地推理引擎（Metal/CUDA/ROCm），heartflow 是远程 API 客户端，**引擎层无可借鉴**；可指导的是 agent 形态四件——原生 agent 循环（状态同置）、会话快照经济、协作式中断、集成测试纪律——以及它的发布哲学：软件是「供用户用 coding agent 自行改造成工作模板」，而非覆盖一切setup 的成品。
 
-### 借鉴点子（ds4 + pi-subagents missions/schedules 深度研读，待落地 §1/§4）
+#### 借鉴点子（ds4 + pi-subagents missions/schedules 深度研读，待落地 §1/§4）
 
 **ds4（`AGENT.md`，antirez）四条工程纪律直接对应「大项目持续运行」**：
 
@@ -952,7 +919,7 @@ pub struct QueueSet {
 
 **已知关联债（2026-10-19 重新核实，已收窄）**：旧描述「`compact.rs:319` 按条数切 + `conversation.rs:245-323` 只 stub 不剔孤儿 `tool_result`」**部分过期**——孤儿防护已有两层：`compact.rs:329-331` 切割边界回退（尾部绝不以孤儿 `tool_result` 开头，测试 `compaction_never_orphans_a_tool_result_at_the_boundary` 在）+ `conversation.rs:372-410` `repair_tool_pairing` 每请求安全网（丢弃无匹配 `tool_use` 的 result，:549 与 `build_replay_messages` 组合应用于每个请求）。剩余债务 = ①按条数切导致保留尾无 token 预算、②无硬触发、③截断摘要信息损失、④续延句缺省略量声明。完整改造规格见下节，按本仓「先埋点观测，有证据再改」推进。
 
-### 设计规格：compaction 完整改造（ds4 双触发 + kimi-code recipe 收口，**部分落地 2026-10-21**）
+#### 设计规格：compaction 完整改造（ds4 双触发 + kimi-code recipe 收口，**部分落地 2026-10-21**）
 
 **现状核实（代码实证）**：触发 = `should_compact_with_estimate`（`compact.rs:244-257`）单阈值（`context_window_tokens/2` 或绝对 `max_estimated_tokens` 默认 10k），带 `TokenCalibration`（:59-154）provider 上报 usage 仿射校正（451 turn 实测中位误差 62.4%→12.0%）；切割 = `compact_session_in_place:319` 按**消息条数**（`preserve_recent_messages` 默认 4）+ 边界回退；重建 = 续延 system 消息 + pinned + 保留尾（:354-362），摘要为**确定性截断**（`summarize_messages:379-404`，每消息 80→240 char 近因 ramp）非模型生成；续延句已有「continue from where it left off」+ 可选「preserved verbatim」+ 抑制追问（:275-294）。
 
@@ -967,7 +934,7 @@ pub struct QueueSet {
 - **Phase 4 不变量测试 ✅ 已落地（并当场揪出一个真 bug）**：`compaction_pipeline_preserves_tool_pairing_for_random_well_formed_sessions`——200 例确定性 xorshift 随机良构会话（混合 tool_use 广告/结果、pinned 回合）经 compact + replay + repair 后断言三不变量（尾不孤立、result 必有前序 ad、ad 必有后继 result）。**由 property test 揪出并已修**：`/pin` 若落在带 `tool_use` 的 assistant 消息上，其 result 被摘要后线上会悬空 ad（provider 400）——修复 = pinned 广告拖行紧随的 result 一并 verbatim 存活（`pin_following` 逻辑 + 专项测试）。
 - **回滚**：新行为全部挂 `CompactionConfig` 新字段（默认值 = 现状），`tail_budget_tokens` / `soft_trigger` 可单独回退；触发口径只影响「何时压」，不影响 transcript 结构不变量。
 
-### 借鉴点子（kimi-code memory 机制，待落地 §4/§5）
+#### 借鉴点子（kimi-code memory 机制，待落地 §4/§5）
 
 kimi-code 的 memory 是「事件溯源 + 折叠」范式，与 ds4 的「摘要+tail」compaction 互补，两条 compaction recipe 可对照取舍：
 
@@ -978,7 +945,7 @@ kimi-code 的 memory 是「事件溯源 + 折叠」范式，与 ds4 的「摘要
 4. **blobs 脱水/再水化（`.replayable({ blobs: { dehydrate/rehydrate } })`）**：大 payload 脱水成 blob、按需 rehydrate，不常驻 context。→ 对应 ds4「可重载大体积数据只记 path/range」与 §5 上下文预算：工具结果/附件的大体量内容应脱水、注入前按需还原。
 5. **单轮 loop 内「看见」已发生事件**：loop 中状态即全部已折叠事件的结果（`foldAppendMessage`/`foldLoopEvent`），dispatch 同步折叠 + `drainQueue`。→ heartflow 对应记忆既有约束「在飞回合必须能被事件循环够到」（`run_one_turn` 内联 await 是根因）；P2 并发模型应保证事件可见性，勿重蹈覆辙。
 
-### 借鉴点子（easy-llm-cli / Gemini-CLI 派生 深度研读，待落地 §3/§4/§5/§6）
+#### 借鉴点子（easy-llm-cli / Gemini-CLI 派生 深度研读，待落地 §3/§4/§5/§6）
 
 本地副本 `.workbuddy/easy-llm-cli`（即 Gemini CLI 派生，架构见 `docs/architecture.md`：CLI 前端包 + Core 后端包 + `packages/core/src/tools/` 工具模块，与 heartflow `cli`→`provider/runtime/api`→`tools` 同构）。可借鉴点按落点分：
 
@@ -993,27 +960,8 @@ kimi-code 的 memory 是「事件溯源 + 折叠」范式，与 ds4 的「摘要
 
 **§3 代理（已在 §3 末补沙箱出口代理正交说明）**、**§5 工具/上下文面（见下节）**、**§6 编辑后反馈（checkpointing 的 `/restore` 已在上文 §4 列）** 不重复。
 
-## 5. 工具面与上下文预算
 
-- **pi-tbox**：跨扩展的 toolset 开关/分组/focus + **上下文字符账本**（core floor vs extension budget 分开计数）+ 基线钉住（`defaults`/`save`/`restore`）。heartflow 工具已 15+ 且 MCP 全量下发，需要同款账本与 focus 模式；
-- **pi-mcp-adapter**：单代理工具 ~200 token、MCP server 懒加载、自动探测/导入既有配置。与现有 `crates/mcp` 的关系是「替代方案」而非补丁——若 MCP 工具描述吃掉上下文成为实测问题，再评估；
-- **pi-plan-mode / Plannotator**：plan 作为可审阅工件。heartflow 已有 `plan` 权限档（只写 `.heartflow/plans/*.md`）与 `/plan`，缺的是计划的可审阅呈现；
-- **rpiv-ask-user-question**：结构化选项提问。heartflow 已有 `ask_user`，借鉴其选项渲染进权限门确认流；
-- **pi-footer**：状态栏定制。低优先，现有 TUI footer 已够用。
-
-### 借鉴点子（easy-llm-cli 工具/上下文面，待落地 §5）
-
-1. **BaseTool 契约（`docs/core/tools-api.md`）**：每个工具实现 `name`(API 内名)/`displayName`(人读)/`description`(给模型的说明)/`parameterSchema`(JSON Schema)/`validateToolParams()`(参数校验)/`getDescription()`(执行前给用户的「将要做什么」人读预览)/`shouldConfirmExecute()`(是否需用户确认)/`execute()`(带 `AbortSignal` 可取消)；返回 `ToolResult { llmContent, returnDisplay }` 把「喂给模型的历史」与「展示给用户的内容」分离（:7-19,61）。→ heartflow `crates/tools` 已是类似结构，可借鉴两点：(a) `getDescription()` 把「确认前的人读预览」从 `shouldConfirmExecute()` 拆出，权限门确认流更干净；(b) `llmContent`/`returnDisplay` 分离让诊断/回显不被塞进模型历史（与 §6 degradation ledger 同向）。
-2. **ToolRegistry 双发现 + MCP 命名前缀（`docs/core/tools-api.md`）**：registry 既支持 `toolDiscoveryCommand`（产出 JSON `FunctionDeclaration` 注册为 `DiscoveredTool`）也支持 MCP 发现；多 MCP server 时工具名加 `serverAlias__actualToolName` 前缀（:21-27,71）。→ heartflow `crates/mcp` 已接 MCP，工具名前缀冲突规避可直接抄 `server__tool` 约定；命令式发现是「不写代码即加工具」的轻量扩展面，比 §4 的扩展系统更低门槛。
-3. **memport：上下文模块化导入（`docs/core/memport.md`）**：`GEMINI.md` 内用 `@./file.md` 语法把大上下文拆成可复用组件；带**环检测**（:80-91）、**最大嵌套深度 10**（:99）、**路径白名单校验**（:93-95）、**只允许 `.md`**（:11）。→ heartflow 系统提示/项目上下文可借鉴：(a) 把巨型 system prompt 拆成 `@`-import 的模块化片段，按需组合；(b) 环检测 + 深度上限是防「上下文递归爆栈」的现成护栏，对应 §5 上下文预算；(c) 这与 §1 监工/工人「共享模块化项目上下文」也同构。
-4. **token 缓存 + `/stats` 用量可见（`docs/cli/token-caching.md` + `docs/quota-and-pricing.md`）**：API key/Vertex 用户自动复用 system instructions+context 的 KV 缓存降低 token 成本（:1-14）；`/stats` 在会话中/退出时展示 token 用量与 cached 节省（quota-and-pricing.md:3）。→ heartflow §5 上下文预算需要「用了多少、cache 命中多少、哪个 provider 烧钱」的实时可见性，`/stats` 是现成 UX；token 缓存意识应进 provider 层（与 §4 第 7 条 compat 矩阵同源：哪些 provider 支持 prompt cache 是能力标志）。
-
-### 借鉴点子（kimi-code 一方 telemetry 包 + 用户自有 RAG 权限概念，待落地 §5/§4）
-
-1. **RAG 权限校验（用户自有设计概念，**非** kimi-code——源码零命中，如实纠正归属）**：前置原则「**只要用户不能感知的内容，大模型也不可感知**」——权限校验应卡在检索**召回后、注入模型前**。做法：分块时为每 chunk 打 metadata `{ tenant_id, security_level, owner_id, allowed_groups, allowed_users }`；约定「仅当 chunk 的 `security_level` ≤ 用户风险等级才可用，否则丢弃」。**核实结论**：在 `.workbuddy/kimi-code` 全仓 grep `security_level` / `allowed_groups` / `allowed_users` / `tenant_id` / `clearance` 均**零命中**，故这是粘贴稿里的**用户自有设计构想**（或来自他处），不是 kimi-code 功能，不应挂其名。→ 但作为 heartflow 缺口仍高价值：`doc_search`（`runtime` 层 FTS5）与 §2 web_search 结果注入前，加一层**用户可见性门**（按 tenant/owner/group/security_level 过滤），防「把无权内容召回进上下文即等于泄露」。这是路线图目前完全缺失的维度（多项目/多用户场景），与 §4 可观测性、§6 编辑后反馈正交——**记为待自建设计，而非外部借鉴**。
-2. **一方遥测包 + Observation/Eval 分层（源码实证 + 心智模型）**：kimi-code 有**一方遥测包** `@moonshot-ai/kimi-telemetry`（`packages/telemetry`，与 §4 easy-llm-cli 的 OTEL 同向，可作 heartflow tracing 的对标）；可观测性建议分两层——**Observation**（Trace：token use / context use / tool result 等指标采集）与 **Eval**（基于 Observation 的响应策略）。→ heartflow §4 遥测落地时不能只做采集面（Observation），必须同时定义**采集后要触发的动作**（Eval 层；此分层为心智模型、非 kimi-code 专有组件）：token 超预算→触发 compaction（呼应 §4 kimi/ds4 compaction 触发）、tool 连续 fail→降级或告警、provider 烧钱→切换。采集无响应 = 白采。
-
-## 6. 编辑后反馈（pi-lens 借鉴）
+### 6. 编辑后反馈（pi-lens 借鉴）
 
 pi-lens（apmantza/mattgmak）：编辑后即时 LSP 诊断、impact cascade（连带文件诊断）、ast-grep/tree-sitter 结构规则、`symbol_search` 热索引 discovery funnel、诊断分诊（false-positive / suppress / defer / flag 四态）、**degradation ledger**（静默降级行为的有界账本）、read-guard + edit-autopatch。
 
@@ -1025,11 +973,139 @@ heartflow 落点：`edit_file` / `apply_patch` 后回注诊断（Rust 项目先�
 
 **写后诊断回注落地状态（2026-10-21，MVP 已上线，安全编辑闭环补全）**：`runtime::diagnostics`——写类工具改动 `.rs`/`Cargo.toml` 后，向上找 `Cargo.toml`（限 8 级）定位项目根，跑 `cargo check --message-format=short --quiet`（默认 60s 超时，`HEARTFLOW_DIAGNOSTICS_TIMEOUT_SECS` 覆盖；`HEARTFLOW_POST_EDIT_DIAGNOSTICS=0` 总开关），short 格式解析（`file:line:col: level[CODE]: msg`；无位置的 cargo 级错误落 `file="<cargo>"`），结果以 `postEditDiagnostics` 字段**回注进同一工具结果**——模型当轮就能看到编译裁决，省一轮 read→bash→check 往返。**degradation ledger（有界可观测）**：按原因分桶计数（no-manifest / no-cargo / timeout / spawn），`hf doctor` 分级展示（no-manifest 属非 Rust 项目的正常态只展示；timeout/spawn 计入 problems）。**刻意不做**：rust-analyzer 集成（进程寿命管理与 LSP 通信属另一量级）、非 Rust 语言的诊断（等真实需求）、诊断驱动的自动回滚（判断权留给模型与人）。
 
-## 7. 推理引擎生态深研（DeepInfer + deepseek-recipe，2026-10-21 批次）
+
+### 11. 硬骨头作战序列（架构级，按依赖排序执行）
+
+> §1–§10 是方向研究（只记录不执行）。本节把其中**需要动大代码 / 改架构**的条目抽出，按依赖排序成**执行序列**，供迭代落地。铁律：所有 TUI 改动须真机冒烟；所有流式路径改动须先录 cassette（当前无已录夹具）。
+
+#### 11.0 根因锁：P2 并发模型 / 事件循环重构（一切的前提）
+
+- **根因（代码实证）**：`crates/cli/src/tui.rs:1889-1935` 的 live-turn 守卫 + `run_one_turn` 在回合边界内联 `await`，把事件循环停住；`tui.rs:451`/`:527` 注释自陈「the loop intercepts these keys before the reducer sees them」——按键拦截层在 reducer 之前。后果：**在飞回合不可被事件循环够到**。
+- **要改的大代码**：把 turn driver 从「内联 await 停住循环」改为「可被事件循环 pump 的任务」；live-turn 守卫改为非阻塞轮询；TUI 事件循环拆为「输入采集 / turn 驱动 / 渲染」三相。涉及 `cli/src/tui.rs` 事件循环 + `cli/src/main.rs` `run_one_turn` + `runtime` World 所有权（单写者，§9 事件循环调度）。
+- **解锁项（全部挂在它后面）**：P-D Steer、mission 回合自动记账（D1.3）、在飞回合取消（double-Ctrl+C，§4）、§7.2 优雅停机交接、codexmon 工具卡死超时（§8.1）、子代理看门狗（§8.4）、§10.2 每回合 ephemeral + session resume、§10.4 `agent_settled` 真终态（修 `run_one_turn` 终态判据）。
+- **风险**：TUI 交互式，本环境无法真机冒烟，须用户陪测；改动前先录 cassette。
+- **落地状态（2026-10-22，循环结构已重构，待真机陪测）**：
+  - **三相事件循环 ✅**：`drive_loop`（`tui.rs`）拆为 Phase R（脏则渲染）/ Phase T（回合驱动：出队输入、同步 `begin_turn` + `Msg::TurnStarted`、take runtime+prompter 组装回合）/ Phase I（biased `select!`：回合完成臂优先 settle，共享 Msg 通道臂处理导航/reducer/权限/取消/提交）。回合在飞时循环照常迭代，§11.0 根因（内联 await 停住循环）已消除——回归测试 `keys_reach_the_reducer_while_a_turn_is_live` 锁定。
+  - **所有权反转 ✅**：回合 future 改为 `'static` 盒装 future（`Pin<Box<dyn Future<Output = TurnResult<C,T>>>>`），**自持有**该回合的 runtime 与 prompter，结束时经 `TurnResult` 交还；循环持 `Vec<Option<ConversationRuntime>>` 槽位（None ⇔ 该 section 回合在飞）。回合中新建 section 不再与借用冲突，且 future 已具 spawn 条件（本次仍就地 poll，未 `tokio::spawn`——下一步可选）。
+  - **`run_one_turn` 已溶解 ✅**：原函数整体并入三相，无遗留外壳。
+  - **`TurnSaver` seam ✅**（`storage.rs`）：`DiskSaver` 生产实现 + 测试用 `RecordingSaver`，settle 持久化不再耦合真实磁盘路径。
+  - **`guide_snapshot` 泛型化 ✅**：改走 trait 级 `executor().pending_tasks()`，不再下钻具体 executor 类型。
+  - **在飞取消接线 ✅**：double-Ctrl+C 经 `CancellationToken` 取消在飞回合，settle 仍持久化（`double_interrupt_cancels_the_live_turn` 锁定）。
+  - **验证**：`cargo test --workspace` 654 通过 / 0 失败（含 6 个循环级测试：回合完整跑通并持久化、回合中按键达 reducer、follow-up 合并进下一回合、double-Ctrl+C 取消、回合中禁导航、空闲新建 section 独立跑回合）；clippy `-D clippy::all` 干净；panic 棘轮 debt=0；fmt 干净。
+  - **诚实边界（未做）**：① future 仍未真正 `tokio::spawn`（就地 poll，跨线程并发留给 P2 下一步）；② **真机冒烟未做**（本环境无 TTY）——须用户按下方陪测清单逐项验证后才算闭合；③ 流式路径本体（runtime）未动，未录 cassette 不阻塞本项，但后续 §11.5 流式改动仍须先录。
+  - **真机陪测清单**：正常多轮对话与 follow-up 合并；回合中 PageUp/PageDown 滚动与按键响应；double-Ctrl+C 取消在飞回合（transcript 出现取消痕迹且会话已保存）；回合中 Ctrl+PgUp/PgDn 被拦（出现 "finish or cancel" 守卫提示）；Ctrl+N 新建 section 并独立跑回合；权限弹窗（Allow/Deny）在回合中正常往返；退出（idle 双击 Ctrl+C / 回合中取消后退出）无卡死、无 panic。
+
+#### 11.1 TUI 升级（用户点名，真机冒烟陪测）
+
+- **P-C TUI 三件套（§1 P-C）**：回合内输入路由补 `DeliveryMode` + 计数显示；队列编辑键位（withdraw/edit/reorder/改派）；引导 overlay（T6 两栏可编辑确认）。
+- **KI-001 Alt+Enter 全屏**（known-issues.md）：交互式 PTY 内 Alt+Enter 被 TUI 按键拦截层吃掉，未透传 → 交互态激活时透传 PTY。
+- **KI-002 Ctrl+C 提示过短**（known-issues.md）：打断/确认提示走瞬时 `status_note` 被下一帧覆盖 → 改为持久状态栏保留到结算或显式超时。
+- **已知未修（§9）**：TUI 流式尾部每帧 clone、表格列宽不按终端封顶 → 端到端冒烟 + cassette 后改。
+- **铁律**：TUI 斜杠命令派发（`println!` 与 alt-screen 不兼容）刻意不盲改，只有真机冒烟能验。
+- **依赖**：KI-001/002 是「拦截层局部透传」小改，可**先于 11.0** 落地；P-C 三件套建议 11.0 后做最稳。
+
+#### 11.2 P-D Steer（注入在飞回合）
+
+- 前置 11.0。递送语义 `Steer` = 注入当前回合（§1 D2.x）；默认 `FollowUp`，`Steer` 经 11.0 可用。逐条 steer 递送 + 失败按条目重排 + 明示（§1 P-D/P-E）。
+
+#### 11.3 mission 回合自动记账 + 在飞回合取消
+
+- **D1.3 runtime 续跑驱动器**：每 turn 开头注入 mission reminder（status + criteria + 预算剩余）；截止调度（到期限提醒，不杀）。前置 11.0 事件循环够到。
+- **在飞回合取消（§4）**：double-Ctrl+C 取消在飞回合。前置 11.0。
+
+#### 11.4 per-section 泳道递送轮转（TUI 半边）
+
+- 数据结构（`QueueEntry.lane`）+ REPL 观测面已落地（§1 2026-10-22 批次）；TUI 侧轮转规则（`MAX_SECTIONS=9`，`tui.rs:1103`）未做。前置 11.1 TUI 升级的队列编辑键位。
+
+#### 11.5 次级 / 独立（不阻塞主线）
+
+- **§4 cassette 录制扩展**为 ds4 式集成测试：先录夹具（铁律），再动流式路径。
+- **§10.2 ephemeral + session resume** / **§10.4 `agent_settled` 真终态**：与 11.0 同源，可在 11.0 一并收口。
+- **跨进程单写者 World（P2 跨进程）**：进程内 Semaphore 先行，跨进程槽位留给 bash 长任务外置（§1）再搬。
+- **全树 `cargo update`**：无关 major 的传递刷新，独立小步验证（brotli 8→9 等）。
+- **§7.1 deepseek-recipe 引入评估**：外部依赖大决策，须先验证 MSRV/构建体积，不在硬骨头首批。
+
+#### 执行顺序建议（明日）
+
+1. **11.0 根因锁**（最大架构块，先做解锁一切）—— 本环境无法真机冒烟，用户陪测。
+2. **11.1 TUI 升级 + KI-001/002**（用户点名陪测）—— KI-001/002 小改可先于 11.0。
+3. **11.2 / 11.3**（Steer + mission 记账 + 取消，前置 11.0）。
+4. **11.4**（per-section 轮转，前置 11.1）。
+
+
+## B. 外部调研与借鉴（只记录不执行）
+
+> B 组为外部项目源码研读与设计判据锁定，当前**不落地、只作 A 组的依据来源**。
+
+### 2. 搜索与研究能力（web_search / web_fetch 增强）
+
+**现状（代码实证）**：`crates/tools/src/web.rs:857` `web_search` 只有 DuckDuckGo HTML 单引擎、keyless；`web_fetch` 浏览器 UA + 5 跳重定向 + SSRF 护栏（`ensure_public`，`:409`）。无爬虫、无深度研究、无 provider 链。
+
+**借鉴 MergeSearch（shaonianG，本地副本 `archive/pi-research/MergeSearch`，Python）**：
+
+- 多平台聚合 MCP 服务四工具：`search` / `fetch` / `crawl` / `research`——**crawl 与 research 是 heartflow 缺的两档**；
+- Key 池化 + 平台间 failover/轮询/随机 + 失败 Key 拉黑 5 分钟；
+- `proxy_router.py` 是完整可移植的 Clash 风格分流引擎（`DOMAIN` / `DOMAIN-SUFFIX` / `DOMAIN-KEYWORD` / `IP-CIDR` / `REGEX` / `MATCH`，direct/auto/global 三模式）——**直接对应 §3 代理条目**；
+- 用量统计持久化（`stats.json`）。
+
+**借鉴 pi-web-access（nicobailon）**：
+
+- 30+ provider 统一抽象 + `searchRouting` 有序路由 + `fallbackOn` 条件（如 `invalid-response`）；explicit-only provider 不进 auto 链；
+- `maxInlineContentChars`（30K）结果预算——**搜索结果的「进上下文体量」必须是个显式预算，不是副产品**；
+- 内容协商优先取 Markdown、`redirects: "same-origin"` 选项、`data:` URI 消毒（防 base64 图片占满上下文）；
+- 凭证安全范式：错误信息脱敏、跨源重定向剥密钥、SSRF 全局防护。
+
+**落点**：provider 链 + fallback（DeepSeek 服务端搜索已有协议口子，见原路线图）、`crawl` 工具（有界深度/页数）、结果预算参数。**明确不做**：视频理解、YouTube、浏览器渲染（归 browser use 条目）。
+
+
+### 3. 代理体系优化
+
+**现状（代码实证）**：`crates/api/src/retry.rs:17` `build_http()` 只设 `connect_timeout(15s)` / `read_timeout(300s)`，**无任何代理配置**——reqwest 隐式读 env 代理（`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`），不可见、不可控、doctor 无法展示。`crates/tools/src/web.rs:73` 与 `crates/tools/src/image.rs:313` 各自另建 blocking client，同样裸奔。
+
+**四类必须处理的场景**：
+
+1. **幽灵代理**：env 设了 `HTTPS_PROXY` 但代理没开——现状每次请求先吃 15s connect timeout × 3 次重试 ≈ **45s/请求**才失败。必须启动时（或首请求前）对 proxy host:port 做 TCP 探测，失败则 warning + 降级直连；
+2. **Windows 系统代理**：Clash/V2Ray「系统代理」按钮写的是 WinINET 注册表（`HKCU\...\Internet Settings` 的 `ProxyEnable`/`ProxyServer`/`ProxyOverride`），reqwest 不读——本机主力场景，必须自己读（`windows-sys` 已在依赖树）；
+3. **按目标分流**：NO_PROXY 之外无规则。国内 API（DeepSeek）走代理反而慢/被风控，Google/GitHub 需要代理——直接移植 MergeSearch `proxy_router.py` 的规则引擎到 Rust（`api` crate，纯函数、离线可测）；
+4. **fail 语义**：借鉴 pi-web-access 的 **fail-closed**（代理配置解析失败时拒绝请求而非静默绕过）；CLI 场景默认应对立成 fail-open 到 direct + 显著 warning，做成开关。
+
+**解析顺序（设计）**：显式配置（`[proxy]` 节 / `HEARTFLOW_PROXY`）> env > Windows 系统代理 > direct。要显式化：`Client::builder().no_proxy()` 关掉 reqwest 隐式行为，自解析后 `.proxy(Proxy::all(...))`，这样顺序可控、`hf doctor` 可打印当前生效代理与判定理由。 socks5 由 reqwest  socks feature 覆盖，探测时按 scheme 分支。
+
+**实现对照 MergeSearch `proxy_router.py`（heartflow-proxy 已落地，以下为差异判据）**：
+
+- 规则引擎特征完全同构：`DOMAIN`/`DOMAIN-SUFFIX`/`DOMAIN-KEYWORD`/`IP-CIDR`/`REGEX`/`MATCH`，首条命中生效，闭包按目标分流（MergeSearch `proxy_router.py:13-107`，heartflow `crates/proxy/src/rules.rs:94-143`）；REGEX 两方都匹配**整 URL**（MergeSearch `:58` ↔ heartflow `rules.rs:86`），语义一致；
+- **一处发散需定夺**：MergeSearch `auto` 未命中规则时回退 `auto_default`（默认 `direct`，可配，`proxy_router.py:78/:101`）；heartflow 取「有 rules 未命中→直连、无 rules→全局」。两方案均可，heartflow 当前选「无 rules 即全局」因为 `[proxy]` 显式地址本身即表达「要用代理」，空规则表罕见；若将来想让 `auto` 默认保守直连，加 `auto_default` 旋钮即可与 MergeSearch 对齐；
+- MergeSearch 兼容旧写法（`*.domain` / 裸域名 / `re:` 前缀，`:62-71`）并预留 `GEOIP,CN`（忽略，:59）；heartflow 严格只认 `TYPE,VALUE,ACTION`，未知类型报错（更显式 fail-closed）。地理分流（GEOIP）作为未来可选项记录。
+
+**与 easy-llm-cli 的沙箱出口代理正交**：easy-llm-cli 的 `GEMINI_SANDBOX_PROXY_COMMAND`（`docs/examples/proxy-script.md`，一个只允许 `example.com:443` 的 CONNECT allow-list 代理）管控的是**沙箱内部进程的网络出口**，与 heartflow §3 的「API 出站代理」是两层不同语义：§3 是 host→API 的 egress 选择，沙箱代理是 sandbox→egress 的 allow-list。若将来做 §4 沙箱，网络出口管控可复用此「用户自带 allow-list 代理脚本」模式，二者不冲突、可叠加。
+
+
+### 5. 工具面与上下文预算
+
+- **pi-tbox**：跨扩展的 toolset 开关/分组/focus + **上下文字符账本**（core floor vs extension budget 分开计数）+ 基线钉住（`defaults`/`save`/`restore`）。heartflow 工具已 15+ 且 MCP 全量下发，需要同款账本与 focus 模式；
+- **pi-mcp-adapter**：单代理工具 ~200 token、MCP server 懒加载、自动探测/导入既有配置。与现有 `crates/mcp` 的关系是「替代方案」而非补丁——若 MCP 工具描述吃掉上下文成为实测问题，再评估；
+- **pi-plan-mode / Plannotator**：plan 作为可审阅工件。heartflow 已有 `plan` 权限档（只写 `.heartflow/plans/*.md`）与 `/plan`，缺的是计划的可审阅呈现；
+- **rpiv-ask-user-question**：结构化选项提问。heartflow 已有 `ask_user`，借鉴其选项渲染进权限门确认流；
+- **pi-footer**：状态栏定制。低优先，现有 TUI footer 已够用。
+
+#### 借鉴点子（easy-llm-cli 工具/上下文面，待落地 §5）
+
+1. **BaseTool 契约（`docs/core/tools-api.md`）**：每个工具实现 `name`(API 内名)/`displayName`(人读)/`description`(给模型的说明)/`parameterSchema`(JSON Schema)/`validateToolParams()`(参数校验)/`getDescription()`(执行前给用户的「将要做什么」人读预览)/`shouldConfirmExecute()`(是否需用户确认)/`execute()`(带 `AbortSignal` 可取消)；返回 `ToolResult { llmContent, returnDisplay }` 把「喂给模型的历史」与「展示给用户的内容」分离（:7-19,61）。→ heartflow `crates/tools` 已是类似结构，可借鉴两点：(a) `getDescription()` 把「确认前的人读预览」从 `shouldConfirmExecute()` 拆出，权限门确认流更干净；(b) `llmContent`/`returnDisplay` 分离让诊断/回显不被塞进模型历史（与 §6 degradation ledger 同向）。
+2. **ToolRegistry 双发现 + MCP 命名前缀（`docs/core/tools-api.md`）**：registry 既支持 `toolDiscoveryCommand`（产出 JSON `FunctionDeclaration` 注册为 `DiscoveredTool`）也支持 MCP 发现；多 MCP server 时工具名加 `serverAlias__actualToolName` 前缀（:21-27,71）。→ heartflow `crates/mcp` 已接 MCP，工具名前缀冲突规避可直接抄 `server__tool` 约定；命令式发现是「不写代码即加工具」的轻量扩展面，比 §4 的扩展系统更低门槛。
+3. **memport：上下文模块化导入（`docs/core/memport.md`）**：`GEMINI.md` 内用 `@./file.md` 语法把大上下文拆成可复用组件；带**环检测**（:80-91）、**最大嵌套深度 10**（:99）、**路径白名单校验**（:93-95）、**只允许 `.md`**（:11）。→ heartflow 系统提示/项目上下文可借鉴：(a) 把巨型 system prompt 拆成 `@`-import 的模块化片段，按需组合；(b) 环检测 + 深度上限是防「上下文递归爆栈」的现成护栏，对应 §5 上下文预算；(c) 这与 §1 监工/工人「共享模块化项目上下文」也同构。
+4. **token 缓存 + `/stats` 用量可见（`docs/cli/token-caching.md` + `docs/quota-and-pricing.md`）**：API key/Vertex 用户自动复用 system instructions+context 的 KV 缓存降低 token 成本（:1-14）；`/stats` 在会话中/退出时展示 token 用量与 cached 节省（quota-and-pricing.md:3）。→ heartflow §5 上下文预算需要「用了多少、cache 命中多少、哪个 provider 烧钱」的实时可见性，`/stats` 是现成 UX；token 缓存意识应进 provider 层（与 §4 第 7 条 compat 矩阵同源：哪些 provider 支持 prompt cache 是能力标志）。
+
+#### 借鉴点子（kimi-code 一方 telemetry 包 + 用户自有 RAG 权限概念，待落地 §5/§4）
+
+1. **RAG 权限校验（用户自有设计概念，**非** kimi-code——源码零命中，如实纠正归属）**：前置原则「**只要用户不能感知的内容，大模型也不可感知**」——权限校验应卡在检索**召回后、注入模型前**。做法：分块时为每 chunk 打 metadata `{ tenant_id, security_level, owner_id, allowed_groups, allowed_users }`；约定「仅当 chunk 的 `security_level` ≤ 用户风险等级才可用，否则丢弃」。**核实结论**：在 `.workbuddy/kimi-code` 全仓 grep `security_level` / `allowed_groups` / `allowed_users` / `tenant_id` / `clearance` 均**零命中**，故这是粘贴稿里的**用户自有设计构想**（或来自他处），不是 kimi-code 功能，不应挂其名。→ 但作为 heartflow 缺口仍高价值：`doc_search`（`runtime` 层 FTS5）与 §2 web_search 结果注入前，加一层**用户可见性门**（按 tenant/owner/group/security_level 过滤），防「把无权内容召回进上下文即等于泄露」。这是路线图目前完全缺失的维度（多项目/多用户场景），与 §4 可观测性、§6 编辑后反馈正交——**记为待自建设计，而非外部借鉴**。
+2. **一方遥测包 + Observation/Eval 分层（源码实证 + 心智模型）**：kimi-code 有**一方遥测包** `@moonshot-ai/kimi-telemetry`（`packages/telemetry`，与 §4 easy-llm-cli 的 OTEL 同向，可作 heartflow tracing 的对标）；可观测性建议分两层——**Observation**（Trace：token use / context use / tool result 等指标采集）与 **Eval**（基于 Observation 的响应策略）。→ heartflow §4 遥测落地时不能只做采集面（Observation），必须同时定义**采集后要触发的动作**（Eval 层；此分层为心智模型、非 kimi-code 专有组件）：token 超预算→触发 compaction（呼应 §4 kimi/ds4 compaction 触发）、tool 连续 fail→降级或告警、provider 烧钱→切换。采集无响应 = 白采。
+
+
+### 7. 推理引擎生态深研（DeepInfer + deepseek-recipe，2026-10-21 批次）
 
 **结论先行**：DeepInfer 引擎本体（deepseek-ai，Apache 2.0，vLLM 深度魔改的 Python/CUDA/CANN 推理框架，Linux-only）对 heartflow——Rust 编写的 **API 客户端**——**无可直接利用的代码**；真正可「直接利用或深度适配」的是配套组件 **deepseek-recipe**（deepseek-ai，**MIT，纯 Rust workspace**，crates.io 已发布 0.2.0）：它做的三协议转换 + 精确 token 编解码 + 流式输出解析，与 heartflow `provider` / `api` / `compact.rs` 是同构面。引擎层剩余价值是方法论（见 7.2）。
 
-### 7.1 deepseek-recipe：首个「同语言 + 同协议面」的可评估组件（源码实证）
+#### 7.1 deepseek-recipe：首个「同语言 + 同协议面」的可评估组件（源码实证）
 
 本地副本 `.workbuddy/deepseek-recipe`（`git clone --depth 1`，不入库）。workspace 成员（`Cargo.toml:2-11`）：`deepseek-recipe`（协议转换 + 输出解析）/ `-core`（conversation/message/image/tool 共享类型）/ `-encoding`（V4 与 V4.1 prompt 渲染 + token 编码）/ `-image`（OpenCV 预处理）/ `-macros`（`prompt!` 宏）/ `-python`（PyO3 绑定）/ `server-rs`（Axum 示例）/ `encoding-decoding-demo`（web demo）。edition 2024，dev toolchain 钉 1.97.1（`rust-toolchain.toml`），**未声明 `rust-version`**。
 
@@ -1049,7 +1125,7 @@ heartflow 落点：`edit_file` / `apply_patch` 后回注诊断（Rust 项目先�
 
 **依赖评估（未来若评估引入，须先验证，当前不跑 cargo）**：① recipe 未声明 `rust-version`，其 edition 2024 + 依赖树是否突破 heartflow MSRV 1.88 需实跑验证；② `tokenizers` 是重量级原生依赖，Windows 构建体积与 CI 时长成本需量化；③ tokenizer.json 获取路径：HF Hub 运行时下载（http feature）vs 随仓库分发——按本仓 vendored 纪律，未修改上游资产不入库，但「clone 即可跑」检验法要求有确定获取路径，二者需折中；④ 引入属**外部依赖**而非衍生代码，按 AGENTS.md 第三方纪律在 README §致谢点名（NOTICE 仅针对衍生/移植代码）；⑤ 更轻替代：只借鉴 special-token 边界编码与流式状态机方法论，tokenizer 单引 `tokenizers` crate 自接。
 
-### 7.2 DeepInfer 引擎：方法论借鉴（代码不可用）
+#### 7.2 DeepInfer 引擎：方法论借鉴（代码不可用）
 
 **不可用判决**：Python 3.12 + vLLM fork + CUDA 13 / CANN 9.2 + Linux + GCC≥13；硬件限 NVIDIA SM100 与昇腾 950；模型限 DeepSeek-V4.1-Flash（默认 1017 checkpoint）。heartflow 是跨平台 Rust 客户端，零代码可复用。但同仓 `doc/inference_deployment_qa.md`（官方部署 QA）暴露的设计逻辑有多条可迁移：
 
@@ -1065,7 +1141,8 @@ heartflow 落点：`edit_file` / `apply_patch` 后回注诊断（Rust 项目先�
 
 **明确不做/不可用**：引擎代码、kernel 库（FlashMLA/DeepGEMM/DeepEP/TileKernels/DeepSelect）、MoE EP/EPLB、PD 分离部署、KVCache 存储与负载均衡（官方明示未开源）——全部是服务端 GPU 栈，heartflow 不涉足。heartflow 与 DeepInfer 生态的真实交集只有两个：**deepseek-recipe 的协议/tokenizer 面**，以及「客户端如何对齐官方 API 行为」这一命题。
 
-## 8. bash job 监控 / job 超时 / 挂起检测（2026-10-21 网络调研批次）
+
+### 8. bash job 监控 / job 超时 / 挂起检测（2026-10-21 网络调研批次）
 
 **调研来源**：`codexmon`（tigercosmos/codexmon，Go 写的 codex CLI 监工：三层超时 + 健康分档）、IdleWatchdog 参考实现（gunbark.dev 两篇 deep-dive）、counterpoint agent（mozart-orchestration `COUNTERPOINT.md`，外部 CLI 防挂纪律）、`agentic-process-monitor` skill（sentinel+heartbeat+子代理轮询）、timetobuildbob「The Session Wasn't Idle — It Was Waiting」（子代理感知的会话看门狗）、Claude Code BashTool 内部机制拆解（CSDN oe1019/159826055：超时自动后台化/进度回调/大输出落盘）。队列与引导的官方语义对照（Qoder docs / ACP steering）已并入 §1 落地状态。
 
@@ -1102,7 +1179,8 @@ heartflow 落点：`edit_file` / `apply_patch` 后回注诊断（Rust 项目先�
 
 **明确不做**：常驻监控 daemon（看门狗随命令/任务生命周期生灭）、跨机器 job 监控、基于 GPU/内存的启发式挂起判定（噪声大于信号）。
 
-## 9. 调度与加速理论（2026-10-22 批次，只记录不执行）
+
+### 9. 调度与加速理论（2026-10-22 批次，只记录不执行）
 
 **诚实定位**：heartflow 是远程 API 客户端，**硬件榨取（GPU/张量核/带宽）不适用**（ds4 判断已记录）；「极致调度与加速」的可适用面是**回合事件循环与渲染路径**的调度理论。理论储备，按「先埋点观测，有证据再改」推进，未到执行位：
 
@@ -1116,7 +1194,71 @@ heartflow 落点：`edit_file` / `apply_patch` 后回注诊断（Rust 项目先�
 
 **明确不做**：常驻监控 daemon（看门狗随命令/任务生命周期生灭）、跨机器 job 监控、基于 GPU/内存的启发式挂起判定（噪声大于信号）、RAM 快照缓存掩盖协议不匹配（ds4 反模式）。
 
-## 原有小项（保留）
+
+### 10. PandaCode / pi / codex / claude 设计借鉴与取舍（2026-10-22 研究，只记录不执行）
+
+**研究来源**：`aicodeking/pandacode`（Tauri 2 桌面外壳，Rust 后端 + TS 前端，369★/53 fork，4 天新仓；浅克隆于 `archive/pandacode`，**不入库**）。它把 Claude Code / Codex / Kimi / OpenCode / GLM / MiMo / Antigravity / Grok（ACP）/ Pi（RPC）/ DeepSeek（ACP）等编码 harness 归一化在同一事件面背后，自带 **MCP host**（`src-tauri/src/providers/mcp_host.rs`）、**Pi RPC 桥**（`providers/pi.rs` + `providers/pi-extension.mjs`）、**队列/引导**（`message_queue.rs` + `providers/steering.rs`）、**architect+workers 团队**（`architect.rs` + `subagents.rs`）。交叉佐证已落地的 `archive/pi-research/pi-subagents` 与 `.workbuddy/` 的 ds4/easy-llm-cli/kimi-code/DeepInfer/deepseek-recipe。
+
+**诚实定位**：pandacode 是 GUI 桌面 app，heartflow 是 **CLI agent**——GUI 专属面（webview 主题、simulator、bots、deploy、overlay）**直接不适用**，只取它验证过的**架构骨架**：① 归一化 provider 事件面；② 每回合 ephemeral 进程 + 会话 resume；③ loopback MCP host（host 暴露工具给 guest harness）；④ host 桥接 guest（Pi RPC）+ 权限模式在 host 强制；⑤ durable 每任务队列 + 引导直接发送的生命周期二分。下面按「采纳 / 改造 / 不做」给结论，全部带 pandacode 行号实证，并对照 heartflow 真实状态（`crates/mcp` 纯 client、`FollowUpQueue` 单 FIFO、无 Pi 集成、`PermissionPrompter` 已存在）。
+
+#### 10.1 归一化 provider 事件面（采纳骨架，不抄实现）
+
+pandacode 把 9+ 种 harness 的差异收敛到一条 `AgentEvent` 流（`kind`: text/tool/approval/done/error/session/subagent/goal…，行号见 `docs/ipc.md` L177-223），每个 adapter 只产出归一化事件；`providers.rs` 即「one normalized event interface」（`docs/providers.md` 开头）。heartflow 已有 `provider` crate，方向一致——**保持 provider 抽象干净、事件面单一**，新增 harness 只写 adapter 不出新事件种类。**明确不抄**：pandacode 为每 harness 写独立协议解析器（Claude stream-json / Codex app-server / ACP / Pi RPC），heartflow 初期只需 1–2 个 harness，不必全支持。
+
+#### 10.2 每回合 ephemeral + 会话 resume（采纳原则）
+
+`docs/design.md` L7：「Spawn provider processes only for active turns and terminate when complete; resume through provider session IDs.」`docs/providers.md` L127-132：每回合独占一进程，完成即关 stdin 释放；下一回合用保存的 `session_id` resume；Stop = harness 中断消息 + grace 后杀进程组。这**正面回应** heartflow 的「在飞回合必须能被事件循环够到」根因（tui.rs:1889 内联 await 停住循环）——**不要让长生命周期 agent 进程卡住事件循环**，靠 session resume 衔接而非常驻。与此前 §1/§4 的 pi job 磁盘状态机、`run_one_turn` 边界推送同构。
+
+#### 10.3 mcp：client→host 的取舍（核心升级点）
+
+heartflow `crates/mcp` 当前是**纯 client**（stdio + Streamable-HTTP/SSE 双传输，`http.rs` `HttpTransport`；`README.md` 自述）。pandacode `mcp_host.rs` 是**host 侧**：每回合起一个 **loopback-only、随机 Bearer token、鉴权强制** 的极简 MCP server（`Server::start_with_approvals` 绑 `127.0.0.1:0`，token=双 UUID；`read_request` 拒 `Origin`/非 loopback `Host`/超 160KB body/非 POST/旧协议版本，L309-333），把 URL+token 按各 harness 原生格式注入（`claude_config`/`pi_config`/`kimi_config`/`codex_config`，L125-136）。
+
+| 取舍 | 判据 | 结论 |
+|---|---|---|
+| **client 传输安全化** | heartflow 也连本地 MCP server（loopback），应校验 endpoint 为 loopback、优先 Bearer、绑帧上限 | **采纳（改造）**：在 `HttpTransport`/`client.rs` 加 endpoint-loopback 校验 + 帧上限；不引入 pandacode 全套 server，只取 client 侧纪律 |
+| **新增极简 MCP host server** | 若 heartflow 要「code mode」驱动外部编码 agent（Pi/Codex），或要可被外部编排器驱动，host 是把本仓工具（file/git/run/jobs/missions）暴露给 guest 的通道 | **采纳（改造，按需）**：照 `mcp_host.rs` 约 300 行 `Server` 实现一个 per-turn loopback host（Bearer + DNS-rebinding 防护 + 一连接一请求 + 信号量 8 + `notifications/cancelled` 取消 + 单次使用 approval），不抄其 `host_tools` 全套，只暴露 heartflow 自有能力 |
+| **rebind 暖进程** | pandacode 暖 agent 先占位 server、adopt 时 rebind 到真回合（同地址同 token，agent 已持有，L52-58） | **暂不做**：heartflow 无暖进程预热需求，留作 P2 并发模型下游 |
+
+#### 10.4 pi 的 codemode：host 桥接 guest + `agent_settled` 生命周期（核心取舍）
+
+**关键结论**：pandacode **不嵌入 Pi 逻辑**——以 `--mode rpc` 把 Pi 当外部进程驱动，经 `--extension` + `PANDACODE_PI_BRIDGE` 注入桥扩展（`pi-extension.mjs`），由 host **强制权限模式**（ask/auto/plan/full），Pi 自身无审批系统（`README.md` L158；`pi-extension.mjs` L44-55：`tool_call` 钩子按 mode 放行/block，`plan` 只放行只读 + `PLAN_APP_TOOLS` 白名单）。这正面回答「pi 的 codemode」：**heartflow 的 code mode 不应 fork/嵌入编码引擎，应走 host-bridges-guest**——heartflow 当 host 持有工具与权限，Pi/Codex 当 guest 经 loopback MCP 回调。
+
+**生命周期二分**（直接修 heartflow `run_one_turn` 活回合守卫）：pandacode `pi.rs` L301-311 —— **`agent_settled`（非 `agent_end`）才是真终态**：重试/compaction/steering 可跟在 `agent_end` 之后；`agent_settled` 才推 `get_session_stats` 并 `done`。heartflow 若把回合结束等同于「子进程退出/末消息」，会漏掉 settle 后的 steering/retry。**采纳**：把「回合真终态」判据从「子进程退出/末消息」改为「host 侧 settle 事件」。
+
+| codemode 取舍 | 判据 | 结论 |
+|---|---|---|
+| 嵌入编码引擎 vs 驱动外部 agent | 嵌入=维护成本 + 与上游漂移；驱动=复用其登录/沙箱/模型，host 只负责工具+权限 | **采纳 host-bridge-guest**（与 §1 pi-subagents 一致） |
+| 权限模式在 host 强制 | Pi 无审批；pandacode 在桥扩展按 mode 拦截，guest 不知情 | **采纳**：heartflow 已有 `PermissionPrompter`（`crates/cli/src/interact.rs`），code mode 复用之，不在 guest 内重造 |
+| `agent_settled` 真终态 | pandacode 实测 `agent_end` 后可仍有 retry/steer | **采纳**：修 `run_one_turn` 终态判据 |
+| Pi RPC 的 `steer` 命令 | `pi_steer` 发 `{type:"steer",id,message}` 按 id 回执；`phase==0||settled` 拒收（`pi.rs` L432-448） | **采纳**到 §1 队列三件套「引导直接发送」分支（per-harness 投递：Claude 注入流输入 / Codex `turn/steer` / Pi `steer`） |
+
+#### 10.5 队列 / 引导二分（升级 heartflow FollowUpQueue）
+
+pandacode 把「引导（steer，进运行回合）」与「排队（queue，回合后 durable）」严格二分（`message_queue.rs` L1-4）：`queued_messages` 是 **per-task、position 有序、可 reorder/update/remove、take 一次性投递、失败 restore 回队首**（`take` L128 + `restore` L137，exactly-once），上限 50/任务、文本 128KiB、重启/失败/stop 后队列仍在。heartflow 当前 `FollowUpQueue` 是**单 FIFO 上限 32、整队合并一条注入**（`crates/cli/src/core.rs:19-107`，§1 L120 已记录）。
+
+| 取舍 | 判据 | 结论 |
+|---|---|---|
+| durable per-task 队列 + reorder | pandacode 验证：partial reorder 拒绝（L117-119）、take 后不可再 take（L241）、失败 restore 保 id/时间（L137-148） | **采纳（改造）**：把单 FIFO 升级为 per-task 有序 + 编辑 + 撤销（§1 D2.x 决策点落地） |
+| steer vs queue 二分 | harness 能否 mid-turn 接受决定走 steer 还是 queue（`steering.rs` L26-63） | **采纳**：heartflow 引导直接发送须 per-harness 分支，不能收编为单一注入 |
+| 上限与边界 | 50/任务、128KiB、附件 1MiB、空文本+空附件拒收（L28-40） | **采纳数值纪律** |
+
+#### 10.6 资源纪律（采纳原则）
+
+pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript 页（100 消息/2MiB）、tool 快照上限 64×8KiB、暖进程至多 2 个等待 10 分钟」（`docs/design.md` L46-48、`docs/providers.md` L238-250）。与 heartflow「性能→流畅→美观」「最小改动不回归」一致。**采纳**：任何新增 harness/子代理/queue 都须带显式上限与惰性加载；**不做** pandacode 的 GUI 专属面（simulator/bots/deploy/overlay/webview 主题）。
+
+#### 10.7 明确不做
+
+- 不抄 GUI：webview 主题、iOS/Android simulator、Telegram/Slack/Discord/WhatsApp bots、Vercel/Cloudflare/Railway/AWS 部署、quick overlay——CLI 不适用。
+- 不全支持 9+ harness 协议解析器；heartflow 归一化面 + 1–2 harness 即可（避免 pandacode 为每 harness 写独立 parser 的维护面）。
+- 不为 code mode 嵌入编码引擎（fork Pi/Codex 内部逻辑）；坚持 host-bridge-guest。
+- 不引入 pandacode 的 `host_tools` 全套（team delegate/browser/moodboard/VM），只暴露 heartflow 自有能力。
+
+
+## C. 功能增强候选（轻量，待评估）
+
+> C 组为轻量功能候选，待评估是否纳入路线。
+
+### 原有小项（保留）
 
 - **Browser use / computer use**：驱动浏览器与 Windows 桌面操作（点击、输入、截屏、表单填充）的原生工具。
 - **长期记忆**：基于向量/embedding 检索的跨会话持久记忆，区别于当前的 FTS5 全文检索。
@@ -1124,6 +1266,55 @@ heartflow 落点：`edit_file` / `apply_patch` 后回注诊断（Rust 项目先�
 - **`hf logs` 子命令**：当前日志仅按 `HEARTFLOW_LOG` 走 stderr、不落盘；要支持一条命令直出历史日志需先引入文件 sink（`tracing-appender`）+ 存储目录 + 轮转策略。
 - **全局开关 `--no-confirm` / `--color`**：非交互危险命令的确认策略已在 `--help` 的 INTERACTION CONTRACT 文档化；显式开关会改变安全/渲染语义，按需再评估。
 - **REPL 流式双写**（自 list.md #74 收编）：流式期间逐段原样打印 markdown 原文（只上 muted 色），回合结束 `MessageStop` 再把整段 assistant_text 重排一次——用户先看到 md 源码、结束时整块跳动（`.bak` T1）。候选修法：(a) 按块边界（空行、未闭合代码围栏）切分，已闭合块渲染一次不再重绘，重排限于最后一个未闭合块，需行数记账 + 光标上移重画；(b) 流式阶段不打印原始 md、改印进度指示。同类未修项：TUI 流式尾部每帧 clone、表格列宽不按终端宽度封顶（list.md #73/#75）。
+
+---
+
+
+---
+
+<!-- file: known-issues.md -->
+
+# 已知问题登记（待修复清单）
+
+本文件登记 heartflow 已观察到的**缺陷与体验问题**。按用户指令（2026-10-22），当前所有条目一律**只登记、不修复**——状态为「登记未修复」。每个条目含：现象、环境·复现、影响、疑点·待查位置（均为**未核实的假设**，仅供参考，修复前必须真机复现并定位根因）、登记日期、状态。
+
+新增条目请沿用 `KI-` 编号并追加到文末；修复后把状态改为「已修复（commit <sha>）」并从清单移除或留痕。
+
+---
+
+## KI-001 · Alt+Enter 在 pwsh 下触发全屏、无法进行多行续行
+
+- **现象**：在交互式命令（实际执行 PowerShell，见 `error.md` 记录：`bash` 工具在 Windows 上跑的是 PowerShell）中输入多行命令时，按 **Alt+Enter** 不会像在普通终端里那样把光标移到下一行继续输入（续行），而是触发**全屏**表现（程序进入/切换全屏），换行意图落空。
+- **环境·复现**：Windows + heartflow TUI（crossterm 原始模式 + 备用屏幕 `EnterAlternateScreen`，`crates/cli/src/tui.rs:60`、`:1679`）。在 TUI 内启动交互式/长运行命令（如 `bash` 工具跑 PowerShell）后，于输入态按 Alt+Enter。
+- **影响**：无法在 TUI 内的 PowerShell 里输入多行脚本/续行；Alt+Enter 被「吃掉」或上抛到全屏语义，破坏正常编辑流。
+- **疑点·待查位置（假设，未核实）**：
+  - TUI 在原始模式 + 备用屏幕下运行（`tui.rs:1679` `enter()`），按键先经事件循环；`tui.rs:451` 注释明确「the loop intercepts these keys before the reducer sees them」——存在一层先于 reducer 的按键拦截。`tui.rs:527` 也把「modified arrow (ctrl/alt/super)」判为编辑器动作而非历史导航，说明修饰键组合在 TUI 层被特判。Alt+Enter 极可能在此层被消费，未转发到 PTY，pwsh 收不到续行信号。
+  - 另一可能：宿主终端（Windows Terminal / ConPTY）在到达 PTY 前就把 Alt+Enter 解释为全屏切换，与 heartflow 的 raw/alt-screen 状态叠加。需真机区分是 TUI 层拦截还是宿主层语义。
+  - 修复方向（待验证）：当交互式终端/输入态激活时，把 Alt+Enter 透传给 PTY 而非拦截/上抛；并确认不会与宿主全屏语义冲突。
+- **登记日期**：2026-10-22
+- **状态**：登记未修复
+
+---
+
+## KI-002 · Ctrl+C 提示文字显示时间过短，看不清消息
+
+- **现象**：运行中按 **Ctrl+C** 触发打断时，界面给出的提示文字（如「再按一次确认打断」之类）**一闪而过**，来不及看清内容就消失。
+- **环境·复现**：heartflow TUI 运行中（agent 回合或交互态），按 Ctrl+C。
+- **影响**：用户无法从提示文字确认当前处于「已 armed 待二次确认」还是「已打断」状态，体验含糊，容易误按或不知已触发。
+- **疑点·待查位置（假设，未核实）**：
+  - `crates/cli/src/tui.rs:226` 有 `ctrl_c_armed: bool` 字段，L348/L394/L399-404/L712 围绕其实现「首次 Ctrl+C 武装、二次确认」的两段式打断；相关提示文字大概率走 `status_note`（如 L364 的 `permission requested …` 同类瞬时状态栏）渲染。若 `status_note` 在下一帧被覆盖、或 armed 态未把提示持续挂起，就会短暂闪现后消失。
+  - 修复方向（待验证）：把打断/确认提示作为**持久状态栏**保留到动作结算或显式超时，而不是瞬时覆盖；或把该提示额外写一行到 transcript，确保可读。
+- **登记日期**：2026-10-22
+- **状态**：登记未修复
+
+---
+
+## 登记纪律
+
+- 只登记、不修复（除非用户当次明确指令）。
+- 每个条目必须含可复核的**现象描述**与**环境/复现**；疑点标注「假设，未核实」，禁止把假设写成结论。
+- 修复前必须真机复现并核对代码，再回填根因与 commit。
+- 本清单与 `roadmap.md`（未实现方向）分工不同：roadmap 是设计/方向，本文件是已观测到的具体缺陷。
 
 
 ---

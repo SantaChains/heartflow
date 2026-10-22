@@ -180,7 +180,8 @@ pub(crate) fn run_doctor(fix: bool) -> Result<Vec<String>, Box<dyn std::error::E
     // own process, so process-local counters are meaningless here). A blocked
     // mission or an unreadable state file is exactly the thing an operator
     // wants surfaced before starting a session.
-    let missions_summary = runtime::summarize_on_disk(&crate::storage::sessions_dir().join("missions"));
+    let missions_summary =
+        runtime::summarize_on_disk(&crate::storage::sessions_dir().join("missions"));
     if missions_summary.corrupted > 0 {
         problems.push(format!(
             "{} mission state file(s) unreadable - /mission will skip them; check ~/.heartflow/sessions/missions",
@@ -194,12 +195,16 @@ pub(crate) fn run_doctor(fix: bool) -> Result<Vec<String>, Box<dyn std::error::E
         missions_summary.blocked,
         missions_summary.complete,
         if missions_summary.budget_exhausted > 0 {
-            format!(", {} over budget (open, reminders paused)", missions_summary.budget_exhausted)
+            format!(
+                ", {} over budget (open, reminders paused)",
+                missions_summary.budget_exhausted
+            )
         } else {
             String::new()
         }
     );
-    let schedule_store = runtime::ScheduleStore::load(&crate::storage::sessions_dir().join("schedules"));
+    let schedule_store =
+        runtime::ScheduleStore::load(&crate::storage::sessions_dir().join("schedules"));
     if schedule_store.corrupted_on_load() {
         problems.push(String::from(
             "schedules.json is unreadable - schedules start empty; salvage or delete ~/.heartflow/sessions/schedules/schedules.json",
@@ -232,7 +237,12 @@ pub(crate) fn run_doctor(fix: bool) -> Result<Vec<String>, Box<dyn std::error::E
             let pending = std::fs::read(&queue_path)
                 .ok()
                 .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
-                .and_then(|value| value.get("pending").and_then(|p| p.as_array()).map(Vec::len))
+                .and_then(|value| {
+                    value
+                        .get("pending")
+                        .and_then(|p| p.as_array())
+                        .map(Vec::len)
+                })
                 .unwrap_or(0);
             println!("  ok   queue: durable queue file sound, {pending} pending");
         }

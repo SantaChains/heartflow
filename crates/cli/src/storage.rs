@@ -140,6 +140,24 @@ pub(crate) async fn save_session_async(
         .map_err(|error| io::Error::other(error.to_string()))?
 }
 
+/// Turn-boundary persistence, injected into the TUI loop (`tui::drive_loop`)
+/// as a port so the loop itself names no disk path: production binds
+/// [`DiskSaver`], tests bind a recorder and never touch the real home
+/// directory. One call per finished turn, success or failure.
+pub(crate) trait TurnSaver {
+    async fn save(&mut self, state: &SessionShared, session: &Session) -> io::Result<PathBuf>;
+}
+
+/// The production [`TurnSaver`]: the real on-disk snapshot save, offloaded to
+/// the blocking pool by [`save_session_async`].
+pub(crate) struct DiskSaver;
+
+impl TurnSaver for DiskSaver {
+    async fn save(&mut self, state: &SessionShared, session: &Session) -> io::Result<PathBuf> {
+        save_session_async(state, session).await
+    }
+}
+
 /// Per-process redaction cache: the redacted prefix of the current transcript,
 /// so each save scrubs only the newly added messages instead of re-running the
 /// four structural regexes over the whole (multi-MB) transcript every turn.

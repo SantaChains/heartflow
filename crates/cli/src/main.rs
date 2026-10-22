@@ -857,13 +857,17 @@ async fn run_repl(
     let job_wall_timeout = env::var("HEARTFLOW_JOB_TIMEOUT_SECS")
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .map_or(
-            Some(runtime::DEFAULT_JOB_WALL_TIMEOUT),
-            |secs| if secs == 0 { None } else { Some(std::time::Duration::from_secs(secs)) },
-        );
+        .map_or(Some(runtime::DEFAULT_JOB_WALL_TIMEOUT), |secs| {
+            if secs == 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_secs(secs))
+            }
+        });
     runtime::set_jobs_root(Some(sessions_dir().join("jobs")));
     let stale_repaired = runtime::reconcile_stale_records();
-    let jobs = runtime::JobRegistry::with_wall_timeout(job_slots, job_max_pending, job_wall_timeout);
+    let jobs =
+        runtime::JobRegistry::with_wall_timeout(job_slots, job_max_pending, job_wall_timeout);
     let runtime_handle = tokio::runtime::Handle::current();
     if stale_repaired > 0 {
         println!("jobs: {stale_repaired} stale record(s) from a previous process marked stopped");
@@ -879,7 +883,11 @@ async fn run_repl(
         println!(
             "missions: {} state file(s) unreadable and skipped: {}",
             corrupted_missions.len(),
-            corrupted_missions.iter().map(|id| format!("m{id}")).collect::<Vec<_>>().join(", ")
+            corrupted_missions
+                .iter()
+                .map(|id| format!("m{id}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     runtime::set_schedules_root(Some(sessions_dir().join("schedules")));
@@ -1050,7 +1058,9 @@ async fn run_repl(
         "session exited while the job was running - output is partial"
     });
     if finalized > 0 {
-        println!("{finalized} job(s) still running at exit; marked stopped with a partial-output note");
+        println!(
+            "{finalized} job(s) still running at exit; marked stopped with a partial-output note"
+        );
     }
     // Queue durability honesty: synchronous writes should never fail on a
     // healthy filesystem; a nonzero count means crash-protection was
@@ -1275,7 +1285,15 @@ async fn dispatch_slash_command(
             LoopControl::Continue
         }
         _ if trimmed == "/schedule" || trimmed.starts_with("/schedule ") => {
-            handle_schedule_command(trimmed, schedules, jobs, state, selection, runtime_handle, schedule_links);
+            handle_schedule_command(
+                trimmed,
+                schedules,
+                jobs,
+                state,
+                selection,
+                runtime_handle,
+                schedule_links,
+            );
             LoopControl::Continue
         }
         _ if trimmed == "/guide" || trimmed.starts_with("/guide ") => {
