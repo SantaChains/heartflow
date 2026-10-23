@@ -494,6 +494,7 @@ AGENTS.md / CLAUDE.md    仓库指令（项目上下文，逐级向上聚合）
 | HEARTFLOW_COMPACT_TRIGGER | 窗口模式下的软触发口径：`half-window`（默认，估算 ≥ 窗口/2）/ `ds4`（估算 ≥ 85%×窗口，或剩余 ≤ min(8192, 窗口/4)）。仅在窗口模式生效；绝对阈值模式不受影响 |
 | HEARTFLOW_COMPACT_TAIL_BUDGET | 压缩保留尾的 token 上限（默认 0 = 关闭，纯条数切割）。超预算时切割点前移、把更多旧消息并入摘要，且绝不孤立 tool_result；单条消息独超预算时保留并如实上报 |
 | HEARTFLOW_REPLAY_VERBATIM_TAIL | 恢复注入时逐字保留的最近 tool_result 条数（默认 12；`>0` 生效，否则回落默认） |
+| HEARTFLOW_CASSETTE | 传输层录制/回放：`record:<path>` 把每个回合的（请求, AgentEvent 流）追加写盘；`replay:<path>` 离线逐字节比对请求并回放事件（不联网、不需密钥）。已录真实夹具与离线回放集成套件见 `crates/provider/tests/fixtures/`——流式路径改动的铁律前置（roadmap §11.5） |
 | HEARTFLOW_POST_EDIT_DIAGNOSTICS | 设 `0` 关闭写后诊断（写类工具改动 `.rs`/`Cargo.toml` 后自动跑 `cargo check --message-format=short` 并把结果回注进同一工具结果；默认开启） |
 | HEARTFLOW_DIAGNOSTICS_TIMEOUT_SECS | 单次写后 `cargo check` 的超时秒数（默认 60；`>0` 生效）。超时按降级账本计数，不阻断工具调用 |
 | HEARTFLOW_JOB_SLOTS | 子代理 job 的并发槽位数（默认 3；`>0` 生效）。超出的 job 排队等槽 |
@@ -873,7 +874,7 @@ pub struct QueueSet {
 - **抗损坏台账闭环**：mission load/summarize 对非 UTF-8 state 文件从「静默跳过（永久不可见）」改为「计入 corrupted 台账」——混沌测试抓出的真缺陷；垃圾/截断/错类型/错形状/缺文件五类损坏全部跳过计数、健康邻存不受染、`next_id` 不回退、doctor 可见。
 - **跨进程文件锁（2026-10-22 批次）**：`runtime::filelock`（`with_exclusive` + `lock_path`）——sidecar `<data>.lock` + OS 建议性锁（Windows `LockFileEx` / Unix `flock`，经 `fd-lock` 封装：本仓 `unsafe_code = forbid`，平台 unsafe 收在实战检验的依赖内，锁语义自持）。**为什么必须锁**：temp+rename 只保证单次写原子，两进程交错 `写 tmp → 截断 tmp → rename` 会把对方的字节 rename 成自己的名字；**为什么锁 sidecar**：rename 会替换数据文件本体，锁在旧文件对象上等于没锁。设计纪律：bounded 等待 5s（1ms→50ms 退避）超时**跳过写并计数**（绝不无锁裸写）、锁失败与写失败同入 `DISK_WRITE_FAILURES`（doctor 可见）、读者不取锁（rename 快照读本就原子，陈旧快照优于启动阻塞）、**同线程禁止嵌套**（内层无法区分自持与外占）。接入面：schedules/mission `state.json`/job `status.json`/queue.json 四处 persist + mission/job 两处 `events.jsonl` append；顺带把 job `status.json` 从裸 `fs::write` 升级为锁内 temp+rename（裸写崩溃留撕裂文件，破坏启动对账）。测试 7 条含**真跨进程互斥**（重执行测试二进制为持锁子进程，父进程 bounded 尝试必超时、子进程退出后内核释放锁可获取）与双线程 RMW 序列化（无锁必丢更新）。诚实边界：这只序列化写，不是多写者数据库——各进程内存仍是事实源，并发写世界仍是「最后落盘者胜」；真正的单写者 World 仍是 P2。**遗留记录**：job id 是进程本地序号，两进程共用 `JOBS_ROOT` 会逻辑互踩（schema 级问题，job 目录需带 pid/会话命名空间，另行处理）。
 - **依赖治理：终端栈收敛 + dependabot 分支裁决（2026-10-22 批次）**：4 条 dependabot 分支按「最优工程取舍、依赖尽量最新」裁决——**采纳 2、结构化采纳 1、否决后超越 1**。① `actions/checkout v4.4.0→v7.0.1`（release.yml 三处钉 SHA，与 ci.yml/docs.yml 对齐）；② `jsonschema 0.57→0.59`（使用面仅 `validator_for`，编译即验证）；③ **ratatui 0.29→0.30.2 结构化迁移**：dependabot 机械 bump 实证是错的（lock 里 ratatui 0.29+0.30 双拷贝），正确路径 = tui-textarea 钉上游 main rev `0ce5d4b`（crates.io 0.7.0 仍钉 ratatui ^0.29；其 `no-backend` feature 弃掉自带 crossterm 0.28 模块）+ 自写 `editor::tui_input`（crossterm 0.29 KeyEvent → tui-textarea `Input`，逐行镜像上游语义含 Release 事件吞咽防 Windows 双写）+ `Backend::Error` 关联类型适配（0.30 新增；`CompanionTerminal` 收紧 `Error = io::Error`，测试新增 `IoTestBackend` 把 TestBackend 的 `Infallible` 抬升）。**成果：crossterm 双拷贝收敛为单 0.29（与 inquire 0.29 天然同源），比升级前少一个拷贝**；`unstable-rendered-line-info` 移居 ratatui-widgets（umbrella 不再转发，直连开启）。④ crossterm 单独 bump 0.28→0.29 的分支**否决**（ratatui 0.29 钉 0.28，单独升是错）。防再犯：dependabot.yml 对 ratatui/crossterm 加 ignore（解除条件 = tui-textarea 0.7.1 发布）。全树 `cargo update` 刻意不做（brotli 8→9 等无关 major 会破坏可归因性，另列任务）。
-- **待做**（依赖排序）：在飞回合取消 ~~（double-Ctrl+C，前置 P2 事件循环可够到在飞回合）~~ **已落地（随 §11.0，2026-10-22）**、cassette 录制扩展为 ds4 式「模型加载/提示渲染/工具调用/会话状态」集成测试、发布 QA 清单落成仓库内可勾选文档（ds4 `QA_BEFORE_RELEASES.md` 纪律）、全树 `cargo update`（无关 major 的传递刷新，独立小步验证）。
+- **待做**（依赖排序）：在飞回合取消 ~~（double-Ctrl+C，前置 P2 事件循环可够到在飞回合）~~ **已落地（随 §11.0，2026-10-22）**、cassette 录制扩展为 ds4 式「模型加载/提示渲染/工具调用/会话状态」集成测试 ~~已落地（2026-10-24，§11.5：两真实夹具 + 离线回放套件）~~、发布 QA 清单落成仓库内可勾选文档（ds4 `QA_BEFORE_RELEASES.md` 纪律）、全树 `cargo update`（无关 major 的传递刷新，独立小步验证）。
 
 目标：让 heartflow 能**维持大项目的持续运行**，现在只记录设计，不执行。
 
@@ -1047,8 +1048,14 @@ heartflow 落点：`edit_file` / `apply_patch` 后回注诊断（Rust 项目先�
 #### 11.5 次级 / 独立（不阻塞主线）
 
 - **§4 cassette 录制扩展**为 ds4 式集成测试：先录夹具（铁律），再动流式路径。
-- **§10.2 ephemeral + session resume** / **§10.4 `agent_settled` 真终态**：与 11.0 同源，可在 11.0 一并收口。
-- **跨进程单写者 World（P2 跨进程）**：进程内 Semaphore 先行，跨进程槽位留给 bash 长任务外置（§1）再搬。
+  - **落地状态（2026-10-24，夹具已录 + 离线回放套件上线）**：机制本就全备（`CassetteClient` Record/Replay、请求逐节比对、`HEARTFLOW_CASSETTE` 已接进 hf 装配），缺的是**真实夹具**——现已录两个 DeepSeek 实链路夹具入库（`crates/provider/tests/fixtures/`）：
+    - `text-turn.json`：纯文本回合（含 25 条真实 reasoning delta——推理流首次有了离线回归锚点）；录制命令：`HEARTFLOW_CASSETTE=record:crates/provider/tests/fixtures/text-turn.json hf prompt -q "..."`。
+    - `tool-turn.json`：真实工具往返（模型真实发起 `bash` 调用、真实执行、第二请求携带真实结果）。
+    - **离线回放集成套件**（`crates/provider/tests/fixtures.rs`，4 测试）：从夹具读回**录制的系统提示**（非重建——含日期/git 状态的活提示天然不可复现）+ 夹具供给工具结果的 `FixtureExecutor`（跨平台确定性：录制的 PowerShell 输出不必在 Linux CI 重跑）→ 复穿真 `ConversationRuntime`；任何提示组装/回放投影/工具广告/消息序漂移都会在请求比对处点名失败——**从此流式路径改动有了可跑进 CI 的回归网**（ds4 四轴：模型/协议加载、提示渲染、工具往返、会话配对不变量）。
+    - **脱敏护栏**：夹具扫描测试（`sk-` 形值/Bearer 即败）+ 提交前人工核验（环境变量名会出现在系统提示文档段，属正常；值绝不入库）。诚实边界：保真层级是 **AgentEvent**（非 wire 字节，§7.2.4 既定裁决）；带错误工具结果的回合暂不可逐字回放（执行器错误由循环自行格式化）；夹具含日期/git 状态，**改提示组装后须重录**（重录命令即一行 env + `hf prompt`）。
+    - provider 公开面新增 `read_entries`/`RecordedEntry`（夹具读取 API）。
+- **§10.2 ephemeral + session resume** / **§10.4 `agent_settled` 真终态**：与 11.0 同源，可在 11.0 一并收口。**收口核对（2026-10-24）**：§11.0 后「回合终态」= turn future 解出（重试在 api 层内、压缩在循环内、steer 吸收后循环继续下一迭代——`agent_settled` 语义在 `run_turn` 结构内成立）；§10.2 的「勿让长生命周期进程卡住事件循环」已由三相循环 + §11.4 后台 section 轮转覆盖；heartflow 是 HTTP 客户端无 per-turn 进程可 ephemeral——两条按「架构上已吸收」结案，无需独立改动。
+- **跨进程单写者 World（P2 跨进程）**：进程内 Semaphore 先行，跨进程槽位留给 bash 长任务外置（§1）再搬。已知缺口：job id 是进程本地序号，两进程共用 `JOBS_ROOT` 会互踩（目录需带 pid/会话命名空间，§4 遗留记录，未做）。
 - **全树 `cargo update`**：无关 major 的传递刷新，独立小步验证（brotli 8→9 等）。
 - **§7.1 deepseek-recipe 引入评估**：外部依赖大决策，须先验证 MSRV/构建体积，不在硬骨头首批。
 
@@ -1216,7 +1223,7 @@ heartflow 落点：`edit_file` / `apply_patch` 后回注诊断（Rust 项目先�
 | 全局分配器 | mimalloc 已是全局分配器（release lto=fat + cgu=1） | 已落地；后续优化先测分配热点再动手 |
 | 流式渲染 | 两路径均不按 delta 重解析（非 O(n²)）；md 渲染一套 IR 两投影器 | 已落地；已知未修：TUI 流式尾部每帧 clone、表格列宽不按终端封顶——改动须端到端冒烟 + cassette |
 | 事件循环调度 | P2 并发模型（单写者 World + 线程池快照 + token 取消传播）是「在飞回合可被够到」的根；io_uring 式批量唤醒、work-stealing 属其下游 | 前置 P2；未观测到调度瓶颈前不动 |
-| 基准套件 | hyperfine 外部基准（启动/冷回合/渲染吞吐）+ 内建 bench（`cargo bench` 尚无 harness）；量化驱动决策要求基准先行 | **未做**；先录 cassette 再建基准，防「更快但漂移」（ds4 纪律 #1：正确性先于速度） |
+| 基准套件 | hyperfine 外部基准（启动/冷回合/渲染吞吐）+ 内建 bench（`cargo bench` 尚无 harness）；量化驱动决策要求基准先行 | **未做**；cassette 夹具已录（§11.5，2026-10-24），基准现在有了防「更快但漂移」的回归网（ds4 纪律 #1：正确性先于速度），可建 |
 | IO 批处理 | 队列/mission/schedule 三落盘点都是同步小写（<256KiB）；批处理收益为负（延迟换吞吐，错方向） | **不做**，除非观测到 fs 延迟成为回合边界瓶颈 |
 
 **明确不做**：常驻监控 daemon（看门狗随命令/任务生命周期生灭）、跨机器 job 监控、基于 GPU/内存的启发式挂起判定（噪声大于信号）、RAM 快照缓存掩盖协议不匹配（ds4 反模式）。

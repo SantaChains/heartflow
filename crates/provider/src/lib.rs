@@ -7,7 +7,7 @@ pub mod config;
 pub mod load;
 
 pub use adapter::{AnthropicStreamClient, TransportClient};
-pub use cassette::{CassetteClient, CassetteMode, CASSETTE_ENV};
+pub use cassette::{read_entries, CassetteClient, CassetteMode, RecordedEntry, CASSETTE_ENV};
 pub use config::{
     config_file_paths, load_merged_settings, set_config_override, ProviderProfile,
     ProviderProtocol, ProviderSelection, ProviderSettings, CONFIG_VERSION,

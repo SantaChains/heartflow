@@ -11,6 +11,7 @@
 | HEARTFLOW_COMPACT_TRIGGER | 窗口模式下的软触发口径：`half-window`（默认，估算 ≥ 窗口/2）/ `ds4`（估算 ≥ 85%×窗口，或剩余 ≤ min(8192, 窗口/4)）。仅在窗口模式生效；绝对阈值模式不受影响 |
 | HEARTFLOW_COMPACT_TAIL_BUDGET | 压缩保留尾的 token 上限（默认 0 = 关闭，纯条数切割）。超预算时切割点前移、把更多旧消息并入摘要，且绝不孤立 tool_result；单条消息独超预算时保留并如实上报 |
 | HEARTFLOW_REPLAY_VERBATIM_TAIL | 恢复注入时逐字保留的最近 tool_result 条数（默认 12；`>0` 生效，否则回落默认） |
+| HEARTFLOW_CASSETTE | 传输层录制/回放：`record:<path>` 把每个回合的（请求, AgentEvent 流）追加写盘；`replay:<path>` 离线逐字节比对请求并回放事件（不联网、不需密钥）。已录真实夹具与离线回放集成套件见 `crates/provider/tests/fixtures/`——流式路径改动的铁律前置（roadmap §11.5） |
 | HEARTFLOW_POST_EDIT_DIAGNOSTICS | 设 `0` 关闭写后诊断（写类工具改动 `.rs`/`Cargo.toml` 后自动跑 `cargo check --message-format=short` 并把结果回注进同一工具结果；默认开启） |
 | HEARTFLOW_DIAGNOSTICS_TIMEOUT_SECS | 单次写后 `cargo check` 的超时秒数（默认 60；`>0` 生效）。超时按降级账本计数，不阻断工具调用 |
 | HEARTFLOW_JOB_SLOTS | 子代理 job 的并发槽位数（默认 3；`>0` 生效）。超出的 job 排队等槽 |

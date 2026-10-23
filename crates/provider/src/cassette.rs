@@ -120,10 +120,13 @@ impl CassetteMode {
 }
 
 /// One recorded turn: the request that produced it, and what came back.
+/// Public so offline harnesses (the committed-fixture replay suite) can read
+/// a cassette's prompts, system prompt and tool results back and re-drive the
+/// loop with them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Entry {
-    request: ApiRequest,
-    events: Vec<AgentEvent>,
+pub struct RecordedEntry {
+    pub request: ApiRequest,
+    pub events: Vec<AgentEvent>,
 }
 
 /// On-disk cassette. `version` is checked on load so a future format change
@@ -132,7 +135,35 @@ struct Entry {
 struct Cassette {
     version: u32,
     recorded_at_unix_secs: u64,
-    entries: Vec<Entry>,
+    entries: Vec<RecordedEntry>,
+}
+
+/// Read a cassette file's entries without constructing a client (§11.5
+/// fixture harness): the entries carry everything a replay driver needs —
+/// the recorded system prompt (so the replay reproduces requests byte-equal
+/// without rebuilding a live, date-stamped prompt), the user prompts, the
+/// tool advertisements, and the tool results the fixture must feed back.
+///
+/// # Errors
+/// Read failures, parse failures and unknown format versions are reported
+/// with the path in the message.
+pub fn read_entries(path: &Path) -> Result<Vec<RecordedEntry>, CassetteError> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| CassetteError(format!("cassette {}: {error}", path.display())))?;
+    let cassette: Cassette = serde_json::from_str(&text).map_err(|error| {
+        CassetteError(format!(
+            "cassette {} is not a valid cassette: {error}",
+            path.display()
+        ))
+    })?;
+    if cassette.version != FORMAT_VERSION {
+        return Err(CassetteError(format!(
+            "cassette {} has format version {} but this build understands {FORMAT_VERSION}",
+            path.display(),
+            cassette.version
+        )));
+    }
+    Ok(cassette.entries)
 }
 
 /// Wraps a transport so a live session can be recorded and replayed.
@@ -143,9 +174,9 @@ pub struct CassetteClient<C> {
     inner: Option<C>,
     mode: CassetteMode,
     /// Events recorded so far, shared with the in-flight relay task.
-    recorded: Arc<Mutex<Vec<Entry>>>,
+    recorded: Arc<Mutex<Vec<RecordedEntry>>>,
     /// Replay cursor, filled on first use.
-    pending: VecDeque<Entry>,
+    pending: VecDeque<RecordedEntry>,
     replay_loaded: bool,
     /// Turns already served in replay mode, for error messages.
     served: usize,
@@ -301,13 +332,13 @@ impl<C: ApiClient> ApiClient for CassetteClient<C> {
 /// user cancelled is recorded with the events that did arrive.
 struct TurnRecorder {
     path: PathBuf,
-    recorded: Arc<Mutex<Vec<Entry>>>,
+    recorded: Arc<Mutex<Vec<RecordedEntry>>>,
     request: Option<ApiRequest>,
     events: Vec<AgentEvent>,
 }
 
 impl TurnRecorder {
-    fn new(path: PathBuf, recorded: Arc<Mutex<Vec<Entry>>>, request: ApiRequest) -> Self {
+    fn new(path: PathBuf, recorded: Arc<Mutex<Vec<RecordedEntry>>>, request: ApiRequest) -> Self {
         Self {
             path,
             recorded,
@@ -324,7 +355,7 @@ impl TurnRecorder {
         let Some(request) = self.request.take() else {
             return;
         };
-        let entry = Entry {
+        let entry = RecordedEntry {
             request,
             events: std::mem::take(&mut self.events),
         };
@@ -349,7 +380,7 @@ impl Drop for TurnRecorder {
     }
 }
 
-fn persist(path: &Path, entries: &[Entry]) -> std::io::Result<()> {
+fn persist(path: &Path, entries: &[RecordedEntry]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;

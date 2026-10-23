@@ -86,6 +86,7 @@ CI 有三条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/**`
 | `HEARTFLOW_PROXY` / `HEARTFLOW_PROXY_MODE` / `HEARTFLOW_NO_PROXY`   | 传输代理：地址 / `direct`\|`global`\|`auto` / 绕过列表，优先级见 `crates/proxy/src/env.rs` | `crates/proxy/src/lib.rs`（`init_global` 于 `crates/cli/src/main.rs` 启动处调用） |
 | `HEARTFLOW_AUTO_COMPACT_TOKENS`                                     | 模型窗口 tokens，优先级高于 `[provider] context_window`       | `crates/cli/src/main.rs:1535`                 |
 | `HEARTFLOW_REPLAY_VERBATIM_TAIL`                                    | 回放时逐字保留的近期 `tool_result` 条数，默认 12              | `crates/cli/src/main.rs:1579`                 |
+| `HEARTFLOW_CASSETTE`                                                 | 传输层录制/回放：`record:<path>` / `replay:<path>`（AgentEvent 保真、请求逐字节比对；已录真实夹具与离线回放集成套件在 `crates/provider/tests/fixtures/`——流式路径改动的铁律前置） | `crates/cli/src/main.rs` 装配、`crates/provider/src/cassette.rs` |
 | `HEARTFLOW_IMAGE_API_KEY` / `_BASE_URL` / `_MODEL` / `_SIZE`        | 启用并参数化 `generate_image`                                 | `crates/tools/src/image.rs:166`               |
 | `HEARTFLOW_COOKIE_JAR`                                              | 指定文件即开启 `web_fetch` 会话 cookie 复用                   | `crates/tools/src/web.rs:253`                 |
 | `HEARTFLOW_CONFIG_HOME`                                             | 覆盖用户配置根（默认 `~/.heartflow`）                         | `crates/runtime/src/config.rs:69`             |
