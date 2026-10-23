@@ -472,6 +472,13 @@ pub struct ConversationRuntime<C, T> {
     /// the host sets a live mailbox before starting the turn — the blocking
     /// REPL never does (it cannot type mid-turn), the TUI loop does.
     steer_mailbox: SteerMailbox,
+    /// Extra system-prompt section injected into every request while set
+    /// (D1.3 mission reminder). Held apart from `system_prompt` so it never
+    /// persists into anything durable — it is a projection of the on-disk
+    /// mission ledger, rebuilt by the host at turn boundaries. Appended
+    /// last: the section is stable within a turn, so provider prompt
+    /// caching only re-pays when the ledger actually changes.
+    turn_context: Option<String>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -501,7 +508,15 @@ where
             token_prefix: Cell::new((0, 0)),
             token_calibration: RefCell::new(TokenCalibration::default()),
             steer_mailbox: SteerMailbox::default(),
+            turn_context: None,
         }
+    }
+
+    /// Set the per-turn context section (D1.3): appended to the system
+    /// prompt of every request in the coming turn(s), never persisted into
+    /// the session. `None` clears it.
+    pub fn set_turn_context(&mut self, section: Option<String>) {
+        self.turn_context = section;
     }
 
     /// Arm the steer mailbox for the next turn: the host keeps a clone to
@@ -606,8 +621,12 @@ where
                 self.compact(self.compaction);
             }
 
+            let mut system_prompt = self.system_prompt.clone();
+            if let Some(section) = &self.turn_context {
+                system_prompt.push(section.clone());
+            }
             let request = ApiRequest {
-                system_prompt: self.system_prompt.clone(),
+                system_prompt,
                 messages: repair_tool_pairing(build_replay_messages(
                     &self.session.messages,
                     self.compaction.replay_verbatim_tail,
@@ -1669,6 +1688,68 @@ mod tests {
         assert!(
             !first_carries,
             "the steer joins the *next* request, not the in-flight one"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_context_rides_the_system_prompt_and_never_the_session() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        struct PromptCapture(Arc<StdMutex<Vec<Vec<String>>>>);
+        impl ApiClient for PromptCapture {
+            fn stream(&mut self, request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(request.system_prompt.clone());
+                Ok(TurnStream::from_events(vec![
+                    AgentEvent::TextDelta("ok".to_string()),
+                    AgentEvent::MessageStop,
+                ]))
+            }
+        }
+
+        let captured: Arc<StdMutex<Vec<Vec<String>>>> = Arc::new(StdMutex::new(Vec::new()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            PromptCapture(Arc::clone(&captured)),
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::Allow),
+            vec!["base prompt".to_string()],
+        );
+
+        runtime.set_turn_context(Some("MISSION REMINDER".to_string()));
+        runtime
+            .run_turn("go", None, &mut noop_notify(), &CancellationToken::new())
+            .await
+            .expect("turn with context");
+        runtime.set_turn_context(None);
+        runtime
+            .run_turn("again", None, &mut noop_notify(), &CancellationToken::new())
+            .await
+            .expect("turn without context");
+
+        let guard = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(guard.len(), 2);
+        assert_eq!(
+            guard[0],
+            vec!["base prompt".to_string(), "MISSION REMINDER".to_string()],
+            "the section is appended after the base prompt"
+        );
+        assert_eq!(
+            guard[1],
+            vec!["base prompt".to_string()],
+            "clearing the context removes it from later requests"
+        );
+        assert!(
+            !runtime
+                .session()
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::System),
+            "the reminder is a per-request projection, never persisted"
         );
     }
 

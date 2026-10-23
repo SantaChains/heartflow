@@ -79,8 +79,9 @@ use tokio_util::sync::CancellationToken;
 use tui_textarea::{CursorMove, TextArea};
 
 use runtime::{
-    AgentEvent, ApiClient, ConversationRuntime, PermissionPromptDecision, PermissionPrompter,
-    PermissionRequest, RuntimeError, SteerMailbox, TokenUsage, ToolExecutor, TurnSummary,
+    auto_record_turn, turn_reminder, AgentEvent, ApiClient, ConversationRuntime, MissionLedger,
+    PermissionPromptDecision, PermissionPrompter, PermissionRequest, RuntimeError, SteerMailbox,
+    TokenUsage, ToolExecutor, TurnSummary,
 };
 
 use crate::config::ConfigWatcher;
@@ -2132,6 +2133,12 @@ where
                 let steer = SteerMailbox::default();
                 let mut runtime = runtime;
                 runtime.set_steer_mailbox(steer.clone());
+                // D1.3 mission reminder: same per-turn projection the REPL
+                // injects — the on-disk ledger rendered as one system-prompt
+                // section, rebuilt fresh at every turn boundary.
+                let missions_root = crate::storage::sessions_dir().join("missions");
+                runtime
+                    .set_turn_context(turn_reminder(&MissionLedger::load(&missions_root).list()));
                 let tx = channels.msg_tx.clone();
                 let mut notify = move |event: &AgentEvent| {
                     let _ = tx.send(Msg::Event(event.clone()));
@@ -2197,12 +2204,24 @@ where
                 // The loop owns the runtime and prompter again; drop the dead
                 // turn's mailbox handle so the next turn arms a fresh one.
                 runtime.set_steer_mailbox(SteerMailbox::default());
+                runtime.set_turn_context(None);
                 prompter = Some(finished_prompter);
+                let mut mission_attention: Option<String> = None;
                 let (ok, err_note) = match turn_outcome {
                     // The summary's contents (iteration count, tool results)
                     // are already folded into the session and the transcript;
                     // the TUI settle only needs success vs. failure.
-                    Ok(_) => (true, None),
+                    Ok(summary) => {
+                        // Auto-account against the single active mission
+                        // (§11.3): success only — a failed turn is not
+                        // productive work and must not reset a blocked
+                        // streak.
+                        let tokens = u64::from(summary.usage.input_tokens)
+                            .saturating_add(u64::from(summary.usage.output_tokens));
+                        mission_attention =
+                            auto_record_turn(&crate::storage::sessions_dir().join("missions"), tokens);
+                        (true, None)
+                    }
                     Err(error) => (false, Some(error.to_string())),
                 };
                 // With the runtime back in hand, persist the turn — success or
@@ -2234,6 +2253,9 @@ where
                 // the injection below carries them (pi's "child completed
                 // before consuming steering" recovery — honest, not lost).
                 app.model.end_turn();
+                if let Some(attention) = mission_attention.take() {
+                    app.push_line(muted_line(format!("· {attention}")));
+                }
                 let recovered = app.model.queue_mut().recover_pending_steers();
                 if !recovered.is_empty() {
                     app.push_line(muted_line(format!(

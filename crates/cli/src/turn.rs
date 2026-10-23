@@ -10,8 +10,8 @@ use std::io::{self, Write};
 
 use crossterm::style::Stylize;
 use runtime::{
-    truncate_chars, AgentEvent, ContentBlock, ConversationMessage, MessageRole, PermissionPrompter,
-    TokenUsage,
+    auto_record_turn, truncate_chars, turn_reminder, AgentEvent, ContentBlock, ConversationMessage,
+    MessageRole, MissionLedger, PermissionPrompter, TokenUsage,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -266,6 +266,11 @@ pub(crate) async fn run_turn_interactive(
     let mut stdout = io::stdout();
     turn.spinner.tick("Thinking", &turn.theme, &mut stdout)?;
 
+    // D1.3 mission reminder: project the on-disk ledger into this turn's
+    // system prompt. The section is a per-turn projection — set, never
+    // persisted — so a mission edited mid-turn is picked up next turn.
+    let missions_root = crate::storage::sessions_dir().join("missions");
+    runtime.set_turn_context(turn_reminder(&MissionLedger::load(&missions_root).list()));
     let mut notify = |event: &AgentEvent| turn.render(event);
     let result = runtime
         .run_turn_with_blocks(
@@ -275,6 +280,18 @@ pub(crate) async fn run_turn_interactive(
             &cancel,
         )
         .await;
+    runtime.set_turn_context(None);
+
+    // Auto-account the finished turn against the single active mission
+    // (§11.3). Success only: a failed turn is not productive work, so it
+    // must not reset a blocked streak or advance the turn budget.
+    if let Ok(summary) = &result {
+        let tokens = u64::from(summary.usage.input_tokens)
+            .saturating_add(u64::from(summary.usage.output_tokens));
+        if let Some(attention) = auto_record_turn(&missions_root, tokens) {
+            println!("{}", format!("· {attention}").dark_grey());
+        }
+    }
 
     let outcome = match result {
         Ok(summary) => {

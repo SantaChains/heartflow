@@ -57,11 +57,11 @@ pub use jobs::{
     DEFAULT_JOB_WALL_TIMEOUT, DEFAULT_MAX_PENDING,
 };
 pub use mission::{
-    budget_attention, command_succeeds, file_matches, mission_disk_write_failures,
-    set_missions_root, summarize_on_disk, CompletionCriterion, CriterionState, Mission,
-    MissionBudget, MissionError, MissionLedger, MissionStatus, MissionSummary, Receipt,
-    BLOCKED_STREAK_NEEDED, BUDGET_ATTENTION_FRACTION, CRITERION_COMMAND_TIMEOUT,
-    MISSION_STATE_LIMIT, RECEIPT_KEEP,
+    auto_record_turn, budget_attention, command_succeeds, file_matches,
+    mission_disk_write_failures, set_missions_root, summarize_on_disk, turn_reminder,
+    CompletionCriterion, CriterionState, Mission, MissionBudget, MissionError, MissionLedger,
+    MissionStatus, MissionSummary, Receipt, BLOCKED_STREAK_NEEDED, BUDGET_ATTENTION_FRACTION,
+    CRITERION_COMMAND_TIMEOUT, MISSION_STATE_LIMIT, RECEIPT_KEEP,
 };
 pub use permissions::{
     PermissionMode, PermissionOutcome, PermissionPolicy, PermissionPromptDecision,

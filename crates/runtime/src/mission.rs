@@ -803,6 +803,109 @@ pub fn budget_attention(mission: &Mission) -> Option<String> {
     None
 }
 
+/// Build the per-turn mission reminder (D1.3, kimi goal injection): the open
+/// missions as one system-prompt section — status, criteria progress, budget
+/// remaining and the `goal_continue` contract ("the previous turn did not
+/// finish this mission; continue it"). Returns `None` when nothing is open.
+/// Budget-exhausted missions are skipped entirely (D1.2: reminders stop, the
+/// mission stays open); Paused missions get a one-line mention without the
+/// continue nudge — pausing is a deliberate choice the ledger should honor.
+#[must_use]
+pub fn turn_reminder(missions: &[Mission]) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for mission in missions {
+        if mission.budget_exhausted || mission.status == MissionStatus::Complete {
+            continue;
+        }
+        let satisfied = mission
+            .states
+            .iter()
+            .filter(|state| matches!(state, CriterionState::Satisfied { .. }))
+            .count();
+        let total = mission.criteria.len();
+        let budget = budget_summary(mission);
+        match mission.status {
+            MissionStatus::Active => {
+                let mut line = format!(
+                    "- m{} ACTIVE: {} — criteria {satisfied}/{total} satisfied — {budget}",
+                    mission.id, mission.objective
+                );
+                if let Some(attention) = budget_attention(mission) {
+                    line.push_str(&format!(" — {attention}"));
+                }
+                line.push_str(
+                    " — goal_continue: this mission is not finished; keep working on it this turn",
+                );
+                lines.push(line);
+            }
+            MissionStatus::Blocked => {
+                let reason = mission
+                    .blocked_reason
+                    .as_deref()
+                    .unwrap_or("unspecified blocker");
+                lines.push(format!(
+                    "- m{} BLOCKED ({reason}): {} — criteria {satisfied}/{total} satisfied — {budget} — decide this turn: resolve the blocker, re-scope the mission, or pause it",
+                    mission.id, mission.objective
+                ));
+            }
+            MissionStatus::Paused => lines.push(format!(
+                "- m{} PAUSED: {} — no continue nudge; resume explicitly when it is back on the agenda",
+                mission.id, mission.objective
+            )),
+            MissionStatus::Complete => continue,
+        }
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "Mission ledger (per-turn reminder). The runtime injected this section: unfinished missions continue by default, completion requires every criterion verified. Update the ledger via /mission rather than declaring success in prose.\n",
+    );
+    out.push_str(&lines.join("\n"));
+    Some(out)
+}
+
+/// Compact used/limit readout over the three budget axes; unlimited axes
+/// report usage only, so the line never hides that a budget exists.
+fn budget_summary(mission: &Mission) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(match mission.budget.tokens {
+        Some(limit) => format!("tokens {}/{}", mission.used.tokens, limit),
+        None => format!("tokens {}", mission.used.tokens),
+    });
+    parts.push(match mission.budget.turns {
+        Some(limit) => format!("turns {}/{}", mission.used.turns, limit),
+        None => format!("turns {}", mission.used.turns),
+    });
+    parts.push(match mission.budget.wall_ms {
+        Some(limit) => format!("wall {}m/{}m", mission.wall_ms() / 60_000, limit / 60_000),
+        None => format!("wall {}m", mission.wall_ms() / 60_000),
+    });
+    parts.join(", ")
+}
+
+/// Auto-account one finished turn against the single active mission (§11.3
+/// mission 回合自动记账; the REPL's manual `/mission record` stays available).
+/// Attribution is only safe with exactly one active mission — with several,
+/// whose budget a turn burned is a guess, so the ledger is left untouched.
+/// Returns the needs-attention reminder, if any (the caller surfaces it).
+pub fn auto_record_turn(root: &Path, tokens_used: u64) -> Option<String> {
+    let ledger = MissionLedger::load(root);
+    let active: Vec<u64> = ledger
+        .list()
+        .iter()
+        .filter(|mission| mission.status == MissionStatus::Active)
+        .map(|mission| mission.id)
+        .collect();
+    let [only] = active.as_slice() else {
+        return None;
+    };
+    ledger
+        .record_turn(*only, tokens_used)
+        .ok()
+        .and_then(|(_, attention)| attention)
+}
+
 /// Run `cmd` through the platform shell and report exit status 0, with a
 /// poll-based timeout (diagnostics.rs pattern). Output is discarded: criteria
 /// verify *that* the command succeeded, not what it printed.
@@ -945,6 +1048,136 @@ mod tests {
         CompletionCriterion::FreeText {
             check: text.to_string(),
         }
+    }
+
+    fn in_memory_mission(id: u64, objective: &str, status: MissionStatus) -> Mission {
+        Mission {
+            id,
+            objective: objective.to_string(),
+            criteria: Vec::new(),
+            states: Vec::new(),
+            status,
+            budget: MissionBudget::default(),
+            used: MissionUsage::default(),
+            blocked_streak: 0,
+            blocked_reason: None,
+            budget_exhausted: false,
+            created_ms: 0,
+            updated_ms: 0,
+            receipts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn turn_reminder_renders_each_open_state_and_skips_closed_work() {
+        let mut active = in_memory_mission(1, "ship the queue UI", MissionStatus::Active);
+        active.criteria = vec![
+            free_criterion("feels done"),
+            free_criterion("also done"),
+            free_criterion("nope"),
+        ];
+        active.states = vec![
+            CriterionState::Satisfied {
+                evidence: "exit 0".to_string(),
+            },
+            CriterionState::Satisfied {
+                evidence: "matched".to_string(),
+            },
+            CriterionState::Pending,
+        ];
+        active.budget.turns = Some(10);
+        let paused = in_memory_mission(2, "parked idea", MissionStatus::Paused);
+        let mut blocked = in_memory_mission(99, "unblock CI", MissionStatus::Blocked);
+        blocked.blocked_reason = Some("api quota".to_string());
+        let mut exhausted = in_memory_mission(100, "over budget", MissionStatus::Active);
+        exhausted.budget_exhausted = true;
+        let complete = in_memory_mission(101, "done deal", MissionStatus::Complete);
+
+        let reminder =
+            turn_reminder(&[active, paused, blocked, exhausted.clone(), complete.clone()])
+                .expect("open work");
+        assert!(reminder.contains("m1 ACTIVE: ship the queue UI"));
+        assert!(reminder.contains("criteria 2/3"));
+        assert!(reminder.contains("turns 0/10"));
+        assert!(reminder.contains("goal_continue"));
+        assert!(reminder.contains("m99 BLOCKED (api quota): unblock CI"));
+        assert!(reminder.contains("m2 PAUSED: parked idea"));
+        assert!(
+            !reminder.contains("m100"),
+            "budget-exhausted: reminders stop"
+        );
+        assert!(!reminder.contains("m101"), "complete missions are closed");
+
+        assert_eq!(turn_reminder(&[]), None, "nothing open, no section");
+        assert_eq!(
+            turn_reminder(&[exhausted, complete]),
+            None,
+            "only closed work is also nothing to remind about"
+        );
+    }
+
+    #[test]
+    fn auto_record_turn_accounts_the_single_active_mission_only() {
+        let _guard = root_guard();
+        let root = temp_root("auto-record");
+        set_missions_root(Some(root.clone()));
+        let ledger = MissionLedger::new();
+        ledger.create(
+            "single active mission",
+            Vec::new(),
+            MissionBudget {
+                turns: Some(2),
+                ..MissionBudget::default()
+            },
+        );
+
+        // Exactly one active mission: the turn is attributed and the budget
+        // attention fires once the axis crosses 90%.
+        assert!(
+            auto_record_turn(&root, 5).is_none(),
+            "1/2 turns is under 90%"
+        );
+        let after = auto_record_turn(&root, 5);
+        assert_eq!(
+            after,
+            Some(
+                "mission m1 budget nearly exhausted on turns: 100% used (2/2) - wrap up the current slice or raise the budget"
+                    .to_string()
+            )
+        );
+        // A third call keeps recording usage but stops reminding (D1.2).
+        assert!(
+            auto_record_turn(&root, 5).is_none(),
+            "reminders stop after exhaustion"
+        );
+        assert_eq!(
+            MissionLedger::load(&root)
+                .get(1)
+                .expect("still there")
+                .used
+                .turns,
+            3,
+            "the mission stays open and keeps accounting"
+        );
+
+        // Two active missions: attribution is a guess, so nothing is written.
+        ledger.create(
+            "second active mission",
+            Vec::new(),
+            MissionBudget::default(),
+        );
+        let snapshot = |missions: &[Mission]| -> Vec<(u64, u64)> {
+            missions
+                .iter()
+                .map(|mission| (mission.id, mission.used.turns))
+                .collect()
+        };
+        let before = snapshot(&MissionLedger::load(&root).list());
+        assert!(auto_record_turn(&root, 100).is_none());
+        let after_two = snapshot(&MissionLedger::load(&root).list());
+        assert_eq!(before, after_two, "ambiguous attribution writes nothing");
+        set_missions_root(None);
+        drop_root(&root);
     }
 
     #[test]
