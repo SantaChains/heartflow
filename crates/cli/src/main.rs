@@ -2669,6 +2669,36 @@ fn env_tail_budget() -> usize {
         .unwrap_or(0)
 }
 
+/// Hard trigger (D4.2): `1`/`true`/`on` arms the context-overflow recovery —
+/// a provider rejection for exceeding the window compacts once and retries
+/// the request exactly once. Anything else keeps the shipped behavior.
+fn env_hard_trigger() -> bool {
+    matches!(
+        env::var("HEARTFLOW_COMPACT_HARD_TRIGGER")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "on"
+    )
+}
+
+/// Continuation-summary source (D4.5): `model` asks the provider to summarize
+/// the dropped region before compaction (degrading to the deterministic
+/// summary if that side call fails); anything else keeps the deterministic
+/// truncation summary.
+fn env_summary_mode() -> runtime::SummaryMode {
+    match env::var("HEARTFLOW_COMPACT_SUMMARY")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "model" | "llm" => runtime::SummaryMode::Model,
+        _ => runtime::SummaryMode::Deterministic,
+    }
+}
+
 /// The shared compaction policy for one provider: `preserve_recent_messages`
 /// recent turns are kept verbatim, and the trigger is half of
 /// `context_window_tokens` (a zero window falls back to the absolute
@@ -2697,6 +2727,8 @@ fn compaction_config(selection: &ProviderSelection) -> CompactionConfig {
         replay_verbatim_tail,
         soft_trigger: env_soft_trigger().unwrap_or(runtime::SoftTrigger::HalfWindow),
         tail_budget_tokens: env_tail_budget(),
+        hard_trigger: env_hard_trigger(),
+        summary_mode: env_summary_mode(),
         ..CompactionConfig::default()
     }
 }

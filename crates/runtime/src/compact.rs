@@ -21,6 +21,11 @@ use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 pub enum ThresholdKind {
     ContextWindowHalf,
     AbsoluteMax,
+    /// The provider rejected the request for exceeding the context window and
+    /// the loop compacted + retried once (D4.2 hard trigger). The only
+    /// ground-truth signal that the session no longer fits — estimates can
+    /// drift, a 400 cannot.
+    WindowFull,
 }
 
 /// One compaction execution, emitted by `compact_session_in_place`.
@@ -51,6 +56,7 @@ pub struct CompactEvent {
 pub struct CompactionStats {
     pub count: u64,
     pub window_half: u64,
+    pub window_full: u64,
     pub absolute: u64,
     pub repair_dropped: u64,
     pub removed_total: u64,
@@ -58,6 +64,7 @@ pub struct CompactionStats {
 
 static COMPACT_COUNT: AtomicU64 = AtomicU64::new(0);
 static COMPACT_WINDOW_HALF: AtomicU64 = AtomicU64::new(0);
+static COMPACT_WINDOW_FULL: AtomicU64 = AtomicU64::new(0);
 static COMPACT_ABSOLUTE: AtomicU64 = AtomicU64::new(0);
 static REPAIR_DROPPED: AtomicU64 = AtomicU64::new(0);
 static REMOVED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -86,6 +93,7 @@ fn process_counters() -> CompactionStats {
     CompactionStats {
         count: COMPACT_COUNT.load(Ordering::Relaxed),
         window_half: COMPACT_WINDOW_HALF.load(Ordering::Relaxed),
+        window_full: COMPACT_WINDOW_FULL.load(Ordering::Relaxed),
         absolute: COMPACT_ABSOLUTE.load(Ordering::Relaxed),
         repair_dropped: REPAIR_DROPPED.load(Ordering::Relaxed),
         removed_total: REMOVED_TOTAL.load(Ordering::Relaxed),
@@ -106,6 +114,7 @@ fn read_stats_file(path: &std::path::Path) -> Option<CompactionStats> {
     Some(CompactionStats {
         count: field("count"),
         window_half: field("window_half"),
+        window_full: field("window_full"),
         absolute: field("absolute"),
         repair_dropped: field("repair_dropped"),
         removed_total: field("removed_total"),
@@ -124,6 +133,7 @@ pub fn compaction_stats() -> CompactionStats {
         Some(file) => CompactionStats {
             count: file.count + process.count,
             window_half: file.window_half + process.window_half,
+            window_full: file.window_full + process.window_full,
             absolute: file.absolute + process.absolute,
             repair_dropped: file.repair_dropped + process.repair_dropped,
             removed_total: file.removed_total + process.removed_total,
@@ -137,8 +147,13 @@ fn write_stats_file(path: &std::path::Path, stats: &CompactionStats) -> std::io:
         std::fs::create_dir_all(parent)?;
     }
     let json = format!(
-        "{{\"version\":1,\"count\":{},\"window_half\":{},\"absolute\":{},\"repair_dropped\":{},\"removed_total\":{}}}\n",
-        stats.count, stats.window_half, stats.absolute, stats.repair_dropped, stats.removed_total
+        "{{\"version\":1,\"count\":{},\"window_half\":{},\"window_full\":{},\"absolute\":{},\"repair_dropped\":{},\"removed_total\":{}}}\n",
+        stats.count,
+        stats.window_half,
+        stats.window_full,
+        stats.absolute,
+        stats.repair_dropped,
+        stats.removed_total
     );
     // Atomic replace: a torn file must never look like valid stats.
     let temp = path.with_extension("json.tmp");
@@ -170,6 +185,9 @@ pub fn record_compact_event(event: &CompactEvent) {
     match event.trigger {
         ThresholdKind::ContextWindowHalf => {
             COMPACT_WINDOW_HALF.fetch_add(1, Ordering::Relaxed);
+        }
+        ThresholdKind::WindowFull => {
+            COMPACT_WINDOW_FULL.fetch_add(1, Ordering::Relaxed);
         }
         ThresholdKind::AbsoluteMax => {
             COMPACT_ABSOLUTE.fetch_add(1, Ordering::Relaxed);
@@ -429,6 +447,29 @@ pub struct CompactionConfig {
     /// longer occupy the whole window by message count alone. `0` disables the
     /// ceiling (current behavior; count-only cut).
     pub tail_budget_tokens: usize,
+    /// Hard trigger (D4.2): when the provider rejects a request for exceeding
+    /// the context window, compact in place and retry the request exactly
+    /// once. Off by default (rollback spec: shipped behavior unchanged).
+    pub hard_trigger: bool,
+    /// How the continuation summary is produced (D4.5). `Deterministic`
+    /// (default) is the shipped truncation summary; `Model` asks the provider
+    /// to summarize the about-to-be-dropped region first (durable-task-state
+    /// contract) and falls back to deterministic on any summarizer failure.
+    pub summary_mode: SummaryMode,
+}
+
+/// Continuation-summary source (D4.5, roadmap §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SummaryMode {
+    /// Deterministic truncation summary — the shipped behavior, zero extra
+    /// requests, reproducible offline (the committed cassette fixtures replay
+    /// with this mode).
+    #[default]
+    Deterministic,
+    /// An LLM call summarizes the dropped region before compaction. Costs one
+    /// side request per compaction; degrades to [`Self::Deterministic`] when
+    /// the summarizer stream fails, so compaction itself never fails.
+    Model,
 }
 
 impl Default for CompactionConfig {
@@ -440,6 +481,8 @@ impl Default for CompactionConfig {
             replay_verbatim_tail: 12,
             soft_trigger: SoftTrigger::HalfWindow,
             tail_budget_tokens: 0,
+            hard_trigger: false,
+            summary_mode: SummaryMode::Deterministic,
         }
     }
 }
@@ -510,6 +553,29 @@ pub fn should_compact_with_estimate(
     }
 }
 
+/// Whether a provider error message reports a context-window overflow (D4.2
+/// hard trigger). Matched at the loop because the error crosses the
+/// `AgentEvent::Error` boundary as text — the structured `ApiError` lives in
+/// the `api` crate and is stringified by the time the conversation loop sees
+/// it. The phrasings are the stable API surfaces of the three supported
+/// dialects (verified against provider documentation and live errors):
+/// OpenAI/DeepSeek say "maximum context length", Anthropic says
+/// "prompt is too long", Responses says "input length and `max_tokens`
+/// exceed context limit".
+#[must_use]
+pub fn is_context_overflow_error(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    [
+        "maximum context length",
+        "prompt is too long",
+        "exceed context limit",
+        "exceeds the context limit",
+        "context_length_exceeded",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
 #[must_use]
 pub fn format_compact_summary(summary: &str) -> String {
     let without_analysis = strip_tag_block(summary, "analysis");
@@ -528,13 +594,26 @@ pub fn format_compact_summary(summary: &str) -> String {
 #[must_use]
 pub fn get_compact_continuation_message(
     summary: &str,
+    model_summary: Option<&str>,
     suppress_follow_up_questions: bool,
     recent_messages_preserved: bool,
     dropped_token_estimate: usize,
 ) -> String {
+    // D4.5: a model-generated summary replaces the deterministic truncation
+    // text when one was fetched; it is labeled as model output so the
+    // continuing model knows to weigh it accordingly (and re-verify anything
+    // load-bearing against the files rather than trusting it blindly).
+    let summary_section = match model_summary {
+        Some(text) if !text.trim().is_empty() => {
+            format!(
+                "Summary (model-generated from the dropped region):\n{}",
+                text.trim()
+            )
+        }
+        _ => format_compact_summary(summary),
+    };
     let mut base = format!(
-        "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n{}",
-        format_compact_summary(summary)
+        "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n{summary_section}"
     );
 
     if recent_messages_preserved {
@@ -624,6 +703,30 @@ pub fn compact_session_in_place(
     session: &mut Session,
     config: CompactionConfig,
 ) -> CompactionResult {
+    compact_session_in_place_with(session, config, derived_trigger(config), None)
+}
+
+/// The trigger kind a soft-gate compaction reports: window regime means the
+/// window policy fired, otherwise the absolute threshold.
+fn derived_trigger(config: CompactionConfig) -> ThresholdKind {
+    if config.context_window_tokens > 0 {
+        ThresholdKind::ContextWindowHalf
+    } else {
+        ThresholdKind::AbsoluteMax
+    }
+}
+
+/// [`compact_session_in_place`] with the knobs the conversation loop needs:
+/// an explicit `trigger` for the observation event (the D4.2 hard path
+/// reports [`ThresholdKind::WindowFull`] instead of the soft kind) and an
+/// optional `model_summary` (D4.5) that replaces the deterministic
+/// truncation summary inside the continuation message when present.
+pub fn compact_session_in_place_with(
+    session: &mut Session,
+    config: CompactionConfig,
+    trigger: ThresholdKind,
+    model_summary: Option<&str>,
+) -> CompactionResult {
     // Misuse guard: below the preserve window there is nothing to summarize,
     // and "compacting" would still replace the transcript with a stub.
     let message_count = session.messages.len();
@@ -684,6 +787,7 @@ pub fn compact_session_in_place(
     let dropped_token_estimate = estimated_raw.saturating_sub(tail_tokens + pinned_tokens);
     let continuation = get_compact_continuation_message(
         &summary,
+        model_summary,
         true,
         !preserved.is_empty() || !pinned.is_empty(),
         dropped_token_estimate,
@@ -708,6 +812,7 @@ pub fn compact_session_in_place(
 
     record_compact_event(&compact_event_for(
         estimated_raw,
+        trigger,
         config,
         naive_keep_from,
         keep_from,
@@ -729,6 +834,7 @@ pub fn compact_session_in_place(
 #[must_use]
 fn compact_event_for(
     estimated_raw: usize,
+    trigger: ThresholdKind,
     config: CompactionConfig,
     naive_keep_from: usize,
     keep_from: usize,
@@ -736,11 +842,7 @@ fn compact_event_for(
     removed: usize,
 ) -> CompactEvent {
     CompactEvent {
-        trigger: if config.context_window_tokens > 0 {
-            ThresholdKind::ContextWindowHalf
-        } else {
-            ThresholdKind::AbsoluteMax
-        },
+        trigger,
         estimated_raw,
         estimated_calibrated: estimated_raw,
         window: config.context_window_tokens,
@@ -916,9 +1018,9 @@ mod tests {
     use super::{
         compact_event_for, compact_session_in_place, compaction_stats, estimate_session_tokens,
         estimate_text_tokens, format_compact_summary, get_compact_continuation_message,
-        plan_compaction_cut, read_stats_file, record_compact_event, record_repair_drops,
-        set_compact_stats_path, should_compact, should_compact_with_estimate, CompactEvent,
-        CompactionConfig, SoftTrigger, ThresholdKind, TokenCalibration,
+        is_context_overflow_error, plan_compaction_cut, read_stats_file, record_compact_event,
+        record_repair_drops, set_compact_stats_path, should_compact, should_compact_with_estimate,
+        CompactEvent, CompactionConfig, SoftTrigger, ThresholdKind, TokenCalibration,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
@@ -1273,12 +1375,75 @@ mod tests {
 
     #[test]
     fn continuation_message_declares_omitted_tokens() {
-        let without = get_compact_continuation_message("summary body", true, true, 0);
+        let without = get_compact_continuation_message("summary body", None, true, true, 0);
         assert!(!without.contains("estimated tokens"));
 
-        let with = get_compact_continuation_message("summary body", true, true, 1_234);
+        let with = get_compact_continuation_message("summary body", None, true, true, 1_234);
         assert!(with.contains("Roughly 1234 estimated tokens of older conversation"));
         assert!(with.contains("preserved verbatim"));
+    }
+
+    #[test]
+    fn model_summary_replaces_the_deterministic_section_when_present() {
+        // D4.5: a fetched summary leads the continuation, labeled as
+        // model-generated; nothing is silently swapped.
+        let with = get_compact_continuation_message(
+            "truncated deterministic body",
+            Some("Goal: ship it.\nNext steps: land the tests."),
+            true,
+            true,
+            500,
+        );
+        assert!(with.contains("Summary (model-generated from the dropped region)"));
+        assert!(with.contains("Goal: ship it."));
+        assert!(
+            !with.contains("truncated deterministic body"),
+            "the deterministic text steps aside entirely"
+        );
+        // A blank model summary must not produce an empty summary section.
+        let blank = get_compact_continuation_message("fallback", Some("   "), true, true, 0);
+        assert!(blank.contains("fallback"), "blank model output degrades");
+    }
+
+    #[test]
+    fn context_overflow_classifier_matches_provider_dialects_only() {
+        // OpenAI / DeepSeek
+        assert!(is_context_overflow_error(
+            "this model's maximum context length is 65536 tokens. However, you requested 70000 tokens"
+        ));
+        // Anthropic
+        assert!(is_context_overflow_error(
+            "Error: prompt is too long: 210000 tokens > 200000 maximum"
+        ));
+        // OpenAI Responses
+        assert!(is_context_overflow_error(
+            "input length and `max_tokens` exceed context limit: 130560 + 8192 > 131072"
+        ));
+        // Anthropic machine type
+        assert!(is_context_overflow_error(
+            "invalid_request_error: context_length_exceeded (prompt is too long)"
+        ));
+        // Ordinary failures that must NOT arm the hard retry.
+        assert!(!is_context_overflow_error(
+            "400 Bad Request: invalid model id"
+        ));
+        assert!(!is_context_overflow_error("file too long to read"));
+        assert!(!is_context_overflow_error(
+            "rate limit exceeded, retry later"
+        ));
+    }
+
+    #[test]
+    fn window_full_trigger_counts_its_own_axis() {
+        let config = CompactionConfig {
+            context_window_tokens: 10_000,
+            ..CompactionConfig::default()
+        };
+        let event = compact_event_for(9_000, ThresholdKind::WindowFull, config, 6, 5, 1_200, 3);
+        assert_eq!(event.trigger, ThresholdKind::WindowFull);
+        let before = compaction_stats().window_full;
+        record_compact_event(&event);
+        assert!(compaction_stats().window_full > before);
     }
 
     #[test]
@@ -1492,7 +1657,15 @@ mod tests {
             context_window_tokens: 200_000,
             ..CompactionConfig::default()
         };
-        let event = compact_event_for(9_000, window_config, 6, 5, 1_200, 3);
+        let event = compact_event_for(
+            9_000,
+            ThresholdKind::ContextWindowHalf,
+            window_config,
+            6,
+            5,
+            1_200,
+            3,
+        );
         assert_eq!(event.trigger, ThresholdKind::ContextWindowHalf);
         assert_eq!(event.window, 200_000);
         assert_eq!(event.estimated_raw, 9_000);
@@ -1504,7 +1677,15 @@ mod tests {
         assert_eq!(event.removed, 3);
 
         // Window unset: the absolute-threshold gate is what fired.
-        let absolute = compact_event_for(500, CompactionConfig::default(), 4, 4, 80, 1);
+        let absolute = compact_event_for(
+            500,
+            ThresholdKind::AbsoluteMax,
+            CompactionConfig::default(),
+            4,
+            4,
+            80,
+            1,
+        );
         assert_eq!(absolute.trigger, ThresholdKind::AbsoluteMax);
         assert_eq!(absolute.window, 0);
         assert_eq!(absolute.walkback_extra, 0, "no boundary walkback");

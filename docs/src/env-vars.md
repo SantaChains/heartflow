@@ -10,6 +10,8 @@
 | HEARTFLOW_AUTO_COMPACT_TOKENS | 模型上下文窗口 tokens；设后即启用回合内 `>50%` 预压缩，未设则回退到 `config.toml` 的 `[provider] context_window`，两者皆无则关闭。用 `hf --provider NAME models` 查窗口 |
 | HEARTFLOW_COMPACT_TRIGGER | 窗口模式下的软触发口径：`half-window`（默认，估算 ≥ 窗口/2）/ `ds4`（估算 ≥ 85%×窗口，或剩余 ≤ min(8192, 窗口/4)）。仅在窗口模式生效；绝对阈值模式不受影响 |
 | HEARTFLOW_COMPACT_TAIL_BUDGET | 压缩保留尾的 token 上限（默认 0 = 关闭，纯条数切割）。超预算时切割点前移、把更多旧消息并入摘要，且绝不孤立 tool_result；单条消息独超预算时保留并如实上报 |
+| HEARTFLOW_COMPACT_HARD_TRIGGER | 设 `1`/`true`/`on` 启用硬触发（D4.2）：provider 以「超上下文窗口」拒绝请求时立即压缩并**重试该请求一次**（第二次拒绝如实失败；仅窗口模式生效）。默认关闭 |
+| HEARTFLOW_COMPACT_SUMMARY | 压缩续延摘要来源（D4.5）：`model`/`llm` = 压缩前用一次 provider 调用按 durable-task-state 契约摘要被丢弃区域（失败自动降级确定性摘要，压缩本身绝不失败）；默认确定性截断摘要 |
 | HEARTFLOW_REPLAY_VERBATIM_TAIL | 恢复注入时逐字保留的最近 tool_result 条数（默认 12；`>0` 生效，否则回落默认） |
 | HEARTFLOW_CASSETTE | 传输层录制/回放：`record:<path>` 把每个回合的（请求, AgentEvent 流）追加写盘；`replay:<path>` 离线逐字节比对请求并回放事件（不联网、不需密钥）。已录真实夹具与离线回放集成套件见 `crates/provider/tests/fixtures/`——流式路径改动的铁律前置（roadmap §11.5） |
 | HEARTFLOW_POST_EDIT_DIAGNOSTICS | 设 `0` 关闭写后诊断（写类工具改动 `.rs`/`Cargo.toml` 后自动跑 `cargo check --message-format=short` 并把结果回注进同一工具结果；默认开启） |

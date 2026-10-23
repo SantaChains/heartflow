@@ -7,8 +7,9 @@ use tokio::task::{AbortHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::compact::{
-    compact_session_in_place, estimate_tokens_from, should_compact_with_estimate, truncate_chars,
-    CompactionConfig, CompactionResult, TokenCalibration,
+    compact_session_in_place_with, estimate_tokens_from, is_context_overflow_error,
+    should_compact_with_estimate, truncate_chars, CompactionConfig, CompactionResult, SummaryMode,
+    ThresholdKind, TokenCalibration,
 };
 use crate::permissions::{PermissionOutcome, PermissionPolicy, PermissionPrompter};
 use crate::schema::validate_tool_input;
@@ -230,6 +231,11 @@ pub struct TurnSummary {
 /// Nudge injected as a user message when the model stops with unfinished
 /// plan tasks; keeps the transcript API-consistent and resume-safe.
 const CONTINUATION_PROMPT: &str = "Continue: your task list still has unfinished items. Work on the next task now and update the todo list as you go.";
+
+/// The D4.5 summarizer contract (ds4 `misc/COMPACT.md`): durable task state
+/// only, no invention, reloadable bulk data recorded as path/range, and a
+/// hard stop after summarizing — the summarizer never continues the task.
+const SUMMARIZER_PROMPT: &str = "You summarize an earlier portion of a coding conversation that is being compacted. Produce a durable task-state summary with exactly these sections, each as a short bullet list, omitting any that are empty: Goal and constraints; Files read or changed; Commands run and their key results; Decisions made and approaches rejected; Known issues; Next steps. Rules: state only facts present in the conversation — never invent or guess; for large outputs or files, record the path or range instead of the content; keep it under 300 words; when you finish the summary, stop. Do not continue the user's task, do not ask questions, do not add commentary.";
 
 /// Tool-result ceiling in characters: larger outputs are head+tail truncated
 /// so a runaway command or MCP tool can never blow the model context.
@@ -589,6 +595,9 @@ where
         let mut tool_results = Vec::new();
         let mut iterations = 0usize;
         let mut continuations = 0usize;
+        // D4.2: the hard-trigger retry happens at most once per turn; a
+        // second context-overflow rejection surfaces as a real error.
+        let mut hard_retried = false;
 
         loop {
             iterations += 1;
@@ -617,8 +626,24 @@ where
 
             // Hermes-style >50% pre-compaction: shrink the context before
             // spending a request on it, but only when a window is configured.
+            // D4.5: in Model summary mode the dropped region is summarized by
+            // the provider first (degrading to the deterministic summary if
+            // that side call fails — compaction itself must never fail).
             if self.should_compact(self.compaction) {
-                self.compact(self.compaction);
+                let model_summary = if self.compaction.summary_mode == SummaryMode::Model {
+                    self.summarize_dropped_via_llm().await
+                } else {
+                    None
+                };
+                self.compact_with(
+                    self.compaction,
+                    if self.compaction.context_window_tokens > 0 {
+                        ThresholdKind::ContextWindowHalf
+                    } else {
+                        ThresholdKind::AbsoluteMax
+                    },
+                    model_summary.as_deref(),
+                );
             }
 
             let mut system_prompt = self.system_prompt.clone();
@@ -639,6 +664,30 @@ where
                 Self::consume_stream(&mut stream, notify, cancel).await;
 
             if let Some(message) = stream_error {
+                // D4.2 hard trigger: a context-overflow rejection is the only
+                // ground truth that the session no longer fits (estimates
+                // drift; a 400 does not). Compact once and retry the request
+                // exactly once — a second rejection fails the turn for real,
+                // so a poisoned session can never loop here.
+                if !hard_retried
+                    && self.compaction.hard_trigger
+                    && self.compaction.context_window_tokens > 0
+                    && self.session.messages.len() > self.compaction.preserve_recent_messages
+                    && is_context_overflow_error(&message)
+                {
+                    hard_retried = true;
+                    tracing::warn!(
+                        target: "heartflow::compact",
+                        "provider rejected the request as over the context window; compacting and retrying once (hard trigger)"
+                    );
+                    let result =
+                        self.compact_with(self.compaction, ThresholdKind::WindowFull, None);
+                    notify(&AgentEvent::Truncated(format!(
+                        "context overflow; {} older messages compacted, retrying once",
+                        result.removed_message_count
+                    )));
+                    continue;
+                }
                 return Err(RuntimeError::with_hint(message, error_hint));
             }
             if !finished {
@@ -1030,14 +1079,109 @@ where
     /// itself moves messages instead of cloning them.
     pub fn compact(&mut self, config: CompactionConfig) -> CompactionResult {
         if self.should_compact(config) {
-            let result = compact_session_in_place(&mut self.session, config);
-            self.token_prefix.set((0, 0));
-            result
+            self.compact_now(config)
         } else {
             CompactionResult {
                 summary: String::new(),
                 removed_message_count: 0,
             }
+        }
+    }
+
+    /// Gate-free compaction for callers that already decided (`/compact`,
+    /// the D4.2 hard trigger): same in-place rebuild, deterministic summary.
+    pub fn compact_now(&mut self, config: CompactionConfig) -> CompactionResult {
+        self.compact_with(
+            config,
+            if config.context_window_tokens > 0 {
+                ThresholdKind::ContextWindowHalf
+            } else {
+                ThresholdKind::AbsoluteMax
+            },
+            None,
+        )
+    }
+
+    /// The loop's compaction core: an explicit trigger kind for the
+    /// observation event and an optional model-generated summary (D4.5).
+    fn compact_with(
+        &mut self,
+        config: CompactionConfig,
+        trigger: ThresholdKind,
+        model_summary: Option<&str>,
+    ) -> CompactionResult {
+        let result =
+            compact_session_in_place_with(&mut self.session, config, trigger, model_summary);
+        self.token_prefix.set((0, 0));
+        result
+    }
+
+    /// D4.5: summarize the region a compaction is about to drop with one
+    /// provider call, under the ds4 durable-task-state contract (goal and
+    /// constraints, files read/changed, commands run and their key results,
+    /// decisions and rejected approaches, known issues, next steps; no
+    /// invented facts; summarize and stop — never continue the user's task).
+    /// Returns `None` on any failure (stream error, empty reply, no stop) so
+    /// the caller degrades to the deterministic summary; compaction must
+    /// never fail because its summarizer hiccuped. Events are swallowed on
+    /// purpose: this is a side request, not turn output, and must not pollute
+    /// the transcript.
+    async fn summarize_dropped_via_llm(&mut self) -> Option<String> {
+        let config = self.compaction;
+        let keep_from = self
+            .session
+            .messages
+            .len()
+            .saturating_sub(config.preserve_recent_messages);
+        if keep_from == 0 {
+            return None;
+        }
+        const SUMMARY_INPUT_CAP: usize = 48_000;
+        const SUMMARY_OUTPUT_CAP: usize = 16_000;
+        let mut transcript = String::new();
+        for message in &self.session.messages[..keep_from] {
+            for block in &message.blocks {
+                if let crate::session::ContentBlock::Text { text } = block {
+                    transcript.push_str(text);
+                    transcript.push('\n');
+                }
+            }
+            if transcript.len() >= SUMMARY_INPUT_CAP {
+                break;
+            }
+        }
+        if transcript.trim().is_empty() {
+            return None;
+        }
+        let request = ApiRequest {
+            system_prompt: vec![SUMMARIZER_PROMPT.to_string()],
+            messages: vec![ConversationMessage::user_blocks(vec![ContentBlock::Text {
+                text: format!("Conversation to summarize:\n\n{transcript}"),
+            }])],
+            tools: Vec::new(),
+        };
+        let mut stream = self.api_client.stream(request).ok()?;
+        let mut summary = String::new();
+        let mut finished = false;
+        while let Some(event) = stream.recv().await {
+            match event {
+                AgentEvent::TextDelta(delta) => {
+                    if summary.len() < SUMMARY_OUTPUT_CAP {
+                        summary.push_str(&delta);
+                    }
+                }
+                AgentEvent::MessageStop => {
+                    finished = true;
+                    break;
+                }
+                AgentEvent::Error { .. } => return None,
+                _ => {}
+            }
+        }
+        if finished && !summary.trim().is_empty() {
+            Some(summary)
+        } else {
+            None
         }
     }
 
@@ -1208,7 +1352,10 @@ mod tests {
         ConversationRuntime, RuntimeError, StaticToolExecutor, ToolError, ToolExecutor, ToolSpec,
         TurnStream,
     };
-    use crate::compact::{compact_session_in_place, estimate_session_tokens, CompactionConfig};
+    use crate::compact::{
+        compact_session_in_place, estimate_session_tokens, CompactionConfig, SoftTrigger,
+        SummaryMode,
+    };
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest,
@@ -1751,6 +1898,266 @@ mod tests {
                 .any(|message| message.role == MessageRole::System),
             "the reminder is a per-request projection, never persisted"
         );
+    }
+
+    /// Seed a session with enough history that compaction has something to
+    /// fold (`message_count > preserve_recent_messages`) and enough *weight*
+    /// that the token estimates cross the gates under test (~chars/4).
+    fn fat_session(rounds: usize) -> Session {
+        let mut session = Session::new();
+        for round in 0..rounds {
+            session.messages.push(ConversationMessage::user_text(
+                format!("question {round} with some padding text to give the region weight ")
+                    .repeat(6),
+            ));
+            session
+                .messages
+                .push(ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: format!("answer {round} with padding text of its own ").repeat(6),
+                }]));
+        }
+        session
+    }
+
+    #[tokio::test]
+    async fn hard_trigger_compacts_and_retries_once_on_context_overflow() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        #[derive(Clone)]
+        struct OverflowThenReply(Arc<StdMutex<Vec<ApiRequest>>>);
+        impl ApiClient for OverflowThenReply {
+            fn stream(&mut self, request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+                let call = {
+                    let mut guard = self
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard.push(request);
+                    guard.len()
+                };
+                match call {
+                    1 => Ok(TurnStream::from_events(vec![AgentEvent::Error {
+                        message: "this model's maximum context length is 1000 tokens. However, you requested 1200 tokens".to_string(),
+                        hint: None,
+                    }])),
+                    _ => Ok(TurnStream::from_events(vec![
+                        AgentEvent::TextDelta("recovered".to_string()),
+                        AgentEvent::MessageStop,
+                    ])),
+                }
+            }
+        }
+
+        let requests: Arc<StdMutex<Vec<ApiRequest>>> = Arc::new(StdMutex::new(Vec::new()));
+        let mut runtime = ConversationRuntime::new(
+            fat_session(3),
+            OverflowThenReply(Arc::clone(&requests)),
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::Allow),
+            Vec::new(),
+        )
+        .with_compaction(CompactionConfig {
+            context_window_tokens: 2_000,
+            // Soft gate high enough to stay out of the way: the hard path is
+            // under test, and a soft compaction would consume call 1.
+            soft_trigger: SoftTrigger::Ds4,
+            hard_trigger: true,
+            ..CompactionConfig::default()
+        });
+
+        let summary = runtime
+            .run_turn("go", None, &mut noop_notify(), &CancellationToken::new())
+            .await
+            .expect("the hard retry recovers the turn");
+        assert_eq!(summary.iterations, 2, "overflow, compact, retry");
+
+        let guard = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(guard.len(), 2, "exactly one retry");
+        assert!(
+            guard[1].messages.len() < guard[0].messages.len(),
+            "the retry went out after compaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_overflow_fails_the_turn_and_disabled_never_retries() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        #[derive(Clone)]
+        struct AlwaysOverflow(Arc<StdMutex<usize>>);
+        impl ApiClient for AlwaysOverflow {
+            fn stream(&mut self, _request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+                let mut calls = self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *calls += 1;
+                Ok(TurnStream::from_events(vec![AgentEvent::Error {
+                    message: "prompt is too long: 210000 tokens > 200000 maximum".to_string(),
+                    hint: None,
+                }]))
+            }
+        }
+
+        // Armed but the overflow repeats: one retry, then a real failure.
+        let calls = Arc::new(StdMutex::new(0usize));
+        let mut runtime = ConversationRuntime::new(
+            fat_session(3),
+            AlwaysOverflow(Arc::clone(&calls)),
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::Allow),
+            Vec::new(),
+        )
+        .with_compaction(CompactionConfig {
+            context_window_tokens: 2_000,
+            soft_trigger: SoftTrigger::Ds4,
+            hard_trigger: true,
+            ..CompactionConfig::default()
+        });
+        let error = runtime
+            .run_turn("go", None, &mut noop_notify(), &CancellationToken::new())
+            .await
+            .expect_err("a repeated overflow must fail the turn");
+        assert!(error.to_string().contains("prompt is too long"));
+        assert_eq!(
+            *calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            2,
+            "no second retry loop"
+        );
+
+        // Unarmed (the shipped default): the overflow surfaces immediately.
+        let calls = Arc::new(StdMutex::new(0usize));
+        let mut runtime = ConversationRuntime::new(
+            fat_session(3),
+            AlwaysOverflow(Arc::clone(&calls)),
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::Allow),
+            Vec::new(),
+        )
+        .with_compaction(CompactionConfig {
+            context_window_tokens: 2_000,
+            soft_trigger: SoftTrigger::Ds4,
+            ..CompactionConfig::default()
+        });
+        let error = runtime
+            .run_turn("go", None, &mut noop_notify(), &CancellationToken::new())
+            .await
+            .expect_err("without the hard trigger the overflow is terminal");
+        assert!(error.to_string().contains("prompt is too long"));
+        assert_eq!(
+            *calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            1,
+            "no retry when unarmed"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_summary_rides_the_continuation_and_degrades_on_failure() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        #[derive(Clone)]
+        struct SummaryThenReply {
+            requests: Arc<StdMutex<Vec<ApiRequest>>>,
+            fail_the_summarizer: bool,
+        }
+        impl ApiClient for SummaryThenReply {
+            fn stream(&mut self, request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+                let is_summarizer = request
+                    .system_prompt
+                    .first()
+                    .is_some_and(|section| section.contains("durable task-state summary"));
+                {
+                    let mut guard = self
+                        .requests
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard.push(request);
+                }
+                if is_summarizer {
+                    return Ok(if self.fail_the_summarizer {
+                        TurnStream::from_events(vec![AgentEvent::Error {
+                            message: "summarizer offline".to_string(),
+                            hint: None,
+                        }])
+                    } else {
+                        TurnStream::from_events(vec![
+                            AgentEvent::TextDelta("Goal: land compaction.".to_string()),
+                            AgentEvent::MessageStop,
+                        ])
+                    });
+                }
+                Ok(TurnStream::from_events(vec![
+                    AgentEvent::TextDelta("ok".to_string()),
+                    AgentEvent::MessageStop,
+                ]))
+            }
+        }
+
+        for (fail, expect_model_summary) in [(false, true), (true, false)] {
+            let requests: Arc<StdMutex<Vec<ApiRequest>>> = Arc::new(StdMutex::new(Vec::new()));
+            let mut runtime = ConversationRuntime::new(
+                fat_session(4),
+                SummaryThenReply {
+                    requests: Arc::clone(&requests),
+                    fail_the_summarizer: fail,
+                },
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::Allow),
+                Vec::new(),
+            )
+            .with_compaction(CompactionConfig {
+                // The half-window soft gate (500) fires on the seeded
+                // session (~1150 estimated) while the post-compaction tail
+                // (~430) stays under it, exercising summarize-then-compact
+                // exactly once.
+                context_window_tokens: 1_000,
+                summary_mode: SummaryMode::Model,
+                ..CompactionConfig::default()
+            });
+            runtime
+                .run_turn("go", None, &mut noop_notify(), &CancellationToken::new())
+                .await
+                .expect("compaction must never fail the turn");
+
+            let guard = requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The soft gate fires at the loop top: the side summarizer call
+            // goes out before the main request.
+            assert!(
+                guard.len() >= 2,
+                "summarizer call then main request (fail={fail})"
+            );
+            let text = runtime
+                .session()
+                .messages
+                .first()
+                .map(|message| {
+                    message
+                        .blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                text.contains("model-generated from the dropped region"),
+                expect_model_summary,
+                "fail={fail}: {text}"
+            );
+            if expect_model_summary {
+                assert!(text.contains("Goal: land compaction."));
+            }
+        }
     }
 
     #[tokio::test]

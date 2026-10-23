@@ -27,9 +27,10 @@ pub use checkpoint::{
 pub use compact::estimate_tokens_from;
 pub use compact::{
     compact_session_in_place, compaction_stats, estimate_session_tokens, format_compact_summary,
-    get_compact_continuation_message, plan_compaction_cut, set_compact_stats_path, should_compact,
-    truncate_chars, CompactEvent, CompactionConfig, CompactionResult, CompactionStats, CutPlan,
-    SoftTrigger, ThresholdKind, TokenCalibration,
+    get_compact_continuation_message, is_context_overflow_error, plan_compaction_cut,
+    set_compact_stats_path, should_compact, truncate_chars, CompactEvent, CompactionConfig,
+    CompactionResult, CompactionStats, CutPlan, SoftTrigger, SummaryMode, ThresholdKind,
+    TokenCalibration,
 };
 pub use config::{
     ConfigEntry, ConfigError, ConfigLoader, ConfigSource, RuntimeConfig,
