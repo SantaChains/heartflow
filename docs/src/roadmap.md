@@ -207,7 +207,7 @@ pub struct QueueSet {
 - **队列命名泳道（2026-10-22 批次，D2.1 数据结构半边）**：`QueueEntry.lane` 标签 + `send_in_lane`/`lane_names`/`items_in_lane`；REPL `/queue send --lane <name>`、`/queue lane <name>`、列表 `@name` 标注。**纪律：泳道是观测与编辑维度，递送仍是全局到达序**——跨泳道轮转规则需要 TUI 侧（P-C）才有意义，离线拍脑袋定轮转属猜测。
 **落地状态（2026-10-21 第二批网络核验，Qoder 官方文档对照）**：Qoder 官方「排队 vs 插话」二分（docs.qoder.com conversation-input）与本仓 `FollowUp` vs `Steer`（P-D）**语义同构**——插话「在安全执行边界交给 Agent，不直接停止当前执行」正是本仓「明确不做强插打断」的官方版；排队消息管理面「插话 / 撤回到输入框编辑 / 移除 / 多条重排」= `/queue send/remove/move/edit` 已覆盖；「设置 → 运行中发送方式」= D2.3 默认 FollowUp；composer 在「压缩中 / 有待处理请求」时提示不支持插话 → TUI P-C 待做项。qoder 式「引导 = 结合当前消息、总结之前工作、明确后续任务后发送」= `/guide` 三段草稿 + 默认直接发送，已实现。生态侧：ACP `_session/steering` 扩展（Claude/Codex 已支持，agent-shell 0.78 的 RET=排队 / M-RET=插话）→ 若将来做 ACP server 可对齐；灵码（Qoder CN）的「消息排队 + 全自动执行模式带终端命令禁止名单」中，禁止名单与既有 `is_dangerous_command` 分级确认同族。
 
-- **待做**：~~P-C（TUI 队列编辑键位 + 引导 overlay——本仓铁律：TUI 派发不盲改，需真机冒烟）~~ **已落地（2026-10-24，§11.1）**：队列编辑面板（Ctrl+Q：编辑/撤条/重排/改派）+ guide overlay 两栏可编辑（T6）+ 状态栏 mode 分流计数；REPL 补 `/queue relane`。per-section 泳道递送轮转（D2.1 的 TUI 半边；数据结构与 REPL 观测面已落地）——前置已满足，见 §11.4。mission 回合自动记账与提醒注入 ~~（D1.3，前置 P2 事件循环）~~ **已落地（2026-10-23，§11.3）**。跨进程文件锁已落地（§4，2026-10-22 批次）。**P-D Steer 已落地（2026-10-23，§11.2）**：`DeliveryMode`（Steer/FollowUp/Auto，默认 FollowUp）+ runtime `SteerMailbox` 迭代边界注入 + TUI Ctrl+S 全链，未消费 steer 回收为 follow-up（条目不丢）。
+- **待做**：~~P-C（TUI 队列编辑键位 + 引导 overlay——本仓铁律：TUI 派发不盲改，需真机冒烟）~~ **已落地（2026-10-24，§11.1）**：队列编辑面板（Ctrl+Q：编辑/撤条/重排/改派）+ guide overlay 两栏可编辑（T6）+ 状态栏 mode 分流计数；REPL 补 `/queue relane`。~~per-section 泳道递送轮转（D2.1 的 TUI 半边）~~ **已落地（2026-10-24，§11.4）**：section 即泳道、跨 section 公平轮转 + TUI 默认逐条递送（D2.2 补全）+ 回合事件按 section 路由、回合中导航解禁。mission 回合自动记账与提醒注入 ~~（D1.3，前置 P2 事件循环）~~ **已落地（2026-10-23，§11.3）**。跨进程文件锁已落地（§4，2026-10-22 批次）。**P-D Steer 已落地（2026-10-23，§11.2）**：`DeliveryMode`（Steer/FollowUp/Auto，默认 FollowUp）+ runtime `SteerMailbox` 迭代边界注入 + TUI Ctrl+S 全链，未消费 steer 回收为 follow-up（条目不丢）。
 
 
 ### 4. 工程稳定性与持久性（大项目持续运行）
@@ -382,6 +382,12 @@ heartflow 落点：`edit_file` / `apply_patch` 后回注诊断（Rust 项目先�
 #### 11.4 per-section 泳道递送轮转（TUI 半边）
 
 - 数据结构（`QueueEntry.lane`）+ REPL 观测面已落地（§1 2026-10-22 批次）；TUI 侧轮转规则（`MAX_SECTIONS=9`，`tui.rs:1103`）未做。前置 11.1 TUI 升级的队列编辑键位。
+- **落地状态（2026-10-24，全链落地，待真机冒烟）**：
+  - **轮转规则裁决（按 D2.1 既定倾向）**：**section 就是递送泳道**——轮转发生在 section 之间，section 内部保持到达序（lane 维持「观测与编辑维度」纪律，2026-10-22 批次的约束原样保留）。循环空闲且无 fresh 提交待跑时，`Shell::next_queue_section` 从 `delivery_cursor` 起环形扫描，取下一个有待发条目的 section，**一次取一条**跑一个完整回合（`/queue merge` 的 section 仍按 opt-in 整队合并为一条）；游标在被服务的 section 之后推进——公平轮转而非前排独占。这同时补齐了 D2.2 的 TUI 半边：TUI 递送从「整队合并注入」改为**默认逐条**（与 REPL 逐条路径同语义，裸文本、无合并头）。
+  - **前置解锁：回合事件按 section 路由**——`Msg::Event/TurnStarted/TurnFinished` 携带 section 标签，后台 section 的回合流进**自己的** transcript/状态栏，绝不污染活动 section；`Msg::PermissionRequest` 仍属活动面。由此**解除 §11.0 时代的「回合中禁止切换 section」封锁**（该封锁是为旧内联循环设的防线）：回合运行中可自由 Ctrl+PgDn/PgUp/Ctrl+T 切换与开新 section——这正是「当前工作时切换另一个 section」的原始诉求；后台回合运行时活动 section 的 Ctrl+C/Esc **转交运行中 section** 处理（双击取消语义全局一致，Esc 不再误退整个 shell）。
+  - **自动递送的护栏**：轮转是自动的，失败的条目**自动重排一次**；**同一 id 连续第二次失败终态化为 `Failed`**（台账可见、明示）——自动队列绝不无限重试毒条目。迟到 steer 的回收（§11.2）改为留在本 section 队列里等轮转，不再整队合并注入。
+  - **测试**：`follow_ups_submitted_during_a_turn_run_one_per_turn`（逐条递送，每条一个请求）、`section_navigation_works_while_a_turn_is_live`（封锁解除，回合中切换、回合留在原 section）、`queued_work_rotates_into_a_background_section`（标题场景：排队工作在后台 section 自动跑完、操作者已切走、台账 delivered）、`a_poisoned_queue_entry_fails_after_one_retry`（恰好两次尝试后 Failed，请求数=3）。循环测试的 `LoopReport` 新增全 section 台账快照。
+  - **验证**：765 通过 / 0 失败、clippy `-D clippy::all` 干净、fmt 干净、panic 棘轮 debt=0（uv）。顺手修掉 `jobs.rs` 槽位测试的固定 120ms sleep 时序断言（满载并行下饿死，改有界轮询）。**真机冒烟卡**：① 回合中 Ctrl+T/Ctrl+PgDn 切换 section，原 section 的回合继续、tab 带 `*`、流式只进原 section；② section A 排两条 follow-up → 切到 section B → A 的条目在后台逐条自动跑完、状态栏计数递减；③ 制造一条必败 follow-up → 观察一次自动重试后 `Failed` 入台账、不再无限请求。
 
 #### 11.5 次级 / 独立（不阻塞主线）
 

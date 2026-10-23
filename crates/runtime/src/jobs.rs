@@ -850,8 +850,15 @@ mod tests {
                 }),
             )
             .expect("second");
-        std::thread::sleep(Duration::from_millis(120));
         // Only one slot: exactly one runner started; the other stays queued.
+        // Poll to that state (bounded) instead of sleeping a fixed slice —
+        // under a full parallel test run the worker thread may not be
+        // scheduled within any fixed window, and the invariant is the state,
+        // not the clock.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while started.load(Ordering::Relaxed) != 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(started.load(Ordering::Relaxed), 1);
         let statuses: Vec<_> = registry
             .list()

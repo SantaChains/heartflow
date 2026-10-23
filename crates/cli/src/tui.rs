@@ -98,7 +98,9 @@ use crate::{expand_attachments, AgentRuntime, DiskSaver, SessionShared, TurnSave
 type Backend = CrosstermBackend<io::Stdout>;
 
 /// The only way to mutate [`App`]. Key/Resize come from the crossterm pump;
-/// Event/TurnStarted/TurnFinished come from the inline turn.
+/// Event/TurnStarted/TurnFinished come from a turn — tagged with the section
+/// that turn belongs to (§11.4: a background section's turn must feed its own
+/// transcript, never the active one's).
 pub(crate) enum Msg {
     /// A key press from the crossterm event stream.
     Key(KeyEvent),
@@ -107,14 +109,29 @@ pub(crate) enum Msg {
     Paste(String),
     /// The terminal was resized; forces a relayout + repaint.
     Resize,
-    /// One streamed event from the running turn.
-    Event(AgentEvent),
-    /// A submission was picked up and a turn is now live.
-    TurnStarted,
-    /// The turn ended; `note` is a short tail (save path, error) for the status.
-    TurnFinished { ok: bool, note: String },
+    /// One streamed event from the running turn in `section`.
+    Event { section: usize, event: AgentEvent },
+    /// A submission was picked up and a turn is now live in `section`.
+    TurnStarted { section: usize },
+    /// The turn in `section` ended; `note` is a short tail (save path, error)
+    /// for that section's status.
+    TurnFinished {
+        section: usize,
+        ok: bool,
+        note: String,
+    },
     /// A tool needs interactive approval; raises the permission overlay.
     PermissionRequest(PermissionRequest),
+}
+
+/// Which section a message belongs to (§11.4). Turn traffic carries its own
+/// tag; everything else (`None`) belongs to whichever section is active.
+fn msg_section(msg: &Msg) -> Option<usize> {
+    match msg {
+        Msg::Event { section, .. } | Msg::TurnStarted { section } => Some(*section),
+        Msg::TurnFinished { section, .. } => Some(*section),
+        _ => None,
+    }
 }
 
 /// What the permission overlay resolved to. Carried back to the prompter over a
@@ -393,8 +410,10 @@ impl App {
             Msg::Resize => true,
             Msg::Key(key) => self.on_key(key),
             Msg::Paste(text) => self.on_paste(text),
-            Msg::Event(event) => self.apply_event(&event),
-            Msg::TurnStarted => {
+            // The section tag is loop-level routing; the reducer is already
+            // talking to the right section when it sees these.
+            Msg::Event { event, .. } => self.apply_event(&event),
+            Msg::TurnStarted { .. } => {
                 self.turn_active = true;
                 self.assistant_buf.clear();
                 self.thinking_buf.clear();
@@ -406,7 +425,7 @@ impl App {
                 self.status_note = format!("turn running · {hint} twice to cancel");
                 true
             }
-            Msg::TurnFinished { ok, note } => {
+            Msg::TurnFinished { ok, note, .. } => {
                 self.finish_turn(ok, &note);
                 true
             }
@@ -536,11 +555,11 @@ impl App {
                 self.submit_steer();
                 true
             }
-            // Section navigation belongs to the shell and only runs while idle;
-            // the loop intercepts these keys before the reducer sees them. A
-            // turn runs inline and parks the loop inside `run_one_turn`, so
-            // mid-turn they land here: consume them with a guard note rather
-            // than letting a stray chord reach the editor.
+            // Section navigation belongs to the shell and is handled at the
+            // loop level (safe mid-turn since §11.4's section-tagged routing).
+            // This arm is defense in depth for a nav chord that ever reaches
+            // the reducer: consume it with a guard note rather than letting a
+            // stray key fall into the editor.
             Some(Action::NextSection | Action::PrevSection | Action::NewSection) => {
                 self.status_note =
                     String::from("finish or cancel the turn before switching sections");
@@ -1439,6 +1458,14 @@ pub(crate) struct Shell {
     active: usize,
     /// Header context (model · cwd · context budget), shared by all sections.
     chrome: Chrome,
+    /// Where the §11.4 rotation scan resumes. Sections are the delivery
+    /// swimlanes (D2.1's verdict): when the loop goes idle and a fresh submit
+    /// is not waiting, pending queue entries run one turn at a time,
+    /// round-robin across the sections that have them, so work queued in a
+    /// background section progresses even while another section is on screen.
+    /// The cursor advances past each section the moment it is served, which
+    /// is what makes the rotation fair rather than front-loaded.
+    delivery_cursor: usize,
 }
 
 impl Shell {
@@ -1449,6 +1476,7 @@ impl Shell {
             sections: vec![App::new()],
             active: 0,
             chrome: Chrome::default(),
+            delivery_cursor: 0,
         }
     }
 
@@ -1479,6 +1507,35 @@ impl Shell {
     fn section_index_mut(&mut self, idx: usize) -> &mut App {
         let clamped = idx.min(self.sections.len().saturating_sub(1));
         &mut self.sections[clamped]
+    }
+
+    /// The next section the rotation should serve (§11.4): scan from just
+    /// past the cursor, wrapping, and stop at the first idle section holding
+    /// at least one deliverable (non-Steer) pending entry. `None` when no
+    /// section has queued work. Delivery *within* a section stays arrival
+    /// order — lanes remain an observation/editing dimension (D2.1/D2.2
+    /// discipline); the rotation is across sections.
+    fn next_queue_section(&self) -> Option<usize> {
+        let len = self.sections.len();
+        if len == 0 {
+            return None;
+        }
+        let cursor = self.delivery_cursor % len;
+        for offset in 0..len {
+            let index = (cursor + offset) % len;
+            let section = &self.sections[index];
+            if !section.model.is_running()
+                && section
+                    .model
+                    .queue()
+                    .items()
+                    .iter()
+                    .any(|entry| entry.mode != crate::core::DeliveryMode::Steer)
+            {
+                return Some(index);
+            }
+        }
+        None
     }
 
     /// Advance to the next section, wrapping at the end. A no-op with a single
@@ -2380,9 +2437,9 @@ where
         choice_rx: channels.choice_rx,
     });
     // Turn inputs waiting to run, oldest first. An idle submit stages one turn
-    // here; a submit *during* a turn goes into `app.model`'s follow-up queue
-    // and is merged into a single injection at the turn boundary (locked
-    // FollowUpQueue semantics).
+    // here (fresh submits keep first priority and always run in the active
+    // section); a submit *during* a turn goes into that section's follow-up
+    // queue and is picked up one entry per turn by the §11.4 rotation.
     let mut queue: VecDeque<String> = VecDeque::new();
     // Seed the guide snapshot while the runtime is free (before the first turn)
     // so Ctrl+G has a work log to preview from the first idle moment.
@@ -2400,6 +2457,13 @@ where
     // cancel token: created per turn, loop-held while it runs, dropped at
     // settle. The runtime gets its clone before moving into the future.
     let mut turn_steer: Option<SteerMailbox> = None;
+    // The queue entry this turn is delivering, when the turn came from the
+    // rotation (§11.4). Terminalized at settle: Delivered on success, one
+    // re-queue on failure, `Failed` in the ledger if the *same* entry fails a
+    // second consecutive time — an auto-rotating queue must not retry a
+    // poisoned entry forever.
+    let mut turn_entry: Option<crate::core::QueueEntry> = None;
+    let mut last_failed_entry: Option<u64> = None;
 
     while !shell.section().quit {
         // ---- Phase R: render ----
@@ -2408,19 +2472,51 @@ where
             dirty = false;
         }
         // ---- Phase T: turn driving (start) ----
-        // The queued input always belongs to the active section: a submit is
-        // drained and run before any key (including a section switch) is
-        // processed, and a live turn blocks nav, so `active` is stable from
-        // here through the turn and its boundary refresh.
+        // Fresh submits come first and always run in the active section: a
+        // submit is drained and run before any key (including a section
+        // switch) is processed, and a live turn blocks nav. When nothing is
+        // staged, the §11.4 rotation picks the next section with pending
+        // queue work (round-robin from the cursor) and runs its oldest
+        // deliverable entry there — one entry per turn, merged mode aside.
         if turn.is_none() {
-            if let Some(input) = queue.pop_front() {
-                let active = shell.active_index();
+            let pickup: Option<(usize, String)> = if let Some(input) = queue.pop_front() {
+                turn_entry = None;
+                Some((shell.active_index(), input))
+            } else if let Some(section) = shell.next_queue_section() {
+                let model = &mut shell.section_index_mut(section).model;
+                let picked = if model.queue().is_merged() {
+                    // Merged mode (D2.2 opt-in): the section's whole pending
+                    // queue is one combined injection, terminalized on the
+                    // spot by the drain — nothing left to settle.
+                    model
+                        .queue_mut()
+                        .drain_injection()
+                        .map(|injection| (injection, None))
+                } else {
+                    // Default per-entry delivery (D2.2): one entry, one turn —
+                    // the raw text, exactly like the REPL's per-item path (no
+                    // merged-injection header around a single message); the
+                    // entry terminalizes at settle.
+                    model.queue_mut().take_next().map(|entry| {
+                        let injection = entry.text.clone();
+                        (injection, Some(entry))
+                    })
+                };
+                picked.map(|(injection, entry)| {
+                    shell.delivery_cursor = (section + 1) % shell.sections.len();
+                    turn_entry = entry;
+                    (section, injection)
+                })
+            } else {
+                None
+            };
+            if let Some((active, input)) = pickup {
                 // Set the queue-routing flag synchronously (before any await) so
                 // a submit from the very first instant of the turn enqueues
                 // rather than racing the async `Msg::TurnStarted`.
-                shell.section_mut().model.begin_turn();
+                shell.section_index_mut(active).model.begin_turn();
                 let cancel = CancellationToken::new();
-                let _ = channels.msg_tx.send(Msg::TurnStarted);
+                let _ = channels.msg_tx.send(Msg::TurnStarted { section: active });
                 // Take the section's runtime and the shared prompter out of the
                 // loop's hands: the turn future owns them while it runs, which
                 // is what keeps this loop free to switch sections, spawn new
@@ -2451,7 +2547,10 @@ where
                     .set_turn_context(turn_reminder(&MissionLedger::load(&missions_root).list()));
                 let tx = channels.msg_tx.clone();
                 let mut notify = move |event: &AgentEvent| {
-                    let _ = tx.send(Msg::Event(event.clone()));
+                    let _ = tx.send(Msg::Event {
+                        section: active,
+                        event: event.clone(),
+                    });
                 };
                 let blocks = expand_attachments(&input);
                 // The loop keeps its own token clone so the input phase can
@@ -2556,12 +2655,12 @@ where
                 }
                 // Turn boundary (locked FollowUpQueue semantics): drop the
                 // running flag so a submit racing the save routes to the next
-                // turn, then merge everything queued during the turn into one
-                // injection that becomes the next input. Delivering after
-                // *any* finish — success or failure — loses nothing. Steers
-                // the turn never consumed are demoted to follow-ups first so
-                // the injection below carries them (pi's "child completed
-                // before consuming steering" recovery — honest, not lost).
+                // turn. Steers the turn never consumed are demoted to
+                // follow-ups (pi's "child completed before consuming
+                // steering" recovery) and *stay* in the section's queue —
+                // the §11.4 rotation picks them up like any pending entry,
+                // one turn each, instead of the old whole-queue merged
+                // injection.
                 app.model.end_turn();
                 if let Some(attention) = mission_attention.take() {
                     app.push_line(muted_line(format!("· {attention}")));
@@ -2573,11 +2672,33 @@ where
                         recovered.len()
                     )));
                 }
-                if let Some(injection) = app.model.queue_mut().drain_injection() {
-                    queue.push_back(injection);
+                // Terminalize the rotation's ledger entry (§11.4): Delivered
+                // on success; one automatic re-queue on failure; the *same*
+                // entry failing a second consecutive time files as `Failed` —
+                // an auto-rotating queue must not retry a poisoned entry
+                // forever.
+                if let Some(entry) = turn_entry.take() {
+                    let retried = last_failed_entry == Some(entry.id);
+                    let state = if ok {
+                        last_failed_entry = None;
+                        crate::core::QueueEntryState::Delivered
+                    } else if retried {
+                        last_failed_entry = None;
+                        crate::core::QueueEntryState::Failed
+                    } else {
+                        last_failed_entry = Some(entry.id);
+                        crate::core::QueueEntryState::Pending
+                    };
+                    if state == crate::core::QueueEntryState::Pending {
+                        app.model.queue_mut().requeue_front(entry);
+                    } else {
+                        app.model.queue_mut().finish_entry(entry, state);
+                    }
                 }
                 let note = err_note.unwrap_or(save_note);
-                let _ = channels.msg_tx.send(Msg::TurnFinished { ok, note });
+                let _ = channels
+                    .msg_tx
+                    .send(Msg::TurnFinished { section, ok, note });
                 // Turn boundary: refresh the guide snapshot to fold in the turn
                 // that just finished, and pick up config surfaces edited on disk
                 // while it ran. theme swaps the global palette (the next frame
@@ -2608,18 +2729,17 @@ where
             }
             maybe = channels.msg_rx.recv() => match maybe {
                 Some(msg) => {
-                    // Section navigation is a shell concern and runs only
-                    // while idle: a live turn owns its section's runtime, so
-                    // switching never pulls a runtime out from under a running
-                    // turn. Mid-turn the keys fall through to the reducer,
-                    // which consumes them with a guard note.
-                    let nav = if turn.is_none() {
-                        match &msg {
-                            Msg::Key(key) => shell.section().keymap.resolve(key),
-                            _ => None,
-                        }
-                    } else {
-                        None
+                    // Section navigation is a shell concern. Since §11.4 gave
+                    // turn traffic its own section tag, switching while a
+                    // turn runs is safe: the live turn keeps its runtime (the
+                    // slot it owns is keyed by *its* section, not the active
+                    // one) and its events route to their own transcript —
+                    // which is what unlocks "work continues in a background
+                    // section while you switch to another" (the original
+                    // queue-mode ask).
+                    let nav = match &msg {
+                        Msg::Key(key) => shell.section().keymap.resolve(key),
+                        _ => None,
                     };
                     match nav {
                         Some(Action::NextSection) => {
@@ -2658,19 +2778,41 @@ where
                             }
                         }
                         // Every other key (and any non-key message) belongs to
-                        // the active section's reducer.
+                        // a section's reducer. Turn traffic (§11.4 tags)
+                        // routes to the section that owns the turn; keys go
+                        // to the active section — except interrupt/escape
+                        // while a *background* turn runs, which the running
+                        // section must see (its own `turn_active` drives the
+                        // double-press cancel and keeps Esc from quitting the
+                        // shell mid-turn).
                         _ => {
-                            dirty |= shell.section_mut().update(msg);
+                            let mut routed = msg_section(&msg);
+                            if let (Some(live), Msg::Key(key)) = (turn.as_ref(), &msg) {
+                                let action = shell.section().keymap.resolve(key);
+                                if live.section != shell.active_index()
+                                    && matches!(
+                                        action,
+                                        Some(Action::Interrupt) | Some(Action::Escape)
+                                    )
+                                {
+                                    routed = Some(live.section);
+                                }
+                            }
+                            let target = routed.unwrap_or_else(|| shell.active_index());
+                            dirty |= shell.section_index_mut(target).update(msg);
                             // A resolved permission overlay returns to the
                             // prompter, which is parked inside the suspended
                             // turn future.
-                            if let Some(choice) = shell.section_mut().take_permission_choice() {
+                            if let Some(choice) = shell.section_index_mut(target).take_permission_choice() {
                                 let _ = channels.choice_tx.send(choice);
                             }
                             // Second Ctrl+C tap, or a quit request: cancel and
                             // let the turn unwind before the loop tears down.
                             if let Some(cancel) = turn_cancel.as_ref() {
-                                if shell.section_mut().take_cancel() || shell.section().quit {
+                                let running = turn.as_ref().map_or(target, |live| live.section);
+                                if shell.section_index_mut(running).take_cancel()
+                                    || (turn.is_none() && shell.section().quit)
+                                {
                                     cancel.cancel();
                                 }
                             }
@@ -2782,6 +2924,24 @@ mod tests {
         KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
     }
 
+    /// Turn traffic for section 0 — the section tag is loop-level routing the
+    /// reducer ignores, so tests talk to section 0 uniformly.
+    fn turn_started() -> Msg {
+        Msg::TurnStarted { section: 0 }
+    }
+
+    fn ev(event: AgentEvent) -> Msg {
+        Msg::Event { section: 0, event }
+    }
+
+    fn finished(ok: bool, note: &str) -> Msg {
+        Msg::TurnFinished {
+            section: 0,
+            ok,
+            note: note.to_string(),
+        }
+    }
+
     fn ctrl_g() -> KeyEvent {
         KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)
     }
@@ -2797,7 +2957,7 @@ mod tests {
     #[test]
     fn permission_request_raises_the_overlay() {
         let mut app = App::new();
-        app.update(Msg::TurnStarted);
+        app.update(turn_started());
         assert!(app.permission.is_none());
         assert!(app.update(request("bash")), "raising the overlay repaints");
         assert!(app.permission.is_some());
@@ -2831,7 +2991,7 @@ mod tests {
     #[test]
     fn permission_overlay_esc_denies_without_quitting() {
         let mut app = App::new();
-        app.update(Msg::TurnStarted);
+        app.update(turn_started());
         app.update(request("bash"));
         app.update(Msg::Key(key(KeyCode::Esc)));
         assert!(matches!(
@@ -2858,7 +3018,7 @@ mod tests {
     #[test]
     fn permission_overlay_renders_the_policys_reason() {
         let mut app = App::new();
-        app.update(Msg::TurnStarted);
+        app.update(turn_started());
         app.update(Msg::PermissionRequest(PermissionRequest {
             tool_name: "write_file".to_string(),
             input: r#"{"path":"../escape.rs"}"#.to_string(),
@@ -2983,7 +3143,7 @@ mod tests {
     fn steer_submit_while_running_stages_for_the_live_turn() {
         let mut app = App::new();
         app.model.begin_turn();
-        app.update(Msg::TurnStarted);
+        app.update(turn_started());
         for c in "pivot now".chars() {
             app.update(Msg::Key(char_key(c)));
         }
@@ -3000,7 +3160,7 @@ mod tests {
             "the steer is visible in the queue with its mode"
         );
         // Consuming the steer terminalizes the entry and echoes it.
-        assert!(app.update(Msg::Event(AgentEvent::Steered("pivot now".into()))));
+        assert!(app.update(ev(AgentEvent::Steered("pivot now".into()))));
         assert!(app.model.queue().is_empty());
     }
 
@@ -3185,7 +3345,7 @@ mod tests {
         assert!(app.status_note.contains("queue is empty"));
 
         app.model.begin_turn();
-        app.update(Msg::TurnStarted);
+        app.update(turn_started());
         app.model
             .queue_mut()
             .send("aa", crate::core::QueueSource::User);
@@ -3306,7 +3466,7 @@ mod tests {
     #[test]
     fn help_overlay_is_consultable_mid_turn_without_disturbing_it() {
         let mut app = App::new();
-        app.update(Msg::TurnStarted);
+        app.update(turn_started());
         // Read-only: raising it during a live turn neither cancels nor queues.
         assert!(app.update(Msg::Key(key(KeyCode::F(1)))));
         assert!(app.help_open);
@@ -3406,7 +3566,7 @@ mod tests {
     #[test]
     fn ctrl_c_double_tap_cancels_a_running_turn_without_quitting() {
         let mut app = App::new();
-        app.update(Msg::TurnStarted);
+        app.update(turn_started());
         app.update(Msg::Key(ctrl_c()));
         assert!(!app.quit, "a running turn is not killed by one Ctrl+C");
         assert!(!app.take_cancel(), "first tap only arms");
@@ -3418,7 +3578,7 @@ mod tests {
     #[test]
     fn a_stray_key_disarms_the_cancel_double_tap() {
         let mut app = App::new();
-        app.update(Msg::TurnStarted);
+        app.update(turn_started());
         app.update(Msg::Key(ctrl_c()));
         app.update(Msg::Key(char_key('x')));
         app.update(Msg::Key(ctrl_c()));
@@ -3455,10 +3615,10 @@ mod tests {
         // A tool start rewrites the transient note ("tool 1: `bash`"); the
         // armed/cancelling hint must outlive it (KI-002).
         let mut app = App::new();
-        app.update(Msg::TurnStarted);
+        app.update(turn_started());
         app.update(Msg::Key(ctrl_c()));
         assert!(app.rendered_status_note().contains("again to cancel"));
-        app.update(Msg::Event(AgentEvent::ToolUse {
+        app.update(ev(AgentEvent::ToolUse {
             id: "1".into(),
             name: "bash".into(),
             input: "{}".into(),
@@ -3469,7 +3629,7 @@ mod tests {
         );
         app.update(Msg::Key(ctrl_c()));
         assert_eq!(app.rendered_status_note(), "cancelling turn…");
-        app.update(Msg::Event(AgentEvent::ToolUse {
+        app.update(ev(AgentEvent::ToolUse {
             id: "2".into(),
             name: "read_file".into(),
             input: "{}".into(),
@@ -3479,10 +3639,7 @@ mod tests {
             "cancelling turn…",
             "the cancelling note survives further stream events"
         );
-        app.update(Msg::TurnFinished {
-            ok: true,
-            note: "saved x".into(),
-        });
+        app.update(finished(true, "saved x"));
         assert_eq!(
             app.rendered_status_note(),
             "saved x",
@@ -3493,7 +3650,7 @@ mod tests {
     #[test]
     fn cancel_hint_disappears_when_the_double_tap_disarms() {
         let mut app = App::new();
-        app.update(Msg::TurnStarted);
+        app.update(turn_started());
         app.update(Msg::Key(ctrl_c()));
         assert!(app.rendered_status_note().contains("again to cancel"));
         app.update(Msg::Key(char_key('x')));
@@ -3507,7 +3664,7 @@ mod tests {
     #[test]
     fn escape_is_inert_while_a_turn_runs() {
         let mut app = App::new();
-        app.update(Msg::TurnStarted);
+        app.update(turn_started());
         app.update(Msg::Key(key(KeyCode::Esc)));
         assert!(!app.quit, "Esc must not abandon a running turn");
     }
@@ -3515,15 +3672,15 @@ mod tests {
     #[test]
     fn text_deltas_accumulate_then_message_stop_flushes_to_the_transcript() {
         let mut app = App::new();
-        app.update(Msg::TurnStarted);
-        app.update(Msg::Event(AgentEvent::TextDelta("he".into())));
-        app.update(Msg::Event(AgentEvent::TextDelta("llo".into())));
+        app.update(turn_started());
+        app.update(ev(AgentEvent::TextDelta("he".into())));
+        app.update(ev(AgentEvent::TextDelta("llo".into())));
         assert_eq!(app.assistant_buf, "hello", "deltas append");
         assert!(
             app.transcript.is_empty(),
             "not flushed until the segment ends"
         );
-        app.update(Msg::Event(AgentEvent::MessageStop));
+        app.update(ev(AgentEvent::MessageStop));
         assert!(app.assistant_buf.is_empty(), "flush clears the buffer");
         assert_eq!(app.transcript.len(), 1, "the segment lands as one line");
     }
@@ -3531,9 +3688,9 @@ mod tests {
     #[test]
     fn tool_use_flushes_text_then_result_clears_the_marker() {
         let mut app = App::new();
-        app.update(Msg::TurnStarted);
-        app.update(Msg::Event(AgentEvent::TextDelta("let me check".into())));
-        app.update(Msg::Event(AgentEvent::ToolUse {
+        app.update(turn_started());
+        app.update(ev(AgentEvent::TextDelta("let me check".into())));
+        app.update(ev(AgentEvent::ToolUse {
             id: "1".into(),
             name: "bash".into(),
             input: "{}".into(),
@@ -3544,7 +3701,7 @@ mod tests {
             1,
             "pending text flushed before the tool"
         );
-        app.update(Msg::Event(AgentEvent::ToolResult {
+        app.update(ev(AgentEvent::ToolResult {
             id: "1".into(),
             name: "bash".into(),
             output: "ok".into(),
@@ -3560,12 +3717,9 @@ mod tests {
     #[test]
     fn turn_finished_clears_the_active_state() {
         let mut app = App::new();
-        app.update(Msg::TurnStarted);
+        app.update(turn_started());
         assert!(app.turn_active);
-        app.update(Msg::TurnFinished {
-            ok: true,
-            note: "saved x".into(),
-        });
+        app.update(finished(true, "saved x"));
         assert!(!app.turn_active);
         assert_eq!(app.status_note, "saved x");
     }
@@ -3634,12 +3788,12 @@ mod tests {
     #[test]
     fn long_tool_output_collapses_and_tab_expands_it() {
         let mut app = App::new();
-        app.update(Msg::TurnStarted);
+        app.update(turn_started());
         let body = (0..20)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        app.update(Msg::Event(AgentEvent::ToolResult {
+        app.update(ev(AgentEvent::ToolResult {
             id: "1".into(),
             name: "bash".into(),
             output: body,
@@ -3658,7 +3812,7 @@ mod tests {
     #[test]
     fn short_tool_output_starts_expanded() {
         let mut app = App::new();
-        app.update(Msg::Event(AgentEvent::ToolResult {
+        app.update(ev(AgentEvent::ToolResult {
             id: "1".into(),
             name: "read_file".into(),
             output: "one\ntwo".into(),
@@ -3671,13 +3825,13 @@ mod tests {
     #[test]
     fn thinking_persists_folded_and_tab_expands_it() {
         let mut app = App::new();
-        app.update(Msg::TurnStarted);
+        app.update(turn_started());
         // Reasoning streams, then the answer, then the segment ends.
-        app.update(Msg::Event(AgentEvent::ThinkingDelta(
+        app.update(ev(AgentEvent::ThinkingDelta(
             "step one\nstep two\nstep three".into(),
         )));
-        app.update(Msg::Event(AgentEvent::TextDelta("the answer".into())));
-        app.update(Msg::Event(AgentEvent::MessageStop));
+        app.update(ev(AgentEvent::TextDelta("the answer".into())));
+        app.update(ev(AgentEvent::MessageStop));
         // Reasoning is process: it lands folded (one marker row) ahead of the
         // answer, so the real output is what stands out.
         assert!(
@@ -3722,9 +3876,9 @@ mod tests {
     fn fold_thinking_off_starts_reasoning_expanded() {
         let mut app = App::new();
         app.settings.fold_thinking = false;
-        app.update(Msg::TurnStarted);
-        app.update(Msg::Event(AgentEvent::ThinkingDelta("a\nb".into())));
-        app.update(Msg::Event(AgentEvent::MessageStop));
+        app.update(turn_started());
+        app.update(ev(AgentEvent::ThinkingDelta("a\nb".into())));
+        app.update(ev(AgentEvent::MessageStop));
         assert!(
             matches!(app.transcript[0], Item::Thinking { expanded: true, .. }),
             "fold_thinking = false opens reasoning inline"
@@ -3735,7 +3889,7 @@ mod tests {
     fn zero_tool_inline_lines_folds_even_short_output() {
         let mut app = App::new();
         app.settings.tool_inline_lines = 0;
-        app.update(Msg::Event(AgentEvent::ToolResult {
+        app.update(ev(AgentEvent::ToolResult {
             id: "1".into(),
             name: "read_file".into(),
             output: "one\ntwo".into(),
@@ -3809,7 +3963,7 @@ mod tests {
     #[test]
     fn a_running_turn_guards_section_switching() {
         let mut app = App::new();
-        app.update(Msg::TurnStarted);
+        app.update(turn_started());
         // Ctrl+PageDown is the default next-section chord; mid-turn the reducer
         // consumes it with a guard note instead of quitting or folding.
         let next = KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL);
@@ -4083,6 +4237,8 @@ mod loop_tests {
     #[derive(Clone, Debug, Default, PartialEq, Eq)]
     struct FrameSnapshot {
         turn_active: bool,
+        /// Which section the live turn belongs to (§11.4): `None` when idle.
+        running_section: Option<usize>,
         scroll_up: u16,
         sections: usize,
         transcript_len: usize,
@@ -4244,6 +4400,9 @@ mod loop_tests {
         frames: Vec<FrameSnapshot>,
         saves: usize,
         requests: Vec<ApiRequest>,
+        /// Terminal ledger of every section's queue after the loop ended
+        /// ("#id state text"), for asserting delivery outcomes (§11.4).
+        ledger: Vec<String>,
     }
 
     /// Run `orchestrate` against a live [`drive_loop`] on a `LocalSet`. The
@@ -4304,6 +4463,10 @@ mod loop_tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(FrameSnapshot {
                     turn_active: shell.section().turn_active,
+                    running_section: shell
+                        .sections
+                        .iter()
+                        .position(|section| section.turn_active),
                     scroll_up: shell.section().scroll_up,
                     sections: shell.sections.len(),
                     transcript_len: shell.section().transcript.len(),
@@ -4330,8 +4493,10 @@ mod loop_tests {
         // through it: the runner's bounded wait consumes the channel signal,
         // and the outcome must survive that.
         let outcome = Arc::new(Mutex::new(None));
+        let ledger_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let (done_tx, mut done_rx) = oneshot::channel::<()>();
         let recorded = Arc::clone(&outcome);
+        let recorded_ledger = Arc::clone(&ledger_out);
         let local = tokio::task::LocalSet::new();
         local.spawn_local(async move {
             let result = drive_loop(
@@ -4352,6 +4517,16 @@ mod loop_tests {
                 recording_saver,
             )
             .await;
+            // The shell drops with this task; snapshot its queue ledgers on
+            // the way out so tests can assert delivery outcomes (§11.4).
+            *recorded_ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = shell
+                .sections
+                .iter()
+                .flat_map(|section| section.model.queue().recent())
+                .map(|entry| format!("#{} {} {}", entry.id, entry.state.label(), entry.text))
+                .collect();
             *recorded
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
@@ -4386,11 +4561,16 @@ mod loop_tests {
                 .as_ref(),
             Some(Ok(()))
         );
+        let ledger = ledger_out
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         LoopReport {
             loop_ok,
             frames,
             saves: saves.load(Ordering::SeqCst),
             requests,
+            ledger,
         }
     }
 
@@ -4474,12 +4654,16 @@ mod loop_tests {
     }
 
     #[tokio::test]
-    async fn follow_ups_submitted_during_a_turn_merge_into_the_next_one() {
+    async fn follow_ups_submitted_during_a_turn_run_one_per_turn() {
+        // §11.4/D2.2: the TUI now delivers per entry (rotation granularity),
+        // not as one merged injection — each queued follow-up becomes its own
+        // turn in arrival order.
         let gate = Arc::new(Notify::new());
         let report = run_loop_test(
             vec![
                 ScriptEntry::gated(ScriptEntry::text("first"), gate),
                 ScriptEntry::immediate(ScriptEntry::text("second")),
+                ScriptEntry::immediate(ScriptEntry::text("third")),
             ],
             |controls| async move {
                 controls.submit_text("one");
@@ -4490,22 +4674,23 @@ mod loop_tests {
                     .wait_for(|frame| frame.turn_active && frame.status_note.contains("queued"))
                     .await;
                 controls.open_gate(0);
-                // First wait for turn two's TurnStarted to be *processed* (the
-                // "turn running" note): `turn_active` alone is reducer-lagged,
-                // and `requests` bumps the instant turn two's stream is called
-                // — the stale frame in between matches neither here.
+                // Each follow-up is its own turn; wait for the *last* one to
+                // settle (queue then empty, nothing left for the rotation to
+                // stage) before quitting.
+                for expected in [2usize, 3] {
+                    controls
+                        .wait_for(move |frame| frame.requests == expected)
+                        .await;
+                }
                 controls
-                    .wait_for(|frame| {
-                        frame.turn_active
-                            && frame.requests == 2
-                            && frame.status_note.contains("turn running")
-                    })
+                    .wait_for(|frame| frame.requests == 3 && frame.running_section.is_none())
                     .await;
-                // Then wait for turn two's own TurnFinished to surface.
-                controls
-                    .wait_for(|frame| !frame.turn_active && frame.status_note.contains("saved"))
-                    .await;
-                controls.interrupt();
+                // Robust exit: whatever is live gets cancelled, then the idle
+                // press quits.
+                for _ in 0..3 {
+                    controls.interrupt();
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
             },
         )
         .await;
@@ -4514,22 +4699,25 @@ mod loop_tests {
             "the loop did not exit cleanly; frames: {:?}",
             report.frames
         );
-        assert_eq!(report.saves, 2, "both turns persisted");
-        assert_eq!(report.requests.len(), 2, "both turns ran");
+        assert_eq!(report.saves, 3, "three turns persisted");
+        assert_eq!(report.requests.len(), 3, "one turn per follow-up");
         assert!(
             request_texts(&report.requests[0])
                 .iter()
                 .any(|text| text.contains("one")),
             "the first turn ran the first submit"
         );
-        let merged = request_texts(&report.requests[1]);
         assert!(
-            merged.iter().any(|text| text.contains("two")),
-            "the second turn carries the first follow-up: {merged:?}"
+            request_texts(&report.requests[1])
+                .iter()
+                .any(|text| text.contains("two") && !text.contains("three")),
+            "the second turn is the first follow-up alone"
         );
         assert!(
-            merged.iter().any(|text| text.contains("three")),
-            "the second turn carries the second follow-up: {merged:?}"
+            request_texts(&report.requests[2])
+                .iter()
+                .any(|text| text.contains("three")),
+            "the third turn is the second follow-up"
         );
     }
 
@@ -4772,23 +4960,30 @@ mod loop_tests {
     }
 
     #[tokio::test]
-    async fn section_navigation_is_blocked_while_a_turn_is_live() {
+    async fn section_navigation_works_while_a_turn_is_live() {
+        // §11.4 lifted the idle-only nav block: with section-tagged routing a
+        // live turn never depends on which section is on screen, so switching
+        // mid-turn must work and the turn must keep running in its section.
         let gate = Arc::new(Notify::new());
         let report = run_loop_test(
             vec![ScriptEntry::gated(ScriptEntry::text("late"), gate)],
             |controls| async move {
                 controls.submit_text("hi");
-                controls.wait_for(|frame| frame.turn_active).await;
-                // Ctrl+PageDown is NextSection; mid-turn it must be consumed
-                // with a guard note, never performed.
-                controls.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL));
                 controls
-                    .wait_for(|frame| {
-                        frame.turn_active && frame.status_note.contains("finish or cancel")
-                    })
+                    .wait_for(|frame| frame.running_section == Some(0))
                     .await;
+                // Ctrl+PageDown is NextSection: mid-turn it must switch.
+                controls.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL));
+                // Single section: NextSection wraps to itself, so prove the
+                // path by opening a second section instead (Ctrl+T).
+                controls.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+                controls.wait_for(|frame| frame.sections == 2).await;
+                // The turn is still running in section 0 while section 1 is
+                // on screen; releasing the gate settles it there.
                 controls.open_gate(0);
-                controls.wait_for(|frame| !frame.turn_active).await;
+                controls
+                    .wait_for(|frame| frame.running_section.is_none())
+                    .await;
                 controls.interrupt();
             },
         )
@@ -4800,8 +4995,138 @@ mod loop_tests {
         );
         assert_eq!(report.saves, 1);
         assert!(
-            report.frames.iter().all(|frame| frame.sections == 1),
-            "no section was switched mid-turn"
+            report
+                .frames
+                .iter()
+                .any(|frame| frame.sections == 2 && frame.running_section == Some(0)),
+            "the turn kept running in its section after the switch"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_work_rotates_into_a_background_section() {
+        // The §11.4 headline: work queued in section 1 keeps running (one
+        // entry per turn, round-robin) while the operator has switched to
+        // section 2.
+        let first_gate = Arc::new(Notify::new());
+        let second_gate = Arc::new(Notify::new());
+        let report = run_loop_test(
+            vec![
+                ScriptEntry::gated(ScriptEntry::text("first"), first_gate),
+                ScriptEntry::gated(ScriptEntry::text("queued reply"), second_gate),
+            ],
+            |controls| async move {
+                controls.submit_text("go");
+                controls
+                    .wait_for(|frame| frame.running_section == Some(0))
+                    .await;
+                controls.submit_text("follow-up work");
+                controls
+                    .wait_for(|frame| frame.status_note.contains("queued"))
+                    .await;
+                // Turn one settles; the rotation stages the queued entry as
+                // turn two in section 0 — parked on its own gate.
+                controls.open_gate(0);
+                controls
+                    .wait_for(|frame| frame.running_section == Some(0) && frame.requests == 2)
+                    .await;
+                // Switch to a fresh section while the background turn runs.
+                controls.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+                controls.wait_for(|frame| frame.sections == 2).await;
+                // Release the background turn: it settles in section 0 while
+                // section 1 is on screen.
+                controls.open_gate(1);
+                controls
+                    .wait_for(|frame| frame.running_section.is_none())
+                    .await;
+                controls.interrupt();
+            },
+        )
+        .await;
+        assert!(
+            report.loop_ok,
+            "the loop did not exit cleanly; frames: {:?}",
+            report.frames
+        );
+        assert_eq!(report.requests.len(), 2);
+        assert_eq!(report.saves, 2);
+        assert!(
+            request_texts(&report.requests[1])
+                .iter()
+                .any(|text| text.contains("follow-up work")),
+            "the rotation delivered the queued entry verbatim"
+        );
+        assert!(
+            report
+                .ledger
+                .iter()
+                .any(|row| row.contains("delivered") && row.contains("follow-up work")),
+            "the ledger terminalizes the rotation delivery: {:?}",
+            report.ledger
+        );
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_queue_entry_fails_after_one_retry() {
+        // The rotation is automatic, so a failing entry must not retry
+        // forever: one automatic re-queue, then the second consecutive
+        // failure files the entry as `Failed` in the ledger.
+        let gate = Arc::new(Notify::new());
+        let report = run_loop_test(
+            vec![ScriptEntry::gated(ScriptEntry::text("ok"), gate)],
+            |controls| async move {
+                controls.submit_text("go");
+                controls
+                    .wait_for(|frame| frame.running_section == Some(0))
+                    .await;
+                // The follow-up has no script left: its turn fails (empty
+                // stream), twice in a row.
+                controls.submit_text("poison");
+                controls
+                    .wait_for(|frame| frame.status_note.contains("queued"))
+                    .await;
+                controls.open_gate(0);
+                // Turn one settles, the poison entry runs and fails, is
+                // re-queued, fails again, and terminalizes. Requests stop at
+                // 2 (the good turn + the first poison attempt... plus the
+                // retry = 3 total API calls).
+                for expected in [2usize, 3] {
+                    controls
+                        .wait_for(move |frame| frame.requests == expected)
+                        .await;
+                }
+                // Nothing left to run: idle again.
+                controls
+                    .wait_for(|frame| frame.running_section.is_none())
+                    .await;
+                controls.interrupt();
+            },
+        )
+        .await;
+        assert!(
+            report.loop_ok,
+            "the loop did not exit cleanly; frames: {:?}",
+            report.frames
+        );
+        assert_eq!(
+            report.requests.len(),
+            3,
+            "one good turn, then exactly two attempts at the poisoned entry"
+        );
+        assert!(
+            report
+                .ledger
+                .iter()
+                .any(|row| row.contains("failed") && row.contains("poison")),
+            "the second consecutive failure terminalizes as Failed: {:?}",
+            report.ledger
+        );
+        assert!(
+            !report
+                .ledger
+                .iter()
+                .any(|row| row.contains("pending") && row.contains("poison")),
+            "the poisoned entry never lingers as pending"
         );
     }
 
