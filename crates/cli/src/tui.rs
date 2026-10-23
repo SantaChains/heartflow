@@ -2525,11 +2525,29 @@ where
                 // (a live turn blocks this phase) and restore + re-queue rather
                 // than dropping the input if they ever fire.
                 let Some(runtime) = runtimes[active].take() else {
+                    // The rotation's entry was already taken out of the
+                    // section queue; a plain input push-back would lose it
+                    // between ledgers. Restore it to the front so the next
+                    // pickup retakes it.
+                    if let Some(entry) = turn_entry.take() {
+                        shell
+                            .section_index_mut(active)
+                            .model
+                            .queue_mut()
+                            .requeue_front(entry);
+                    }
                     queue.push_front(input);
                     continue;
                 };
                 let Some(turn_prompter) = prompter.take() else {
                     runtimes[active] = Some(runtime);
+                    if let Some(entry) = turn_entry.take() {
+                        shell
+                            .section_index_mut(active)
+                            .model
+                            .queue_mut()
+                            .requeue_front(entry);
+                    }
                     queue.push_front(input);
                     continue;
                 };

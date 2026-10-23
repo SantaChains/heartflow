@@ -204,19 +204,29 @@ fn job_dir(root: &Path, id: u64) -> PathBuf {
 fn persist(root: &Option<PathBuf>, id: u64, status_json: &str) {
     let Some(root) = root else { return };
     let dir = job_dir(root, id);
-    if std::fs::create_dir_all(&dir).is_err() {
+    persist_status_at(&dir.join("status.json"), status_json);
+}
+
+/// Locked temp+rename write of one `status.json`, usable from any path (the
+/// rotation/reconcile writers included — a bare `fs::write` here used to be
+/// able to leave a torn file that then breaks the next reconciliation).
+fn persist_status_at(final_path: &Path, status_json: &str) {
+    let Some(dir) = final_path.parent() else {
+        DISK_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
         DISK_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let final_path = dir.join("status.json");
-    let tmp_path = dir.join("status.json.tmp");
+    let tmp_path = final_path.with_extension("json.tmp");
     let write = || -> std::io::Result<()> {
         std::fs::write(&tmp_path, status_json)?;
-        let _ = std::fs::remove_file(&final_path);
-        std::fs::rename(&tmp_path, &final_path)
+        let _ = std::fs::remove_file(final_path);
+        std::fs::rename(&tmp_path, final_path)
     };
     match crate::filelock::with_exclusive(
-        &crate::filelock::lock_path(&final_path),
+        &crate::filelock::lock_path(final_path),
         crate::filelock::DEFAULT_LOCK_TIMEOUT,
         write,
     ) {
@@ -786,7 +796,13 @@ pub fn reconcile_stale_records() -> usize {
             )
         });
         if let Ok(json) = serde_json::to_string_pretty(&record) {
-            if std::fs::write(&status_path, json).is_ok() {
+            persist_status_at(&status_path, &json);
+            // The helper counts failures on the same doctor-visible counter;
+            // a successful rewrite repairs exactly one record.
+            if std::fs::read_to_string(&status_path)
+                .map(|text| text == json)
+                .unwrap_or(false)
+            {
                 repaired += 1;
             }
         }
