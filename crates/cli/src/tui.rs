@@ -145,13 +145,39 @@ impl PendingPermission {
     }
 }
 
+/// The queue panel's live state (§11.1 P-C): just the selected row — the rows
+/// themselves are read live from the follow-up queue, so a settle-time drain
+/// can never leave the panel pointing at stale data. Rendered by
+/// [`render_queue_overlay`], driven by [`App::queue_panel_key`].
+struct QueuePanel {
+    selected: usize,
+}
+
+impl QueuePanel {
+    fn new() -> Self {
+        Self { selected: 0 }
+    }
+
+    /// Keep the selection on a live row after any mutation that may have
+    /// shrunk the queue.
+    fn clamp(&mut self, len: usize) {
+        if len == 0 {
+            self.selected = 0;
+        } else {
+            self.selected = self.selected.min(len - 1);
+        }
+    }
+}
+
 /// The guide overlay's live state: the next-task text captured from the input
-/// and the assembled draft preview. Rendered by [`render_guide_overlay`],
-/// confirmed by [`App::guide_key`]. The draft is built once at open time from
-/// the [`GuideContext`] snapshot, so what is previewed is exactly what is sent.
+/// and the assembled draft in an **editable** editor (T6 two-column confirm).
+/// The draft is built once at open time from the [`GuideContext`] snapshot;
+/// whatever the editor holds at confirm time is exactly what is sent.
 struct PendingGuide {
     task: String,
-    draft: String,
+    /// The draft body, editable inside the overlay: confirm sends *this*
+    /// text, not the originally assembled one.
+    editor: TextArea<'static>,
 }
 
 /// Full-screen permission prompter. Instead of grabbing the terminal with
@@ -274,6 +300,9 @@ pub(crate) struct App {
     /// (not an `Option`) because the overlay has no payload: it renders straight
     /// from the live keymap, so it always shows the current bindings.
     help_open: bool,
+    /// Live queue panel, if the operator is inspecting/editing the pending
+    /// follow-ups (§11.1 P-C).
+    queue_panel: Option<QueuePanel>,
     /// Resolved key bindings: defaults plus layered `keymap.toml` overrides.
     /// Held on the model rather than a process-wide singleton so a turn-boundary
     /// hot-reload can swap it without unsafe global state.
@@ -344,6 +373,7 @@ impl App {
             permission_choice: None,
             guide: None,
             help_open: false,
+            queue_panel: None,
             keymap,
             history: History::empty(),
             history_path: PathBuf::new(),
@@ -382,9 +412,11 @@ impl App {
             }
             Msg::PermissionRequest(request) => {
                 self.scroll_up = 0;
-                // A pending approval supersedes guide editing; drop that overlay
-                // so it cannot stay stuck behind the permission popup.
+                // A pending approval supersedes guide editing and the queue
+                // panel; drop those overlays so they cannot stay stuck
+                // behind the permission popup.
                 self.guide = None;
+                self.queue_panel = None;
                 self.permission = Some(PendingPermission::new(request));
                 self.status_note =
                     String::from("permission requested · ↑/↓ select · Enter confirm · Esc deny");
@@ -412,6 +444,11 @@ impl App {
         // it, and only its own close keys dismiss it.
         if self.help_open {
             return self.help_key(key);
+        }
+        // The queue panel is modal while open (§11.1 P-C): it owns the keys
+        // so navigation/edit chords never leak into the editor behind it.
+        if self.queue_panel.is_some() {
+            return self.queue_panel_key(key);
         }
         // A modified Enter (shift/alt) inserts a line instead of submitting,
         // mirroring the REPL editor's "bare Enter sends, Shift/Alt+Enter
@@ -475,6 +512,12 @@ impl App {
                 self.open_guide();
                 true
             }
+            // Toggle the pending-queue panel. Safe mid-turn: queue mutations
+            // only matter at the settle boundary, never to the live turn.
+            Some(Action::QueuePanel) => {
+                self.toggle_queue_panel();
+                true
+            }
             // Raise the read-only key reference. It changes no conversation
             // state, so unlike section navigation it is not gated on
             // `turn_active` — the operator can consult it mid-turn.
@@ -523,7 +566,12 @@ impl App {
     /// overlay swallows paste exactly as it swallows keys, so a stray block can
     /// never reach the editor behind it.
     fn on_paste(&mut self, text: String) -> bool {
-        if self.permission.is_some() || self.guide.is_some() || self.help_open {
+        // The guide overlay's draft editor takes the paste (T6); the other
+        // modal overlays swallow it exactly as they swallow keys.
+        if let Some(pending) = &mut self.guide {
+            return pending.editor.insert_str(text);
+        }
+        if self.permission.is_some() || self.help_open || self.queue_panel.is_some() {
             return false;
         }
         self.input.insert_str(text)
@@ -694,18 +742,30 @@ impl App {
             self.status_note = String::from("type the next task first, then Ctrl+G to guide it");
             return;
         }
+        // T6 two-column confirm: the draft loads into an editable editor, so
+        // the operator can reshape the assembled injection before sending —
+        // what the editor holds at confirm time is exactly what is sent.
         let draft = guide_draft(&self.guide_context, trimmed);
+        let mut editor = TextArea::from(draft.split('\n').map(str::to_string).collect::<Vec<_>>());
+        editor.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" draft · edit freely · Enter sends ")
+                .border_style(Style::default().fg(Theme::current().accent().ratatui())),
+        );
         self.guide = Some(PendingGuide {
             task: trimmed.to_string(),
-            draft,
+            editor,
         });
-        self.status_note = String::from("guide draft ready · Enter sends · Esc keeps editing");
+        self.status_note =
+            String::from("guide draft ready · edit · Enter sends · Esc keeps the task");
     }
 
-    /// Keys while the guide overlay is raised. Enter confirms (routes the draft
-    /// as a submission, clearing the input); Esc or Ctrl+C cancels and leaves
-    /// the task in the input for editing. Any other key is swallowed so stray
-    /// input cannot reach the editor behind the overlay.
+    /// Keys while the guide overlay is raised. Enter confirms (routes the
+    /// *edited* draft as a submission, clearing the input); Esc or Ctrl+C
+    /// cancels and leaves the task in the input for editing. Every other key
+    /// edits the draft in place (T6), so stray input never reaches the editor
+    /// behind the overlay.
     fn guide_key(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c')) {
@@ -716,12 +776,16 @@ impl App {
         if key.code == KeyCode::Enter {
             if let Some(pending) = self.guide.take() {
                 let label = format!("guide: {}", pending.task);
+                let body = pending.editor.lines().join("\n");
                 self.input = editor(&self.keymap);
-                self.route_submission(&label, pending.draft);
+                self.route_submission(&label, body);
             }
             return true;
         }
-        false
+        match &mut self.guide {
+            Some(pending) => pending.editor.input(tui_input(key)),
+            None => false,
+        }
     }
 
     /// Keys while the key-reference overlay is raised. Esc or the help binding
@@ -737,6 +801,139 @@ impl App {
             return true;
         }
         false
+    }
+
+    /// Toggle the queue panel (§11.1 P-C). Opening on an empty queue hints
+    /// instead, so the chord teaches rather than pops a dead panel.
+    fn toggle_queue_panel(&mut self) {
+        if self.queue_panel.is_some() {
+            self.queue_panel = None;
+            self.status_note = String::from("queue panel closed");
+            return;
+        }
+        if self.model.queue().is_empty() {
+            self.status_note = String::from("queue is empty · submits during a turn queue here");
+            return;
+        }
+        self.queue_panel = Some(QueuePanel::new());
+        self.status_note =
+            String::from("queue panel · ↑/↓ select · e edit · x withdraw · +/- reorder · l lane");
+    }
+
+    /// Keys while the queue panel is raised. The rows are the *live* pending
+    /// queue; every mutation re-clamps the selection so it always sits on a
+    /// real entry. Swallows every key so chords never reach the editor.
+    fn queue_panel_key(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let closes = key.code == KeyCode::Esc
+            || (ctrl && key.code == KeyCode::Char('c'))
+            || matches!(self.keymap.resolve(&key), Some(Action::QueuePanel));
+        if closes {
+            self.queue_panel = None;
+            self.status_note = String::from("queue panel closed");
+            return true;
+        }
+        let len = self.model.queue().len();
+        let selected_id = match self.queue_panel.as_ref() {
+            Some(panel) => self
+                .model
+                .queue()
+                .items()
+                .get(panel.selected.min(len.saturating_sub(1)))
+                .map(|entry| entry.id),
+            // Only `on_key` calls here with the panel raised; treat any other
+            // entry as a no-op rather than inventing a selection.
+            None => None,
+        };
+        let Some(id) = selected_id else {
+            // The queue drained underneath the panel (settle-time delivery);
+            // there is nothing left to edit.
+            self.queue_panel = None;
+            self.status_note = String::from("queue drained · panel closed");
+            return true;
+        };
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(panel) = &mut self.queue_panel {
+                    panel.selected = panel.selected.saturating_sub(1);
+                }
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(panel) = &mut self.queue_panel {
+                    panel.selected = (panel.selected + 1).min(len.saturating_sub(1));
+                }
+                true
+            }
+            // Edit: pull the entry out and park its text in the input editor
+            // for rework (D2.4 "取出回输入框回炉").
+            KeyCode::Enter | KeyCode::Char('e') => {
+                if let Some(text) = self.model.queue_mut().withdraw(id) {
+                    self.input = editor_with_text(&self.keymap, &text);
+                    self.status_note = format!("entry #{id} back in the input · edit and resend");
+                }
+                self.close_panel_if_empty();
+                true
+            }
+            // Withdraw without the round trip to the input (the ledger keeps
+            // the text visible under the panel's recent section).
+            KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('x') | KeyCode::Char('d') => {
+                if self.model.queue_mut().withdraw(id).is_some() {
+                    self.status_note = format!("entry #{id} withdrawn");
+                }
+                self.close_panel_if_empty();
+                true
+            }
+            // Reorder towards earlier / later delivery.
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                self.model.queue_mut().move_entry(id, true);
+                self.panel_clamp();
+                true
+            }
+            KeyCode::Char('-') | KeyCode::Char('_') => {
+                self.model.queue_mut().move_entry(id, false);
+                self.panel_clamp();
+                true
+            }
+            // Re-lane: cycle main → existing lanes (D2.4 改派). New lanes are
+            // born via `/queue send --lane`; the panel can only move an entry
+            // among lanes that already exist.
+            KeyCode::Char('l') => {
+                let mut lanes = vec![crate::core::MAIN_LANE.to_string()];
+                lanes.extend(self.model.queue().lane_names());
+                let current = self
+                    .model
+                    .queue()
+                    .items()
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .map(|entry| entry.lane.clone())
+                    .unwrap_or_else(|| crate::core::MAIN_LANE.to_string());
+                let next = match lanes.iter().position(|lane| *lane == current) {
+                    Some(index) => lanes[(index + 1) % lanes.len()].clone(),
+                    None => lanes[0].clone(),
+                };
+                if self.model.queue_mut().reassign_lane(id, &next) {
+                    self.status_note = format!("entry #{id} → lane {next}");
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn close_panel_if_empty(&mut self) {
+        if self.model.queue().is_empty() {
+            self.queue_panel = None;
+        } else {
+            self.panel_clamp();
+        }
+    }
+
+    fn panel_clamp(&mut self) {
+        if let Some(panel) = &mut self.queue_panel {
+            panel.clamp(self.model.queue().len());
+        }
     }
 
     /// The pure `AgentEvent -> transcript` reducer. This is the heart of the
@@ -1597,17 +1794,32 @@ fn view(app: &App, area: Rect, frame: &mut Frame, context_window: Option<usize>)
     }
     let queued = app.model.queue().len();
     if queued > 0 {
+        // Split the count by delivery mode (§11.1 P-C): a steer in flight is
+        // a different promise than a follow-up waiting its turn.
+        let steering = app
+            .model
+            .queue()
+            .items()
+            .iter()
+            .filter(|entry| entry.mode == crate::core::DeliveryMode::Steer)
+            .count();
+        let label = if steering > 0 {
+            format!("  [{} queued · {} steering]", queued - steering, steering)
+        } else {
+            format!("  [{queued} queued]")
+        };
         status_spans.push(Span::styled(
-            format!("  [{queued} queued]"),
+            label,
             Style::default().fg(theme.accent().ratatui()),
         ));
     }
     frame.render_widget(Line::from(status_spans), areas[2]);
 
     // Overlays float above every region. Layering, bottom to top: the read-only
-    // key reference, then the guide draft, then the permission popup, so an
-    // approval always wins the topmost layer.
+    // key reference, then the queue panel, then the guide draft, then the
+    // permission popup, so an approval always wins the topmost layer.
     render_help_overlay(app, frame);
+    render_queue_overlay(app, frame);
     render_guide_overlay(app, frame);
     render_permission_overlay(app, frame);
 }
@@ -1680,17 +1892,17 @@ fn render_permission_overlay(app: &App, frame: &mut Frame) {
     );
 }
 
-/// Draw the centered guide preview while the operator confirms a next-task
-/// draft. The body is the exact text [`App::guide_key`] sends on Enter, so the
-/// preview never lies about the injection. Wider than the permission popup
-/// because a three-part draft is meant to be read before it is sent.
+/// Draw the centered guide confirm while the operator shapes a next-task
+/// draft. T6 two-column view: the left column keeps the task and the assembly
+/// note; the right column is the **editable** draft editor — what it holds at
+/// confirm time is exactly what [`App::guide_key`] sends.
 fn render_guide_overlay(app: &App, frame: &mut Frame) {
     let Some(pending) = &app.guide else {
         return;
     };
     let theme = Theme::current();
     let area = frame.area();
-    let width = (area.width * 3 / 4).clamp(40, 100).min(area.width);
+    let width = (area.width * 3 / 4).clamp(50, 110).min(area.width);
     let height = 16u16.min(area.height);
     let x = area.x + (area.width.saturating_sub(width) / 2);
     let y = area.y + (area.height.saturating_sub(height) / 2);
@@ -1702,32 +1914,130 @@ fn render_guide_overlay(app: &App, frame: &mut Frame) {
     };
     frame.render_widget(Clear, popup);
 
-    let mut lines = vec![Line::from(Span::styled(
-        "guide · next task (zero-token draft)",
-        Style::default()
-            .fg(theme.accent().ratatui())
-            .add_modifier(Modifier::BOLD),
-    ))];
-    for line in pending.draft.lines() {
-        lines.push(Line::from(Span::styled(
-            line.to_string(),
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+        .split(Rect {
+            x: popup.x + 1,
+            y: popup.y + 1,
+            width: popup.width.saturating_sub(2),
+            height: popup.height.saturating_sub(2),
+        });
+    let mut left = vec![
+        Line::from(Span::styled(
+            "guide · next task",
+            Style::default()
+                .fg(theme.accent().ratatui())
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            pending.task.clone(),
             Style::default().fg(theme.muted().ratatui()),
-        )));
-    }
-    lines.push(Line::from(""));
-    // The confirm keys are hardcoded (Enter/Esc), not keymap-driven, so the
-    // footer states them literally rather than through `hint_for`.
-    lines.push(Line::from(Span::styled(
-        "Enter sends · Esc keeps editing · queued behind a running turn",
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "the draft was assembled from the work log, the current state and the task; edit the right column freely — Enter sends it as-is.",
+            Style::default().fg(theme.muted().ratatui()).add_modifier(Modifier::DIM),
+        )),
+    ];
+    left.push(Line::from(""));
+    left.push(Line::from(Span::styled(
+        "Enter sends · Esc keeps the task · queued behind a running turn",
         Style::default().fg(theme.accent().ratatui()),
     )));
+    frame.render_widget(
+        Paragraph::new(Text::from(left)).wrap(Wrap { trim: true }),
+        columns[0],
+    );
+    frame.render_widget(&pending.editor, columns[1]);
+    // A border around the whole popup gives the two columns one shared frame.
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" guide ")
         .border_style(Style::default().fg(theme.accent().ratatui()));
+    frame.render_widget(block, popup);
+}
+
+/// Draw the centered queue panel (§11.1 P-C): the live pending queue with the
+/// selected row highlighted, plus the editing keys. Rows are read at render
+/// time, so a settle-time delivery cannot leave the panel showing ghosts.
+fn render_queue_overlay(app: &App, frame: &mut Frame) {
+    let Some(panel) = &app.queue_panel else {
+        return;
+    };
+    let theme = Theme::current();
+    let area = frame.area();
+    let entries = app.model.queue().items();
+    let rows = entries.len().max(1);
+    // Title + one line per entry + a blank + the footer + two borders.
+    let height = (rows as u16 + 5).min(area.height);
+    let width = (area.width * 3 / 4).clamp(50, 110).min(area.width);
+    let x = area.x + (area.width.saturating_sub(width) / 2);
+    let y = area.y + (area.height.saturating_sub(height) / 2);
+    let popup = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            "pending queue · {} (oldest first) · recent ledger {}",
+            entries.len(),
+            app.model.queue().recent().len()
+        ),
+        Style::default()
+            .fg(theme.accent().ratatui())
+            .add_modifier(Modifier::BOLD),
+    ))];
+    for (index, entry) in entries.iter().enumerate() {
+        let selected = index == panel.selected.min(entries.len().saturating_sub(1));
+        let mode = if entry.mode == crate::core::DeliveryMode::Steer {
+            " ·steer"
+        } else {
+            ""
+        };
+        let lane = if entry.lane == crate::core::MAIN_LANE {
+            String::new()
+        } else {
+            format!(" @{}", entry.lane)
+        };
+        let text: String = entry.text.chars().take(90).collect();
+        let row = format!(
+            "{}#{} [{}{lane}{mode}] {text}",
+            if selected { "❯ " } else { "  " },
+            entry.id,
+            entry.source.label()
+        );
+        let style = if selected {
+            Style::default()
+                .fg(theme.accent().ratatui())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.muted().ratatui())
+        };
+        lines.push(Line::from(Span::styled(row, style)));
+    }
+    if entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(empty)",
+            Style::default().fg(theme.muted().ratatui()),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ select · e edit in input · x withdraw · +/- reorder · l re-lane · Esc close",
+        Style::default().fg(theme.accent().ratatui()),
+    )));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" queue ")
+        .border_style(Style::default().fg(theme.accent().ratatui()));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .wrap(Wrap { trim: true })
+            .wrap(Wrap { trim: false })
             .block(block),
         popup,
     );
@@ -2758,12 +3068,13 @@ mod tests {
         assert!(app.update(Msg::Key(ctrl_g())), "Ctrl+G opens the overlay");
         let pending = app.guide.as_ref().expect("guide open");
         assert_eq!(pending.task, "next step");
+        let draft = pending.editor.lines().join("\n");
         assert!(
-            pending.draft.contains("[guide: next task]\nnext step"),
+            draft.contains("[guide: next task]\nnext step"),
             "the task lands last in the draft"
         );
         assert!(
-            pending.draft.contains("user: did a thing"),
+            draft.contains("user: did a thing"),
             "the snapshot's work log rides along"
         );
     }
@@ -2836,6 +3147,109 @@ mod tests {
             "draft me",
             "the task survives a cancel for further editing"
         );
+    }
+
+    #[test]
+    fn guide_draft_is_editable_before_confirming() {
+        // T6: the confirm overlay edits the draft in place; Enter sends the
+        // edited body, not the assembled original.
+        let mut app = App::new();
+        for c in "ship it".chars() {
+            app.update(Msg::Key(char_key(c)));
+        }
+        app.update(Msg::Key(ctrl_g()));
+        assert!(app.guide.is_some(), "overlay open");
+        // Edit inside the overlay: type a marker at the draft's head.
+        for c in "EDIT:".chars() {
+            app.update(Msg::Key(char_key(c)));
+        }
+        app.update(Msg::Key(key(KeyCode::Enter)));
+        let body = app.take_submit().expect("edited draft staged");
+        assert!(
+            body.starts_with("EDIT:"),
+            "the edited text leads the sent body: {body:?}"
+        );
+        assert!(
+            body.contains("ship it"),
+            "the untouched rest of the draft survives the edit"
+        );
+    }
+
+    #[test]
+    fn queue_panel_edits_withdraws_reorders_and_relanes() {
+        let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        let mut app = App::new();
+        // Opening on an empty queue hints instead of popping a dead panel.
+        app.update(Msg::Key(ctrl_q));
+        assert!(app.queue_panel.is_none());
+        assert!(app.status_note.contains("queue is empty"));
+
+        app.model.begin_turn();
+        app.update(Msg::TurnStarted);
+        app.model
+            .queue_mut()
+            .send("aa", crate::core::QueueSource::User);
+        app.model
+            .queue_mut()
+            .send_in_lane("review", "bb", crate::core::QueueSource::Guide);
+        app.model
+            .queue_mut()
+            .send("cc", crate::core::QueueSource::User);
+
+        // Open, walk down to bb (#2), and re-lane it into main.
+        app.update(Msg::Key(ctrl_q));
+        assert!(app.queue_panel.is_some());
+        app.update(Msg::Key(key(KeyCode::Down)));
+        app.update(Msg::Key(char_key('l')));
+        assert!(
+            app.status_note.contains("#2 → lane main"),
+            "the cycle moved bb out of review: {}",
+            app.status_note
+        );
+        // Select cc (#3) and move it one slot earlier; the selection follows
+        // the index, so it now points at bb.
+        app.update(Msg::Key(key(KeyCode::Down)));
+        app.update(Msg::Key(char_key('+')));
+        assert_eq!(
+            app.model.queue().items()[1].text,
+            "cc",
+            "reorder moved cc ahead of bb"
+        );
+        // Withdraw the selected entry (bb): the ledger terminalizes it.
+        app.update(Msg::Key(char_key('x')));
+        assert_eq!(app.model.queue().len(), 2);
+        assert!(app
+            .model
+            .queue()
+            .recent()
+            .iter()
+            .any(|entry| entry.text == "bb"
+                && entry.state == crate::core::QueueEntryState::Withdrawn));
+        // Edit pulls the selected entry (clamped onto cc) back into the
+        // input for rework; the panel stays open with one row left.
+        app.update(Msg::Key(key(KeyCode::Down)));
+        app.update(Msg::Key(char_key('e')));
+        assert!(app.queue_panel.is_some());
+        assert_eq!(app.input.lines().join("\n"), "cc");
+        // Close: the remaining entry stays queued.
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert!(app.queue_panel.is_none());
+        assert_eq!(app.model.queue().len(), 1);
+    }
+
+    #[test]
+    fn queue_panel_closes_when_the_last_entry_leaves() {
+        let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        let mut app = App::new();
+        app.model.begin_turn();
+        app.model
+            .queue_mut()
+            .send("only", crate::core::QueueSource::User);
+        app.update(Msg::Key(ctrl_q));
+        assert!(app.queue_panel.is_some());
+        app.update(Msg::Key(char_key('x')));
+        assert!(app.queue_panel.is_none(), "no rows left, panel closes");
+        assert!(app.model.queue().is_empty());
     }
 
     #[test]
@@ -4314,6 +4728,47 @@ mod loop_tests {
             "the unconsumed steer becomes the next turn: {:?}",
             request_texts(&report.requests[1])
         );
+    }
+
+    #[tokio::test]
+    async fn a_withdrawn_queue_entry_never_runs() {
+        // §11.1 P-C at loop level: a follow-up queued mid-turn can be
+        // withdrawn through the panel before the settle boundary — it must
+        // never reach the provider.
+        let gate = Arc::new(Notify::new());
+        let report = run_loop_test(
+            vec![ScriptEntry::gated(ScriptEntry::text("first reply"), gate)],
+            |controls| async move {
+                controls.submit_text("go");
+                controls.wait_for(|frame| frame.turn_active).await;
+                controls.submit_text("extra work");
+                controls
+                    .wait_for(|frame| frame.turn_active && frame.status_note.contains("queued"))
+                    .await;
+                // Open the panel (Ctrl+Q), withdraw the selected entry, close.
+                controls.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+                controls.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+                controls.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                controls.open_gate(0);
+                controls
+                    .wait_for(|frame| !frame.turn_active && frame.status_note.contains("saved"))
+                    .await;
+                controls.interrupt();
+            },
+        )
+        .await;
+        assert!(
+            report.loop_ok,
+            "the loop did not exit cleanly; frames: {:?}",
+            report.frames
+        );
+        assert_eq!(
+            report.requests.len(),
+            1,
+            "the withdrawn follow-up never ran: {:?}",
+            report.requests.len()
+        );
+        assert_eq!(report.saves, 1);
     }
 
     #[tokio::test]

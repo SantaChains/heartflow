@@ -207,7 +207,7 @@ pub struct QueueSet {
 - **队列命名泳道（2026-10-22 批次，D2.1 数据结构半边）**：`QueueEntry.lane` 标签 + `send_in_lane`/`lane_names`/`items_in_lane`；REPL `/queue send --lane <name>`、`/queue lane <name>`、列表 `@name` 标注。**纪律：泳道是观测与编辑维度，递送仍是全局到达序**——跨泳道轮转规则需要 TUI 侧（P-C）才有意义，离线拍脑袋定轮转属猜测。
 **落地状态（2026-10-21 第二批网络核验，Qoder 官方文档对照）**：Qoder 官方「排队 vs 插话」二分（docs.qoder.com conversation-input）与本仓 `FollowUp` vs `Steer`（P-D）**语义同构**——插话「在安全执行边界交给 Agent，不直接停止当前执行」正是本仓「明确不做强插打断」的官方版；排队消息管理面「插话 / 撤回到输入框编辑 / 移除 / 多条重排」= `/queue send/remove/move/edit` 已覆盖；「设置 → 运行中发送方式」= D2.3 默认 FollowUp；composer 在「压缩中 / 有待处理请求」时提示不支持插话 → TUI P-C 待做项。qoder 式「引导 = 结合当前消息、总结之前工作、明确后续任务后发送」= `/guide` 三段草稿 + 默认直接发送，已实现。生态侧：ACP `_session/steering` 扩展（Claude/Codex 已支持，agent-shell 0.78 的 RET=排队 / M-RET=插话）→ 若将来做 ACP server 可对齐；灵码（Qoder CN）的「消息排队 + 全自动执行模式带终端命令禁止名单」中，禁止名单与既有 `is_dangerous_command` 分级确认同族。
 
-- **待做**：P-C（TUI 队列编辑键位 + 引导 overlay——本仓铁律：TUI 派发不盲改，需真机冒烟）、per-section 泳道递送轮转（D2.1 的 TUI 半边；数据结构与 REPL 观测面已落地）、mission 回合自动记账与提醒注入 ~~（D1.3，前置 P2 事件循环）~~ **已落地（2026-10-23，§11.3）**。跨进程文件锁已落地（§4，2026-10-22 批次）。**P-D Steer 已落地（2026-10-23，§11.2）**：`DeliveryMode`（Steer/FollowUp/Auto，默认 FollowUp）+ runtime `SteerMailbox` 迭代边界注入 + TUI Ctrl+S 全链，未消费 steer 回收为 follow-up（条目不丢）。
+- **待做**：~~P-C（TUI 队列编辑键位 + 引导 overlay——本仓铁律：TUI 派发不盲改，需真机冒烟）~~ **已落地（2026-10-24，§11.1）**：队列编辑面板（Ctrl+Q：编辑/撤条/重排/改派）+ guide overlay 两栏可编辑（T6）+ 状态栏 mode 分流计数；REPL 补 `/queue relane`。per-section 泳道递送轮转（D2.1 的 TUI 半边；数据结构与 REPL 观测面已落地）——前置已满足，见 §11.4。mission 回合自动记账与提醒注入 ~~（D1.3，前置 P2 事件循环）~~ **已落地（2026-10-23，§11.3）**。跨进程文件锁已落地（§4，2026-10-22 批次）。**P-D Steer 已落地（2026-10-23，§11.2）**：`DeliveryMode`（Steer/FollowUp/Auto，默认 FollowUp）+ runtime `SteerMailbox` 迭代边界注入 + TUI Ctrl+S 全链，未消费 steer 回收为 follow-up（条目不丢）。
 
 
 ### 4. 工程稳定性与持久性（大项目持续运行）
@@ -348,10 +348,15 @@ heartflow 落点：`edit_file` / `apply_patch` 后回注诊断（Rust 项目先�
 - **已知未修（§9）**：TUI 流式尾部每帧 clone、表格列宽不按终端封顶 → 端到端冒烟 + cassette 后改。
 - **铁律**：TUI 斜杠命令派发（`println!` 与 alt-screen 不兼容）刻意不盲改，只有真机冒烟能验。
 - **依赖**：KI-001/002 是「拦截层局部透传」小改，可**先于 11.0** 落地；P-C 三件套建议 11.0 后做最稳。
-- **落地状态（2026-10-23，KI-001/002 已修，待真机冒烟）**：
+- **落地状态（2026-10-23，KI-001/002 已修；2026-10-24，P-C 三件套已落地；均待真机冒烟）**：
   - **KI-001 根因更正（代码实证）**：「TUI 拦截层吃掉 Alt+Enter」不成立——无绑定认领该键、textarea 对任意修饰键 Enter 都插换行；「全屏」来自 Windows Terminal 默认键绑定 `alt+enter → toggleFullscreen` 在 ConPTY 之前消费按键。且「透传 PTY」无机制可挂（全仓无 PTY，`!CMD`/bash 子进程 stdin 均 null）。真缺陷 = TUI 与 REPL 输入面不一致：TUI 里 Shift+Enter 因 keymap 匹配掩盖 SHIFT 而**提交**（REPL 是换行），宿主吃掉 Alt+Enter 后用户无可用多行键。修复 = `on_key` 在 keymap 解析前拦截 Shift/Alt+Enter 插换行 + 输入栏标题提示 `shift+enter newline`（与 REPL「裸 Enter 发送、Shift/Alt+Enter 换行」对齐）。
   - **KI-002 修复**：`App::rendered_status_note()` 把武装（`ctrl_c_armed`）与确认打断（新增 `cancel_requested`，直到回合结算）做成**状态派生的粘性覆盖**，流事件（每个 `ToolUse` 重写瞬态 note）盖不掉；提示寿命与状态严格同寿命（他键解除武装/回合结算即消失），免超时器。循环级测试 `the_armed_cancel_hint_survives_streaming_tool_events` + 3 个 App 级测试锁定。
-  - **验证**：747 通过 / 0 失败、clippy `-D clippy::all` 干净、fmt 干净、panic 棘轮零新增。**真机冒烟待陪测**（两张新卡：① 输入态 Shift+Enter/Alt+Enter 换行、裸 Enter 提交多行草稿；② 回合中首个 Ctrl+C 后提示在工具滚动期间持续可见、他键解除、二次确认后「cancelling turn…」留存至结算）。
+  - **P-C 三件套（2026-10-24）**：
+    - **队列编辑面板**：`Action::QueuePanel`（默认 **Ctrl+Q**，可重映射；空队开面板给提示不开死面板）模态浮层，行为读**活队列**（settle 递送后面板不显示幽灵行）：↑/↓ 选择、`e` 取出回输入框回炉（D2.4）、`x` 撤条入台账、`+/-` 前后移、`l` 在 main+既有 lane 间轮转改派、Esc 关闭；回合中可开（队列变更只在 settle 边界生效，不打扰在飞回合）；权限弹窗弹出时压下面板。REPL 侧补 `/queue relane <id> <lane>`（D2.4 改派此前两面皆缺，core 补 `reassign_lane`——lane 是观测/编辑维度，不动到达序）。
+    - **引导 overlay 升 T6 两栏可编辑**：草稿装进 overlay 内的 `TextArea`（左栏任务+说明、右栏可编辑草稿、粘贴进草稿），Enter 发送**编辑后**的正文（所见即所发不变，只是所见可改）；Esc 取消任务留输入框不变。
+    - **输入路由与计数**：mode 路由已随 §11.2 落地（Enter=FollowUp、Ctrl+S=Steer）；状态栏计数分流 `[N queued · M steering]`。
+    - **测试**：core `reassign_lane`（no-op 边界 + 不动序）、App 级 3（面板编辑/撤条/重排/改派全走查、末条撤空自动关、guide 编辑后发送）、循环级 `a_withdrawn_queue_entry_never_runs`（回合中排入→面板撤条→结算后零递送，请求数=1）。
+  - **验证**：763 通过 / 0 失败、clippy `-D clippy::all` 干净、fmt 干净、panic 棘轮 debt=0（uv 跑）。**真机冒烟待陪测**（新增 3 张：① 回合中 Ctrl+Q 开面板、e/x/+/-/l 各操作、Esc 关闭；② Ctrl+G 草稿可编辑、Enter 发送编辑后正文；③ 状态栏 queued/steering 分流计数）。
 
 #### 11.2 P-D Steer（注入在飞回合）
 

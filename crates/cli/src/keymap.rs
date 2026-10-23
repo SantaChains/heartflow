@@ -51,6 +51,11 @@ pub enum Action {
     /// work + current state + the task) and send it, queued behind a running
     /// turn so it never interrupts.
     Guide,
+    /// Toggle the pending-queue panel (§11.1 P-C): inspect and edit what is
+    /// queued behind a running turn — edit, withdraw, reorder, re-lane.
+    /// Read-write, but queue mutations are settle-time concerns, so it is
+    /// safe mid-turn.
+    QueuePanel,
     /// Switch to the next conversation section (tab) in the shell. Idle-only: a
     /// turn runs inline and holds its section's runtime, so the reducer guards
     /// these mid-turn instead of switching under a live turn.
@@ -79,6 +84,7 @@ const ALL_ACTIONS: &[Action] = &[
     Action::ScrollUp,
     Action::ScrollDown,
     Action::Guide,
+    Action::QueuePanel,
     Action::NextSection,
     Action::PrevSection,
     Action::NewSection,
@@ -98,6 +104,7 @@ impl Action {
             Action::ScrollUp => "scroll_up",
             Action::ScrollDown => "scroll_down",
             Action::Guide => "guide",
+            Action::QueuePanel => "queue_panel",
             Action::NextSection => "next_section",
             Action::PrevSection => "prev_section",
             Action::NewSection => "new_section",
@@ -121,6 +128,7 @@ impl Action {
             Action::ScrollUp => "scroll the transcript up",
             Action::ScrollDown => "scroll the transcript down",
             Action::Guide => "preview and send a zero-token next-task draft",
+            Action::QueuePanel => "open the pending-queue panel (edit/withdraw/reorder/re-lane)",
             Action::NextSection => "switch to the next conversation section",
             Action::PrevSection => "switch to the previous conversation section",
             Action::NewSection => "open a new conversation section",
@@ -236,6 +244,10 @@ impl Default for Keymap {
                 (
                     Binding::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
                     Action::Guide,
+                ),
+                (
+                    Binding::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                    Action::QueuePanel,
                 ),
                 (
                     Binding::new(KeyCode::PageDown, KeyModifiers::CONTROL),
@@ -635,6 +647,10 @@ mod tests {
         assert_eq!(
             keymap.resolve(&ctrl(KeyCode::Char('g'))),
             Some(Action::Guide)
+        );
+        assert_eq!(
+            keymap.resolve(&ctrl(KeyCode::Char('q'))),
+            Some(Action::QueuePanel)
         );
         assert_eq!(
             keymap.resolve(&ctrl(KeyCode::PageDown)),

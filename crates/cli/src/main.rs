@@ -1467,6 +1467,28 @@ fn handle_queue_command(input: &str, model: &mut HeartModel) {
                 if moved { format!("entry #{id} moved.") } else { format!("cannot move #{id} in that direction.") }
             );
         }
+        "relane" => {
+            // `/queue relane <id> <name>` — reassign a pending entry to
+            // another lane (D2.4 改派); delivery order is untouched.
+            let mut parts = rest.split_whitespace();
+            let (id_part, lane) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+            let Ok(id) = id_part.parse::<u64>() else {
+                println!("usage: /queue relane <id> <lane>");
+                return;
+            };
+            if lane.is_empty() {
+                println!("usage: /queue relane <id> <lane>");
+                return;
+            }
+            println!(
+                "{}",
+                if model.queue_mut().reassign_lane(id, lane) {
+                    format!("entry #{id} reassigned to lane {lane}.")
+                } else {
+                    format!("no pending entry #{id}, or already in lane {lane}.")
+                }
+            );
+        }
         "merge" => {
             let merged = !model.queue().is_merged();
             model.queue_mut().set_merged(merged);
@@ -1492,7 +1514,7 @@ fn handle_queue_command(input: &str, model: &mut HeartModel) {
             );
         }
         other => println!(
-            "usage: /queue [send [--lane <name>] <text>|lane <name>|edit <id> <text>|remove <id>|move <id> up|down|merge|pop|clear] (`{other}` is not a subcommand)"
+            "usage: /queue [send [--lane <name>]|lane <name>|edit <id> <text>|remove <id>|move <id> up|down|relane <id> <lane>|merge|pop|clear] (`{other}` is not a subcommand)"
         ),
     }
 }

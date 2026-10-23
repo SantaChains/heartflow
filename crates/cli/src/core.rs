@@ -517,6 +517,24 @@ impl FollowUpQueue {
         true
     }
 
+    /// Reassign a pending entry to another lane (D2.4 改派). Delivery order
+    /// is untouched — the lane is an observation/editing tag, not a position.
+    pub fn reassign_lane(&mut self, id: u64, lane: &str) -> bool {
+        let lane = lane.trim();
+        if lane.is_empty() {
+            return false;
+        }
+        let Some(entry) = self.pending.iter_mut().find(|entry| entry.id == id) else {
+            return false;
+        };
+        if entry.lane == lane {
+            return false;
+        }
+        entry.lane = lane.to_string();
+        self.persist();
+        true
+    }
+
     /// Withdraw the most recently queued message (Esc-on-queued semantics);
     /// returns it so the caller can restore it into the input buffer.
     pub fn cancel_last(&mut self) -> Option<String> {
@@ -860,6 +878,26 @@ mod tests {
         let merged = q.drain_injection().expect("recovered steers deliverable");
         assert!(merged.contains("late-1") && merged.contains("late-2"));
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn reassign_lane_moves_an_entry_without_touching_order() {
+        let mut q = FollowUpQueue::new();
+        q.send("first", QueueSource::User);
+        q.send_in_lane("review", "second", QueueSource::Guide);
+        // Same lane / blank / unknown id are honest no-ops.
+        assert!(!q.reassign_lane(2, "review"));
+        assert!(!q.reassign_lane(2, "   "));
+        assert!(!q.reassign_lane(99, "main"));
+        assert!(q.reassign_lane(2, "urgent"));
+        assert_eq!(q.items()[1].lane, "urgent");
+        assert_eq!(
+            q.lane_names(),
+            vec!["main".to_string(), "urgent".to_string()],
+            "the emptied review lane disappears from the listing"
+        );
+        // Arrival order is untouched: first is still first.
+        assert_eq!(q.items()[0].text, "first");
     }
 
     // ---- durability (long-run stability §4) --------------------------------

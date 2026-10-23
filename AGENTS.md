@@ -60,7 +60,7 @@ CI 有三条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/**`
 
 ### REPL（`crates/cli/src/main.rs:962` `dispatch_slash_command`）
 
-`/help /status /model [NAME] /mode [NAME] /plan [GOAL|approve|end|status] /compact /pin /focus /save /clear /sessions /open N /remember T /search Q /mcp /expand [ID] /checkpoints /restore N [--purge] /queue [send|edit|remove|move|merge|pop|clear] /guide [TASK|draft T|queue T] /jobs [spawn [--write]|stop|log] /init /restart /exit`（`/quit` 为别名），以及不走模型的 `!CMD` 前缀。`/focus` 切换聚焦模式（隐藏 mascot 伴侣、收窄输入区为最小 chrome）。
+`/help /status /model [NAME] /mode [NAME] /plan [GOAL|approve|end|status] /compact /pin /focus /save /clear /sessions /open N /remember T /search Q /mcp /expand [ID] /checkpoints /restore N [--purge] /queue [send [--lane]|lane|edit|remove|move|relane|merge|pop|clear] /guide [TASK|draft T|queue T] /jobs [spawn [--write]|stop|log] /init /restart /exit`（`/quit` 为别名），以及不走模型的 `!CMD` 前缀。`/focus` 切换聚焦模式（隐藏 mascot 伴侣、收窄输入区为最小 chrome）。
 
 `/model`（无参）打印当前**真实**传输身份——`provider`（目录键，未命中则 `custom`）/ `protocol` / `base_url` / `model` / `known models`（目录中该 provider 的模型），取代旧的写死 DeepSeek 清单，使传输失败一眼可辨协议而非误读厂商（env-anthropic 路径显示 `provider: anthropic (env)`）；`/model NAME` 切换成功后把该模型记入 `~/.heartflow/provider.toml`（`source=user`）。REPL 补全不止命令名：`/model `、`/mode `、`/open ` 后跟空格按命令弹出参数候选表格（分别为目录中当前 provider 的模型 / 权限三档 / 会话序号），↑/↓ 选择、Tab 或 Enter 只补全当前参数位，Esc 取消高亮。
 
@@ -101,7 +101,7 @@ CI 有三条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/**`
 
 `[theme]`：`heading`、`accent`、`muted`、`success`、`error`，可选 `emphasis`、`strong`、`inline_code`、`link`、`quote`；用户层 `~/.heartflow/theme.toml`、项目层 `.heartflow/theme.toml` 逐项覆盖（加载器 `crates/cli/src/theme.rs` 的 `theme_file_paths`）。
 
-`[keymap]`：动作名 → 键串或键串数组（`submit`/`steer_submit`/`interrupt`/`escape`/`toggle_fold`/`scroll_up`/`scroll_down`/`guide`/`next_section`/`prev_section`/`new_section`/`help`；`steer_submit` 默认 Ctrl+S——回合运行中把输入注入在飞回合（§11.2 Steer），空闲时等同 `submit`）；空数组解绑（键回落编辑器），`ctrl`/`alt`/`super` 参与匹配、`shift` 忽略、字符大小写不敏感；同 theme 两层逐动作覆盖（`crates/cli/src/keymap.rs`）。
+`[keymap]`：动作名 → 键串或键串数组（`submit`/`steer_submit`/`interrupt`/`escape`/`toggle_fold`/`scroll_up`/`scroll_down`/`guide`/`queue_panel`/`next_section`/`prev_section`/`new_section`/`help`；`steer_submit` 默认 Ctrl+S——回合运行中把输入注入在飞回合（§11.2 Steer），空闲时等同 `submit`；`queue_panel` 默认 Ctrl+Q——待发队列编辑面板（选择/取出回炉/撤条/重排/改派 lane，§11.1 P-C））；空数组解绑（键回落编辑器），`ctrl`/`alt`/`super` 参与匹配、`shift` 忽略、字符大小写不敏感；同 theme 两层逐动作覆盖（`crates/cli/src/keymap.rs`）。
 
 `[settings]`：`scroll_step`（u16，默认 3）、`tool_inline_lines`（usize，默认 3）、`fold_thinking`（bool，默认 true）、`frame_budget_ms`（u64，默认 80，仅启动时读取）；同 theme 两层逐项覆盖（`crates/cli/src/settings.rs`）。
 
