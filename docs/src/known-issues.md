@@ -18,7 +18,7 @@
   - 「透传 PTY」方向无机制可挂：全仓无 PTY（`!CMD` 与 bash 工具的子进程 stdin 均为 `Stdio::null()`），不存在「交互态透传」通道；该假设按无机制处理，不在本条修复范围。
 - **修复（2026-10-23）**：TUI 对齐 REPL 约定——`on_key` 在 keymap 解析前拦截 Shift/Alt+Enter 插入换行（`tui.rs`），输入栏标题提示补 `shift+enter newline`。Windows Terminal 用户用 Shift+Enter（宿主不拦截）；要让 Alt+Enter 到达应用须自行在终端设置解绑其全屏动作。
 - **登记日期**：2026-10-22
-- **状态**：已修复（commit 52ff429，真机冒烟待用户陪测）
+- **状态**：已修复（commit b9d2f9a，真机冒烟待用户陪测）
 
 ---
 
@@ -30,7 +30,7 @@
 - **根因核实（2026-10-23，代码实证）**：原假设方向正确。武装提示写进**瞬态** `status_note`，而回合在飞时每个 `AgentEvent::ToolUse`（工具启动）都会重写 `status_note` 为 `tool N: \`name\``——工具密集的回合里提示在下一帧就被覆盖。armed 态本身并未丢失（`ctrl_c_armed` 不受流事件影响），丢的只是**显示**。
 - **修复（2026-10-23）**：状态栏改为渲染**状态派生**的粘性覆盖——`App::rendered_status_note()` 在 `cancel_requested`（确认打断、直到回合结算）或 `ctrl_c_armed`（武装、直到任意他键解除或回合结算）为真时优先显示打断提示，流事件只重写底下的瞬态 note、盖不掉覆盖层。提示存续期与它描述的状态严格同寿命（状态是纯函数），无需显式超时器。循环级测试 `the_armed_cancel_hint_survives_streaming_tool_events` 锁定（武装提示在工具事件穿流期间持续在帧上可见）。
 - **登记日期**：2026-10-22
-- **状态**：已修复（commit 52ff429，真机冒烟待用户陪测）
+- **状态**：已修复（commit b9d2f9a，真机冒烟待用户陪测）
 
 ---
 
