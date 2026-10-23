@@ -33,6 +33,10 @@ use tracing::warn;
 pub enum Action {
     /// Take the input editor's text as a submission (queued if a turn is live).
     Submit,
+    /// Send the input into the *running* turn (steer, §11.2): the text joins
+    /// the live conversation at the next iteration boundary instead of
+    /// waiting for the turn to settle. Behaves like `Submit` while idle.
+    SteerSubmit,
     /// The interrupt key: cancel a running turn (double-tap) or quit when idle.
     Interrupt,
     /// The escape key: dismiss an overlay or quit when idle; inert mid-turn.
@@ -68,6 +72,7 @@ pub enum Action {
 /// change that automatically flows into `from_name`.
 const ALL_ACTIONS: &[Action] = &[
     Action::Submit,
+    Action::SteerSubmit,
     Action::Interrupt,
     Action::Escape,
     Action::ToggleFold,
@@ -86,6 +91,7 @@ impl Action {
     pub const fn as_name(self) -> &'static str {
         match self {
             Action::Submit => "submit",
+            Action::SteerSubmit => "steer_submit",
             Action::Interrupt => "interrupt",
             Action::Escape => "escape",
             Action::ToggleFold => "toggle_fold",
@@ -106,6 +112,9 @@ impl Action {
     pub const fn describe(self) -> &'static str {
         match self {
             Action::Submit => "send the input (queued while a turn runs)",
+            Action::SteerSubmit => {
+                "send the input into the running turn (steer); submits when idle"
+            }
             Action::Interrupt => "cancel a running turn (press twice) / quit when idle",
             Action::Escape => "dismiss an overlay / quit when idle",
             Action::ToggleFold => "fold or unfold the latest process entry",
@@ -199,6 +208,10 @@ impl Default for Keymap {
                 (
                     Binding::new(KeyCode::Enter, KeyModifiers::NONE),
                     Action::Submit,
+                ),
+                (
+                    Binding::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                    Action::SteerSubmit,
                 ),
                 (
                     Binding::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -601,6 +614,10 @@ mod tests {
     fn default_keymap_resolves_the_shipped_bindings() {
         let keymap = Keymap::default();
         assert_eq!(keymap.resolve(&key(KeyCode::Enter)), Some(Action::Submit));
+        assert_eq!(
+            keymap.resolve(&ctrl(KeyCode::Char('s'))),
+            Some(Action::SteerSubmit)
+        );
         assert_eq!(
             keymap.resolve(&ctrl(KeyCode::Char('c'))),
             Some(Action::Interrupt)

@@ -862,7 +862,7 @@ pub struct QueueSet {
 - **队列命名泳道（2026-10-22 批次，D2.1 数据结构半边）**：`QueueEntry.lane` 标签 + `send_in_lane`/`lane_names`/`items_in_lane`；REPL `/queue send --lane <name>`、`/queue lane <name>`、列表 `@name` 标注。**纪律：泳道是观测与编辑维度，递送仍是全局到达序**——跨泳道轮转规则需要 TUI 侧（P-C）才有意义，离线拍脑袋定轮转属猜测。
 **落地状态（2026-10-21 第二批网络核验，Qoder 官方文档对照）**：Qoder 官方「排队 vs 插话」二分（docs.qoder.com conversation-input）与本仓 `FollowUp` vs `Steer`（P-D）**语义同构**——插话「在安全执行边界交给 Agent，不直接停止当前执行」正是本仓「明确不做强插打断」的官方版；排队消息管理面「插话 / 撤回到输入框编辑 / 移除 / 多条重排」= `/queue send/remove/move/edit` 已覆盖；「设置 → 运行中发送方式」= D2.3 默认 FollowUp；composer 在「压缩中 / 有待处理请求」时提示不支持插话 → TUI P-C 待做项。qoder 式「引导 = 结合当前消息、总结之前工作、明确后续任务后发送」= `/guide` 三段草稿 + 默认直接发送，已实现。生态侧：ACP `_session/steering` 扩展（Claude/Codex 已支持，agent-shell 0.78 的 RET=排队 / M-RET=插话）→ 若将来做 ACP server 可对齐；灵码（Qoder CN）的「消息排队 + 全自动执行模式带终端命令禁止名单」中，禁止名单与既有 `is_dangerous_command` 分级确认同族。
 
-- **待做**：P-C（TUI 队列编辑键位 + 引导 overlay——本仓铁律：TUI 派发不盲改，需真机冒烟）、P-D（Steer，前置 P2 并发模型）、per-section 泳道递送轮转（D2.1 的 TUI 半边；数据结构与 REPL 观测面已落地）、mission 回合自动记账与提醒注入（D1.3，前置 P2 事件循环）。跨进程文件锁已落地（§4，2026-10-22 批次）。
+- **待做**：P-C（TUI 队列编辑键位 + 引导 overlay——本仓铁律：TUI 派发不盲改，需真机冒烟）、per-section 泳道递送轮转（D2.1 的 TUI 半边；数据结构与 REPL 观测面已落地）、mission 回合自动记账与提醒注入（D1.3，前置 P2 事件循环）。跨进程文件锁已落地（§4，2026-10-22 批次）。**P-D Steer 已落地（2026-10-23，§11.2）**：`DeliveryMode`（Steer/FollowUp/Auto，默认 FollowUp）+ runtime `SteerMailbox` 迭代边界注入 + TUI Ctrl+S 全链，未消费 steer 回收为 follow-up（条目不丢）。
 
 
 ### 4. 工程稳定性与持久性（大项目持续运行）
@@ -1011,6 +1011,12 @@ heartflow 落点：`edit_file` / `apply_patch` 后回注诊断（Rust 项目先�
 #### 11.2 P-D Steer（注入在飞回合）
 
 - 前置 11.0。递送语义 `Steer` = 注入当前回合（§1 D2.x）；默认 `FollowUp`，`Steer` 经 11.0 可用。逐条 steer 递送 + 失败按条目重排 + 明示（§1 P-D/P-E）。
+- **落地状态（2026-10-23，全链落地，待真机冒烟）**：
+  - **runtime 半边**：`SteerMailbox`（`Arc<Mutex<VecDeque<String>>>` 共享信箱，锁污染恢复）+ `ConversationRuntime::set_steer_mailbox`（按回合武装，回合前设置、settle 时复位）；回合循环在**迭代边界**（与取消检查同点——pi「runner 在安全点消费，不抢断 LLM 调用」语义）drain 信箱，把每条 steer 作为**用户消息**追加进 session，发 `AgentEvent::Steered(text)`；无工具调用的末轮自然结束 → 未消费的 steer 留给宿主回收。测试：`steered_text_joins_the_next_request_as_a_user_message`（工具处理器内 push，断言第二请求携带、第一请求不携带、恰好一个事件）。
+  - **core 半边**：`DeliveryMode { Steer, FollowUp(默认，D2.3), Auto(保留) }` 进 `QueueEntry`（`#[serde(default)]`，旧 queue.json 无该字段可加载，测试钉死）；`send_with_mode` + `claim_steered`（pi FIFO 文本认领：等文本的最旧 steer 条目认领 `Steered` 事件，Delivered 入台账，幂等）+ `recover_pending_steers`（未消费→FollowUp，条目不丢）+ `drain_injection` 排除 Steer 条目（steers 永不混进下一回合合并注入）。
+  - **TUI 半边**：`Action::SteerSubmit`（默认 **Ctrl+S**，可经 keymap.toml 重映射；空闲时回落为普通 submit，永不是死键）；`submit_steer` 回合在飞时入队（mode=Steer 供 `/queue` 观测）+ 暂存给循环推入信箱 + transcript 回显 `(steering)`；`Steered` 事件到达时认领条目 + `· steered:` 行明示；settle 时先 `recover_pending_steers`（transcript `· N late steer(s) queued as follow-up(s)` 明示）再合并注入——**「child completed before consuming steering」诚实命名**。循环级测试：`a_steer_joins_the_running_turns_next_request`（Ctrl+S 后第二请求携带文本、第一请求不携带）+ `a_late_steer_is_recovered_as_the_next_turn`（无工具回合结算后 steer 转下一回合，saves=2）。
+  - **诚实边界**：REPL 侧无 in-flight 输入面，steer 仅 TUI 可达（turn.rs 的 `Steered` 臂保持穷尽）；`Auto` 模式保留未实现（steer 保持显式，默认语义不变）；TUI 注入仍是「合并注入」形态（逐条递送的 TUI 化属 P-C 队列编辑键位）。
+  - **验证**：755 通过 / 0 失败（+8 新测试）、clippy `-D clippy::all` 干净、fmt 干净、panic 棘轮 debt=0（uv 跑）。**真机冒烟卡**：回合运行中 Ctrl+S 发文本 → 状态栏 `steering` 提示、工具步后模型看到并回应；无工具短回合中 Ctrl+S → 回合结束出现 `late steer(s) queued` 且下一回合执行该文本；`/queue` 列表出现 `·steer` 标注条目。
 
 #### 11.3 mission 回合自动记账 + 在飞回合取消
 

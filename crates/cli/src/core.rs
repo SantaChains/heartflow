@@ -65,6 +65,36 @@ impl QueueSource {
     }
 }
 
+/// Delivery semantics for one entry (pi `SteerDeliveryMode`, roadmap §1
+/// D2.x/§11.2). The default is `FollowUp` — D2.3 pins "等上一个任务完成再
+/// 开下一个" as the default semantics, so steering stays an explicit act.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeliveryMode {
+    /// Inject into the *live* turn at its next iteration boundary (TUI-only:
+    /// it needs the §11.0 loop to keep pumping input mid-turn).
+    Steer,
+    /// Queue as the next turn once the current one settles (default).
+    #[default]
+    FollowUp,
+    /// Runner decides by busy/idle. Reserved so the on-disk format can carry
+    /// the intent; currently resolves to FollowUp (steering stays explicit).
+    Auto,
+}
+
+impl DeliveryMode {
+    /// The `/queue` listing tag; only steer is worth a marker (follow-up is
+    /// the unremarkable default).
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            DeliveryMode::Steer => "steer",
+            DeliveryMode::FollowUp => "follow-up",
+            DeliveryMode::Auto => "auto",
+        }
+    }
+}
+
 /// Lifecycle of one entry. Every id ends in exactly one terminal state in the
 /// `recent` ledger (the "条目不丢" invariant the tests pin).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -101,6 +131,11 @@ pub struct QueueEntry {
     /// interleaving rules offline would be guesswork. The tag is what the
     /// per-section queue view filters on.
     pub lane: String,
+    /// How this entry is meant to reach the model (§11.2). `#[serde(default)]`
+    /// keeps queues persisted before the field existed loadable — they read
+    /// as plain follow-ups, which is what they were.
+    #[serde(default)]
+    pub mode: DeliveryMode,
 }
 
 /// The implicit lane every plain send lands in.
@@ -307,6 +342,28 @@ impl FollowUpQueue {
     /// arrival order (see [`QueueEntry::lane`]); the lane decides where the
     /// entry shows up and how it is edited.
     pub fn send_in_lane(&mut self, lane: &str, text: &str, source: QueueSource) -> Option<u64> {
+        self.send_entry(lane, text, source, DeliveryMode::FollowUp)
+    }
+
+    /// Queue with an explicit delivery mode (§11.2). A `Steer` entry rides
+    /// the live turn's mailbox, not the next-turn queue — it sits in
+    /// `pending` only so `/queue` can show it and recovery can find it.
+    pub fn send_with_mode(
+        &mut self,
+        text: &str,
+        source: QueueSource,
+        mode: DeliveryMode,
+    ) -> Option<u64> {
+        self.send_entry(MAIN_LANE, text, source, mode)
+    }
+
+    fn send_entry(
+        &mut self,
+        lane: &str,
+        text: &str,
+        source: QueueSource,
+        mode: DeliveryMode,
+    ) -> Option<u64> {
         let lane = lane.trim();
         let text = text.trim();
         if lane.is_empty() || text.is_empty() || self.pending.len() >= self.limit {
@@ -320,6 +377,7 @@ impl FollowUpQueue {
             source,
             state: QueueEntryState::Pending,
             lane: lane.to_string(),
+            mode,
         });
         self.persist();
         Some(id)
@@ -466,24 +524,76 @@ impl FollowUpQueue {
         self.withdraw(last)
     }
 
-    /// Drain every pending entry into one injected user message, oldest
-    /// first, leaving the queue empty (compat: TUI turn boundary + merged
-    /// mode). Delivered entries land in the ledger.
-    pub fn drain_injection(&mut self) -> Option<String> {
-        if self.pending.is_empty() {
-            return None;
-        }
-        let merged = merge_injection(
-            &self
-                .pending
-                .iter()
-                .map(|entry| entry.text.as_str())
-                .collect::<Vec<_>>(),
-        );
-        for mut entry in std::mem::take(&mut self.pending) {
+    /// Claim the oldest pending steer whose text matches (pi's FIFO text
+    /// matching: the runtime event carries no id, so the oldest equal-text
+    /// steer claims it) and file it as delivered. Returns whether a pending
+    /// entry was claimed — an unclaimed `Steered` event means the entry was
+    /// withdrawn between submit and consumption, which is fine.
+    pub fn claim_steered(&mut self, text: &str) -> bool {
+        let Some(position) = self.pending.iter().position(|entry| {
+            entry.mode == DeliveryMode::Steer
+                && entry.state == QueueEntryState::Pending
+                && entry.text == text
+        }) else {
+            return false;
+        };
+        if let Some(mut entry) = self.pending.remove(position) {
             entry.state = QueueEntryState::Delivered;
             self.file_recent(entry);
         }
+        self.persist();
+        true
+    }
+
+    /// Convert every still-pending steer into a plain follow-up (pi's
+    /// "child completed before consuming steering" recovery): the turn
+    /// settled before the loop could absorb them, so they run as the next
+    /// turn instead of being lost. Returns the recovered texts (oldest
+    /// first) so the caller can surface the demotion honestly.
+    pub fn recover_pending_steers(&mut self) -> Vec<String> {
+        let mut recovered = Vec::new();
+        for entry in &mut self.pending {
+            if entry.mode == DeliveryMode::Steer {
+                entry.mode = DeliveryMode::FollowUp;
+                recovered.push(entry.text.clone());
+            }
+        }
+        if !recovered.is_empty() {
+            self.persist();
+        }
+        recovered
+    }
+
+    /// Drain every pending entry into one injected user message, oldest
+    /// first, leaving the queue empty (compat: TUI turn boundary + merged
+    /// mode). Delivered entries land in the ledger. Steer-mode entries are
+    /// *not* delivery here — they belong to the live turn (or, after
+    /// [`Self::recover_pending_steers`], already became follow-ups).
+    pub fn drain_injection(&mut self) -> Option<String> {
+        if self
+            .pending
+            .iter()
+            .all(|entry| entry.mode == DeliveryMode::Steer)
+        {
+            return None;
+        }
+        let texts: Vec<&str> = self
+            .pending
+            .iter()
+            .filter(|entry| entry.mode != DeliveryMode::Steer)
+            .map(|entry| entry.text.as_str())
+            .collect();
+        let merged = merge_injection(&texts);
+        let mut steers = VecDeque::new();
+        while let Some(mut entry) = self.pending.pop_front() {
+            if entry.mode == DeliveryMode::Steer {
+                steers.push_back(entry);
+            } else {
+                entry.state = QueueEntryState::Delivered;
+                self.file_recent(entry);
+            }
+        }
+        self.pending = steers;
         Some(merged)
     }
 
@@ -685,8 +795,8 @@ pub fn guide_draft(context: &GuideContext, task: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_guide, guide_context, guide_draft, FollowUpQueue, GuideContext, GuideSections,
-        HeartModel, QueueEntryState, QueueLoad, QueueSource,
+        build_guide, guide_context, guide_draft, DeliveryMode, FollowUpQueue, GuideContext,
+        GuideSections, HeartModel, QueueEntryState, QueueLoad, QueueSource,
     };
 
     #[test]
@@ -704,6 +814,52 @@ mod tests {
         assert!(merged.contains("2. second"));
         assert!(q.is_empty());
         assert!(q.drain_injection().is_none());
+    }
+
+    #[test]
+    fn steer_entries_are_excluded_from_the_injection_until_consumed() {
+        let mut q = FollowUpQueue::new();
+        q.send("a-plain", QueueSource::User);
+        assert!(q
+            .send_with_mode("b-steer", QueueSource::User, DeliveryMode::Steer)
+            .is_some());
+        q.send("c-plain", QueueSource::User);
+        // The injection carries only the follow-ups, arrival order kept.
+        let merged = q.drain_injection().expect("follow-ups present");
+        assert!(merged.contains("a-plain") && merged.contains("c-plain"));
+        assert!(
+            !merged.contains("b-steer"),
+            "steers never ride the injection"
+        );
+        assert_eq!(q.len(), 1, "the steer stays pending for the live turn");
+        // Consumption claims the oldest equal-text steer and terminalizes it.
+        assert!(q.claim_steered("b-steer"));
+        assert!(
+            !q.claim_steered("b-steer"),
+            "a steer is delivered exactly once"
+        );
+        assert!(q.is_empty());
+        let ledger = q.recent();
+        assert!(ledger.iter().any(|entry| entry.text == "b-steer"
+            && entry.state == QueueEntryState::Delivered
+            && entry.mode == DeliveryMode::Steer));
+        // An event nothing claims (entry withdrawn mid-flight) is a no-op.
+        assert!(!q.claim_steered("never-queued"));
+    }
+
+    #[test]
+    fn unconsumed_steers_recover_as_follow_ups() {
+        let mut q = FollowUpQueue::new();
+        q.send_with_mode("late-1", QueueSource::User, DeliveryMode::Steer);
+        q.send_with_mode("late-2", QueueSource::Guide, DeliveryMode::Steer);
+        let recovered = q.recover_pending_steers();
+        assert_eq!(recovered, vec!["late-1".to_string(), "late-2".to_string()]);
+        // Idempotent: nothing left to convert.
+        assert!(q.recover_pending_steers().is_empty());
+        // After recovery the injection delivers them like any follow-up.
+        let merged = q.drain_injection().expect("recovered steers deliverable");
+        assert!(merged.contains("late-1") && merged.contains("late-2"));
+        assert!(q.is_empty());
     }
 
     // ---- durability (long-run stability §4) --------------------------------
@@ -748,6 +904,42 @@ mod tests {
         assert_eq!(restored.items()[0].lane, "review");
         assert_eq!(restored.next_id_probe(), 3, "ids continue after restart");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_queue_file_without_mode_loads_as_follow_ups() {
+        // A queue persisted before DeliveryMode existed has no `mode` field;
+        // serde's default keeps it loadable and every entry reads as a plain
+        // follow-up — which is what it was.
+        let path = queue_tmp("legacy-no-mode");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"version":1,"next_id":2,"limit":32,"merged":false,"#,
+                r#""pending":[{"id":1,"text":"old entry","source":"user","#,
+                r#""state":"pending","lane":"main"}],"recent":[]}"#
+            ),
+        )
+        .expect("write legacy queue file");
+        let (restored, outcome) = FollowUpQueue::load(path.clone());
+        assert_eq!(
+            outcome,
+            QueueLoad::Restored {
+                pending: 1,
+                recent: 0
+            }
+        );
+        assert_eq!(restored.items()[0].mode, DeliveryMode::FollowUp);
+        let merged = restored_drains_the_legacy_entry(restored);
+        assert!(merged.contains("old entry"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn restored_drains_the_legacy_entry(mut queue: FollowUpQueue) -> String {
+        queue
+            .drain_injection()
+            .expect("legacy entry delivers like a follow-up")
     }
 
     #[test]

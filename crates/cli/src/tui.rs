@@ -80,11 +80,13 @@ use tui_textarea::{CursorMove, TextArea};
 
 use runtime::{
     AgentEvent, ApiClient, ConversationRuntime, PermissionPromptDecision, PermissionPrompter,
-    PermissionRequest, RuntimeError, TokenUsage, ToolExecutor, TurnSummary,
+    PermissionRequest, RuntimeError, SteerMailbox, TokenUsage, ToolExecutor, TurnSummary,
 };
 
 use crate::config::ConfigWatcher;
-use crate::core::{guide_context, guide_draft, GuideContext, HeartModel};
+use crate::core::{
+    guide_context, guide_draft, DeliveryMode, GuideContext, HeartModel, QueueSource,
+};
 use crate::editor::{tui_input, History};
 use crate::keymap::{Action, Keymap};
 use crate::markdown;
@@ -236,6 +238,11 @@ pub(crate) struct App {
     /// Set by `submit()` when idle; drained by the loop and run as the next
     /// turn. A submit *during* a turn goes to `model`'s follow-up queue instead.
     pending_submit: Option<String>,
+    /// Set by `submit_steer()` while a turn runs; drained by the loop into
+    /// the live turn's steer mailbox (§11.2). One staged steer at a time —
+    /// the loop drains on every processed key, so a second press stages
+    /// fresh only after the first has left the reducer.
+    pending_steer: Option<String>,
     /// Set by the second Ctrl+C tap; drained by the loop to cancel the turn.
     pending_cancel: bool,
     /// True from the confirming interrupt tap until the turn settles. While
@@ -327,6 +334,7 @@ impl App {
             last_usage: None,
             ctrl_c_armed: false,
             pending_submit: None,
+            pending_steer: None,
             pending_cancel: false,
             cancel_requested: false,
             model: HeartModel::new(),
@@ -478,6 +486,12 @@ impl App {
                 self.submit();
                 true
             }
+            // Steer (§11.2): into the live turn, not behind it. Falls back to
+            // a plain submit while idle, so the chord is never a dead key.
+            Some(Action::SteerSubmit) => {
+                self.submit_steer();
+                true
+            }
             // Section navigation belongs to the shell and only runs while idle;
             // the loop intercepts these keys before the reducer sees them. A
             // turn runs inline and parks the loop inside `run_one_turn`, so
@@ -561,6 +575,41 @@ impl App {
         // `history_path` are disjoint fields, so the borrows do not conflict.
         self.history.push(&self.history_path, trimmed);
         self.route_submission(trimmed, trimmed.to_string());
+    }
+
+    /// Steer submit (§11.2): while a turn runs, the text joins the *live*
+    /// conversation at its next iteration boundary (staged for the loop to
+    /// push into the turn's steer mailbox) instead of waiting behind it as a
+    /// follow-up. While idle there is nothing to steer — it behaves exactly
+    /// like [`Self::submit`] so the chord is never a dead key.
+    fn submit_steer(&mut self) {
+        let text = self.input.lines().join("\n");
+        self.input = editor(&self.keymap);
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.history.push(&self.history_path, trimmed);
+        if !self.model.is_running() {
+            self.route_submission(trimmed, trimmed.to_string());
+            return;
+        }
+        self.scroll_up = 0;
+        self.push_line(Line::from(Span::styled(
+            format!("❯ {trimmed} (steering)"),
+            Style::default().fg(Theme::current().muted().ratatui()),
+        )));
+        if self
+            .model
+            .queue_mut()
+            .send_with_mode(trimmed, QueueSource::User, DeliveryMode::Steer)
+            .is_some()
+        {
+            self.pending_steer = Some(trimmed.to_string());
+            self.status_note = String::from("steering the running turn · joins at the next step");
+        } else {
+            self.status_note = String::from("follow-up queue is full · withdraw one first");
+        }
     }
 
     /// Up/Down history recall at the input buffer's edges, mirroring the
@@ -735,6 +784,15 @@ impl App {
                 )));
                 true
             }
+            AgentEvent::Steered(text) => {
+                // The live turn absorbed the steer; claim its queue entry (by
+                // oldest equal text) so the ledger records the delivery and
+                // the queued count drops. An unclaimed event means the entry
+                // was withdrawn mid-flight — nothing to do.
+                self.model.queue_mut().claim_steered(text);
+                self.push_line(muted_line(format!("· steered: {text}")));
+                true
+            }
             AgentEvent::Error { message, hint } => {
                 self.push_line(Line::from(Span::styled(
                     format!("✘ {message}"),
@@ -847,6 +905,12 @@ impl App {
     /// Drain a staged submission, if any.
     fn take_submit(&mut self) -> Option<String> {
         self.pending_submit.take()
+    }
+
+    /// Drain a staged steer (§11.2); the loop forwards it into the live
+    /// turn's mailbox.
+    fn take_steer(&mut self) -> Option<String> {
+        self.pending_steer.take()
     }
 
     /// Drain a staged cancel request.
@@ -2021,6 +2085,10 @@ where
     // phase can cancel without borrowing the turn.
     let mut turn: Option<LiveTurn<C, T>> = None;
     let mut turn_cancel: Option<CancellationToken> = None;
+    // The live turn's steer mailbox (§11.2), same lifetime discipline as the
+    // cancel token: created per turn, loop-held while it runs, dropped at
+    // settle. The runtime gets its clone before moving into the future.
+    let mut turn_steer: Option<SteerMailbox> = None;
 
     while !shell.section().quit {
         // ---- Phase R: render ----
@@ -2058,6 +2126,12 @@ where
                     queue.push_front(input);
                     continue;
                 };
+                // Arm this turn's steer mailbox before the runtime moves into
+                // the future: the loop keeps the clone to push into while the
+                // turn runs.
+                let steer = SteerMailbox::default();
+                let mut runtime = runtime;
+                runtime.set_steer_mailbox(steer.clone());
                 let tx = channels.msg_tx.clone();
                 let mut notify = move |event: &AgentEvent| {
                     let _ = tx.send(Msg::Event(event.clone()));
@@ -2088,6 +2162,7 @@ where
                     section: active,
                 });
                 turn_cancel = Some(cancel);
+                turn_steer = Some(steer);
             }
         }
         // ---- Phase I: input collection (and turn completion) ----
@@ -2106,19 +2181,22 @@ where
                     continue;
                 };
                 turn_cancel = None;
+                turn_steer = None;
                 let section = live.section;
                 // The finished future drops here; its output is already in
                 // `outcome`.
                 drop(live);
                 let Some(TurnResult {
-                    runtime,
+                    mut runtime,
                     prompter: finished_prompter,
                     outcome: turn_outcome,
                 }) = outcome
                 else {
                     continue;
                 };
-                // The loop owns the runtime and prompter again.
+                // The loop owns the runtime and prompter again; drop the dead
+                // turn's mailbox handle so the next turn arms a fresh one.
+                runtime.set_steer_mailbox(SteerMailbox::default());
                 prompter = Some(finished_prompter);
                 let (ok, err_note) = match turn_outcome {
                     // The summary's contents (iteration count, tool results)
@@ -2151,8 +2229,18 @@ where
                 // running flag so a submit racing the save routes to the next
                 // turn, then merge everything queued during the turn into one
                 // injection that becomes the next input. Delivering after
-                // *any* finish — success or failure — loses nothing.
+                // *any* finish — success or failure — loses nothing. Steers
+                // the turn never consumed are demoted to follow-ups first so
+                // the injection below carries them (pi's "child completed
+                // before consuming steering" recovery — honest, not lost).
                 app.model.end_turn();
+                let recovered = app.model.queue_mut().recover_pending_steers();
+                if !recovered.is_empty() {
+                    app.push_line(muted_line(format!(
+                        "· {} late steer(s) queued as follow-up(s)",
+                        recovered.len()
+                    )));
+                }
                 if let Some(injection) = app.model.queue_mut().drain_injection() {
                     queue.push_back(injection);
                 }
@@ -2258,6 +2346,17 @@ where
                     }
                     if let Some(text) = shell.section_mut().take_submit() {
                         queue.push_back(text);
+                    }
+                    // A staged steer goes into the live turn's mailbox
+                    // (§11.2); if the turn settled in the same window, demote
+                    // its pending queue entry to a follow-up instead.
+                    if let Some(text) = shell.section_mut().take_steer() {
+                        match turn_steer.as_ref() {
+                            Some(mailbox) => mailbox.push(text),
+                            None => {
+                                shell.section_mut().model.queue_mut().recover_pending_steers();
+                            }
+                        }
                     }
                 }
                 // Pump gone: cancel a live turn so it unwinds and settles (the
@@ -2546,6 +2645,43 @@ mod tests {
             app.status_note.contains("queued"),
             "the status bar surfaces the queue depth"
         );
+    }
+
+    #[test]
+    fn steer_submit_while_running_stages_for_the_live_turn() {
+        let mut app = App::new();
+        app.model.begin_turn();
+        app.update(Msg::TurnStarted);
+        for c in "pivot now".chars() {
+            app.update(Msg::Key(char_key(c)));
+        }
+        let steer_key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(app.update(Msg::Key(steer_key)));
+        assert!(
+            app.pending_submit.is_none(),
+            "a steer must never queue a separate turn"
+        );
+        assert_eq!(app.take_steer().as_deref(), Some("pivot now"));
+        assert_eq!(
+            app.model.queue().items().front().map(|entry| entry.mode),
+            Some(crate::core::DeliveryMode::Steer),
+            "the steer is visible in the queue with its mode"
+        );
+        // Consuming the steer terminalizes the entry and echoes it.
+        assert!(app.update(Msg::Event(AgentEvent::Steered("pivot now".into()))));
+        assert!(app.model.queue().is_empty());
+    }
+
+    #[test]
+    fn steer_submit_while_idle_behaves_like_a_plain_submit() {
+        let mut app = App::new();
+        for c in "hi".chars() {
+            app.update(Msg::Key(char_key(c)));
+        }
+        let steer_key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(app.update(Msg::Key(steer_key)));
+        assert!(app.take_steer().is_none(), "nothing to steer while idle");
+        assert_eq!(app.take_submit().as_deref(), Some("hi"));
     }
 
     #[test]
@@ -4046,6 +4182,116 @@ mod loop_tests {
             report.frames
         );
         assert_eq!(report.saves, 1);
+    }
+
+    #[tokio::test]
+    async fn a_steer_joins_the_running_turns_next_request() {
+        // §11.2 end to end: Ctrl+S mid-turn puts the input into the live
+        // turn; the runtime absorbs it at the iteration boundary after the
+        // tool round, so the *second* request carries it as a user message.
+        let gate = Arc::new(Notify::new());
+        let tool_round = vec![
+            AgentEvent::ToolUse {
+                id: "1".into(),
+                name: "bash".into(),
+                input: "{}".into(),
+            },
+            AgentEvent::MessageStop,
+        ];
+        let report = run_loop_test(
+            vec![
+                ScriptEntry::gated(tool_round, gate),
+                ScriptEntry::immediate(ScriptEntry::text("steered ack")),
+            ],
+            |controls| async move {
+                controls.submit_text("go");
+                controls.wait_for(|frame| frame.turn_active).await;
+                for c in "STEER-NOW".chars() {
+                    controls.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+                }
+                controls.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+                controls
+                    .wait_for(|frame| frame.status_note.contains("steering"))
+                    .await;
+                controls.open_gate(0);
+                controls
+                    .wait_for(|frame| !frame.turn_active && frame.status_note.contains("saved"))
+                    .await;
+                controls.interrupt();
+            },
+        )
+        .await;
+        assert!(
+            report.loop_ok,
+            "the loop did not exit cleanly; frames: {:?}",
+            report.frames
+        );
+        assert_eq!(report.saves, 1);
+        assert_eq!(report.requests.len(), 2, "tool round then steered round");
+        assert!(
+            request_texts(&report.requests[1])
+                .iter()
+                .any(|text| text.contains("STEER-NOW")),
+            "the steered text rides the second request: {:?}",
+            request_texts(&report.requests[1])
+        );
+        assert!(
+            !request_texts(&report.requests[0])
+                .iter()
+                .any(|text| text.contains("STEER-NOW")),
+            "the first request was already in flight when the steer landed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_steer_is_recovered_as_the_next_turn() {
+        // The tool-less turn settles before it can consume the steer; the
+        // entry must be demoted to a follow-up and run as the next turn —
+        // recovered, never lost (pi's "child completed before consuming
+        // steering").
+        let gate = Arc::new(Notify::new());
+        let report = run_loop_test(
+            vec![
+                ScriptEntry::gated(ScriptEntry::text("plain reply"), gate),
+                ScriptEntry::immediate(ScriptEntry::text("after recovery")),
+            ],
+            |controls| async move {
+                controls.submit_text("go");
+                controls.wait_for(|frame| frame.turn_active).await;
+                for c in "LATE-STEER".chars() {
+                    controls.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+                }
+                controls.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+                controls
+                    .wait_for(|frame| frame.status_note.contains("steering"))
+                    .await;
+                controls.open_gate(0);
+                // Turn one settles without consuming; the recovered steer
+                // then runs as turn two.
+                controls
+                    .wait_for(|frame| !frame.turn_active && frame.status_note.contains("saved"))
+                    .await;
+                controls.wait_for(|frame| frame.requests == 2).await;
+                controls
+                    .wait_for(|frame| !frame.turn_active && frame.status_note.contains("saved"))
+                    .await;
+                controls.interrupt();
+            },
+        )
+        .await;
+        assert!(
+            report.loop_ok,
+            "the loop did not exit cleanly; frames: {:?}",
+            report.frames
+        );
+        assert_eq!(report.saves, 2, "both the turn and the recovered steer ran");
+        assert!(
+            request_texts(&report.requests[1])
+                .iter()
+                .any(|text| text.contains("LATE-STEER")),
+            "the unconsumed steer becomes the next turn: {:?}",
+            request_texts(&report.requests[1])
+        );
     }
 
     #[tokio::test]

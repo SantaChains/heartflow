@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinSet};
@@ -64,6 +64,13 @@ pub enum AgentEvent {
     /// into `max_output_tokens`). Whatever streamed so far is kept and the turn
     /// still finishes normally; the notice only warns that the answer is partial.
     Truncated(String),
+    /// A steered user message was absorbed into the live turn at an iteration
+    /// boundary (roadmap §11.2, pi steering): the text is already appended to
+    /// the session and rides the *next* request as a user message. Emitted
+    /// once per consumed steer. Steers that outlive the turn are never
+    /// delivered as this event — the caller recovers them (re-queue as a
+    /// follow-up) so no typed work is lost.
+    Steered(String),
     Error {
         message: String,
         /// Optional human-readable hint for what to try next. Populated by
@@ -404,6 +411,41 @@ fn repair_tool_pairing(messages: Vec<ConversationMessage>) -> Vec<ConversationMe
     repaired
 }
 
+/// Shared mailbox for steering an in-flight turn (roadmap §11.2, pi
+/// steering). The UI half keeps a clone while the turn future owns the
+/// runtime; the turn loop drains it at iteration boundaries — the same safe
+/// points where cancellation is honored — and appends each text to the
+/// session so the *next* request already carries it. A steer never
+/// interrupts an in-flight LLM call (that stays the double-Ctrl+C cancel's
+/// job), and one that outlives the turn is left unconsumed for the caller
+/// to recover: the mailbox reports nothing on its own.
+#[derive(Clone, Debug, Default)]
+pub struct SteerMailbox {
+    slots: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl SteerMailbox {
+    /// Queue one steered text (arrival order is delivery order).
+    pub fn push(&self, text: String) {
+        // A poisoned lock means the draining side panicked mid-turn; the turn
+        // is unwinding anyway, so keeping the text cannot make anything worse.
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(text);
+    }
+
+    /// Take every queued text, oldest first. Called only by the turn loop at
+    /// an iteration boundary.
+    pub fn drain(&self) -> Vec<String> {
+        let mut guard = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.drain(..).collect()
+    }
+}
+
 pub struct ConversationRuntime<C, T> {
     session: Session,
     api_client: C,
@@ -426,6 +468,10 @@ pub struct ConversationRuntime<C, T> {
     /// into it — the cache must keep holding the raw heuristic sum, or every
     /// observation would be fit against an already-corrected value.
     token_calibration: RefCell<TokenCalibration>,
+    /// Where steered user text waits while a turn runs (§11.2). Empty unless
+    /// the host sets a live mailbox before starting the turn — the blocking
+    /// REPL never does (it cannot type mid-turn), the TUI loop does.
+    steer_mailbox: SteerMailbox,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -454,7 +500,16 @@ where
             compaction: CompactionConfig::default(),
             token_prefix: Cell::new((0, 0)),
             token_calibration: RefCell::new(TokenCalibration::default()),
+            steer_mailbox: SteerMailbox::default(),
         }
+    }
+
+    /// Arm the steer mailbox for the next turn: the host keeps a clone to
+    /// push into while the turn future owns `self`; the loop drains it at
+    /// iteration boundaries. Setting a fresh mailbox per turn also drops any
+    /// stale handle a finished turn left behind.
+    pub fn set_steer_mailbox(&mut self, mailbox: SteerMailbox) {
+        self.steer_mailbox = mailbox;
     }
 
     /// Enable in-turn window pre-compaction: before every stream, the loop
@@ -531,6 +586,18 @@ where
             // tool batch) instead of spending another request before noticing it.
             if cancel.is_cancelled() {
                 return Err(RuntimeError::new("turn cancelled"));
+            }
+
+            // Steer consumption point (§11.2): absorb steered user text at the
+            // same safe boundary where cancellation is honored, so the request
+            // below already carries it as a user message. Never mid-stream —
+            // a steer that arrives during the final (tool-less) reply simply
+            // stays unconsumed for the caller to recover.
+            for text in self.steer_mailbox.drain() {
+                self.session
+                    .messages
+                    .push(ConversationMessage::user_text(text.clone()));
+                notify(&AgentEvent::Steered(text));
             }
 
             // Hermes-style >50% pre-compaction: shrink the context before
@@ -703,6 +770,10 @@ where
                     }
                     // ToolResult events are produced by the runtime itself.
                     Some(AgentEvent::ToolResult { .. }) => {}
+                    // Steered is emitted by the turn loop, never by a wire
+                    // stream; one showing up here would be a scripted client
+                    // echoing it back — ignore rather than double-inject.
+                    Some(AgentEvent::Steered(_)) => {}
                 },
             }
             if cancelled {
@@ -1491,6 +1562,114 @@ mod tests {
             output: "4".to_string(),
             is_error: false,
         }));
+    }
+
+    #[tokio::test]
+    async fn steered_text_joins_the_next_request_as_a_user_message() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        use crate::SteerMailbox;
+
+        // The steer is pushed from inside the tool handler — the exact window
+        // between iteration 1's drain and iteration 2's — so the test proves
+        // the boundary consumption, not just a pre-turn push.
+        #[derive(Clone)]
+        struct CapturingClient {
+            requests: Arc<StdMutex<Vec<ApiRequest>>>,
+        }
+        impl ApiClient for CapturingClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+                let call = {
+                    let mut guard = self
+                        .requests
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard.push(request);
+                    guard.len()
+                };
+                match call {
+                    1 => Ok(TurnStream::from_events(vec![
+                        AgentEvent::ToolUse {
+                            id: "probe-1".to_string(),
+                            name: "probe".to_string(),
+                            input: "x".to_string(),
+                        },
+                        AgentEvent::MessageStop,
+                    ])),
+                    _ => Ok(TurnStream::from_events(vec![
+                        AgentEvent::TextDelta("noted.".to_string()),
+                        AgentEvent::MessageStop,
+                    ])),
+                }
+            }
+        }
+
+        let requests: Arc<StdMutex<Vec<ApiRequest>>> = Arc::new(StdMutex::new(Vec::new()));
+        let mailbox = SteerMailbox::default();
+        let push_mailbox = mailbox.clone();
+        let tool_executor = StaticToolExecutor::new().register("probe", move |_| {
+            push_mailbox.push("STEER-MARKER while the tool ran".to_string());
+            Ok("probed".to_string())
+        });
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            CapturingClient {
+                requests: Arc::clone(&requests),
+            },
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::Allow),
+            Vec::new(),
+        );
+        runtime.set_steer_mailbox(mailbox);
+
+        let mut events = Vec::new();
+        let summary = runtime
+            .run_turn(
+                "run the probe",
+                None,
+                &mut |event| events.push(event.clone()),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("steered turn should succeed");
+        assert_eq!(summary.iterations, 2, "tool round then steered round");
+
+        // Exactly one Steered event, and the second request carries the text
+        // as a plain user message.
+        let steered_events = events
+            .iter()
+            .filter(
+                |event| matches!(event, AgentEvent::Steered(text) if text.contains("STEER-MARKER")),
+            )
+            .count();
+        assert_eq!(steered_events, 1, "one Steered event per consumed steer");
+        let guard = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(guard.len(), 2);
+        let second = &guard[1];
+        let carries = second.messages.iter().any(|message| {
+            message.role == MessageRole::User
+                && message
+                    .blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text { text } if text.contains("STEER-MARKER")))
+        });
+        assert!(
+            carries,
+            "the steered text rides request two as a user message"
+        );
+        // The first request must NOT carry it (it was pushed mid-turn).
+        let first_carries = guard[0].messages.iter().any(|message| {
+            message
+                .blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Text { text } if text.contains("STEER-MARKER")))
+        });
+        assert!(
+            !first_carries,
+            "the steer joins the *next* request, not the in-flight one"
+        );
     }
 
     #[tokio::test]

@@ -153,6 +153,17 @@ impl TurnRenderer {
                 .ok();
                 out.flush().ok();
             }
+            // Steered only reaches a turn that armed a steer mailbox; the
+            // blocking REPL cannot type mid-turn, so this arm stays dead —
+            // kept exhaustive so adding the variant cannot slip by silently.
+            AgentEvent::Steered(text) => {
+                writeln!(
+                    out,
+                    "{}",
+                    format!("· steered: {text}").with(self.theme.muted())
+                )
+                .ok();
+            }
             AgentEvent::Error { .. } => {}
         }
     }

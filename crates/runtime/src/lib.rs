@@ -37,7 +37,7 @@ pub use config::{
 };
 pub use conversation::{
     AgentEvent, ApiClient, ApiRequest, ConversationRuntime, RuntimeError, StaticToolExecutor,
-    ToolError, ToolExecutor, ToolSpec, TurnStream, TurnSummary,
+    SteerMailbox, ToolError, ToolExecutor, ToolSpec, TurnStream, TurnSummary,
 };
 pub use diagnostics::{
     diagnostics_degradation_detail, diagnostics_ledger, run_post_edit_diagnostics, DiagnosticItem,

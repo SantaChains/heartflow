@@ -2,6 +2,7 @@ __pycache__/
 archive/
 .history/
 .trae/
+.zcode/
 
 target/
 .heartflow/

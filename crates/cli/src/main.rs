@@ -1346,12 +1346,20 @@ fn handle_queue_command(input: &str, model: &mut HeartModel) {
             let lanes = model.queue().lane_names();
             println!("{} queued (oldest first):", model.queue().len());
             for entry in model.queue().items() {
+                let lane = if entry.lane == core::MAIN_LANE {
+                    String::new()
+                } else {
+                    format!("@{} ", entry.lane)
+                };
+                let mode = if entry.mode == core::DeliveryMode::Steer {
+                    format!("·{} ", entry.mode.tag())
+                } else {
+                    String::new()
+                };
                 println!(
-                    "  #{} [{}{}{}] {}",
+                    "  #{} [{} {lane}{mode}] {}",
                     entry.id,
                     entry.source.label(),
-                    if entry.lane == core::MAIN_LANE { "" } else { "@" },
-                    if entry.lane == core::MAIN_LANE { "" } else { entry.lane.as_str() },
                     truncate_chars(&entry.text, 120)
                 );
             }
