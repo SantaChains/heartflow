@@ -619,7 +619,7 @@ mod tests {
         assert!(store.get(made.id).expect("present").trigger_due(u64::MAX));
         // A huge interval books once at u64::MAX and the saturating
         // subtraction keeps it honest afterwards (no overflow, no refire).
-        let (store, id) = interval_store(u64::MAX / 1000 - 1);
+        let (store, _id) = interval_store(u64::MAX / 1000 - 1);
         assert_eq!(
             store.run_due(u64::MAX, DueReason::Timer).len(),
             1,

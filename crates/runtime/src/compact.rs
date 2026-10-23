@@ -1565,9 +1565,15 @@ mod tests {
         assert!(compaction_stats().count > before.count);
 
         // A torn or hand-mangled file degrades to "no history" — never an
-        // error, never a panic.
-        std::fs::write(&path, "{not json").expect("write corrupt file");
-        assert_eq!(read_stats_file(&path), None);
+        // error, never a panic. The corrupt file must be a *private* path:
+        // the process-global stats file is concurrently rewritten by other
+        // tests' event records, which would heal the corruption mid-assert
+        // and turn this into a parallel-test race.
+        let torn =
+            std::env::temp_dir().join(format!("hf-compact-stats-torn-{}.json", std::process::id()));
+        std::fs::write(&torn, "{not json").expect("write corrupt file");
+        assert_eq!(read_stats_file(&torn), None);
+        let _ = std::fs::remove_file(&torn);
         let _ = compaction_stats();
         let _ = std::fs::remove_file(&path);
     }
