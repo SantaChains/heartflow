@@ -20,7 +20,7 @@
 - [架构](https://raw.githubusercontent.com/SantaChains/heartflow/main/docs/src/architecture.md): Workspace 结构（`crates/*`，依赖单向 `cli → {provider, runtime, api, tools, mcp, store, commands}`，`provider → {api, runtime}`；`runtime` 不感知传输细节）：
 - [接入 MCP 服务](https://raw.githubusercontent.com/SantaChains/heartflow/main/docs/src/mcp-servers.md): heartflow 既是 MCP **客户端**（挂载外部工具），本身也是一个可被别的 agent 调用的终端工具。本页讲如何给 hf 挂上现成的文档类 MCP 服务，让 agent 在写代码时拉到最新 API 文档。
 - [AI 文档集成](https://raw.githubusercontent.com/SantaChains/heartflow/main/docs/src/ai-integration.md): 本页记录 heartflow 面向"文档可被人和 AI 工具消费"的整套适配：文档站点（mdBook → GitHub Pages）、API 文档（rustdoc）、`llms.txt`、Context7 与 DeepWiki。地基是 `docs/` 下的 mdBook——其余各项都从中派生。
-- [已知问题登记（待修复清单）](https://raw.githubusercontent.com/SantaChains/heartflow/main/docs/src/known-issues.md): 本文件登记 heartflow 已观察到的**缺陷与体验问题**。按用户指令（2026-10-22），当前所有条目一律**只登记、不修复**——状态为「登记未修复」。每个条目含：现象、环境·复现、影响、疑点·待查位置（均为**未核实的假设**，仅供参考，修复前必须真机复现并定位根因）、登记日期、状态。
+- [已知问题登记（待修复清单）](https://raw.githubusercontent.com/SantaChains/heartflow/main/docs/src/known-issues.md): 本文件登记 heartflow 已观察到的**缺陷与体验问题**。按用户指令（2026-10-22）建立的登记纪律：条目登记时一律先**只登记、不修复**（状态「登记未修复」）；修复须先真机复现并核实根因，再回填根因与 commit（状态「已修复」）。每个条目含：现象、环境·复现、影响、根因核实（登记时为「疑点·待查位置」假设，修复时回填实证）、登记日期、状态。
 
 ## Optional
 

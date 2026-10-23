@@ -238,6 +238,12 @@ pub(crate) struct App {
     pending_submit: Option<String>,
     /// Set by the second Ctrl+C tap; drained by the loop to cancel the turn.
     pending_cancel: bool,
+    /// True from the confirming interrupt tap until the turn settles. While
+    /// set (or while the double-tap is armed) the rendered status note shows
+    /// the cancel state as a sticky override — stream events rewrite the
+    /// transient note on every tool start, which used to erase the hint
+    /// before it could be read (KI-002).
+    cancel_requested: bool,
     /// Shared session core: the follow-up queue plus the turn-running flag.
     /// Submitting while a turn runs enqueues here (silently, never
     /// interrupting); the loop merges the whole queue into one injection at the
@@ -322,6 +328,7 @@ impl App {
             ctrl_c_armed: false,
             pending_submit: None,
             pending_cancel: false,
+            cancel_requested: false,
             model: HeartModel::new(),
             guide_context: GuideContext::default(),
             permission: None,
@@ -355,6 +362,7 @@ impl App {
                 self.running_tool = None;
                 self.tool_step = 0;
                 self.ctrl_c_armed = false;
+                self.cancel_requested = false;
                 let hint = self.cancel_key_hint();
                 self.status_note = format!("turn running · {hint} twice to cancel");
                 true
@@ -396,6 +404,22 @@ impl App {
         if self.help_open {
             return self.help_key(key);
         }
+        // A modified Enter (shift/alt) inserts a line instead of submitting,
+        // mirroring the REPL editor's "bare Enter sends, Shift/Alt+Enter
+        // continues" (KI-001). Alt+Enter is also the chord a host may never
+        // deliver — Windows Terminal binds it to fullscreen by default and
+        // consumes it before the app sees a key — so Shift+Enter is the
+        // reliable continuation key there.
+        if key.code == KeyCode::Enter
+            && key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+        {
+            // Any key other than the interrupt binding disarms the double-tap.
+            self.ctrl_c_armed = false;
+            self.input.insert_newline();
+            return true;
+        }
         let action = self.keymap.resolve(&key);
         // Any key other than the interrupt binding disarms the double-tap, so a
         // cancel really requires two consecutive presses of that key.
@@ -407,12 +431,10 @@ impl App {
                 if self.turn_active {
                     if self.ctrl_c_armed {
                         self.pending_cancel = true;
+                        self.cancel_requested = true;
                         self.ctrl_c_armed = false;
-                        self.status_note = String::from("cancelling turn…");
                     } else {
                         self.ctrl_c_armed = true;
-                        let hint = self.cancel_key_hint();
-                        self.status_note = format!("press {hint} again to cancel the turn");
                     }
                 } else {
                     self.quit = true;
@@ -496,6 +518,25 @@ impl App {
     /// truthful after a remap.
     fn cancel_key_hint(&self) -> String {
         self.keymap.hint_for(Action::Interrupt)
+    }
+
+    /// The note the status bar renders this frame. The cancel states are
+    /// sticky overrides derived from state — a stream event rewrites the
+    /// transient note on every tool start, which used to erase the
+    /// armed/cancelling hint before it could be read (KI-002) — so the hint
+    /// survives exactly as long as the state it describes: until another key
+    /// disarms the double-tap, or the turn settles.
+    fn rendered_status_note(&self) -> Cow<'_, str> {
+        if self.cancel_requested {
+            Cow::Borrowed("cancelling turn…")
+        } else if self.turn_active && self.ctrl_c_armed {
+            Cow::Owned(format!(
+                "press {} again to cancel the turn",
+                self.cancel_key_hint()
+            ))
+        } else {
+            Cow::Borrowed(&self.status_note)
+        }
     }
 
     /// Rebuild the input bar's title from the current keymap, used after a load
@@ -719,6 +760,7 @@ impl App {
         self.turn_active = false;
         self.running_tool = None;
         self.ctrl_c_armed = false;
+        self.cancel_requested = false;
         self.status_note = if ok {
             if note.is_empty() {
                 String::from("idle")
@@ -1059,7 +1101,7 @@ fn muted_line(text: impl Into<String>) -> Line<'static> {
 /// it stays truthful after a `keymap.toml` remap instead of naming dead keys.
 fn input_block(keymap: &Keymap) -> Block<'static> {
     Block::default().borders(Borders::ALL).title(format!(
-        " input  ({} submit · {} fold · {}/{} scroll · {} keys · {} quit) ",
+        " input  ({} submit · shift+enter newline · {} fold · {}/{} scroll · {} keys · {} quit) ",
         keymap.hint_for(Action::Submit),
         keymap.hint_for(Action::ToggleFold),
         keymap.hint_for(Action::ScrollUp),
@@ -1440,8 +1482,9 @@ fn view(app: &App, area: Rect, frame: &mut Frame, context_window: Option<usize>)
             theme.success().ratatui()
         }),
     )];
+    let status_note = app.rendered_status_note();
     status_spans.push(Span::styled(
-        app.status_note.as_str(),
+        status_note.as_ref(),
         Style::default().fg(theme.muted().ratatui()),
     ));
     if let Some(usage) = app.last_usage {
@@ -2811,6 +2854,85 @@ mod tests {
     }
 
     #[test]
+    fn modified_enter_continues_a_line_instead_of_submitting() {
+        // Shift+Enter and Alt+Enter must both continue the draft, mirroring
+        // the REPL editor — Windows Terminal consumes Alt+Enter as its own
+        // fullscreen toggle before the app sees a key, so Shift+Enter is the
+        // chord that has to work (KI-001).
+        for modifiers in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+            let mut app = App::new();
+            for c in "one".chars() {
+                app.update(Msg::Key(char_key(c)));
+            }
+            assert!(app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, modifiers))));
+            assert!(
+                app.take_submit().is_none(),
+                "a modified Enter must not submit"
+            );
+            for c in "two".chars() {
+                app.update(Msg::Key(char_key(c)));
+            }
+            // Bare Enter then sends the whole multi-line draft as one turn.
+            assert!(app.update(Msg::Key(key(KeyCode::Enter))));
+            assert_eq!(app.take_submit().as_deref(), Some("one\ntwo"));
+        }
+    }
+
+    #[test]
+    fn cancel_hint_survives_stream_events_until_the_turn_settles() {
+        // A tool start rewrites the transient note ("tool 1: `bash`"); the
+        // armed/cancelling hint must outlive it (KI-002).
+        let mut app = App::new();
+        app.update(Msg::TurnStarted);
+        app.update(Msg::Key(ctrl_c()));
+        assert!(app.rendered_status_note().contains("again to cancel"));
+        app.update(Msg::Event(AgentEvent::ToolUse {
+            id: "1".into(),
+            name: "bash".into(),
+            input: "{}".into(),
+        }));
+        assert!(
+            app.rendered_status_note().contains("again to cancel"),
+            "the armed hint survives a tool start"
+        );
+        app.update(Msg::Key(ctrl_c()));
+        assert_eq!(app.rendered_status_note(), "cancelling turn…");
+        app.update(Msg::Event(AgentEvent::ToolUse {
+            id: "2".into(),
+            name: "read_file".into(),
+            input: "{}".into(),
+        }));
+        assert_eq!(
+            app.rendered_status_note(),
+            "cancelling turn…",
+            "the cancelling note survives further stream events"
+        );
+        app.update(Msg::TurnFinished {
+            ok: true,
+            note: "saved x".into(),
+        });
+        assert_eq!(
+            app.rendered_status_note(),
+            "saved x",
+            "settle replaces the sticky override"
+        );
+    }
+
+    #[test]
+    fn cancel_hint_disappears_when_the_double_tap_disarms() {
+        let mut app = App::new();
+        app.update(Msg::TurnStarted);
+        app.update(Msg::Key(ctrl_c()));
+        assert!(app.rendered_status_note().contains("again to cancel"));
+        app.update(Msg::Key(char_key('x')));
+        assert_eq!(
+            app.rendered_status_note(),
+            "turn running · ctrl+c twice to cancel",
+            "after disarm the bar falls back to the transient note"
+        );
+    }
+
+    #[test]
     fn escape_is_inert_while_a_turn_runs() {
         let mut app = App::new();
         app.update(Msg::TurnStarted);
@@ -3617,7 +3739,7 @@ mod loop_tests {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .len(),
-                    status_note: shell.section().status_note.clone(),
+                    status_note: shell.section().rendered_status_note().into_owned(),
                 });
             Ok(())
         };
@@ -3868,6 +3990,62 @@ mod loop_tests {
             report.frames.iter().any(|frame| frame.transcript_len > 0),
             "the cancellation surfaces in the transcript"
         );
+    }
+
+    #[tokio::test]
+    async fn the_armed_cancel_hint_survives_streaming_tool_events() {
+        // KI-002 at loop level: while the double-tap is armed, a tool start
+        // must not erase the "press again to cancel" hint from the rendered
+        // status bar. The tool result landing in the transcript proves the
+        // stream events were processed past the overwrite point. The agent
+        // loop calls the API a second time after the tool round, so the
+        // script carries the closing text reply as its own entry.
+        let gate = Arc::new(Notify::new());
+        let tool_round = vec![
+            AgentEvent::ToolUse {
+                id: "1".into(),
+                name: "bash".into(),
+                input: "{}".into(),
+            },
+            AgentEvent::MessageStop,
+        ];
+        let report = run_loop_test(
+            vec![
+                ScriptEntry::gated(tool_round, gate),
+                ScriptEntry::immediate(ScriptEntry::text("after the tool")),
+            ],
+            |controls| async move {
+                controls.submit_text("hi");
+                controls.wait_for(|frame| frame.turn_active).await;
+                // First tap arms; the hint must be on screen.
+                controls.interrupt();
+                controls
+                    .wait_for(|frame| frame.status_note.contains("again to cancel"))
+                    .await;
+                // Release the stream: the tool start rewrites the transient
+                // note, yet the armed hint must still render after the tool
+                // result is in the transcript.
+                controls.open_gate(0);
+                controls
+                    .wait_for(|frame| {
+                        frame.status_note.contains("again to cancel") && frame.transcript_len >= 2
+                    })
+                    .await;
+                // The turn runs to completion (never cancelled here): settle
+                // replaces the sticky hint.
+                controls
+                    .wait_for(|frame| !frame.turn_active && frame.status_note.contains("saved"))
+                    .await;
+                controls.interrupt();
+            },
+        )
+        .await;
+        assert!(
+            report.loop_ok,
+            "the loop did not exit cleanly; frames: {:?}",
+            report.frames
+        );
+        assert_eq!(report.saves, 1);
     }
 
     #[tokio::test]
