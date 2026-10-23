@@ -89,6 +89,13 @@ pub struct JobRecord {
     pub status: JobStatus,
     /// First 80 chars of the prompt, for humans scanning `/jobs`.
     pub prompt_head: String,
+    /// Owning process id. Job ids are process-local sequences, so two
+    /// heartflow processes sharing `JOBS_ROOT` would collide on `job-<id>`;
+    /// the pid namespaces the directory AND tells reconcile whom a live job
+    /// belongs to (a second process must not terminalize the first one's
+    /// running jobs). `0` marks records from before the field existed.
+    #[serde(default)]
+    pub pid: u32,
     /// Terminal note (pi status-note discipline): stopped/failed jobs say the
     /// output was partial so the supervisor never mistakes a cut-off for a
     /// finished task.
@@ -179,8 +186,13 @@ fn jobs_root() -> Option<PathBuf> {
     JOBS_ROOT.read().ok().and_then(|slot| slot.clone())
 }
 
+/// Namespace a job directory by the *writing* process's pid. Job ids are
+/// process-local sequences starting at 1, so the pid is what keeps two
+/// heartflow processes sharing one root from writing over each other's
+/// `status.json`. Layout: `job-<pid>-<id>` (legacy dirs are `job-<id>` with
+/// `record.pid == 0`).
 fn job_dir(root: &Path, id: u64) -> PathBuf {
-    root.join(format!("job-{id}"))
+    root.join(format!("job-{}-{id}", std::process::id()))
 }
 
 /// Best-effort disk write under the cross-process sidecar lock; a failed
@@ -341,6 +353,7 @@ impl JobRegistry {
             label: label.trim().to_string(),
             status: JobStatus::Queued,
             prompt_head,
+            pid: std::process::id(),
             note: None,
             result_head: None,
         };
@@ -689,11 +702,63 @@ fn kind_label(kind: MessageKind) -> &'static str {
 /// whose process died is not running. Scanning on registry startup, any
 /// `status.json` still queued/running is re-filed as `Stopped` with the pi
 /// status-note so a stale record can never masquerade as live work.
+/// Whether a process id is still running, cross-platform without new deps.
+///
+/// Deliberately conservative: an *undeterminable* pid (the probe command
+/// itself fails) reports alive. Stopping a job whose owner may still be
+/// running is the result-changing direction ("结果会变错" 的降级); leaving a
+/// dead owner's job in `running` until the next reconcile is recoverable.
+/// Residual risk, recorded honestly: a dead owner's pid can be reused by an
+/// unrelated process, leaving the job stranded as `running` — pi's
+/// process-terminal proof is the fuller answer if that ever bites.
+fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        // `tasklist` filters by exact pid and prints one CSV line whose shape
+        // is `"image.exe","<pid>","session",...` - the pid is the second
+        // quoted field, so match `,"<pid>",` rather than anything looser
+        // (image names and memory figures could otherwise collide). A dead
+        // pid yields only the unquoted "INFO:" line.
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output();
+        match output {
+            Ok(output) => String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line.contains(&format!(",\"{pid}\","))),
+            Err(_) => true, // cannot prove dead -> treat as alive
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(true)
+    }
+}
+
+/// Startup reconciliation over the shared jobs root. Ownership rules
+/// (§4 cross-process fix):
+///
+/// - a job owned by *this* pid is a previous incarnation of this process
+///   that died mid-job -> terminalize (the original behavior);
+/// - a legacy record (`pid == 0`, from before namespacing) cannot be
+///   attributed -> terminalize, exactly as the old code did;
+/// - a job owned by a *foreign* pid is terminalized only when that process
+///   is verifiably dead — a second heartflow process starting must never
+///   stop the first one's live jobs (the collision this fixes).
 pub fn reconcile_stale_records() -> usize {
     let Some(root) = jobs_root() else { return 0 };
     let Ok(entries) = std::fs::read_dir(&root) else {
         return 0;
     };
+    let own_pid = std::process::id();
     let mut repaired = 0;
     for entry in entries.flatten() {
         let status_path = entry.path().join("status.json");
@@ -706,11 +771,20 @@ pub fn reconcile_stale_records() -> usize {
         if record.status.is_terminal() {
             continue;
         }
+        if record.pid != 0 && record.pid != own_pid && process_alive(record.pid) {
+            // Another live process owns this job; hands off.
+            continue;
+        }
         record.status = JobStatus::Stopped;
-        record.note = Some(
+        record.note = Some(if record.pid == 0 || record.pid == own_pid {
             "process exited before completion - output is partial; the task was NOT finished"
-                .to_string(),
-        );
+                .to_string()
+        } else {
+            format!(
+                "owning process {} exited before completion - output is partial; the task was NOT finished",
+                record.pid
+            )
+        });
         if let Ok(json) = serde_json::to_string_pretty(&record) {
             if std::fs::write(&status_path, json).is_ok() {
                 repaired += 1;
@@ -729,6 +803,18 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    /// `set_jobs_root` mutates a process-global; tests that persist (or
+    /// reconcile over the shared root) must serialize, or one test's records
+    /// land in another test's root mid-assert. Every test takes the lock for
+    /// its whole body (mission.rs ROOT_LOCK pattern).
+    static ROOT_LOCK: Mutex<()> = Mutex::new(());
+
+    fn root_guard() -> std::sync::MutexGuard<'static, ()> {
+        ROOT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// Runner that blocks until released — drives slot/saturation tests.
     struct GateRunner {
@@ -788,6 +874,7 @@ mod tests {
 
     #[test]
     fn lifecycle_runs_through_slots_and_terminalizes() {
+        let _guard = root_guard();
         set_jobs_root_for_test("lifecycle");
         let registry = JobRegistry::new(2, DEFAULT_MAX_PENDING);
         let gate = gate();
@@ -826,6 +913,7 @@ mod tests {
 
     #[test]
     fn excess_jobs_queue_behind_full_slots() {
+        let _guard = root_guard();
         set_jobs_root_for_test("slots");
         let registry = JobRegistry::new(1, DEFAULT_MAX_PENDING);
         let gate = gate();
@@ -874,6 +962,7 @@ mod tests {
 
     #[test]
     fn pending_cap_refuses_instead_of_growing() {
+        let _guard = root_guard();
         set_jobs_root_for_test("cap");
         // One slot, two allowed non-terminal: first runs, second queues,
         // third is refused at the cap.
@@ -918,6 +1007,7 @@ mod tests {
 
     #[test]
     fn stop_discards_result_and_appends_the_partial_note() {
+        let _guard = root_guard();
         set_jobs_root_for_test("stop");
         let registry = JobRegistry::new(2, DEFAULT_MAX_PENDING);
         let gate = gate();
@@ -963,6 +1053,7 @@ mod tests {
     /// unwinding microseconds later may not claim Complete afterwards).
     #[test]
     fn finalize_on_shutdown_honest_and_unoverwriteable() {
+        let _guard = root_guard();
         set_jobs_root_for_test("shutdown");
         let registry = JobRegistry::new(2, DEFAULT_MAX_PENDING);
         let gate = gate();
@@ -1019,6 +1110,7 @@ mod tests {
 
     #[test]
     fn failed_runner_carries_note_and_keeps_list_bounded() {
+        let _guard = root_guard();
         set_jobs_root_for_test("failed");
         let registry = JobRegistry::new(1, DEFAULT_MAX_PENDING);
         struct Boom;
@@ -1069,6 +1161,7 @@ mod tests {
     /// terminal verdict wins — a late completion may not overwrite a timeout).
     #[test]
     fn wall_timeout_stops_a_stuck_running_job_and_wins_the_verdict() {
+        let _guard = root_guard();
         set_jobs_root_for_test("wall");
         let registry = JobRegistry::with_wall_timeout(
             1,
@@ -1138,5 +1231,204 @@ mod tests {
 
     fn clear_jobs_root_for_test() {
         super::set_jobs_root(None);
+    }
+
+    /// A child process that stays alive until killed — stands in for "another
+    /// live heartflow process owning a job".
+    fn spawn_sleeper() -> std::process::Child {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = std::process::Command::new("ping");
+            command.args(["-n", "30", "127.0.0.1"]);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30");
+            command
+        };
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command.spawn().expect("sleeper child")
+    }
+
+    fn write_record(
+        root: &std::path::Path,
+        dir_name: &str,
+        record: &super::JobRecord,
+    ) -> std::path::PathBuf {
+        let dir = root.join(dir_name);
+        std::fs::create_dir_all(&dir).expect("foreign job dir");
+        let path = dir.join("status.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(record).expect("serialize record"),
+        )
+        .expect("write foreign record");
+        path
+    }
+
+    fn running_record(id: u64, pid: u32) -> super::JobRecord {
+        super::JobRecord {
+            id,
+            label: format!("job {id}"),
+            status: super::JobStatus::Running,
+            prompt_head: "foreign work".to_string(),
+            pid,
+            note: None,
+            result_head: None,
+        }
+    }
+
+    /// Runner that finishes immediately — drives the namespace test.
+    struct QuickRunner {
+        done: Arc<AtomicUsize>,
+    }
+
+    impl JobRunner for QuickRunner {
+        fn run(
+            &mut self,
+            _prompt: &str,
+            _stop: &StopFlag,
+            _emit: &mut dyn FnMut(MessageKind, &str),
+        ) -> Result<String, String> {
+            self.done.fetch_add(1, Ordering::SeqCst);
+            Ok("done".to_string())
+        }
+    }
+
+    #[test]
+    fn job_dirs_carry_the_pid_namespace() {
+        let _guard = root_guard();
+        set_jobs_root_for_test("namespace");
+        let registry = JobRegistry::new(1, DEFAULT_MAX_PENDING);
+        let done = Arc::new(AtomicUsize::new(0));
+        registry
+            .spawn(
+                "ns",
+                "finish now",
+                Box::new(QuickRunner {
+                    done: Arc::clone(&done),
+                }),
+            )
+            .expect("spawn");
+        // The invariant under test is the spawn-time write, so poll for the
+        // file itself (bounded) - under a fully loaded test run the slot
+        // thread may take arbitrarily long, and any fixed sleep window races.
+        let root = super::jobs_root().expect("root set");
+        let dir = root.join(format!("job-{}-1", std::process::id()));
+        let status_path = dir.join("status.json");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Ok(text) = std::fs::read_to_string(&status_path) {
+                break text;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the namespaced status.json never appeared: {}",
+                status_path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.contains(&format!("\"pid\": {}", std::process::id())));
+        // The runner finishing is auxiliary; poll it (bounded) because under
+        // a loaded suite the worker thread may start arbitrarily late.
+        let done_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while done.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < done_deadline,
+                "the runner never finished"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        clear_jobs_root_for_test();
+    }
+
+    #[test]
+    fn reconcile_leaves_a_live_foreign_job_alone() {
+        let _guard = root_guard();
+        set_jobs_root_for_test("foreign-live");
+        let root = super::jobs_root().expect("root set");
+        let mut sleeper = spawn_sleeper();
+        let path = write_record(
+            &root,
+            &format!("job-{}-9", sleeper.id()),
+            &running_record(9, sleeper.id()),
+        );
+        let repaired = super::reconcile_stale_records();
+        let content = std::fs::read_to_string(&path).expect("record intact");
+        assert!(
+            content.contains("\"running\""),
+            "a live foreign owner's job must not be terminalized: {content}"
+        );
+        assert_eq!(repaired, 0, "nothing was repaired for the live foreign job");
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        clear_jobs_root_for_test();
+    }
+
+    #[test]
+    fn reconcile_stops_a_dead_foreign_job_with_the_owner_named() {
+        let _guard = root_guard();
+        set_jobs_root_for_test("foreign-dead");
+        let root = super::jobs_root().expect("root set");
+        // A child that exits immediately: after wait() its pid is dead.
+        let mut short_lived = {
+            #[cfg(windows)]
+            {
+                let mut command = std::process::Command::new("cmd");
+                command.args(["/C", "exit", "0"]);
+                command
+            }
+            #[cfg(not(windows))]
+            {
+                let mut command = std::process::Command::new("true");
+                command
+            }
+        };
+        let dead_pid = short_lived.spawn().expect("child ran").id();
+        // Give the child a moment to exit so its pid is genuinely dead.
+        std::thread::sleep(Duration::from_millis(300));
+        let path = write_record(
+            &root,
+            &format!("job-{dead_pid}-9"),
+            &running_record(9, dead_pid),
+        );
+        let repaired = super::reconcile_stale_records();
+        assert_eq!(repaired, 1);
+        let content = std::fs::read_to_string(&path).expect("record readable");
+        assert!(content.contains("\"stopped\""));
+        assert!(
+            content.contains(&format!("owning process {dead_pid} exited")),
+            "the note names the dead owner: {content}"
+        );
+        clear_jobs_root_for_test();
+    }
+
+    #[test]
+    fn reconcile_stops_own_and_legacy_records_as_before() {
+        let _guard = root_guard();
+        set_jobs_root_for_test("own-legacy");
+        let root = super::jobs_root().expect("root set");
+        // Our own pid: a previous incarnation of this process.
+        let own = write_record(
+            &root,
+            &format!("job-{}-1", std::process::id()),
+            &running_record(1, std::process::id()),
+        );
+        // Legacy layout: no pid in the name, none in the record.
+        let legacy = write_record(&root, "job-7", &running_record(7, 0));
+        assert_eq!(super::reconcile_stale_records(), 2);
+        for (path, label) in [(own, "own"), (legacy, "legacy")] {
+            let content = std::fs::read_to_string(path).expect("record readable");
+            assert!(content.contains("\"stopped\""), "{label} terminalized");
+            assert!(
+                content.contains("process exited before completion"),
+                "{label} keeps the original note: {content}"
+            );
+        }
+        clear_jobs_root_for_test();
     }
 }
