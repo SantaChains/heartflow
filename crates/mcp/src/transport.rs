@@ -26,10 +26,16 @@ type WriteCommand = (String, SyncSender<WriteOutcome>);
 
 /// Byte stream to an MCP peer, framed as newline-delimited JSON.
 pub trait Transport: Send {
+    /// # Errors
+    /// Fails when the line cannot be written (broken pipe, peer gone).
     fn send_line(&mut self, line: &str) -> io::Result<()>;
 
     /// Wait up to `timeout` for the next line. `Ok(None)` means the peer
     /// closed the stream.
+    ///
+    /// # Errors
+    /// Fails on a read error other than a clean peer close; `Ok(None)` is
+    /// the closed-stream signal, not an error.
     fn recv_line(&mut self, timeout: Duration) -> io::Result<Option<String>>;
 }
 
@@ -45,6 +51,12 @@ pub struct StdioTransport {
 
 impl StdioTransport {
     /// Spawn `program` with inherited environment plus `env` additions.
+    ///
+    /// # Errors
+    /// Fails when the program cannot be spawned (missing binary, permission)
+    /// or the stdin/stdout pipes cannot be established; the reader and writer
+    /// threads start before returning, so a peer that dies immediately
+    /// surfaces on the first `recv_line` instead.
     pub fn spawn(
         program: &str,
         args: &[String],

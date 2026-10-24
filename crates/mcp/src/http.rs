@@ -48,6 +48,11 @@ impl HttpTransport {
     /// Connect to a Streamable-HTTP MCP endpoint. `headers` are sent verbatim
     /// (auth already resolved by the caller); `bearer`, when set, becomes an
     /// `Authorization: Bearer` header.
+    ///
+    /// # Errors
+    /// Fails only when the worker thread cannot be spawned; the endpoint
+    /// itself is contacted lazily on the first request, so an unreachable or
+    /// rejecting server surfaces there, not here.
     pub fn new(
         url: String,
         headers: Vec<(String, String)>,

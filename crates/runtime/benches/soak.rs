@@ -54,7 +54,9 @@ struct ReplyClient;
 impl ApiClient for ReplyClient {
     fn stream(&mut self, _request: ApiRequest) -> Result<TurnStream, RuntimeError> {
         Ok(TurnStream::from_events(vec![
-            AgentEvent::TextDelta("soak reply with some body text to grow the transcript ".repeat(6)),
+            AgentEvent::TextDelta(
+                "soak reply with some body text to grow the transcript ".repeat(6),
+            ),
             AgentEvent::Usage(TokenUsage {
                 input_tokens: 2_200,
                 output_tokens: 120,
@@ -71,9 +73,7 @@ impl ApiClient for ReplyClient {
 struct Alternating(std::sync::atomic::AtomicUsize);
 impl ApiClient for Alternating {
     fn stream(&mut self, request: ApiRequest) -> Result<TurnStream, RuntimeError> {
-        let n = self
-            .0
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _ = black_box(&request);
         if n % 2 == 0 {
             SoakClient.stream(request)
@@ -84,8 +84,8 @@ impl ApiClient for Alternating {
 }
 
 fn main() {
-    let executor = StaticToolExecutor::new()
-        .register("echo", |input: &str| Ok(format!("echoed {input}")));
+    let executor =
+        StaticToolExecutor::new().register("echo", |input: &str| Ok(format!("echoed {input}")));
     let system_prompt = SystemPromptBuilder::new()
         .with_project_context(runtime::ProjectContext {
             cwd: std::path::PathBuf::from("/soak"),

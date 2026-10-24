@@ -40,6 +40,11 @@ pub struct McpClient {
 
 impl McpClient {
     /// Run the `initialize` handshake and announce readiness.
+    ///
+    /// # Errors
+    /// Fails when the handshake request cannot be delivered (transport I/O),
+    /// the peer answers with a JSON-RPC error, or the response is not the
+    /// expected `initialize` result shape.
     pub fn connect(mut transport: Box<dyn Transport>) -> Result<Self, McpError> {
         let result = send_request(
             &mut transport,
@@ -66,6 +71,11 @@ impl McpClient {
     }
 
     /// Advertised tools; entries without a name are skipped.
+    ///
+    /// # Errors
+    /// Fails on transport I/O, a JSON-RPC error response, or a response body
+    /// that is not the expected `tools/list` result shape. Malformed tool
+    /// entries are skipped, not errors.
     pub fn list_tools(&self) -> Result<Vec<McpTool>, McpError> {
         let result = self.request("tools/list", &json!({}))?;
         let entries = result
@@ -78,6 +88,10 @@ impl McpClient {
 
     /// Invoke one tool. `is_error` surfaces in-band as `Ok`, matching the
     /// protocol; only transport and JSON-RPC failures return `Err`.
+    ///
+    /// # Errors
+    /// Fails on transport I/O, a JSON-RPC error response, or a response body
+    /// that is not the expected `tools/call` result shape.
     pub fn call_tool(&self, name: &str, arguments: &Value) -> Result<McpToolResult, McpError> {
         let result = self.request("tools/call", &json!({"name": name, "arguments": arguments}))?;
         Ok(McpToolResult {
