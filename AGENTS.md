@@ -143,7 +143,7 @@ CI 有三条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/**`
 
 三段式 `plan(dry) → publish → windows-zip`，零 Node；发布逻辑集中在 `scripts/release.sh`，CI 与本地共用同一事实源。
 
-- 本地预检（必须先于 push，不得用 Actions 试错）：`bash scripts/release.sh plan`；`RELEASE_DRY_RUN=1 bash scripts/release.sh publish`（只读预演，需本地 git-cliff）。质量门本地全绿后才 push。
+- 本地预检（必须先于 push，不得用 Actions 试错）：`bash scripts/release.sh plan`；`RELEASE_TAG=<tag> RELEASE_BUMP=<bump> RELEASE_DRY_RUN=1 bash scripts/release.sh publish`（只读预演，需本地 git-cliff；tag/bump 取 plan 输出——脚本不自动继承）。质量门本地全绿后才 push。
 - 版本语义：`feat:` → minor、`fix:` → patch、`!` 或 `BREAKING CHANGE:` → major；`chore/docs/test/ci/style/build` 不入正文且 plan job 秒级短路（规则见根 `cliff.toml`）。提交 scope 用 crate 名，如 `feat(tools): ...`。
 - crates.io：裸名 `api/runtime/mcp/tools/store/commands` 已被占用，内部 crate 统一挂 `heartflow-` 前缀发布，`[lib] name` 与源码 `use` 保持不变（靠 `[workspace.dependencies]` 的 `package =` 重命名）。认证走仓库 secret `CRATES_IO_TOKEN`；单 crate 失败自动重试（429 退避），"already uploaded" 幂等跳过；版本一次性，同版本不可重发。
 - 续发：publish 中途失败时 tag 与 Release 已建，重跑整链会因 "tag 之后无 feat/fix" 判 `released=false` 而短路；改用 `RELEASE_TAG=<tag> RELEASE_BUMP=<bump> bash scripts/release.sh publish`。
