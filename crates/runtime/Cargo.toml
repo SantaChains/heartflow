@@ -35,3 +35,8 @@ thiserror = "2"
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "hot_paths"
+harness = false
+
