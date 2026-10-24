@@ -660,7 +660,7 @@ pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript �
 
 **版权纪律**：Microsoft 代码 MIT——本条目仅取设计判据，无代码移植，无 NOTICE 义务；将来移植任何片段须按 AGENTS 追加 NOTICE。
 
-- **模型自举 ✅ 已落地（2026-10-24，`/bootstrap <provider> [model] [--reorganize]`，REPL）**：一条命令完成「换 provider/token → 热重载 → 记忆随行」。**积木已在**：`/model` 切换（自记 provider.toml）、ConfigWatcher 回合边界重建 runtime（新 base_url/api_key 生效）、MEMORY.md 模型无关自动随行。**缺口**：① 编排命令（如 `/bootstrap <provider> [--token-env NAME]`——校验新凭据可达后再切换，失败不换防「自举失败锁死」）；② 「整理记忆到新模型」步（MEMORY.md 跨模型共享，缺一次面向新模型的记忆重整——压缩/按新模型上下文风格重排，可复用 D4.5 摘要契约）；③ 切换瞬间的在飞回合处置（等结算 or 取消，须明示）。
+- **模型自举 ✅ 已落地（2026-10-24，`/bootstrap <provider> [model] [--reorganize]`，REPL）**：一条命令完成「换 provider/token → 热重载 → 记忆随行」。**积木已在**：`/model` 切换（自记 provider.toml）、ConfigWatcher 回合边界重建 runtime（新 base_url/api_key 生效）、MEMORY.md 模型无关自动随行。**三缺口全部补齐（2026-10-24 真机验证）**：① 编排命令 `/bootstrap <provider> [model] [--token <key>] [--reorganize]`——三段预检（resolve/可达性/runtime build）全过才切换；② `--reorganize` 由新模型在会话内重写 MEMORY.md（.bak 备份+原子写+transcript 可审计）；③ REPL 斜杠命令天然回合间隙执行（在飞处置不适用，TUI 无斜杠面为诚实边界）。**DeepSeek 特殊优化**：models list 自动选 flash 档（点名模型先对照端点清单验证，不在清单则警告保留用户选择）、余额 best-effort 请求（/user/balance）、**服务端上报的 context window 自动填入目录**（persist_model source=User）；`--token <key>` 支持内联凭据（config api_key 同形）。**真机验证**：endpoint 可达 2 模型 → 自动选 deepseek-flash → 余额 43.46 CNY → 切换完成。web_search 兜底（端点不报 context 时查网填参）记为后续。
 ## C. 功能增强候选（轻量，待评估）
 
 > C 组为轻量功能候选，待评估是否纳入路线。

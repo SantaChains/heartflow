@@ -2440,23 +2440,39 @@ async fn handle_bootstrap_command(
         .map(str::trim)
         .unwrap_or_default();
     if requested.is_empty() {
-        println!("usage: /bootstrap <provider> [model] [--reorganize]");
+        println!("usage: /bootstrap <provider> [model] [--token <key>] [--reorganize]");
         println!(
             "       validates the new provider (credentials reachable) BEFORE switching, then swaps the live runtime; memory carries over automatically."
+        );
+        println!(
+            "       DeepSeek-optimized: auto-picks the flash model when none is named, verifies a named model against the endpoint's list, requests the account balance, and fills the server-reported context window into the catalog."
         );
         return;
     }
     let reorganize = requested.contains("--reorganize");
     let requested = requested.replace("--reorganize", "").trim().to_string();
-    let mut parts = requested.split_whitespace();
+    // `--token <key>` supplies an inline credential (config's `api_key` shape)
+    // instead of relying on the provider.toml/env resolution.
+    let mut inline_token: Option<String> = None;
+    let mut tokens: Vec<&str> = requested.split_whitespace().collect();
+    if let Some(position) = tokens.iter().position(|part| *part == "--token") {
+        if position + 1 < tokens.len() {
+            inline_token = Some(tokens[position + 1].to_string());
+            tokens.drain(position..=position + 1);
+        } else {
+            println!("usage: --token needs a key argument");
+            return;
+        }
+    }
+    let mut parts = tokens.into_iter();
     let Some(provider) = parts.next() else {
-        println!("usage: /bootstrap <provider> [model] [--reorganize]");
+        println!("usage: /bootstrap <provider> [model] [--token <key>] [--reorganize]");
         return;
     };
     let model = parts.next();
 
     // Pre-flight 1: resolve. An unknown provider never touches the live runtime.
-    let next = match resolve_selection(Some(provider), model) {
+    let mut next = match resolve_selection(Some(provider), model) {
         Ok(next) => next,
         Err(error) => {
             println!("bootstrap aborted (nothing switched): {error}");
@@ -2466,25 +2482,74 @@ async fn handle_bootstrap_command(
     // Pre-flight 2: reachability. The OpenAI-compatible models list doubles as
     // a credential + endpoint proof; protocols without a probe fall back to
     // build-time validation with an honest note.
-    if let ProviderSelection::Profile(profile) = &next {
+    let mut server_context: Option<u64> = None;
+    if let ProviderSelection::Profile(profile) = &mut next {
+        if let Some(token) = &inline_token {
+            profile.api_key = token.clone();
+        }
         if profile.protocol == ProviderProtocol::OpenAi {
             let client =
                 OpenAiClient::new(profile.api_key.clone()).with_base_url(profile.base_url.clone());
-            match client.list_models().await {
-                Ok(models) => {
-                    println!(
-                        "pre-flight ok: endpoint reachable, {} models listed",
-                        models.len()
-                    );
-                }
+            let models = match client.list_models().await {
+                Ok(models) => models,
                 Err(error) => {
                     println!(
                         "bootstrap aborted (nothing switched): endpoint check failed: {error}"
                     );
                     return;
                 }
+            };
+            println!(
+                "pre-flight ok: endpoint reachable, {} models listed",
+                models.len()
+            );
+            // DeepSeek-specialized selection: a named model is verified against
+            // the endpoint's own list (warned, not refused — some endpoints
+            // under-report); unnamed defaults to the flash tier.
+            let picked = if let Some(requested_model) = model {
+                if models.iter().any(|info| info.id == requested_model) {
+                    println!("model `{requested_model}` verified against the endpoint list");
+                } else {
+                    println!(
+                        "note: `{requested_model}` is not in the endpoint's list; keeping your explicit choice"
+                    );
+                }
+                Some(requested_model.to_string())
+            } else if let Some(flash) = models
+                .iter()
+                .map(|info| info.id.as_str())
+                .find(|id| id.contains("flash"))
+            {
+                println!("no model named; auto-selected the flash tier: {flash}");
+                Some(flash.to_string())
+            } else {
+                let fallback = models.first().map(|info| info.id.clone());
+                match &fallback {
+                    Some(id) => println!("no model named and no flash tier; selected: {id}"),
+                    None => println!("endpoint listed no models; keeping the catalog default"),
+                }
+                fallback
+            };
+            if let Some(picked) = picked {
+                server_context = models
+                    .iter()
+                    .find(|info| info.id == picked)
+                    .and_then(|info| info.context_length.map(u64::from));
+                next.set_model(picked);
+            }
+            // Balance is a best-effort extra (DeepSeek's /user/balance); a
+            // provider without that endpoint just skips the line.
+            if let Ok(balance) = client.get_balance().await {
+                for info in &balance.balance_infos {
+                    println!("balance: {} {}", info.total_balance, info.currency);
+                }
             }
         } else {
+            if inline_token.is_some() {
+                println!(
+                    "note: --token applies to OpenAI-compatible profiles; this protocol resolves its credential from the environment"
+                );
+            }
             println!(
                 "note: {} has no reachability probe; validation is build-time only",
                 profile.protocol.as_str()
@@ -2510,7 +2575,7 @@ async fn handle_bootstrap_command(
             &profile.base_url,
             profile.protocol,
             &profile.model,
-            profile.context_window.map(u64::from),
+            server_context.or(profile.context_window.map(u64::from)),
             ModelSource::User,
         ) {
             println!("(could not record model in catalog: {error})");
