@@ -660,7 +660,7 @@ pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript �
 
 **版权纪律**：Microsoft 代码 MIT——本条目仅取设计判据，无代码移植，无 NOTICE 义务；将来移植任何片段须按 AGENTS 追加 NOTICE。
 
-- **模型自举（model self-bootstrap，2026-10-24 用户点名，优先级高）**：一条命令完成「换 provider/token → 热重载 → 记忆随行」。**积木已在**：`/model` 切换（自记 provider.toml）、ConfigWatcher 回合边界重建 runtime（新 base_url/api_key 生效）、MEMORY.md 模型无关自动随行。**缺口**：① 编排命令（如 `/bootstrap <provider> [--token-env NAME]`——校验新凭据可达后再切换，失败不换防「自举失败锁死」）；② 「整理记忆到新模型」步（MEMORY.md 跨模型共享，缺一次面向新模型的记忆重整——压缩/按新模型上下文风格重排，可复用 D4.5 摘要契约）；③ 切换瞬间的在飞回合处置（等结算 or 取消，须明示）。
+- **模型自举 ✅ 已落地（2026-10-24，`/bootstrap <provider> [model] [--reorganize]`，REPL）**：一条命令完成「换 provider/token → 热重载 → 记忆随行」。**积木已在**：`/model` 切换（自记 provider.toml）、ConfigWatcher 回合边界重建 runtime（新 base_url/api_key 生效）、MEMORY.md 模型无关自动随行。**缺口**：① 编排命令（如 `/bootstrap <provider> [--token-env NAME]`——校验新凭据可达后再切换，失败不换防「自举失败锁死」）；② 「整理记忆到新模型」步（MEMORY.md 跨模型共享，缺一次面向新模型的记忆重整——压缩/按新模型上下文风格重排，可复用 D4.5 摘要契约）；③ 切换瞬间的在飞回合处置（等结算 or 取消，须明示）。
 ## C. 功能增强候选（轻量，待评估）
 
 > C 组为轻量功能候选，待评估是否纳入路线。

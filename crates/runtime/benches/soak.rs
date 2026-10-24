@@ -18,9 +18,8 @@ use std::time::Instant;
 
 use runtime::estimate_tokens_from;
 use runtime::{
-    AgentEvent, ApiClient, ApiRequest, ConversationRuntime, PermissionMode,
-    PermissionPolicy, RuntimeError, Session, StaticToolExecutor, SystemPromptBuilder, TokenUsage,
-    TurnStream,
+    AgentEvent, ApiClient, ApiRequest, ConversationRuntime, PermissionMode, PermissionPolicy,
+    RuntimeError, Session, StaticToolExecutor, SystemPromptBuilder, TokenUsage, TurnStream,
 };
 use tokio_util::sync::CancellationToken;
 

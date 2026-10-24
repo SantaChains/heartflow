@@ -114,6 +114,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "Assemble a prior-work/state/task draft to send",
     ),
     (
+        "/bootstrap <provider> [MODEL]",
+        "Validated provider swap: pre-flight, switch, memory carries over",
+    ),
+    (
         "/init",
         "Scaffold a starting AGENTS.md in the current directory",
     ),

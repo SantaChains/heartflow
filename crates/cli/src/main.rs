@@ -1317,6 +1317,11 @@ async fn dispatch_slash_command(
             *planning = false;
             LoopControl::Continue
         }
+        _ if trimmed == "/bootstrap" || trimmed.starts_with("/bootstrap ") => {
+            handle_bootstrap_command(state, trimmed, selection, runtime, mode, catalog).await;
+            *planning = false;
+            LoopControl::Continue
+        }
         _ if trimmed == "/plan" || trimmed.starts_with("/plan ") => {
             handle_plan_command(
                 state, trimmed, planning, plan_path, cwd, mode, runtime, prompter,
@@ -2415,6 +2420,178 @@ fn confirm_restart() -> bool {
         .unwrap_or(false)
 }
 
+/// `/bootstrap <provider> [model] [--reorganize]` — 模型自举: swap the session's
+/// provider/token/model in one validated step. Pre-flight runs BEFORE any
+/// switch (resolve → reachability probe → runtime build), so a failed
+/// bootstrap never strands the session on a broken transport. Memory carries
+/// over automatically: MEMORY.md is model-agnostic and re-read every turn.
+/// `--reorganize` additionally runs one in-session turn asking the NEW model
+/// to reorganize MEMORY.md, written back atomically behind a `.bak` backup.
+async fn handle_bootstrap_command(
+    state: &SessionShared,
+    input: &str,
+    selection: &mut ProviderSelection,
+    runtime: &mut AgentRuntime,
+    mode: &str,
+    _catalog: &ProviderCatalog,
+) {
+    let requested = input
+        .strip_prefix("/bootstrap")
+        .map(str::trim)
+        .unwrap_or_default();
+    if requested.is_empty() {
+        println!("usage: /bootstrap <provider> [model] [--reorganize]");
+        println!(
+            "       validates the new provider (credentials reachable) BEFORE switching, then swaps the live runtime; memory carries over automatically."
+        );
+        return;
+    }
+    let reorganize = requested.contains("--reorganize");
+    let requested = requested.replace("--reorganize", "").trim().to_string();
+    let mut parts = requested.split_whitespace();
+    let Some(provider) = parts.next() else {
+        println!("usage: /bootstrap <provider> [model] [--reorganize]");
+        return;
+    };
+    let model = parts.next();
+
+    // Pre-flight 1: resolve. An unknown provider never touches the live runtime.
+    let next = match resolve_selection(Some(provider), model) {
+        Ok(next) => next,
+        Err(error) => {
+            println!("bootstrap aborted (nothing switched): {error}");
+            return;
+        }
+    };
+    // Pre-flight 2: reachability. The OpenAI-compatible models list doubles as
+    // a credential + endpoint proof; protocols without a probe fall back to
+    // build-time validation with an honest note.
+    if let ProviderSelection::Profile(profile) = &next {
+        if profile.protocol == ProviderProtocol::OpenAi {
+            let client =
+                OpenAiClient::new(profile.api_key.clone()).with_base_url(profile.base_url.clone());
+            match client.list_models().await {
+                Ok(models) => {
+                    println!(
+                        "pre-flight ok: endpoint reachable, {} models listed",
+                        models.len()
+                    );
+                }
+                Err(error) => {
+                    println!(
+                        "bootstrap aborted (nothing switched): endpoint check failed: {error}"
+                    );
+                    return;
+                }
+            }
+        } else {
+            println!(
+                "note: {} has no reachability probe; validation is build-time only",
+                profile.protocol.as_str()
+            );
+        }
+    }
+    // Pre-flight 3: build the replacement runtime. On any failure the live
+    // runtime stays untouched.
+    let rebuilt = match build_runtime(state, runtime.session().clone(), next.clone(), true, mode) {
+        Ok(rebuilt) => rebuilt,
+        Err(error) => {
+            println!("bootstrap aborted (nothing switched): {error}");
+            return;
+        }
+    };
+    *runtime = rebuilt;
+    *selection = next;
+    println!("bootstrap complete -> model {}", selection.model());
+    println!("memory carried over: MEMORY.md is model-agnostic and re-read every turn.");
+    if let ProviderSelection::Profile(profile) = selection {
+        if let Err(error) = persist_model(
+            &home_dir(),
+            &profile.base_url,
+            profile.protocol,
+            &profile.model,
+            profile.context_window.map(u64::from),
+            ModelSource::User,
+        ) {
+            println!("(could not record model in catalog: {error})");
+        }
+        println!(
+            "note: the switch is session-live; to make it permanent, set the same [provider] in config.toml"
+        );
+    }
+    if reorganize {
+        reorganize_memory(state, runtime).await;
+    }
+}
+
+/// The `--reorganize` step: one in-session turn on the NEW model rewrites
+/// MEMORY.md for its own future use. The transcript keeps the change
+/// auditable; the file is backed up and only replaced on a non-empty result.
+async fn reorganize_memory(state: &SessionShared, runtime: &mut AgentRuntime) {
+    let path = home_dir().join(".heartflow").join("MEMORY.md");
+    let Ok(current) = std::fs::read_to_string(&path) else {
+        println!("no MEMORY.md to reorganize (skipped)");
+        return;
+    };
+    let prompt = format!(
+        "Reorganize the following long-term memory file for your own future use: deduplicate, group by theme, keep every durable preference, pitfall and fact, drop nothing that is still useful, and output ONLY the reorganized markdown with no commentary.
+
+--- MEMORY.md ---
+{current}"
+    );
+    let outcome = run_turn_interactive(state, runtime, &prompt, None).await;
+    let Ok(outcome) = outcome else {
+        println!("reorganize turn failed; memory untouched");
+        return;
+    };
+    if !outcome.ok {
+        println!("reorganize turn failed; memory untouched");
+        return;
+    }
+    let text: String = runtime
+        .session()
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::Assistant)
+        .map(|message| {
+            message
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                )
+        })
+        .unwrap_or_default();
+    if text.trim().is_empty() {
+        println!("model produced no reorganized memory; file untouched");
+        return;
+    }
+    let backup = path.with_extension("md.bak");
+    if std::fs::copy(&path, &backup).is_err() {
+        println!("could not back up MEMORY.md; file untouched");
+        return;
+    }
+    let temp = path.with_extension("md.tmp");
+    if std::fs::write(&temp, &text)
+        .and_then(|_| std::fs::rename(&temp, &path))
+        .is_ok()
+    {
+        println!("memory reorganized (backup: {})", backup.display());
+    } else {
+        println!(
+            "could not write the reorganized memory; backup at {}",
+            backup.display()
+        );
+    }
+}
+
 fn handle_model_command(
     state: &SessionShared,
     input: &str,
@@ -3164,6 +3341,8 @@ fn print_repl_help() {
     println!("  /help          Show help");
     println!("  /status        Show session status");
     println!("  /model [NAME]  Show or switch the model");
+    println!("  /bootstrap <P> Validated provider swap: pre-flight, switch, memory carries");
+    println!("                 over (--reorganize lets the new model rewrite MEMORY.md)");
     println!("  /mode [NAME]   Show or switch the permission mode");
     println!("  /plan <GOAL>   Plan first (writes gated to .heartflow/plans), then /plan approve to execute");
     println!("  /compact       Compact session history");
