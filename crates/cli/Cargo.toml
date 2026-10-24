@@ -69,3 +69,8 @@ unicode-width = "0.2"
 
 [lints]
 workspace = true
+
+# Feature-carrier: enabled for `unstable-rendered-line-info` (see above); no
+# direct `use` — cargo-machete text-matching cannot see feature wiring.
+[package.metadata.cargo-machete]
+ignored = ["ratatui-widgets"]
