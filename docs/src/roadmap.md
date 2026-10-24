@@ -661,6 +661,21 @@ pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript �
 **版权纪律**：Microsoft 代码 MIT——本条目仅取设计判据，无代码移植，无 NOTICE 义务；将来移植任何片段须按 AGENTS 追加 NOTICE。
 
 - **模型自举 ✅ 已落地（2026-10-24，`/bootstrap <provider> [model] [--reorganize]`，REPL）**：一条命令完成「换 provider/token → 热重载 → 记忆随行」。**积木已在**：`/model` 切换（自记 provider.toml）、ConfigWatcher 回合边界重建 runtime（新 base_url/api_key 生效）、MEMORY.md 模型无关自动随行。**三缺口全部补齐（2026-10-24 真机验证）**：① 编排命令 `/bootstrap <provider> [model] [--token <key>] [--reorganize]`——三段预检（resolve/可达性/runtime build）全过才切换；② `--reorganize` 由新模型在会话内重写 MEMORY.md（.bak 备份+原子写+transcript 可审计）；③ REPL 斜杠命令天然回合间隙执行（在飞处置不适用，TUI 无斜杠面为诚实边界）。**DeepSeek 特殊优化**：models list 自动选 flash 档（点名模型先对照端点清单验证，不在清单则警告保留用户选择）、余额 best-effort 请求（/user/balance）、**服务端上报的 context window 自动填入目录**（persist_model source=User）；`--token <key>` 支持内联凭据（config api_key 同形）。**真机验证**：endpoint 可达 2 模型 → 自动选 deepseek-flash → 余额 43.46 CNY → 切换完成。web_search 兜底（端点不报 context 时查网填参）记为后续。
+#### C-1. 模式系统四态 + 采样参数面（2026-10-24 用户点名设计，采样管道实现中，模式分相落地）
+
+用户要求的四模式（Tab 切换）、采样参数、强度显示、联网开关，分层设计如下。
+
+**采样参数**（实现中，子代理执行）：config `[provider]` 新键 temperature/top_p/top_k/frequency_penalty/presence_penalty/seed → `SamplingParams` 共享体 serde(flatten) 进 MessageRequest/ChatRequest → 三协议 adapter 贯通（responses 仅 temperature/top_p）。全 None 时请求 JSON 逐字节不变（cassette 夹具仲裁）。**beam search 不适用判决**：chat API 解码在服务端，num_beams 是本地推理概念——如实记录不实现。**第二个 TUI 判决：不需要**——参数属配置面（config + `hf config export`），TUI 加参数浮层是界面税；强度用状态行显示（见下）。
+
+**四态模式**（同构复用：全部建立在现有 permission-mode + 系统提示段 + 工具过滤三件套上，不造新机制）：
+- **agent** = 现默认（workspace-write/full）——已存在。
+- **plan** = 现有 plan 权限档（写门禁到 `.heartflow/plans/*.md`——正是「不能动已有文件但可写想法」）；「省 token 强约束」补一段 plan 系统提示（禁读大文件、答案直给）。
+- **spec（自研新范式）**：网络搜索先行（web 工具保留）→ 产出 spec 文档（写门禁到 `.heartflow/specs/*.md`）+ task/todo 列表（todo_write）→ **不实现**。落点 = plan 档的姊妹权限档 + 「先搜后写」系统提示段 + spec 模板。与 §1 的 `/guide` 三段草稿同族。
+- **loop（hermes/harness 闭环，按研究定案）**：网络研究定案 = Anthropic generator-evaluator 循环 + Hermes 闭环（持久记忆→执行→自纠→避坑）。**本仓积木已全**：mission 账本（四态+判据+预算）+ 自动记账（§11.3）+ 续跑 nudge + full 权限 + MEMORY.md 避坑注入 + 停机守卫（double-Ctrl+C 仍可达）。loop 模式 = full 权限 + mission 自动续跑驱动（判据未满足即自动下一回合）+ blocked 三连检测停机。**分相**：等当前批真机测试后再建（它是权限最高的模式，需要测试过的基础）。
+- **Tab 切换判决**：Tab 已绑 toggle_fold——模式轮换用新 keymap 动作 `cycle_mode`（默认 **BackTab/Shift+Tab**，可重映射），折叠保持 Tab。轮换序 agent→plan→spec→loop。
+- **思考强度**：reasoning_effort 已在 profile 贯通到请求；补 `/effort [low|medium|high]` REPL 命令（镜像 /model 重建）+ TUI 状态行显示（chrome 扩展一字段）+ keymap `cycle_effort`（默认 Ctrl+E）。
+- **联网开关（开/关/本地）**：工具面过滤——开=web_search/web_fetch 正常；关=从工具集剔除；本地=web 剔除但保留 doc_search（rga 本地文档/知识库检索，clone 仓库研读属本地读）。shape = build_runtime 时的工具注册过滤 + 模式默认值（spec 默认开、loop 默认开、plan 默认本地）。`/web on|off|local` 命令 + 状态行标注。
+
 ## C. 功能增强候选（轻量，待评估）
 
 > C 组为轻量功能候选，待评估是否纳入路线。
