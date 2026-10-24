@@ -876,7 +876,7 @@ pub struct QueueSet {
 - **抗损坏台账闭环**：mission load/summarize 对非 UTF-8 state 文件从「静默跳过（永久不可见）」改为「计入 corrupted 台账」——混沌测试抓出的真缺陷；垃圾/截断/错类型/错形状/缺文件五类损坏全部跳过计数、健康邻存不受染、`next_id` 不回退、doctor 可见。
 - **跨进程文件锁（2026-10-22 批次）**：`runtime::filelock`（`with_exclusive` + `lock_path`）——sidecar `<data>.lock` + OS 建议性锁（Windows `LockFileEx` / Unix `flock`，经 `fd-lock` 封装：本仓 `unsafe_code = forbid`，平台 unsafe 收在实战检验的依赖内，锁语义自持）。**为什么必须锁**：temp+rename 只保证单次写原子，两进程交错 `写 tmp → 截断 tmp → rename` 会把对方的字节 rename 成自己的名字；**为什么锁 sidecar**：rename 会替换数据文件本体，锁在旧文件对象上等于没锁。设计纪律：bounded 等待 5s（1ms→50ms 退避）超时**跳过写并计数**（绝不无锁裸写）、锁失败与写失败同入 `DISK_WRITE_FAILURES`（doctor 可见）、读者不取锁（rename 快照读本就原子，陈旧快照优于启动阻塞）、**同线程禁止嵌套**（内层无法区分自持与外占）。接入面：schedules/mission `state.json`/job `status.json`/queue.json 四处 persist + mission/job 两处 `events.jsonl` append；顺带把 job `status.json` 从裸 `fs::write` 升级为锁内 temp+rename（裸写崩溃留撕裂文件，破坏启动对账）。测试 7 条含**真跨进程互斥**（重执行测试二进制为持锁子进程，父进程 bounded 尝试必超时、子进程退出后内核释放锁可获取）与双线程 RMW 序列化（无锁必丢更新）。诚实边界：这只序列化写，不是多写者数据库——各进程内存仍是事实源，并发写世界仍是「最后落盘者胜」；真正的单写者 World 仍是 P2。**遗留记录**：~~job id 是进程本地序号，两进程共用 `JOBS_ROOT` 会逻辑互踩~~（2026-10-24 已修：job 目录 `job-<pid>-<id>` 命名空间 + `JobRecord.pid` + 对账三分法——自己的/遗留的照旧停；外来 pid **探活**（Windows `tasklist`/Unix `ps`，不确定视为活），活则不动（第二进程不再误停第一进程的在飞 job）、死则停并注「owning process N exited」；残留：pid 复用可致死主 job 滞留 running，pi 的 process-terminal proof 是后续答案）。
 - **依赖治理：终端栈收敛 + dependabot 分支裁决（2026-10-22 批次）**：4 条 dependabot 分支按「最优工程取舍、依赖尽量最新」裁决——**采纳 2、结构化采纳 1、否决后超越 1**。① `actions/checkout v4.4.0→v7.0.1`（release.yml 三处钉 SHA，与 ci.yml/docs.yml 对齐）；② `jsonschema 0.57→0.59`（使用面仅 `validator_for`，编译即验证）；③ **ratatui 0.29→0.30.2 结构化迁移**：dependabot 机械 bump 实证是错的（lock 里 ratatui 0.29+0.30 双拷贝），正确路径 = tui-textarea 钉上游 main rev `0ce5d4b`（crates.io 0.7.0 仍钉 ratatui ^0.29；其 `no-backend` feature 弃掉自带 crossterm 0.28 模块）+ 自写 `editor::tui_input`（crossterm 0.29 KeyEvent → tui-textarea `Input`，逐行镜像上游语义含 Release 事件吞咽防 Windows 双写）+ `Backend::Error` 关联类型适配（0.30 新增；`CompanionTerminal` 收紧 `Error = io::Error`，测试新增 `IoTestBackend` 把 TestBackend 的 `Infallible` 抬升）。**成果：crossterm 双拷贝收敛为单 0.29（与 inquire 0.29 天然同源），比升级前少一个拷贝**；`unstable-rendered-line-info` 移居 ratatui-widgets（umbrella 不再转发，直连开启）。④ crossterm 单独 bump 0.28→0.29 的分支**否决**（ratatui 0.29 钉 0.28，单独升是错）。防再犯：dependabot.yml 对 ratatui/crossterm 加 ignore（解除条件 = tui-textarea 0.7.1 发布）。全树 `cargo update` 刻意不做（brotli 8→9 等无关 major 会破坏可归因性，另列任务）~~已执行（2026-10-24，9209aa8）~~。
-- **待做**（依赖排序）：在飞回合取消 ~~（double-Ctrl+C，前置 P2 事件循环可够到在飞回合）~~ **已落地（随 §11.0，2026-10-22）**、cassette 录制扩展为 ds4 式「模型加载/提示渲染/工具调用/会话状态」集成测试 ~~已落地（2026-10-24，§11.5：两真实夹具 + 离线回放套件）~~、发布 QA 清单落成仓库内可勾选文档（ds4 `QA_BEFORE_RELEASES.md` 纪律）、全树 `cargo update` ~~（无关 major 的传递刷新，独立小步验证）~~ **已落地（2026-10-24，§11.5）**：126 包传递刷新（brotli 8→9 / rand 0.9→0.10 / shlex 1→2 / windows-sys 0.60→0.59 收敛等，全部传递依赖、仓内零直接引用），更新前后全门禁 + doctor 冒烟仲裁。诚实边界：brotli 9 的真实网络解压路径不受离线测试覆盖，下次真机会话顺带即验。
+- **待做**（依赖排序）：在飞回合取消 ~~（double-Ctrl+C，前置 P2 事件循环可够到在飞回合）~~ **已落地（随 §11.0，2026-10-22）**、cassette 录制扩展为 ds4 式「模型加载/提示渲染/工具调用/会话状态」集成测试 ~~已落地（2026-10-24，§11.5：两真实夹具 + 离线回放套件）~~、发布 QA 清单落成仓库内可勾选文档 ~~（ds4 `QA_BEFORE_RELEASES.md` 纪律）~~ **已落地（2026-10-24，docs/src/release-qa.md，含历史坑登记）**、全树 `cargo update` ~~（无关 major 的传递刷新，独立小步验证）~~ **已落地（2026-10-24，§11.5）**：126 包传递刷新（brotli 8→9 / rand 0.9→0.10 / shlex 1→2 / windows-sys 0.60→0.59 收敛等，全部传递依赖、仓内零直接引用），更新前后全门禁 + doctor 冒烟仲裁。诚实边界：brotli 9 的真实网络解压路径不受离线测试覆盖，下次真机会话顺带即验。
 
 目标：让 heartflow 能**维持大项目的持续运行**，现在只记录设计，不执行。
 
@@ -1370,3 +1370,60 @@ pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript �
 ## License
 
 本项目以 [Apache License 2.0](https://github.com/SantaChains/heartflow/blob/main/LICENSE) 开源。
+
+
+---
+
+<!-- file: release-qa.md -->
+
+# 发布前 QA 清单
+
+ds4 `QA_BEFORE_RELEASES.md` 纪律的本仓落地（roadmap §4）：每次发版前逐项勾选。分四段——本地硬门禁、离线行为仲裁、冒烟、真机陪测与发版流程。**任何一项不过就停**：发布逻辑靠 `scripts/release.sh` 共用事实源，但质量判断在这里。
+
+本清单本身随踩坑更新：每次发版发现的坑，修完回填一条（写明日期与原因），这是清单的生长方式。
+
+## 1. 本地硬门禁（提交前全部必跑，全绿才许 push）
+
+- [ ] `cargo build --release` 干净（`target/release/hf(.exe)` 产出）。
+- [ ] `cargo fmt --all -- --check` 干净。
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings -A clippy::pedantic`——`clippy::all` 零告警是硬门；pedantic 提示级不强求清零，但**新增代码不添新 pedantic 告警**。
+- [ ] `cargo test --workspace` 全过，**记下总数**（当前基线 779；数量涨跌要能解释——新测试计入，删测试要问为什么）。
+- [ ] `uv run scripts/check_panic_budget.py`——`debt=0` 纪律；**绝不为让门禁变绿而 `--update`**（`--update` 只在真的清掉存量债之后跑）。
+- [ ] amend 之后**重跑全部门禁**（历史教训：amend 收尾打磨后忘跑 clippy，存量告警在下一轮才暴露）。
+
+## 2. 离线行为仲裁（cassette 时代起必跑）
+
+- [ ] `cargo test -p heartflow-provider --test fixtures`——两真实夹具复穿真运行时；**提示组装/回放投影/工具广告/消息序的任何漂移在这里点名失败**。
+- [ ] 动过流式路径？铁律：**先重录夹具再动**（录制 = `HEARTFLOW_CASSETTE=record:crates/provider/tests/fixtures/<name>.json hf prompt -q "..."`，一行一个夹具）；录完跑秘密扫描 + 人工核验（环境变量**名**可入库，**值**绝不）。
+- [ ] 全树 `cargo update` 之类依赖刷新后：更新前后各跑一遍全门禁；终端栈（ratatui/crossterm/tui-textarea git 钉住面）变动必须显式核对。
+
+## 3. 冒烟（构建产物本体）
+
+- [ ] `hf --help` 正常。
+- [ ] `hf doctor` 正常（子命令形态——写成 `--doctor` 会被判 usage error 以 exit 2 退出，这是参数解析器的既定行为不是 bug）。
+- [ ] `hf system-prompt` 正常；改过系统提示词时，核对 `FRONTIER_MODEL_NAME = "heartflow"` 身份不变量仍在（`crates/runtime/src/prompt.rs`）。
+- [ ] 改过配置面？`hf config export <surface>` 导出→重导入 round trip。
+
+## 4. 真机陪测与发版流程
+
+- [ ] **TUI 改动必须有真机冒烟卡**，且逐张勾完才算闭合。陪测卡登记在 `roadmap.md` 对应小节的「真机冒烟待陪测」处（当前累积见 §11.0/§11.1/§11.2/§11.3/§11.4）；用 `target/release/hf.exe` 验，别用 PATH 上的旧版。
+- [ ] 跨平台路径（进程树击杀、锁语义等）真机验证过再发（Windows 本机即验；Unix 侧 CI 覆盖编译面）。
+- [ ] `bash scripts/release.sh plan`——`released=true`、版本号语义对（`feat:`→minor、`fix:`→patch、`!`/`BREAKING CHANGE:`→major）。
+- [ ] `RELEASE_DRY_RUN=1 bash scripts/release.sh publish` 只读预演过（需本地 git-cliff）。
+- [ ] push 后核对三条 CI 链：release.yml（发版）、docs.yml（文档站）、ci.yml（外部 PR 质量门）。
+- [ ] Release 资产核对：Windows amd64 zip + `.sha256` + `SHA256SUMS` + SLSA provenance；`bucket/heartflow.json` 的 version/url/hash 由 windows-zip job 确定性回写（CI 是唯一写入者）。
+- [ ] publish 中途失败的续发口径：`RELEASE_TAG=<tag> RELEASE_BUMP=<bump> bash scripts/release.sh publish`（重跑整链会因「tag 之后无 feat/fix」短路）。
+
+## 5. 未闭合残留的显式登记
+
+发版可以带残留，但**必须在本节点名**，不许静默：
+
+- [ ] （2026-10-24）全树 `cargo update` 后 brotli 9 的真实网络解压路径不受离线测试覆盖（cassette 绕过传输）——下一次真机会话第一次真实 API 对话即验，异常形态：HTTP 解码错误/乱码正文。
+- [ ] （持续）陪测卡全绿前不 push 发版——push 权在用户。
+
+## 历史坑登记（修完的坑回填在此，防再犯）
+
+- 2026-10-23：amend 后没重跑 clippy，存量未使用绑定下一轮才拦下——故第 1 段末条。
+- 2026-10-23：compact 统计损坏测试写坏**进程级全局文件**，并行测试写回「治愈」损坏致偶发失败——磁盘断言必须走私有路径，共享全局态的测试模块须 ROOT_LOCK 串行化（jobs/mission 模式）。
+- 2026-10-24：jobs 槽位测试固定 120ms sleep 断言在满载并行下饿死——时序断言一律改有界轮询，不变量是状态不是时钟。
+- 2026-10-24：全量测试出现瞬时 FAILED 先复跑 3 次再定性；隔离复现通过 = 并行竞态嫌疑，修测试而非回滚代码。

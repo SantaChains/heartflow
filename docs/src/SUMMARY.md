@@ -25,3 +25,4 @@
 - [路线图](roadmap.md)
 - [已知问题登记](known-issues.md)
 - [贡献与质量门](contributing.md)
+- [发布前 QA 清单](release-qa.md)

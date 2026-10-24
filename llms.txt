@@ -21,6 +21,7 @@
 - [接入 MCP 服务](https://raw.githubusercontent.com/SantaChains/heartflow/main/docs/src/mcp-servers.md): heartflow 既是 MCP **客户端**（挂载外部工具），本身也是一个可被别的 agent 调用的终端工具。本页讲如何给 hf 挂上现成的文档类 MCP 服务，让 agent 在写代码时拉到最新 API 文档。
 - [AI 文档集成](https://raw.githubusercontent.com/SantaChains/heartflow/main/docs/src/ai-integration.md): 本页记录 heartflow 面向"文档可被人和 AI 工具消费"的整套适配：文档站点（mdBook → GitHub Pages）、API 文档（rustdoc）、`llms.txt`、Context7 与 DeepWiki。地基是 `docs/` 下的 mdBook——其余各项都从中派生。
 - [已知问题登记（待修复清单）](https://raw.githubusercontent.com/SantaChains/heartflow/main/docs/src/known-issues.md): 本文件登记 heartflow 已观察到的**缺陷与体验问题**。按用户指令（2026-10-22）建立的登记纪律：条目登记时一律先**只登记、不修复**（状态「登记未修复」）；修复须先真机复现并核实根因，再回填根因与 commit（状态「已修复」）。每个条目含：现象、环境·复现、影响、根因核实（登记时为「疑点·待查位置」假设，修复时回填实证）、登记日期、状态。
+- [发布前 QA 清单](https://raw.githubusercontent.com/SantaChains/heartflow/main/docs/src/release-qa.md): ds4 `QA_BEFORE_RELEASES.md` 纪律的本仓落地（roadmap §4）：每次发版前逐项勾选。分四段——本地硬门禁、离线行为仲裁、冒烟、真机陪测与发版流程。**任何一项不过就停**：发布逻辑靠 `scripts/release.sh` 共用事实源，但质量判断在这里。
 
 ## Optional
 
