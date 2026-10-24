@@ -908,6 +908,243 @@ mod tests {
         std::env::temp_dir().join(format!("hf-queue-{}-{tag}.json", std::process::id()))
     }
 
+    /// Invariant fuzz over the whole queue surface (roadmap §4 抗冲击战役①):
+    /// a fixed-seed xorshift drives 400 random operation sequences — send,
+    /// lane send, steer send, edit, move, withdraw, take+deliver, take+fail,
+    /// take+requeue, merged drain, steer claim, steer recovery — while a
+    /// mirror tracks every id ever created. Invariants after every step:
+    /// ids are never reused, no pending id appears twice, and every id ends
+    /// the run in exactly one place (pending / outstanding / terminal
+    /// ledger) — the "条目不丢、递送必终态化" contract under arbitrary
+    /// interleavings, including ops the UI never issues together.
+    #[test]
+    fn queue_invariant_fuzz_random_operation_sequences() {
+        let mut rng: u64 = 0x243F_6A88_85A3_08D3;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut q = FollowUpQueue::new();
+        let mut created: Vec<u64> = Vec::new();
+        let mut outstanding: Vec<u64> = Vec::new();
+        // Unbounded mirror of the terminal history, oldest first. The on-disk
+        // ledger is deliberately bounded (RECENT_LEDGER_CAP); the mirror is
+        // what "nothing is lost" is measured against.
+        let mut terminal: Vec<u64> = Vec::new();
+        let mut counter = 0_usize;
+
+        let pending_ids =
+            |q: &FollowUpQueue| -> Vec<u64> { q.items().iter().map(|entry| entry.id).collect() };
+
+        for _case in 0..400 {
+            counter += 1;
+            let text = format!("msg-{counter}");
+            match next() % 10 {
+                // Plain / lane / steer sends.
+                0 | 1 => {
+                    let before = q.len();
+                    let sent = if next() % 3 == 0 {
+                        q.send_in_lane("fuzz-lane", &text, QueueSource::User)
+                    } else {
+                        q.send(&text, QueueSource::Guide)
+                    };
+                    match sent {
+                        Some(id) => {
+                            assert_eq!(q.len(), before + 1);
+                            assert!(!created.contains(&id), "id {id} reused");
+                            created.push(id);
+                        }
+                        None => assert_eq!(before, 32, "refusal only at the cap"),
+                    }
+                }
+                2 => {
+                    let before = q.len();
+                    let sent = q.send_with_mode(&text, QueueSource::Subagent, DeliveryMode::Steer);
+                    if let Some(id) = sent {
+                        assert!(!created.contains(&id), "id {id} reused");
+                        created.push(id);
+                    } else {
+                        assert_eq!(before, 32, "refusal only at the cap");
+                    }
+                }
+                // Edit a random pending entry.
+                3 => {
+                    let ids = pending_ids(&q);
+                    if !ids.is_empty() {
+                        let target = ids[(next() as usize) % ids.len()];
+                        assert!(q.edit(target, &format!("edited-{target}")));
+                        let entry = q
+                            .items()
+                            .iter()
+                            .find(|entry| entry.id == target)
+                            .expect("still pending");
+                        assert_eq!(entry.text, format!("edited-{target}"));
+                    }
+                }
+                // Move up or down: order changes, the set does not.
+                4 => {
+                    let ids = pending_ids(&q);
+                    if !ids.is_empty() {
+                        let target = ids[(next() as usize) % ids.len()];
+                        let up = next() % 2 == 0;
+                        let before_ids = pending_ids(&q);
+                        let _ = q.move_entry(target, up);
+                        let mut after_ids = pending_ids(&q);
+                        after_ids.sort_unstable();
+                        let mut sorted = before_ids;
+                        sorted.sort_unstable();
+                        assert_eq!(after_ids, sorted, "move preserves the id set");
+                    }
+                }
+                // Withdraw a random pending entry into the ledger.
+                5 => {
+                    let ids = pending_ids(&q);
+                    if !ids.is_empty() {
+                        let target = ids[(next() as usize) % ids.len()];
+                        assert!(q.withdraw(target).is_some());
+                        assert!(!pending_ids(&q).contains(&target));
+                        assert!(q
+                            .recent()
+                            .iter()
+                            .any(|entry| entry.id == target
+                                && entry.state == QueueEntryState::Withdrawn));
+                        terminal.push(target);
+                    }
+                }
+                // Take + deliver / fail (terminal) or requeue (back to front).
+                6 | 7 => {
+                    if let Some(entry) = q.take_next() {
+                        assert!(!pending_ids(&q).contains(&entry.id));
+                        match next() % 3 {
+                            0 => {
+                                let id = entry.id;
+                                outstanding.push(id);
+                                q.finish_entry(
+                                    entry,
+                                    if next() % 2 == 0 {
+                                        QueueEntryState::Delivered
+                                    } else {
+                                        QueueEntryState::Failed
+                                    },
+                                );
+                                outstanding.retain(|live| *live != id);
+                                terminal.push(id);
+                            }
+                            _ => {
+                                let id = entry.id;
+                                q.requeue_front(entry);
+                                // At the cap, requeue_front files the entry
+                                // as `Failed` instead of re-queueing it.
+                                if !pending_ids(&q).contains(&id) {
+                                    terminal.push(id);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Merged drain (the opt-in path): follow-ups terminalize, steers stay.
+                8 => {
+                    if next() % 4 == 0 {
+                        q.set_merged(true);
+                        let steers_before = q
+                            .items()
+                            .iter()
+                            .filter(|entry| entry.mode == DeliveryMode::Steer)
+                            .count();
+                        let drained: Vec<u64> = q
+                            .items()
+                            .iter()
+                            .filter(|entry| entry.mode != DeliveryMode::Steer)
+                            .map(|entry| entry.id)
+                            .collect();
+                        if let Some(injection) = q.drain_injection() {
+                            assert!(!injection.is_empty());
+                        }
+                        terminal.extend(drained);
+                        assert_eq!(
+                            q.items()
+                                .iter()
+                                .filter(|entry| entry.mode == DeliveryMode::Steer)
+                                .count(),
+                            steers_before,
+                            "drain leaves steers pending"
+                        );
+                        q.set_merged(false);
+                    }
+                }
+                // Steer claim and recovery.
+                _ => {
+                    let steer: Vec<u64> = q
+                        .items()
+                        .iter()
+                        .filter(|entry| entry.mode == DeliveryMode::Steer)
+                        .map(|entry| entry.id)
+                        .collect();
+                    if next() % 2 == 0 {
+                        if let Some(&target) = steer.first() {
+                            let text = q
+                                .items()
+                                .iter()
+                                .find(|entry| entry.id == target)
+                                .expect("pending")
+                                .text
+                                .clone();
+                            assert!(q.claim_steered(&text));
+                            terminal.push(target);
+                        }
+                    } else {
+                        q.recover_pending_steers();
+                        assert!(q
+                            .items()
+                            .iter()
+                            .all(|entry| entry.mode != DeliveryMode::Steer));
+                    }
+                }
+            }
+
+            // Global invariants after every step.
+            let ids = pending_ids(&q);
+            let mut unique = ids.clone();
+            unique.sort_unstable();
+            let count = unique.len();
+            unique.dedup();
+            assert_eq!(unique.len(), count, "pending ids are unique");
+            assert!(ids.len() <= 32);
+            // Every id lives in exactly one place (the mirror's terminal set
+            // stands in for the bounded on-disk ledger).
+            for &id in &created {
+                let in_pending = ids.contains(&id);
+                let in_outstanding = outstanding.contains(&id);
+                let in_terminal = terminal.contains(&id);
+                assert!(
+                    usize::from(in_pending)
+                        + usize::from(in_outstanding)
+                        + usize::from(in_terminal)
+                        == 1,
+                    "id {id} must live in exactly one place (pending={in_pending} outstanding={in_outstanding} terminal={in_terminal})"
+                );
+            }
+            // The on-disk ledger is exactly the newest <= 20 terminalized
+            // entries, newest first.
+            let ledger_ids: Vec<u64> = q.recent().iter().map(|entry| entry.id).collect();
+            let expected: Vec<u64> = terminal
+                .iter()
+                .rev()
+                .take(super::RECENT_LEDGER_CAP)
+                .copied()
+                .collect();
+            assert_eq!(
+                ledger_ids, expected,
+                "ledger = newest-20 of terminal history"
+            );
+        }
+        // End state: nothing outstanding, everything accounted for.
+        assert!(outstanding.is_empty());
+        let _ = counter;
+    }
+
     #[test]
     fn queue_roundtrip_survives_restart() {
         let path = queue_tmp("roundtrip");

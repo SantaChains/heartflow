@@ -3415,6 +3415,115 @@ mod tests {
         assert_eq!(app.model.queue().len(), 1);
     }
 
+    /// Reducer fuzz (roadmap §4 抗冲击战役②): a fixed-seed xorshift throws
+    /// 2000 random messages — keys from every binding family, stream events
+    /// from every variant, oversized pastes with control bytes, overlay and
+    /// panel chords, mid-turn traffic — at a single [`App`]. Invariants: the
+    /// reducer never panics, the transcript only grows, and the queue never
+    /// exceeds its cap. The seed is fixed so any panic reproduces exactly.
+    #[test]
+    fn reducer_fuzz_survives_random_message_streams() {
+        let mut rng: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut app = App::new();
+        let mut transcript_floor = 0_usize;
+        let keys = [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
+        ];
+        let events = [
+            AgentEvent::TextDelta("delta text ".into()),
+            AgentEvent::ThinkingDelta("thinking ".into()),
+            AgentEvent::ToolUse {
+                id: "1".into(),
+                name: "bash".into(),
+                input: "{}".into(),
+            },
+            AgentEvent::ToolResult {
+                id: "1".into(),
+                name: "bash".into(),
+                output: "ok".into(),
+                is_error: false,
+            },
+            AgentEvent::ToolResult {
+                id: "9".into(),
+                name: "ghost".into(),
+                output: String::new(),
+                is_error: true,
+            },
+            AgentEvent::Usage(TokenUsage::default()),
+            AgentEvent::MessageStop,
+            AgentEvent::Truncated("max tokens".into()),
+            AgentEvent::Steered("steered text".into()),
+            AgentEvent::Error {
+                message: "boom".into(),
+                hint: Some("try again".into()),
+            },
+        ];
+        for _step in 0..2000 {
+            let msg = match next() % 6 {
+                0 => Msg::Key(keys[(next() as usize) % keys.len()]),
+                1 => Msg::Event {
+                    section: (next() % 2) as usize,
+                    event: events[(next() as usize) % events.len()].clone(),
+                },
+                2 => Msg::Paste(
+                    "paste\nwith\nnewlines \u{7}\u{0}".repeat(1 + (next() % 40) as usize),
+                ),
+                3 => {
+                    if next() % 2 == 0 {
+                        Msg::TurnStarted { section: 0 }
+                    } else {
+                        Msg::Resize
+                    }
+                }
+                4 => Msg::TurnFinished {
+                    section: 0,
+                    ok: next() % 2 == 0,
+                    note: "note".into(),
+                },
+                _ => Msg::PermissionRequest(PermissionRequest {
+                    tool_name: "bash".into(),
+                    input: "{}".into(),
+                    reason: None,
+                }),
+            };
+            app.update(msg);
+            assert!(
+                app.transcript.len() >= transcript_floor,
+                "transcript shrank past floor {transcript_floor}"
+            );
+            transcript_floor = transcript_floor.max(app.transcript.len());
+            // Drain the loop-facing channels so staging does not accumulate;
+            // draining is the loop's job, the reducer only parks state.
+            let _ = app.take_submit();
+            let _ = app.take_steer();
+            let _ = app.take_cancel();
+            let _ = app.take_permission_choice();
+            assert!(
+                app.model.queue().len() <= crate::core::DEFAULT_QUEUE_LIMIT,
+                "queue exceeded its cap"
+            );
+        }
+    }
+
     #[test]
     fn queue_panel_closes_when_the_last_entry_leaves() {
         let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);

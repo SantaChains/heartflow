@@ -754,6 +754,72 @@ mod tests {
         }
     }
 
+    /// Hostile-file fuzz (roadmap §4 抗冲击战役③): random bytes, wrong-type
+    /// TOML, deep nesting and oversized strings all land in
+    /// `.heartflow/keymap.toml` / `settings.toml`. The loaders must never
+    /// panic and must hold the shipped defaults whenever nothing valid
+    /// parses — hostile disk content degrades, it never takes the shell down.
+    #[test]
+    fn config_loaders_survive_hostile_files() {
+        let mut rng: u64 = 0x0D15_EA5E_5EED_C0DE;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let dir = std::env::temp_dir().join(format!("hf-hostile-cfg-{}", std::process::id()));
+        let heart = dir.join(".heartflow");
+        std::fs::create_dir_all(&heart).expect("hostile config dir");
+        for case in 0..300 {
+            let body = match next() % 5 {
+                // Raw binary garbage (invalid UTF-8 included).
+                0 => (0..64).map(|_| (next() % 256) as u8).collect::<Vec<u8>>(),
+                // Valid TOML, wrong shapes everywhere.
+                1 => {
+                    let action = ["submit", "interrupt", "nope", "][", ""][case % 5];
+                    format!(
+                        "[keymap]\n{action} = {{ nested = true }}\nscroll_up = [1, 2.5, true]\n"
+                    )
+                    .into_bytes()
+                }
+                // Deeply nested tables.
+                2 => {
+                    let mut deep = String::from("[keymap]");
+                    deep.push_str(&"[a.b.c.d.e.f.g.h]\n".repeat(1 + case % 50));
+                    deep.push_str("submit = \"ctrl+m\"\n");
+                    deep.into_bytes()
+                }
+                // Oversized strings.
+                3 => {
+                    format!("[keymap]\nsubmit = \"{}\"\n", "x".repeat(1 + case % 5000)).into_bytes()
+                }
+                // Almost-valid key strings.
+                _ => format!(
+                    "[keymap]\nsubmit = [\"ctrl+{}\", \"+++\", \"f{}\", \"\"]\n",
+                    case % 26 + 'a' as usize,
+                    case % 40
+                )
+                .into_bytes(),
+            };
+            std::fs::write(heart.join("keymap.toml"), &body).expect("write hostile keymap");
+            let _ = Keymap::load(&dir, &dir);
+            std::fs::write(heart.join("settings.toml"), &body).expect("write hostile settings");
+            let _ = crate::settings::Settings::load(&dir, &dir);
+        }
+        // A clean file still loads after the storm.
+        std::fs::write(heart.join("keymap.toml"), "[keymap]\nsubmit = \"ctrl+j\"\n")
+            .expect("write clean keymap");
+        std::fs::remove_file(heart.join("settings.toml")).ok();
+        let keymap = Keymap::load(&dir, &dir);
+        assert_eq!(
+            keymap.resolve(&KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            Some(Action::Submit),
+            "loaders recover to full function after hostile input"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn project_override_remaps_an_action_and_drops_its_old_key() {
         let home = TempDir::new("km-user");
