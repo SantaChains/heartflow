@@ -2753,18 +2753,12 @@ fn maybe_auto_compact(state: &SessionShared, runtime: &mut AgentRuntime) {
     }
 }
 
-/// Manual `/compact`: force a compaction immediately by zeroing both the window
-/// and absolute thresholds so the auto gates can't skip it, while still keeping
-/// the recent-message count the active policy preserves. Reports when the
-/// session is still too short to have anything to compact.
+/// Manual `/compact`: force a compaction immediately, bypassing the auto
+/// gates while honoring every knob of the active policy (preserve window,
+/// replay tail, tail budget, summary mode). Reports when the session is
+/// still too short to have anything to compact.
 fn force_compact(state: &SessionShared, runtime: &mut AgentRuntime) {
-    let config = CompactionConfig {
-        preserve_recent_messages: runtime.compaction().preserve_recent_messages,
-        max_estimated_tokens: 0,
-        context_window_tokens: 0,
-        ..CompactionConfig::default()
-    };
-    let result = runtime.compact(config);
+    let result = runtime.compact_now(runtime.compaction());
     if result.removed_message_count == 0 {
         println!("nothing to compact: session is within the preserve window.");
     } else {

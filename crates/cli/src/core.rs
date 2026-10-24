@@ -933,14 +933,12 @@ mod tests {
         // ledger is deliberately bounded (RECENT_LEDGER_CAP); the mirror is
         // what "nothing is lost" is measured against.
         let mut terminal: Vec<u64> = Vec::new();
-        let mut counter = 0_usize;
 
         let pending_ids =
             |q: &FollowUpQueue| -> Vec<u64> { q.items().iter().map(|entry| entry.id).collect() };
 
-        for _case in 0..400 {
-            counter += 1;
-            let text = format!("msg-{counter}");
+        for case in 0..400 {
+            let text = format!("msg-{case}");
             match next() % 10 {
                 // Plain / lane / steer sends.
                 0 | 1 => {
@@ -1142,7 +1140,6 @@ mod tests {
         }
         // End state: nothing outstanding, everything accounted for.
         assert!(outstanding.is_empty());
-        let _ = counter;
     }
 
     #[test]

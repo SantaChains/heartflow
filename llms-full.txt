@@ -1387,7 +1387,7 @@ ds4 `QA_BEFORE_RELEASES.md` 纪律的本仓落地（roadmap §4）：每次发�
 - [ ] `cargo build --release` 干净（`target/release/hf(.exe)` 产出）。
 - [ ] `cargo fmt --all -- --check` 干净。
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings -A clippy::pedantic`——`clippy::all` 零告警是硬门；pedantic 提示级不强求清零，但**新增代码不添新 pedantic 告警**。
-- [ ] `cargo test --workspace` 全过，**记下总数**（当前基线 779；数量涨跌要能解释——新测试计入，删测试要问为什么）。
+- [ ] `cargo test --workspace` 全过，**记下总数**（当前基线 785；数量涨跌要能解释——新测试计入，删测试要问为什么）。
 - [ ] `uv run scripts/check_panic_budget.py`——`debt=0` 纪律；**绝不为让门禁变绿而 `--update`**（`--update` 只在真的清掉存量债之后跑）。
 - [ ] amend 之后**重跑全部门禁**（历史教训：amend 收尾打磨后忘跑 clippy，存量告警在下一轮才暴露）。
 
