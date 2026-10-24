@@ -1363,6 +1363,18 @@ pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript �
 - **测试异常自动分析**：§6 写后诊断已是雏形（cargo check 失败自动回注）；扩展 = loop 模式相（测试失败 → 自动分析回合）。
 - **管道能力**：已具（`hf prompt`/pipe/`--json`/cassette 录放），增强随 §2。
 
+#### 10.9 CLI agent 全景架构研读（2026-10-24 网络研究，只记录不执行）
+
+2026 CLI agent 全景（Claude Code/Codex CLI/Gemini CLI/opencode/Aider 等）的架构创新点，按对 heartflow 的价值分级：
+
+- **OS 内核级沙箱（Codex CLI，采纳方向·大件）**：macOS **Seatbelt** deny-by-default + 参数化可写根、Linux **Landlock + seccomp**、三档沙箱模式——内核强制而非提示词约束。本仓 bash 工具裸跑 + 权限门是应用层防线；内核沙箱是纵深防御的正解。**分相**：陪测批次后评估（Windows 侧对策另研——Job Object 已用于杀树，沙箱化是 Windows Sandbox/AppContainer 赛道）。同场发现：Claude Code 的 MCP/hooks/LSP 跑在沙箱**外**——社区共识是整个 agent 包容器，本仓 MCP 子进程面同此警示。
+- **Hooks 系统（Claude Code，采纳设计）**：生命周期钩子 = 确定性副作用（如 **PreCompact hook 在压缩前把状态刷进 plan 文件**——与 C-1 loop 模式的「压缩前落盘」诉求同构）。本仓无钩子系统；落点 = 回合生命周期事件（pre-compact/pre-save/post-tool）暴露确定性回调。
+- **Subagent 缓存共享（Claude Code，记录）**：fork-subagent 共享 prompt cache + 渐进上下文压缩——本仓 /jobs 工人已有隔离会话，缺的是 **fork 时共享前缀缓存**（省 token 的 subagent spawn）。
+- **无损压缩争议（Codex，研究点）**：社区称其新压缩「lossless」优于摘要式——本仓七相（模型摘要+逐字尾+省略声明+硬触发）是摘要式阵营；「无损」的实现机制（疑似按需重取材）值得下会话研读 open-source CLI 源码对比。
+- **延迟工具加载（Claude Code，轻采纳）**：deferred tool loading——本仓条件注册（rga）是雏形，全工具面懒加载（描述后置、调用时展开）待工具面膨胀后再做。
+- **学术框架（引用）**：arXiv 2604.14228「The Design Space of AI Agent Systems」将 Claude Code 的 delegation 归类为 isolated-subagent-boundaries + deny-first-with-human-escalation——与本仓权限门+worker 只读默认同型，可作为 C-1 模式系统的理论参照。
+- **基准面共识**：Claude Code 强在多文件复杂重构、Gemini CLI 强在 monorepo 级上下文但需近两倍追问——**追问次数是比分数更真实的 UX 指标**（本仓 /effort 与 loop 模式直接作用于它）。
+
 ## C. 功能增强候选（轻量，待评估）
 
 > C 组为轻量功能候选，待评估是否纳入路线。
