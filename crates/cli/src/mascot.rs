@@ -882,6 +882,77 @@ fn write_cells<W: Write>(out: &mut W, cells: &[Vec<Cell>], color: bool) -> io::R
     Ok(())
 }
 
+// ---- 「心狭」wordmark ------------------------------------------------------
+// The project's Chinese mark, drawn beside the head through the same
+// pixel-buffer -> half-block pipeline. The two glyphs are embedded 16x16
+// bitmaps (bit 15 = leftmost column, one row per `u16`), rasterised offline
+// from a system 黑体 face; the mark is data, not a font dependency.
+
+/// 心
+const GLYPH_XIN: [u16; 16] = [
+    0x100, 0x300, 0x180, 0x0c0, 0x000, 0x400, 0x660c, 0x660c, 0x6606, 0x4603, 0xc602, 0xc600,
+    0x608, 0x608, 0x7f8, 0x7f0,
+];
+
+/// 狭
+const GLYPH_XIA: [u16; 16] = [
+    0x20, 0x6c20, 0x39fc, 0x33fe, 0x7020, 0xd924, 0x192c, 0x1820, 0x3fff, 0x6fff, 0xc870, 0x858,
+    0x8c8, 0x198c, 0x7307, 0x2202,
+];
+
+/// Blank columns between the head and the mark, and between the two glyphs.
+const WORDMARK_GAP: usize = 3;
+
+/// Pixel width of the whole mark: two 16px glyphs plus the inner gap.
+const WORDMARK_W: usize = 32 + WORDMARK_GAP;
+
+/// Render the mark as half-block cells: `16/2` rows of [`WORDMARK_W`] cells,
+/// painted in a slightly softened accent so the wordmark sits beside the head
+/// without outshining it.
+fn wordmark_cells(theme: &Theme) -> Vec<Vec<Cell>> {
+    let ink = col_from(theme.accent()).mix(Col::WHITE, 0.15);
+    let mut buf = HalfBuf::new(WORDMARK_W, 16);
+    for (index, glyph) in [GLYPH_XIN, GLYPH_XIA].iter().enumerate() {
+        let offset = index * (16 + WORDMARK_GAP);
+        for (y, row) in glyph.iter().enumerate() {
+            for x in 0..16 {
+                if (row >> (15 - x)) & 1 == 1 {
+                    buf.set(offset + x, y, ink);
+                }
+            }
+        }
+    }
+    buf.encode()
+}
+
+/// Place the wordmark beside the rendered head. The head is `HEAD_H / 2` rows
+/// tall, the mark one row shorter, so the mark gets one blank lead row and
+/// both bottoms align — visually centered against the head.
+fn with_wordmark(head: Vec<Vec<Cell>>, mark: &[Vec<Cell>]) -> Vec<Vec<Cell>> {
+    let blank_gap = || {
+        vec![
+            Cell {
+                ch: ' ',
+                fg: None,
+                bg: None
+            };
+            WORDMARK_GAP
+        ]
+    };
+    head.into_iter()
+        .enumerate()
+        .map(|(row, mut line)| {
+            line.extend(blank_gap());
+            if row > 0 {
+                if let Some(mark_row) = mark.get(row - 1) {
+                    line.extend(mark_row.iter().cloned());
+                }
+            }
+            line
+        })
+        .collect()
+}
+
 /// Draw the startup banner head. On an interactive terminal it plays a short
 /// "waking up" animation (the pulse springs up over ~1s of breathing/bobbing) by
 /// redrawing the head in place; otherwise it emits one static frame. Leaves the
@@ -894,7 +965,7 @@ pub fn draw_banner(theme: &Theme, out: &mut impl Write) -> io::Result<()> {
     let mut mascot = Mascot::booting();
     for frame in 0..frames {
         mascot.advance(dt);
-        let cells = mascot.render_head_cells(theme);
+        let cells = with_wordmark(mascot.render_head_cells(theme), &wordmark_cells(theme));
         if animated {
             queue!(out, Print(SYNC_BEGIN))?;
         }
@@ -917,6 +988,60 @@ pub fn draw_banner(theme: &Theme, out: &mut impl Write) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wordmark_renders_on_the_half_block_grid() {
+        let mark = wordmark_cells(&Theme::current());
+        assert_eq!(mark.len(), 8, "16 pixel rows encode to 8 half-block rows");
+        assert!(mark.iter().all(|row| row.len() == WORDMARK_W));
+        // Both glyphs carry ink: count lit cells via the foreground channel.
+        let lit: usize = mark
+            .iter()
+            .flat_map(|row| row.iter())
+            .filter(|cell| cell.fg.is_some())
+            .count();
+        assert!(
+            (60..=220).contains(&lit),
+            "the two 16x16 glyphs should have a sane ink budget, got {lit}"
+        );
+    }
+
+    #[test]
+    fn wordmark_sits_beside_the_head_without_changing_its_height() {
+        let mut mascot = Mascot::booting();
+        mascot.advance(0.0);
+        let head = mascot.render_head_cells(&Theme::current());
+        let head_rows = head.len();
+        let composed = with_wordmark(head, &wordmark_cells(&Theme::current()));
+        assert_eq!(composed.len(), head_rows, "banner height is unchanged");
+        let expected = WORDMARK_GAP + WORDMARK_W;
+        // The lead row carries only the gap; every other row carries the mark.
+        assert_eq!(composed[0].len(), HEAD_W + WORDMARK_GAP);
+        for row in &composed[1..] {
+            assert_eq!(row.len(), HEAD_W + expected);
+        }
+        // Bottoms align: the mark's last row lands on the head's last row.
+        let tail_ink = composed[head_rows - 1]
+            .iter()
+            .skip(HEAD_W + WORDMARK_GAP)
+            .filter(|cell| cell.fg.is_some())
+            .count();
+        assert!(tail_ink > 0, "the glyph bottoms ride the head's last row");
+    }
+
+    /// Visual check of the embedded bitmaps: `cargo test wordmark_preview -- --nocapture`.
+    #[test]
+    fn wordmark_preview() {
+        for glyph in [GLYPH_XIN, GLYPH_XIA] {
+            for row in glyph {
+                let line: String = (0..16)
+                    .map(|x| if (row >> (15 - x)) & 1 == 1 { '#' } else { '.' })
+                    .collect();
+                println!("{line}");
+            }
+            println!();
+        }
+    }
 
     #[test]
     fn spring_converges_to_target_critically_damped() {
