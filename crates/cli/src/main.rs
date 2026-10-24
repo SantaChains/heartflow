@@ -1319,7 +1319,7 @@ async fn dispatch_slash_command(
             LoopControl::Continue
         }
         _ if trimmed == "/web" || trimmed.starts_with("/web ") => {
-            handle_web_command(state, trimmed, selection, runtime, mode);
+            handle_web_command(state, trimmed);
             *planning = false;
             LoopControl::Continue
         }
@@ -2670,39 +2670,28 @@ async fn reorganize_memory(state: &SessionShared, runtime: &mut AgentRuntime) {
 
 /// `/web on|off|local` — 联网三态 (roadmap C-1). Rebuilds the runtime so the
 /// model sees the tool set change; memory and transcript are unaffected.
-fn handle_web_command(
-    state: &SessionShared,
-    input: &str,
-    selection: &ProviderSelection,
-    runtime: &mut AgentRuntime,
-    mode: &str,
-) {
+fn handle_web_command(state: &SessionShared, input: &str) {
     let requested = input
         .strip_prefix("/web")
         .map(str::trim)
         .unwrap_or_default();
     let Some(access) = crate::tool_exec::WebAccess::parse(requested) else {
-        let current = lock_state(state).web_access;
+        let current = crate::tool_exec::WebAccess::from_u8(
+            lock_state(state)
+                .web_access
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
         println!(
             "usage: /web on|off|local   (current: {}; local keeps document/knowledge-base retrieval)",
             current.label()
         );
         return;
     };
-    lock_state(state).web_access = access;
-    match build_runtime(
-        state,
-        runtime.session().clone(),
-        selection.clone(),
-        true,
-        mode,
-    ) {
-        Ok(rebuilt) => {
-            *runtime = rebuilt;
-            println!("web access -> {}", access.label());
-        }
-        Err(error) => println!("failed to apply web access: {error}"),
-    }
+    // Shared atomic with the executor: the flip lands on the very next request.
+    lock_state(state)
+        .web_access
+        .store(access.as_u8(), std::sync::atomic::Ordering::Relaxed);
+    println!("web access -> {}", access.label());
 }
 
 /// `/effort [none|low|medium|high|max]` — reasoning depth switch. Rebuilds the
@@ -3336,7 +3325,7 @@ mod mode_segment_tests {
     }
 }
 
-fn mode_prompt_segment(mode: &str) -> Option<&'static str> {
+pub(crate) fn mode_prompt_segment(mode: &str) -> Option<&'static str> {
     match mode {
         "plan" => Some(
             "You are in plan mode: read and research freely (web search included), but the only writable location is .heartflow/plans/ as Markdown. Be token-frugal: answer directly, avoid reading large files end-to-end, outline rather than implement, and never modify existing files.",
@@ -3987,7 +3976,11 @@ fn build_runtime_with_mcp(
     Ok(ConversationRuntime::new(
         session,
         client,
-        AgentToolExecutor::new(mcp, questioner, lock_state(state).web_access),
+        AgentToolExecutor::new(
+            mcp,
+            questioner,
+            std::sync::Arc::clone(&lock_state(state).web_access),
+        ),
         permission_policy_for_mode(mode, &mcp_read_only),
         system_prompt,
     )
@@ -4090,7 +4083,12 @@ mod tests {
     fn native_read_only_tools_are_the_only_concurrent_safe_ones() {
         use super::NativeToolExecutor;
         use runtime::ToolExecutor;
-        let exec = NativeToolExecutor::new(None, crate::tool_exec::WebAccess::On);
+        let exec = NativeToolExecutor::new(
+            None,
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+                crate::tool_exec::WebAccess::On as u8,
+            )),
+        );
         // Pure reads/searches/fetches may overlap.
         for tool in [
             "read_file",

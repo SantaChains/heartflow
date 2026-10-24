@@ -56,6 +56,13 @@ pub enum Action {
     /// Read-write, but queue mutations are settle-time concerns, so it is
     /// safe mid-turn.
     QueuePanel,
+    /// Cycle the session mode (C-1 四态): agent(workspace-write) → plan →
+    /// spec → loop → agent. Idle-only per section: a live turn owns its
+    /// runtime, so the switch applies when it settles.
+    CycleMode,
+    /// Cycle web access (C-1 联网三态): on → off → local → on. Live: the
+    /// tool advertisement flips on the very next request.
+    ToggleWeb,
     /// Switch to the next conversation section (tab) in the shell. Idle-only: a
     /// turn runs inline and holds its section's runtime, so the reducer guards
     /// these mid-turn instead of switching under a live turn.
@@ -85,6 +92,8 @@ const ALL_ACTIONS: &[Action] = &[
     Action::ScrollDown,
     Action::Guide,
     Action::QueuePanel,
+    Action::CycleMode,
+    Action::ToggleWeb,
     Action::NextSection,
     Action::PrevSection,
     Action::NewSection,
@@ -105,6 +114,8 @@ impl Action {
             Action::ScrollDown => "scroll_down",
             Action::Guide => "guide",
             Action::QueuePanel => "queue_panel",
+            Action::CycleMode => "cycle_mode",
+            Action::ToggleWeb => "toggle_web",
             Action::NextSection => "next_section",
             Action::PrevSection => "prev_section",
             Action::NewSection => "new_section",
@@ -129,6 +140,8 @@ impl Action {
             Action::ScrollDown => "scroll the transcript down",
             Action::Guide => "preview and send a zero-token next-task draft",
             Action::QueuePanel => "open the pending-queue panel (edit/withdraw/reorder/re-lane)",
+            Action::CycleMode => "cycle the session mode: agent → plan → spec → loop",
+            Action::ToggleWeb => "cycle web access: on → off → local",
             Action::NextSection => "switch to the next conversation section",
             Action::PrevSection => "switch to the previous conversation section",
             Action::NewSection => "open a new conversation section",
@@ -248,6 +261,14 @@ impl Default for Keymap {
                 (
                     Binding::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
                     Action::QueuePanel,
+                ),
+                (
+                    Binding::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+                    Action::CycleMode,
+                ),
+                (
+                    Binding::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+                    Action::ToggleWeb,
                 ),
                 (
                     Binding::new(KeyCode::PageDown, KeyModifiers::CONTROL),
@@ -651,6 +672,14 @@ mod tests {
         assert_eq!(
             keymap.resolve(&ctrl(KeyCode::Char('q'))),
             Some(Action::QueuePanel)
+        );
+        assert_eq!(
+            keymap.resolve(&KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Some(Action::CycleMode)
+        );
+        assert_eq!(
+            keymap.resolve(&ctrl(KeyCode::Char('o'))),
+            Some(Action::ToggleWeb)
         );
         assert_eq!(
             keymap.resolve(&ctrl(KeyCode::PageDown)),

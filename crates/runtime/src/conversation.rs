@@ -178,6 +178,19 @@ pub trait ToolExecutor: Send + Sync + 'static {
         0
     }
 
+    /// Flip the session's web-tool availability (roadmap C-1 联网三态; `0` on,
+    /// `1` off, `2` local). Default: no web tools to flip, so nothing happens.
+    /// The concrete executor stores the flag shared with its host so the swap
+    /// is live without a runtime rebuild.
+    fn set_web_access(&self, _access: u8) {}
+
+    /// Namespaced read-only MCP tool names, so a rebuilt permission policy can
+    /// keep them usable under read-only-family modes. Executors without MCP
+    /// report none.
+    fn mcp_read_only_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Seed the plan ledger deterministically from a plan document, bypassing
     /// the model. `input` uses the same JSON shape as `todo_write`. Executors
     /// without a plan ledger reject the request.

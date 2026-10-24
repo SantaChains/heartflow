@@ -12,6 +12,7 @@
 
 use std::env;
 use std::path::Path;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use mcp::{HttpTransport, McpClient, McpTool, StdioTransport, Transport};
@@ -51,24 +52,46 @@ impl WebAccess {
         }
     }
 
-    fn web_enabled(self) -> bool {
+    pub(crate) fn web_enabled(self) -> bool {
         self == Self::On
+    }
+
+    pub(crate) fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub(crate) fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => Self::Off,
+            2 => Self::Local,
+            _ => Self::On,
+        }
     }
 }
 
 pub(crate) struct NativeToolExecutor {
     todo: Arc<TodoLedger>,
     questioner: Option<Arc<dyn UserQuestioner>>,
-    web_access: WebAccess,
+    /// Shared with `SessionState` so the 联网三态 flips from anywhere (REPL
+    /// command or TUI keybind) without a runtime rebuild: the model sees the
+    /// new tool advertisement on its very next request.
+    web_access: Arc<AtomicU8>,
 }
 
 impl NativeToolExecutor {
-    pub(crate) fn new(questioner: Option<Arc<dyn UserQuestioner>>, web_access: WebAccess) -> Self {
+    pub(crate) fn new(
+        questioner: Option<Arc<dyn UserQuestioner>>,
+        web_access_arc: Arc<AtomicU8>,
+    ) -> Self {
         Self {
             todo: Arc::new(TodoLedger::new()),
-            web_access,
+            web_access: web_access_arc,
             questioner,
         }
+    }
+
+    fn web_enabled(&self) -> bool {
+        WebAccess::from_u8(self.web_access.load(Ordering::Relaxed)).web_enabled()
     }
 
     fn run_ask_user(&self, input: &str) -> Result<String, ToolError> {
@@ -122,10 +145,10 @@ impl ToolExecutor for NativeToolExecutor {
         if tool_name == "ask_user" {
             return self.run_ask_user(input);
         }
-        if !self.web_access.web_enabled() && matches!(tool_name, "web_search" | "web_fetch") {
+        if !self.web_enabled() && matches!(tool_name, "web_search" | "web_fetch") {
             return Err(ToolError::new(format!(
                 "web access is {} for this session; use /web on to re-enable",
-                self.web_access.label()
+                WebAccess::from_u8(self.web_access.load(Ordering::Relaxed)).label()
             )));
         }
         let value = serde_json::from_str(input)
@@ -140,7 +163,7 @@ impl ToolExecutor for NativeToolExecutor {
         tool_specs.push(tools::verify_graphics_tool_spec());
         // The web pair rides the 联网三态 switch: filtered out entirely when
         // the session runs with web access off/local.
-        if self.web_access.web_enabled() {
+        if self.web_enabled() {
             tool_specs.push(tools::web_fetch_tool_spec());
             tool_specs.push(tools::web_search_tool_spec());
         }
@@ -231,10 +254,10 @@ impl AgentToolExecutor {
     pub(crate) fn new(
         mcp: Arc<McpToolset>,
         questioner: Option<Arc<dyn UserQuestioner>>,
-        web_access: WebAccess,
+        web_access_arc: Arc<AtomicU8>,
     ) -> Self {
         Self {
-            native: NativeToolExecutor::new(questioner, web_access),
+            native: NativeToolExecutor::new(questioner, web_access_arc),
             mcp,
         }
     }
@@ -276,6 +299,14 @@ impl AgentToolExecutor {
 }
 
 impl ToolExecutor for AgentToolExecutor {
+    fn set_web_access(&self, access: u8) {
+        self.native.web_access.store(access, Ordering::Relaxed);
+    }
+
+    fn mcp_read_only_names(&self) -> Vec<String> {
+        self.mcp_read_only_names()
+    }
+
     fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
         if let Some(route) = tool_name.strip_prefix("mcp__") {
             return self.call_mcp(route, input);

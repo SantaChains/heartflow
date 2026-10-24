@@ -74,9 +74,9 @@ pub(crate) struct SessionState {
     pub(crate) session_id: Option<String>,
     /// Full text of tool outputs folded during rendering, indexed for `/expand`.
     pub(crate) expandable: Vec<String>,
-    /// 联网三态 (roadmap C-1): web tool advertisement + call gating for the
-    /// session; the runtime is rebuilt on change so the model sees the swap.
-    pub(crate) web_access: crate::tool_exec::WebAccess,
+    /// 联网三态 (roadmap C-1): shared with the tool executor so both the REPL
+    /// command and the TUI keybind flip it live — no runtime rebuild.
+    pub(crate) web_access: std::sync::Arc<std::sync::atomic::AtomicU8>,
     /// Session permission mode ("workspace-write" default); mirrored here so
     /// `run_turn_interactive` can inject the mode's prompt segment without
     /// threading the string through every call site.

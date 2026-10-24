@@ -320,6 +320,10 @@ pub(crate) struct App {
     /// Live queue panel, if the operator is inspecting/editing the pending
     /// follow-ups (§11.1 P-C).
     queue_panel: Option<QueuePanel>,
+    /// Staged by the CycleMode/ToggleWeb keybinds; drained by the loop, which
+    /// owns the runtime (mode policy) and the shared web atomic.
+    pending_mode_cycle: bool,
+    pending_web_cycle: bool,
     /// Resolved key bindings: defaults plus layered `keymap.toml` overrides.
     /// Held on the model rather than a process-wide singleton so a turn-boundary
     /// hot-reload can swap it without unsafe global state.
@@ -391,6 +395,8 @@ impl App {
             guide: None,
             help_open: false,
             queue_panel: None,
+            pending_mode_cycle: false,
+            pending_web_cycle: false,
             keymap,
             history: History::empty(),
             history_path: PathBuf::new(),
@@ -535,6 +541,18 @@ impl App {
             // only matter at the settle boundary, never to the live turn.
             Some(Action::QueuePanel) => {
                 self.toggle_queue_panel();
+                true
+            }
+            // Staged for the loop: mode needs the section runtime (idle-gated
+            // there); web flips the shared atomic from the loop level.
+            Some(Action::CycleMode) => {
+                self.pending_mode_cycle = true;
+                self.status_note = String::from("cycling mode…");
+                true
+            }
+            Some(Action::ToggleWeb) => {
+                self.pending_web_cycle = true;
+                self.status_note = String::from("cycling web access…");
                 true
             }
             // Raise the read-only key reference. It changes no conversation
@@ -1133,6 +1151,15 @@ impl App {
     /// Drain a staged cancel request.
     fn take_cancel(&mut self) -> bool {
         std::mem::take(&mut self.pending_cancel)
+    }
+
+    /// Drain the staged mode-cycle / web-cycle keybinds (C-1).
+    fn take_mode_cycle(&mut self) -> bool {
+        std::mem::take(&mut self.pending_mode_cycle)
+    }
+
+    fn take_web_cycle(&mut self) -> bool {
+        std::mem::take(&mut self.pending_web_cycle)
     }
 
     /// Route a key to the permission overlay: Up/Down (or k/j/Tab) move the
@@ -2411,6 +2438,20 @@ where
 /// Generic over the API client `C` and tool executor `T` so tests script turns
 /// without a provider; `draw` and `save` are injected so the loop runs without
 /// a terminal or the real home directory.
+/// [`crate::permissions::set_runtime_mode_policy`] generic over the runtime's
+/// executor: the drive loop holds `ConversationRuntime<C, T>` where T is only
+/// known as `ToolExecutor`, so the MCP read-only names come through the trait.
+fn set_section_mode_policy<C: ApiClient, T: ToolExecutor>(
+    runtime: &mut ConversationRuntime<C, T>,
+    mode: &str,
+) {
+    let mcp_read_only = runtime.executor().mcp_read_only_names();
+    runtime.set_permission_policy(crate::permissions::permission_policy_for_mode(
+        mode,
+        &mcp_read_only,
+    ));
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_loop<C, T, F, D, S>(
     shell: &mut Shell,
@@ -2561,8 +2602,21 @@ where
                 // injects — the on-disk ledger rendered as one system-prompt
                 // section, rebuilt fresh at every turn boundary.
                 let missions_root = crate::storage::sessions_dir().join("missions");
-                runtime
-                    .set_turn_context(turn_reminder(&MissionLedger::load(&missions_root).list()));
+                let mission_section = turn_reminder(&MissionLedger::load(&missions_root).list());
+                let mode_section = crate::mode_prompt_segment(
+                    &crate::storage::lock_state(&states[shell.active_index()]).mode,
+                );
+                let merged = match (mission_section, mode_section) {
+                    (Some(mission), Some(segment)) => Some(format!(
+                        "{mission}
+
+{segment}"
+                    )),
+                    (Some(mission), None) => Some(mission),
+                    (None, Some(segment)) => Some(segment.to_string()),
+                    (None, None) => None,
+                };
+                runtime.set_turn_context(merged);
                 let tx = channels.msg_tx.clone();
                 let mut notify = move |event: &AgentEvent| {
                     let _ = tx.send(Msg::Event {
@@ -2838,6 +2892,46 @@ where
                     }
                     if let Some(text) = shell.section_mut().take_submit() {
                         queue.push_back(text);
+                    }
+                    // ===== C-1 keybind drains =====
+                    // Web 三态: the shared atomic flips live — the model sees
+                    // the new advertisement on its very next request.
+                    if shell.section_mut().take_web_cycle() {
+                        let state = &states[shell.active_index()];
+                        let next =
+                            match crate::tool_exec::WebAccess::from_u8(crate::storage::lock_state(state).web_access.load(std::sync::atomic::Ordering::Relaxed)) {
+                                crate::tool_exec::WebAccess::On => crate::tool_exec::WebAccess::Off,
+                                crate::tool_exec::WebAccess::Off => crate::tool_exec::WebAccess::Local,
+                                crate::tool_exec::WebAccess::Local => crate::tool_exec::WebAccess::On,
+                            };
+                        if let Some(runtime) = runtimes[shell.active_index()].as_ref() {
+                            runtime.executor().set_web_access(next.as_u8());
+                        }
+                        crate::storage::lock_state(state).web_access.store(next.as_u8(), std::sync::atomic::Ordering::Relaxed);
+                        shell.section_mut().status_note =
+                            format!("web access -> {}", next.label());
+                    }
+                    // Mode cycle: idle-only per section — a live turn owns the
+                    // runtime the new policy must land on.
+                    if shell.section_mut().take_mode_cycle() {
+                        let slot = shell.active_index();
+                        if let Some(runtime) = runtimes[slot].as_mut() {
+                            let state = &states[slot];
+                            let current = crate::storage::lock_state(state).mode.clone();
+                            let next = match current.as_str() {
+                                "plan" => "spec",
+                                "spec" => "loop",
+                                "loop" | "read-only" | "full" => "workspace-write",
+                                _ => "plan",
+                            };
+                            set_section_mode_policy(runtime, next);
+                            crate::storage::lock_state(state).mode = next.to_string();
+                            shell.section_mut().status_note = format!("mode -> {next}");
+                        } else {
+                            shell.section_mut().status_note = String::from(
+                                "finish or cancel the turn before switching modes",
+                            );
+                        }
                     }
                     // A staged steer goes into the live turn's mailbox
                     // (§11.2); if the turn settled in the same window, demote
