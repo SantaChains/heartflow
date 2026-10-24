@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use api::SamplingParams;
 use proxy::ProxyConfig;
 use tracing::{debug, warn};
 
@@ -48,7 +49,7 @@ impl ProviderProtocol {
 }
 
 /// Fully resolved transport configuration for one provider.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProviderProfile {
     pub protocol: ProviderProtocol,
     pub base_url: String,
@@ -60,10 +61,12 @@ pub struct ProviderProfile {
     /// Model context window in tokens, used to drive window-based compaction.
     /// `None` leaves window compaction off unless the env var sets it.
     pub context_window: Option<u32>,
+    /// User-configured sampling knobs; an all-None value changes nothing.
+    pub sampling: SamplingParams,
 }
 
 /// What the CLI resolved for the API transport before constructing a client.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ProviderSelection {
     /// Legacy environment-driven setup (`ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY`).
     Env {
@@ -121,7 +124,7 @@ fn builtin_provider(name: &str) -> Option<BuiltinProvider> {
 ///
 /// Every field is optional so older files load unchanged and unknown fields
 /// are ignored; a broken field is skipped instead of failing the whole file.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ProviderSettings {
     pub name: Option<String>,
     pub protocol: Option<ProviderProtocol>,
@@ -138,6 +141,8 @@ pub struct ProviderSettings {
     pub reasoning_effort: Option<String>,
     /// Model context window in tokens for window-based compaction.
     pub context_window: Option<u32>,
+    /// User-configured sampling knobs; the default value sets none of them.
+    pub sampling: SamplingParams,
     pub version: Option<u32>,
     /// `[proxy]` table: transport proxy routing. Parsed by the `proxy` crate
     /// so the resolution rules stay in one place; absent means "no opinion",
@@ -189,6 +194,12 @@ impl ProviderSettings {
                     | "max_tokens"
                     | "reasoning_effort"
                     | "context_window"
+                    | "temperature"
+                    | "top_p"
+                    | "top_k"
+                    | "frequency_penalty"
+                    | "presence_penalty"
+                    | "seed"
             ) {
                 debug!(file = %source, field = %key, "unknown config field; ignored");
             }
@@ -213,6 +224,14 @@ impl ProviderSettings {
             max_tokens: u32_field(provider, "max_tokens", source),
             reasoning_effort: string_field(provider, "reasoning_effort", source),
             context_window: u32_field(provider, "context_window", source),
+            sampling: SamplingParams {
+                temperature: f32_field(provider, "temperature", source),
+                top_p: f32_field(provider, "top_p", source),
+                top_k: u32_field(provider, "top_k", source),
+                frequency_penalty: f32_field(provider, "frequency_penalty", source),
+                presence_penalty: f32_field(provider, "presence_penalty", source),
+                seed: u64_field(provider, "seed", source),
+            },
             version,
             proxy,
         }
@@ -249,6 +268,24 @@ impl ProviderSettings {
         }
         if source.context_window.is_some() {
             self.context_window = source.context_window;
+        }
+        if source.sampling.temperature.is_some() {
+            self.sampling.temperature = source.sampling.temperature;
+        }
+        if source.sampling.top_p.is_some() {
+            self.sampling.top_p = source.sampling.top_p;
+        }
+        if source.sampling.top_k.is_some() {
+            self.sampling.top_k = source.sampling.top_k;
+        }
+        if source.sampling.frequency_penalty.is_some() {
+            self.sampling.frequency_penalty = source.sampling.frequency_penalty;
+        }
+        if source.sampling.presence_penalty.is_some() {
+            self.sampling.presence_penalty = source.sampling.presence_penalty;
+        }
+        if source.sampling.seed.is_some() {
+            self.sampling.seed = source.sampling.seed;
         }
         if source.version.is_some() {
             self.version = source.version;
@@ -291,6 +328,24 @@ impl ProviderSettings {
         }
         if let Some(effort) = &self.reasoning_effort {
             let _ = writeln!(out, "reasoning_effort = {}", quote_toml_string(effort));
+        }
+        if let Some(temperature) = self.sampling.temperature {
+            let _ = writeln!(out, "temperature = {temperature}");
+        }
+        if let Some(top_p) = self.sampling.top_p {
+            let _ = writeln!(out, "top_p = {top_p}");
+        }
+        if let Some(top_k) = self.sampling.top_k {
+            let _ = writeln!(out, "top_k = {top_k}");
+        }
+        if let Some(frequency_penalty) = self.sampling.frequency_penalty {
+            let _ = writeln!(out, "frequency_penalty = {frequency_penalty}");
+        }
+        if let Some(presence_penalty) = self.sampling.presence_penalty {
+            let _ = writeln!(out, "presence_penalty = {presence_penalty}");
+        }
+        if let Some(seed) = self.sampling.seed {
+            let _ = writeln!(out, "seed = {seed}");
         }
         if let Some(proxy) = &self.proxy {
             out.push_str("\n[proxy]\n");
@@ -369,8 +424,52 @@ fn u32_field(table: &toml::Table, key: &str, source: &str) -> Option<u32> {
     }
 }
 
+fn u64_field(table: &toml::Table, key: &str, source: &str) -> Option<u64> {
+    match table.get(key).map(toml::Value::as_integer) {
+        Some(Some(value)) => u64::try_from(value).map_or_else(
+            |_| {
+                warn!(file = %source, field = key, value, "config field out of range; skipped");
+                None
+            },
+            Some,
+        ),
+        Some(None) => {
+            warn!(file = %source, field = key, "config field type mismatch; skipped");
+            None
+        }
+        None => None,
+    }
+}
+
+/// Sampling floats accept a TOML float, an integer (`temperature = 1`, which
+/// the export path can also re-emit), or a string (`"0.7"`). Non-finite values
+/// are dropped so they can never poison the request JSON.
+fn f32_field(table: &toml::Table, key: &str, source: &str) -> Option<f32> {
+    let value = table.get(key)?;
+    if let Some(number) = value.as_float() {
+        return finite_f32(number, key, source);
+    }
+    if let Some(number) = value.as_integer() {
+        return finite_f32(number as f32, key, source);
+    }
+    if let Some(text) = value.as_str() {
+        return text.trim().parse::<f32>().ok().and_then(|number| finite_f32(number, key, source));
+    }
+    warn!(file = %source, field = key, "config field type mismatch; skipped");
+    None
+}
+
+fn finite_f32(number: f32, key: &str, source: &str) -> Option<f32> {
+    if number.is_finite() {
+        Some(number)
+    } else {
+        warn!(file = %source, field = key, "config field must be finite; skipped");
+        None
+    }
+}
+
 /// Pre-env resolution result: either env mode or a profile awaiting its key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ProviderSpec {
     Env {
         model: String,
@@ -385,6 +484,7 @@ pub enum ProviderSpec {
         max_tokens: u32,
         reasoning_effort: Option<String>,
         context_window: Option<u32>,
+        sampling: SamplingParams,
     },
 }
 
@@ -471,6 +571,7 @@ pub fn resolve_spec(
         max_tokens: settings.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         reasoning_effort: settings.reasoning_effort.clone(),
         context_window: settings.context_window,
+        sampling: settings.sampling,
     })
 }
 
@@ -502,6 +603,7 @@ pub fn materialize(spec: ProviderSpec) -> Result<ProviderSelection, String> {
             max_tokens,
             reasoning_effort,
             context_window,
+            sampling,
         } => {
             // Industry-standard split: `api_key_env` (indirect, secret stays out
             // of the file) takes precedence over inline `[provider] api_key`,
@@ -534,6 +636,7 @@ pub fn materialize(spec: ProviderSpec) -> Result<ProviderSelection, String> {
                 max_tokens,
                 reasoning_effort,
                 context_window,
+                sampling,
             }))
         }
     }
@@ -626,6 +729,7 @@ mod tests {
         materialize, resolve_spec, ProviderProfile, ProviderProtocol, ProviderSelection,
         ProviderSettings, ProviderSpec, CONFIG_VERSION, DEFAULT_MAX_TOKENS, DEFAULT_MODEL,
     };
+    use api::SamplingParams;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -735,6 +839,92 @@ mod tests {
         assert_eq!(merged.context_window, Some(65536));
         merged.merge(settings("[provider]\ncontext_window = 131072\n"));
         assert_eq!(merged.context_window, Some(131_072));
+    }
+
+    #[test]
+    fn sampling_keys_parse_merge_export_and_reach_the_profile() {
+        // Float, quoted string, integer, and seed all land in the settings.
+        let parsed = settings(concat!(
+            "[provider]\n",
+            "temperature = 0.7\n",
+            "top_p = \"0.9\"\n",
+            "top_k = 40\n",
+            "seed = 42\n"
+        ));
+        assert_eq!(parsed.sampling.temperature, Some(0.7));
+        assert_eq!(parsed.sampling.top_p, Some(0.9));
+        assert_eq!(parsed.sampling.top_k, Some(40));
+        assert_eq!(parsed.sampling.seed, Some(42));
+        assert_eq!(parsed.sampling.frequency_penalty, None);
+        assert_eq!(parsed.sampling.presence_penalty, None);
+        // A broken value degrades to None without poisoning the rest.
+        assert_eq!(
+            settings("[provider]\ntemperature = \"oops\"\n").sampling.temperature,
+            None
+        );
+
+        // Later layers override per field; unset fields never erase earlier ones.
+        let mut merged = parsed;
+        merged.merge(settings("[provider]\ntemperature = 0.2\n"));
+        assert_eq!(merged.sampling.temperature, Some(0.2));
+        assert_eq!(merged.sampling.seed, Some(42));
+
+        // Export carries only the set fields so the round-trip is lossless.
+        let exported = merged.to_toml_string();
+        assert!(exported.contains("temperature = 0.2"), "export: {exported}");
+        assert!(exported.contains("seed = 42"), "export: {exported}");
+        assert!(
+            !exported.contains("frequency_penalty"),
+            "unset sampling must not be exported: {exported}"
+        );
+
+        // The resolved spec and the materialized profile carry sampling through.
+        let spec = resolve_spec(
+            Some("custom"),
+            Some("m"),
+            &settings(concat!(
+                "[provider]\n",
+                "base_url = \"http://localhost:8000\"\n",
+                "api_key = \"sk-abc\"\n",
+                "temperature = 0.7\n",
+                "seed = 42\n"
+            )),
+        )
+        .expect("custom provider should resolve");
+        match spec {
+            ProviderSpec::Resolved {
+                sampling,
+                ..
+            } => {
+                assert_eq!(sampling.temperature, Some(0.7));
+                assert_eq!(sampling.seed, Some(42));
+            }
+            other @ ProviderSpec::Env { .. } => panic!("unexpected {other:?}"),
+        }
+        let materialized = materialize(ProviderSpec::Resolved {
+            protocol: ProviderProtocol::OpenAi,
+            base_url: "https://example.invalid".to_string(),
+            api_key_env: "HEARTFLOW_TEST_UNSET_SAMPLING".to_string(),
+            api_key: Some("sk-fallback".to_string()),
+            auth_token_env: None,
+            model: "m".to_string(),
+            max_tokens: DEFAULT_MAX_TOKENS,
+            reasoning_effort: None,
+            context_window: None,
+            sampling: SamplingParams {
+                temperature: Some(0.7),
+                seed: Some(42),
+                ..SamplingParams::default()
+            },
+        })
+        .expect("inline fallback should materialize");
+        match materialized {
+            ProviderSelection::Profile(profile) => {
+                assert_eq!(profile.sampling.temperature, Some(0.7));
+                assert_eq!(profile.sampling.seed, Some(42));
+            }
+            other @ ProviderSelection::Env { .. } => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
@@ -865,6 +1055,7 @@ mod tests {
             max_tokens: DEFAULT_MAX_TOKENS,
             reasoning_effort: None,
             context_window: None,
+            sampling: SamplingParams::default(),
         };
         let error = materialize(spec).expect_err("missing key should error");
         assert!(error.contains("HEARTFLOW_TEST_UNSET_KEY"));
@@ -897,6 +1088,7 @@ mod tests {
             max_tokens: DEFAULT_MAX_TOKENS,
             reasoning_effort: None,
             context_window: None,
+            sampling: SamplingParams::default(),
         };
         match materialize(spec).expect("inline fallback should materialize") {
             ProviderSelection::Profile(profile) => assert_eq!(profile.api_key, "sk-fallback"),
@@ -939,6 +1131,7 @@ mod tests {
             max_tokens: DEFAULT_MAX_TOKENS,
             reasoning_effort: None,
             context_window: None,
+            sampling: SamplingParams::default(),
         };
         match materialize(spec).expect("env key should win") {
             ProviderSelection::Profile(profile) => {
@@ -984,6 +1177,7 @@ mod tests {
             max_tokens: 4096,
             reasoning_effort: None,
             context_window: None,
+            sampling: SamplingParams::default(),
         });
         selection.set_model("new");
         assert_eq!(selection.model(), "new");
@@ -1095,6 +1289,11 @@ mod tests {
             max_tokens: Some(16384),
             reasoning_effort: Some("high".to_string()),
             context_window: Some(65536),
+            sampling: SamplingParams {
+                temperature: Some(0.7),
+                seed: Some(42),
+                ..SamplingParams::default()
+            },
             version: Some(CONFIG_VERSION),
             proxy: None,
         };

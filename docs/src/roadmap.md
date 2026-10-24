@@ -674,7 +674,9 @@ pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript �
 - **loop（hermes/harness 闭环，按研究定案）**：网络研究定案 = Anthropic generator-evaluator 循环 + Hermes 闭环（持久记忆→执行→自纠→避坑）。**本仓积木已全**：mission 账本（四态+判据+预算）+ 自动记账（§11.3）+ 续跑 nudge + full 权限 + MEMORY.md 避坑注入 + 停机守卫（double-Ctrl+C 仍可达）。loop 模式 = full 权限 + mission 自动续跑驱动（判据未满足即自动下一回合）+ blocked 三连检测停机。**分相**：等当前批真机测试后再建（它是权限最高的模式，需要测试过的基础）。
 - **Tab 切换判决**：Tab 已绑 toggle_fold——模式轮换用新 keymap 动作 `cycle_mode`（默认 **BackTab/Shift+Tab**，可重映射），折叠保持 Tab。轮换序 agent→plan→spec→loop。
 - **思考强度**：reasoning_effort 已在 profile 贯通到请求；补 `/effort [low|medium|high]` REPL 命令（镜像 /model 重建）+ TUI 状态行显示（chrome 扩展一字段）+ keymap `cycle_effort`（默认 Ctrl+E）。
-- **联网开关（开/关/本地）**：工具面过滤——开=web_search/web_fetch 正常；关=从工具集剔除；本地=web 剔除但保留 doc_search（rga 本地文档/知识库检索，clone 仓库研读属本地读）。shape = build_runtime 时的工具注册过滤 + 模式默认值（spec 默认开、loop 默认开、plan 默认本地）。`/web on|off|local` 命令 + 状态行标注。
+- **联网开关（开/关/本地，2026-10-24 用户细化）**：工具面过滤——开=web_search/web_fetch 正常；关=从工具集剔除；本地=web 剔除但保留 doc_search（rga 本地文档/知识库检索，clone 仓库研读属本地读）。**plan 可搜索**（用户更正：plan 也保留 web）。shape = build_runtime 时的工具注册过滤 + 模式默认值（spec 开、loop 开、plan 开、agent 开；用户可 `/web on|off|local` 覆盖）。**界面显示**：联网态与思维强度一起进状态行（如 `web:local · effort:high`），并配 keymap 动作（联网建议 Ctrl+O、强度轮换 Ctrl+E，均可重映射；Tab 已被补全/折叠占用不参与）。
+- **spec 执行确认流（用户细化）**：spec 文档写好后**展示在界面上**（overlay 预览全文），并询问三选：**立即执行 / 取消 / 添加修改（type something）**——用户可改文档或附加内容，agent 结合情况合理修订 spec；已完成的 spec **不必立即执行**，可留在 `.heartflow/specs/` 由用户后续在 spec 模式选择执行。**模式纪律**：其他模式（agent/plan/loop）下要求做 spec 工作时，agent 须提示「这是 spec 模式的工作」并拒绝越界执行（模式职责不串）。
+- **粘贴截断缺陷**：见 known-issues.md KI-003（bracketed paste 已启用仍截断——终端未回传粘贴标记假设，待实机复现）。
 
 ## C. 功能增强候选（轻量，待评估）
 

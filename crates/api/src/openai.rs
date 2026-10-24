@@ -7,6 +7,7 @@ use tracing::debug;
 use crate::error::ApiError;
 use crate::retry::{build_http, is_retryable_status, parse_retry_after, RetryPolicy};
 use crate::sse::{SseFrame, SseParser};
+use crate::types::SamplingParams;
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com/v1";
 
@@ -267,6 +268,10 @@ pub struct ChatRequest {
     /// `DeepSeek`/`OpenAI` reasoning effort ("low" | "medium" | "high").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    // Flatten sits last so existing keys keep their JSON order; an all-None
+    // sampling emits no entries at all.
+    #[serde(flatten)]
+    pub sampling: SamplingParams,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -510,7 +515,7 @@ pub struct Balance {
 mod tests {
     use super::{
         ChatChunk, ChatContent, ChatMessage, ChatRequest, ChatRole, ChatTool, ChatToolCallType,
-        ChatToolChoice, ChatToolSpec, ChatUsage, OpenAiClient, ThinkingControl,
+        ChatToolChoice, ChatToolSpec, ChatUsage, OpenAiClient, SamplingParams, ThinkingControl,
     };
     use serde_json::json;
 
@@ -538,6 +543,7 @@ mod tests {
             stream_options: None,
             thinking: None,
             reasoning_effort: None,
+            sampling: SamplingParams::default(),
         };
 
         let value: serde_json::Value =
@@ -549,6 +555,17 @@ mod tests {
         assert!(value.get("stream_options").is_none());
         assert!(value.get("thinking").is_none());
         assert!(value.get("reasoning_effort").is_none());
+        // Default sampling must leave no trace on the wire.
+        for key in [
+            "temperature",
+            "top_p",
+            "top_k",
+            "frequency_penalty",
+            "presence_penalty",
+            "seed",
+        ] {
+            assert!(value.get(key).is_none(), "unset {key} must stay off the wire");
+        }
     }
 
     #[test]
@@ -568,12 +585,46 @@ mod tests {
             stream_options: None,
             thinking: Some(ThinkingControl::enabled()),
             reasoning_effort: Some("high".to_string()),
+            sampling: SamplingParams::default(),
         };
 
         let value: serde_json::Value =
             serde_json::to_value(&request).expect("request should serialize");
         assert_eq!(value["thinking"]["type"], "enabled");
         assert_eq!(value["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn chat_request_serializes_set_sampling_fields_flattened() {
+        let request = ChatRequest {
+            model: "deepseek-chat".to_string(),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: Some(ChatContent::Text("hi".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            max_tokens: Some(512),
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            stream_options: None,
+            thinking: None,
+            reasoning_effort: None,
+            sampling: SamplingParams {
+                temperature: Some(0.7),
+                seed: Some(42),
+                ..SamplingParams::default()
+            },
+        };
+
+        let value: serde_json::Value =
+            serde_json::to_value(&request).expect("request should serialize");
+        assert_eq!(value["temperature"], 0.7);
+        assert_eq!(value["seed"], 42);
+        for key in ["top_p", "top_k", "frequency_penalty", "presence_penalty"] {
+            assert!(value.get(key).is_none(), "unset {key} must stay off the wire");
+        }
     }
 
     #[test]

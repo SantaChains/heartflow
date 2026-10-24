@@ -25,5 +25,6 @@ pub use types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     ImageSource, ImageSourceKind, InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent,
     MessageRequest, MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock,
-    StreamEvent, Thinking, ThinkingKind, ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
+    SamplingParams, StreamEvent, Thinking, ThinkingKind, ToolChoice, ToolDefinition,
+    ToolResultContentBlock, Usage,
 };

@@ -5,8 +5,8 @@ use api::{
     ChatMessage, ChatRequest, ChatResponse, ChatRole, ChatTool, ChatToolCall, ChatToolCallType,
     ChatToolChoice, ChatToolSpec, ContentBlockDelta, ImageSource, InputContentBlock, InputMessage,
     MessageRequest, MessageResponse, OpenAiClient, OutputContentBlock, ResponsesClient,
-    ResponsesEvent, ResponsesPayload, ResponsesResponse, ResponsesUsage, StreamEvent, Thinking,
-    ThinkingControl, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    ResponsesEvent, ResponsesPayload, ResponsesResponse, ResponsesUsage, SamplingParams,
+    StreamEvent, Thinking, ThinkingControl, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use runtime::{
     AgentEvent, ApiClient, ApiRequest, ContentBlock, ConversationMessage, MessageRole,
@@ -30,6 +30,7 @@ pub struct AnthropicStreamClient {
     max_tokens: u32,
     enable_tools: bool,
     reasoning_effort: Option<String>,
+    sampling: SamplingParams,
 }
 
 impl AnthropicStreamClient {
@@ -46,6 +47,7 @@ impl AnthropicStreamClient {
             max_tokens: DEFAULT_MAX_TOKENS,
             enable_tools,
             reasoning_effort: None,
+            sampling: SamplingParams::default(),
         })
     }
 
@@ -61,6 +63,7 @@ impl AnthropicStreamClient {
             max_tokens: profile.max_tokens,
             enable_tools,
             reasoning_effort: profile.reasoning_effort.clone(),
+            sampling: profile.sampling,
         }
     }
 }
@@ -75,6 +78,7 @@ impl ApiClient for AnthropicStreamClient {
             self.max_tokens,
             self.enable_tools,
             self.reasoning_effort.as_deref(),
+            self.sampling,
         );
 
         let handle = tokio::spawn(async move {
@@ -100,6 +104,7 @@ pub struct OpenAiStreamClient {
     max_tokens: u32,
     enable_tools: bool,
     reasoning_effort: Option<String>,
+    sampling: SamplingParams,
 }
 
 impl OpenAiStreamClient {
@@ -113,6 +118,7 @@ impl OpenAiStreamClient {
             max_tokens: profile.max_tokens,
             enable_tools,
             reasoning_effort: profile.reasoning_effort.clone(),
+            sampling: profile.sampling,
         }
     }
 }
@@ -127,6 +133,7 @@ impl ApiClient for OpenAiStreamClient {
             self.max_tokens,
             self.enable_tools,
             self.reasoning_effort.clone(),
+            self.sampling,
         );
 
         let handle = tokio::spawn(async move {
@@ -348,6 +355,7 @@ fn build_message_request(
     max_tokens: u32,
     enable_tools: bool,
     reasoning_effort: Option<&str>,
+    sampling: SamplingParams,
 ) -> MessageRequest {
     MessageRequest {
         model: model.to_string(),
@@ -368,6 +376,14 @@ fn build_message_request(
         tool_choice: enable_tools.then_some(ToolChoice::Auto),
         stream: true,
         thinking: anthropic_thinking(reasoning_effort, max_tokens),
+        // Anthropic's messages API only knows these three knobs; the rest of
+        // the configured sampling must stay off this dialect's wire.
+        sampling: SamplingParams {
+            temperature: sampling.temperature,
+            top_p: sampling.top_p,
+            top_k: sampling.top_k,
+            ..SamplingParams::default()
+        },
     }
 }
 
@@ -558,6 +574,7 @@ fn build_chat_request(
     max_tokens: u32,
     enable_tools: bool,
     reasoning_effort: Option<String>,
+    sampling: SamplingParams,
 ) -> ChatRequest {
     let mut messages = Vec::new();
     if !request.system_prompt.is_empty() {
@@ -596,6 +613,11 @@ fn build_chat_request(
             .as_ref()
             .map(|_| ThinkingControl::enabled()),
         reasoning_effort,
+        // The OpenAI chat dialect has no `top_k`; keep it off the wire.
+        sampling: SamplingParams {
+            top_k: None,
+            ..sampling
+        },
     }
 }
 
@@ -721,6 +743,7 @@ pub struct ResponsesStreamClient {
     model: String,
     max_tokens: u32,
     enable_tools: bool,
+    sampling: SamplingParams,
 }
 
 impl ResponsesStreamClient {
@@ -733,6 +756,7 @@ impl ResponsesStreamClient {
             model: profile.model.clone(),
             max_tokens: profile.max_tokens,
             enable_tools,
+            sampling: profile.sampling,
         }
     }
 }
@@ -741,7 +765,13 @@ impl ApiClient for ResponsesStreamClient {
     fn stream(&mut self, request: ApiRequest) -> Result<TurnStream, RuntimeError> {
         let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let client = self.client.clone();
-        let body = build_responses_body(&request, &self.model, self.max_tokens, self.enable_tools);
+        let body = build_responses_body(
+            &request,
+            &self.model,
+            self.max_tokens,
+            self.enable_tools,
+            self.sampling,
+        );
         let handle = tokio::spawn(async move {
             if let Err(error) = drive_responses_stream(&client, body, &tx).await {
                 let hint = error.suggestion().map(str::to_string);
@@ -763,6 +793,7 @@ fn build_responses_body(
     model: &str,
     max_tokens: u32,
     enable_tools: bool,
+    sampling: SamplingParams,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -772,6 +803,13 @@ fn build_responses_body(
     });
     if !request.system_prompt.is_empty() {
         body["instructions"] = serde_json::Value::String(request.system_prompt.join("\n\n"));
+    }
+    // The Responses dialect only carries these two sampling knobs.
+    if let Some(temperature) = sampling.temperature {
+        body["temperature"] = serde_json::json!(temperature);
+    }
+    if let Some(top_p) = sampling.top_p {
+        body["top_p"] = serde_json::json!(top_p);
     }
     if enable_tools {
         let tools: Vec<serde_json::Value> = request

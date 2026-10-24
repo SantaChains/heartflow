@@ -1,6 +1,25 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// User-configurable sampling knobs shared by every request dialect. Each
+/// field is optional and omitted from the wire JSON when unset, so a default
+/// `SamplingParams` changes nothing a server can observe.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct SamplingParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageRequest {
     pub model: String,
@@ -16,6 +35,10 @@ pub struct MessageRequest {
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<Thinking>,
+    // Flatten sits last so existing keys keep their JSON order; an all-None
+    // sampling emits no entries at all.
+    #[serde(flatten, default)]
+    pub sampling: SamplingParams,
 }
 
 impl MessageRequest {
@@ -285,4 +308,64 @@ pub enum StreamEvent {
     ContentBlockDelta(ContentBlockDeltaEvent),
     ContentBlockStop(ContentBlockStopEvent),
     MessageStop(MessageStopEvent),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InputMessage, MessageRequest, SamplingParams};
+
+    #[test]
+    fn sampling_params_serializes_only_set_fields() {
+        let sampling = SamplingParams {
+            temperature: Some(0.7),
+            seed: Some(42),
+            ..SamplingParams::default()
+        };
+        let json = serde_json::to_value(&sampling).expect("sampling should serialize");
+        assert_eq!(json["temperature"], 0.7);
+        assert_eq!(json["seed"], 42);
+        for key in ["top_p", "top_k", "frequency_penalty", "presence_penalty"] {
+            assert!(json.get(key).is_none(), "unset {key} must stay off the wire");
+        }
+    }
+
+    #[test]
+    fn message_request_with_default_sampling_omits_every_sampling_key() {
+        let request = MessageRequest {
+            model: "m".to_string(),
+            max_tokens: 16,
+            messages: vec![InputMessage::user_text("hi")],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            stream: true,
+            thinking: None,
+            sampling: SamplingParams::default(),
+        };
+        let value = serde_json::to_value(&request).expect("request should serialize");
+        for key in [
+            "temperature",
+            "top_p",
+            "top_k",
+            "frequency_penalty",
+            "presence_penalty",
+            "seed",
+        ] {
+            assert!(value.get(key).is_none(), "unset {key} must stay off the wire");
+        }
+
+        // Set fields land flattened at the top level, next to model/messages.
+        let sampled = MessageRequest {
+            sampling: SamplingParams {
+                temperature: Some(0.7),
+                top_k: Some(40),
+                ..SamplingParams::default()
+            },
+            ..request
+        };
+        let value = serde_json::to_value(&sampled).expect("request should serialize");
+        assert_eq!(value["temperature"], 0.7);
+        assert_eq!(value["top_k"], 40);
+        assert_eq!(value["model"], "m");
+    }
 }

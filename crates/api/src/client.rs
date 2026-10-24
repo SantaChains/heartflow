@@ -322,6 +322,7 @@ mod tests {
             tool_choice: None,
             stream: false,
             thinking: None,
+            sampling: crate::types::SamplingParams::default(),
         };
 
         assert!(request.with_streaming().stream);
