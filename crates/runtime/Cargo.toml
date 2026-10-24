@@ -40,3 +40,7 @@ workspace = true
 name = "hot_paths"
 harness = false
 
+[[bench]]
+name = "soak"
+harness = false
+
