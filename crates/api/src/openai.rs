@@ -564,7 +564,10 @@ mod tests {
             "presence_penalty",
             "seed",
         ] {
-            assert!(value.get(key).is_none(), "unset {key} must stay off the wire");
+            assert!(
+                value.get(key).is_none(),
+                "unset {key} must stay off the wire"
+            );
         }
     }
 
@@ -620,10 +623,14 @@ mod tests {
 
         let value: serde_json::Value =
             serde_json::to_value(&request).expect("request should serialize");
-        assert_eq!(value["temperature"], 0.7);
+        // serde_json widens f32 to f64 inside `Value`; compare via json!().
+        assert_eq!(value["temperature"], serde_json::json!(0.7f32));
         assert_eq!(value["seed"], 42);
         for key in ["top_p", "top_k", "frequency_penalty", "presence_penalty"] {
-            assert!(value.get(key).is_none(), "unset {key} must stay off the wire");
+            assert!(
+                value.get(key).is_none(),
+                "unset {key} must stay off the wire"
+            );
         }
     }
 

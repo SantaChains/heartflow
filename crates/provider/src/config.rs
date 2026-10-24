@@ -453,7 +453,11 @@ fn f32_field(table: &toml::Table, key: &str, source: &str) -> Option<f32> {
         return finite_f32(number as f32, key, source);
     }
     if let Some(text) = value.as_str() {
-        return text.trim().parse::<f32>().ok().and_then(|number| finite_f32(number, key, source));
+        return text
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .and_then(|number| finite_f32(number, key, source));
     }
     warn!(file = %source, field = key, "config field type mismatch; skipped");
     None
@@ -859,7 +863,9 @@ mod tests {
         assert_eq!(parsed.sampling.presence_penalty, None);
         // A broken value degrades to None without poisoning the rest.
         assert_eq!(
-            settings("[provider]\ntemperature = \"oops\"\n").sampling.temperature,
+            settings("[provider]\ntemperature = \"oops\"\n")
+                .sampling
+                .temperature,
             None
         );
 
@@ -892,10 +898,7 @@ mod tests {
         )
         .expect("custom provider should resolve");
         match spec {
-            ProviderSpec::Resolved {
-                sampling,
-                ..
-            } => {
+            ProviderSpec::Resolved { sampling, .. } => {
                 assert_eq!(sampling.temperature, Some(0.7));
                 assert_eq!(sampling.seed, Some(42));
             }

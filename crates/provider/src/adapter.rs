@@ -1120,7 +1120,14 @@ mod tests {
             }],
         };
 
-        let wire = build_message_request(&request, "deepseek-v4-flash", 8192, true, None, SamplingParams::default());
+        let wire = build_message_request(
+            &request,
+            "deepseek-v4-flash",
+            8192,
+            true,
+            None,
+            SamplingParams::default(),
+        );
         assert_eq!(wire.max_tokens, 8192);
         assert_eq!(wire.model, "deepseek-v4-flash");
         let tools = wire.tools.expect("tools should be advertised");
@@ -1128,7 +1135,8 @@ mod tests {
         assert_eq!(tools[0].name, "bash");
         assert_eq!(tools[0].description.as_deref(), Some("run shell"));
 
-        let bare = build_message_request(&request, "m", 4096, false, None, SamplingParams::default());
+        let bare =
+            build_message_request(&request, "m", 4096, false, None, SamplingParams::default());
         assert!(bare.tools.is_none());
         assert!(bare.tool_choice.is_none());
     }
@@ -1151,7 +1159,14 @@ mod tests {
             messages: vec![],
             tools: vec![],
         };
-        let wire = build_message_request(&request, "m", 8192, false, Some("medium"), SamplingParams::default());
+        let wire = build_message_request(
+            &request,
+            "m",
+            8192,
+            false,
+            Some("medium"),
+            SamplingParams::default(),
+        );
         assert_eq!(wire.thinking, Some(Thinking::enabled(4096)));
         let json = serde_json::to_value(&wire).expect("serialize");
         assert_eq!(json["thinking"]["type"], "enabled");
@@ -1170,7 +1185,14 @@ mod tests {
             }],
         };
 
-        let wire = build_chat_request(&request, "deepseek-v4-flash", 8192, true, None, SamplingParams::default());
+        let wire = build_chat_request(
+            &request,
+            "deepseek-v4-flash",
+            8192,
+            true,
+            None,
+            SamplingParams::default(),
+        );
         assert_eq!(wire.messages.len(), 2);
         assert_eq!(wire.messages[0].role, ChatRole::System);
         assert_eq!(
@@ -1248,7 +1270,13 @@ mod tests {
                 input_schema: serde_json::json!({ "type": "object" }),
             }],
         };
-        let body = build_responses_body(&request, "deepseek-reasoner", 4096, true, SamplingParams::default());
+        let body = build_responses_body(
+            &request,
+            "deepseek-reasoner",
+            4096,
+            true,
+            SamplingParams::default(),
+        );
         assert_eq!(body["model"], "deepseek-reasoner");
         assert_eq!(body["instructions"], "be terse");
         assert_eq!(body["max_output_tokens"], 4096);
@@ -1287,7 +1315,8 @@ mod tests {
         assert_eq!(anthropic.sampling.presence_penalty, None);
         assert_eq!(anthropic.sampling.seed, None);
         let json = serde_json::to_value(&anthropic).expect("serialize");
-        assert_eq!(json["temperature"], 0.7);
+        // serde_json widens f32 to f64 inside `Value`; compare via json!().
+        assert_eq!(json["temperature"], serde_json::json!(0.7f32));
         assert!(json.get("frequency_penalty").is_none());
         assert!(json.get("seed").is_none());
 
@@ -1297,19 +1326,20 @@ mod tests {
         assert_eq!(chat.sampling.seed, Some(42));
         assert_eq!(chat.sampling.top_k, None);
         let json = serde_json::to_value(&chat).expect("serialize");
-        assert_eq!(json["temperature"], 0.7);
+        assert_eq!(json["temperature"], serde_json::json!(0.7f32));
         assert_eq!(json["seed"], 42);
         assert!(json.get("top_k").is_none());
 
         // Responses carries only temperature/top_p, injected into the body.
         let body = build_responses_body(&request, "m", 4096, false, sampling);
-        assert_eq!(body["temperature"], 0.7);
-        assert_eq!(body["top_p"], 0.9);
+        assert_eq!(body["temperature"], serde_json::json!(0.7f32));
+        assert_eq!(body["top_p"], serde_json::json!(0.9f32));
         assert!(body.get("top_k").is_none());
         assert!(body.get("frequency_penalty").is_none());
 
         // Default sampling keeps every dialect's wire unchanged.
-        let plain = build_message_request(&request, "m", 8192, false, None, SamplingParams::default());
+        let plain =
+            build_message_request(&request, "m", 8192, false, None, SamplingParams::default());
         let json = serde_json::to_value(&plain).expect("serialize");
         for key in [
             "temperature",
@@ -1319,7 +1349,10 @@ mod tests {
             "presence_penalty",
             "seed",
         ] {
-            assert!(json.get(key).is_none(), "unset {key} must stay off the wire");
+            assert!(
+                json.get(key).is_none(),
+                "unset {key} must stay off the wire"
+            );
         }
         let bare = build_responses_body(&request, "m", 4096, false, SamplingParams::default());
         assert!(bare.get("temperature").is_none());

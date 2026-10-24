@@ -321,11 +321,16 @@ mod tests {
             seed: Some(42),
             ..SamplingParams::default()
         };
-        let json = serde_json::to_value(&sampling).expect("sampling should serialize");
-        assert_eq!(json["temperature"], 0.7);
+        let json = serde_json::to_value(sampling).expect("sampling should serialize");
+        // serde_json widens f32 to f64 inside `Value`, so compare via json!();
+        // the wire string itself carries the shortest repr (`0.7`).
+        assert_eq!(json["temperature"], serde_json::json!(0.7f32));
         assert_eq!(json["seed"], 42);
         for key in ["top_p", "top_k", "frequency_penalty", "presence_penalty"] {
-            assert!(json.get(key).is_none(), "unset {key} must stay off the wire");
+            assert!(
+                json.get(key).is_none(),
+                "unset {key} must stay off the wire"
+            );
         }
     }
 
@@ -351,7 +356,10 @@ mod tests {
             "presence_penalty",
             "seed",
         ] {
-            assert!(value.get(key).is_none(), "unset {key} must stay off the wire");
+            assert!(
+                value.get(key).is_none(),
+                "unset {key} must stay off the wire"
+            );
         }
 
         // Set fields land flattened at the top level, next to model/messages.
@@ -364,8 +372,13 @@ mod tests {
             ..request
         };
         let value = serde_json::to_value(&sampled).expect("request should serialize");
-        assert_eq!(value["temperature"], 0.7);
+        assert_eq!(value["temperature"], serde_json::json!(0.7f32));
         assert_eq!(value["top_k"], 40);
         assert_eq!(value["model"], "m");
+        let wire = serde_json::to_string(&sampled).expect("wire string");
+        assert!(
+            wire.contains("\"temperature\":0.7,") || wire.contains("\"temperature\":0.7}"),
+            "wire must carry a shortest-repr float: {wire}"
+        );
     }
 }
