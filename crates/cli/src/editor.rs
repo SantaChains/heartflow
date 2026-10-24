@@ -118,6 +118,18 @@ const COMMANDS: &[(&str, &str)] = &[
         "Validated provider swap: pre-flight, switch, memory carries over",
     ),
     (
+        "/mode <NAME>",
+        "Switch mode: read-only/workspace-write/full/plan/spec/loop",
+    ),
+    (
+        "/web <on|off|local>",
+        "Web tool access: on / off / local (knowledge-base retrieval only)",
+    ),
+    (
+        "/effort <LEVEL>",
+        "Reasoning depth: none / low / medium / high / max",
+    ),
+    (
         "/init",
         "Scaffold a starting AGENTS.md in the current directory",
     ),

@@ -17,8 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::render::{ColorTheme, Spinner, TerminalRenderer};
 use crate::{
-    expand_attachments, fold_tool_output, save_session_async, AgentRuntime, SessionShared,
-    FOLD_TOOL_OUTPUT_LINES,
+    expand_attachments, fold_tool_output, mode_prompt_segment, save_session_async, AgentRuntime,
+    SessionShared, FOLD_TOOL_OUTPUT_LINES,
 };
 
 /// Aborts the wrapped task when the guard drops. tokio detaches a spawned task
@@ -270,7 +270,21 @@ pub(crate) async fn run_turn_interactive(
     // system prompt. The section is a per-turn projection — set, never
     // persisted — so a mission edited mid-turn is picked up next turn.
     let missions_root = crate::storage::sessions_dir().join("missions");
-    runtime.set_turn_context(turn_reminder(&MissionLedger::load(&missions_root).list()));
+    let mission_section = turn_reminder(&MissionLedger::load(&missions_root).list());
+    // C-1 mode segment: the session's permission mode carries its own contract
+    // (plan token-frugal / spec research-first / loop autonomous drive).
+    let mode_section = mode_prompt_segment(&crate::storage::lock_state(state).mode);
+    let merged = match (mission_section, mode_section) {
+        (Some(mission), Some(segment)) => Some(format!(
+            "{mission}
+
+{segment}"
+        )),
+        (Some(mission), None) => Some(mission),
+        (None, Some(segment)) => Some(segment.to_string()),
+        (None, None) => None,
+    };
+    runtime.set_turn_context(merged);
     let mut notify = |event: &AgentEvent| turn.render(event);
     let result = runtime
         .run_turn_with_blocks(

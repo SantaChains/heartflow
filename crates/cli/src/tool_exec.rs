@@ -21,15 +21,52 @@ use tools::{todo_tool_spec, TodoLedger};
 use crate::config::{load_merged_mcp, McpServerConfig};
 use crate::interact::{QuestionOption, UserQuestioner};
 
+/// Network-research availability for the web tools (roadmap C-1 联网三态):
+/// `On` = normal; `Off` = web tools removed from the advertisement and
+/// rejected on call; `Local` = web off but local knowledge retrieval
+/// (`search_documents`/grep family) untouched.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum WebAccess {
+    #[default]
+    On,
+    Off,
+    Local,
+}
+
+impl WebAccess {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "on" => Some(Self::On),
+            "off" => Some(Self::Off),
+            "local" => Some(Self::Local),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+            Self::Local => "local",
+        }
+    }
+
+    fn web_enabled(self) -> bool {
+        self == Self::On
+    }
+}
+
 pub(crate) struct NativeToolExecutor {
     todo: Arc<TodoLedger>,
     questioner: Option<Arc<dyn UserQuestioner>>,
+    web_access: WebAccess,
 }
 
 impl NativeToolExecutor {
-    pub(crate) fn new(questioner: Option<Arc<dyn UserQuestioner>>) -> Self {
+    pub(crate) fn new(questioner: Option<Arc<dyn UserQuestioner>>, web_access: WebAccess) -> Self {
         Self {
             todo: Arc::new(TodoLedger::new()),
+            web_access,
             questioner,
         }
     }
@@ -85,43 +122,42 @@ impl ToolExecutor for NativeToolExecutor {
         if tool_name == "ask_user" {
             return self.run_ask_user(input);
         }
+        if !self.web_access.web_enabled() && matches!(tool_name, "web_search" | "web_fetch") {
+            return Err(ToolError::new(format!(
+                "web access is {} for this session; use /web on to re-enable",
+                self.web_access.label()
+            )));
+        }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
         tools::execute_tool(tool_name, &value).map_err(ToolError::new)
     }
 
     fn specs(&self) -> Vec<ToolSpec> {
-        let mut specs = tools::mvp_tool_specs()
+        let mut tool_specs = tools::mvp_tool_specs();
+        tool_specs.push(todo_tool_spec());
+        tool_specs.push(tools::ask_user_tool_spec());
+        tool_specs.push(tools::verify_graphics_tool_spec());
+        // The web pair rides the 联网三态 switch: filtered out entirely when
+        // the session runs with web access off/local.
+        if self.web_access.web_enabled() {
+            tool_specs.push(tools::web_fetch_tool_spec());
+            tool_specs.push(tools::web_search_tool_spec());
+        }
+        tool_specs.push(tools::generate_image_tool_spec());
+        // Document search needs the external rga binary; advertise the
+        // tool only when it exists so the model never sees a dead entry.
+        if runtime::rga_available() {
+            tool_specs.push(tools::search_documents_tool_spec());
+        }
+        tool_specs
             .into_iter()
             .map(|spec| ToolSpec {
                 name: spec.name.to_string(),
                 description: spec.description.to_string(),
                 input_schema: spec.input_schema,
             })
-            .collect::<Vec<_>>();
-        for spec in [
-            todo_tool_spec(),
-            tools::ask_user_tool_spec(),
-            tools::verify_graphics_tool_spec(),
-            tools::web_fetch_tool_spec(),
-            tools::web_search_tool_spec(),
-            tools::generate_image_tool_spec(),
-            // Document search needs the external rga binary; advertise the
-            // tool only when it exists so the model never sees a dead entry.
-        ]
-        .into_iter()
-        .chain(if runtime::rga_available() {
-            vec![tools::search_documents_tool_spec()]
-        } else {
-            Vec::new()
-        }) {
-            specs.push(ToolSpec {
-                name: spec.name.to_string(),
-                description: spec.description.to_string(),
-                input_schema: spec.input_schema,
-            });
-        }
-        specs
+            .collect()
     }
 
     fn pending_tasks(&self) -> usize {
@@ -192,9 +228,13 @@ pub(crate) struct AgentToolExecutor {
 }
 
 impl AgentToolExecutor {
-    pub(crate) fn new(mcp: Arc<McpToolset>, questioner: Option<Arc<dyn UserQuestioner>>) -> Self {
+    pub(crate) fn new(
+        mcp: Arc<McpToolset>,
+        questioner: Option<Arc<dyn UserQuestioner>>,
+        web_access: WebAccess,
+    ) -> Self {
         Self {
-            native: NativeToolExecutor::new(questioner),
+            native: NativeToolExecutor::new(questioner, web_access),
             mcp,
         }
     }

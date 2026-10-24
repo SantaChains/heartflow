@@ -97,6 +97,29 @@ pub(crate) fn permission_policy_for_mode_in(
             .with_tool_mode("edit_file", PermissionMode::Prompt)
             .with_tool_mode("apply_patch", PermissionMode::Prompt)
             .with_prompt_gate(plan_gate_for(workspace)),
+        // Spec: research freely (web included), then the only mutation allowed
+        // is the spec document under `.heartflow/specs/` — the mode writes the
+        // design and the task list, never the implementation.
+        "spec" => PermissionPolicy::new(PermissionMode::Deny)
+            .with_tool_mode("read_file", PermissionMode::Allow)
+            .with_tool_mode("glob_search", PermissionMode::Allow)
+            .with_tool_mode("grep_search", PermissionMode::Allow)
+            .with_tool_mode("search_files", PermissionMode::Allow)
+            .with_tool_mode("search_documents", PermissionMode::Allow)
+            .with_tool_mode("web_fetch", PermissionMode::Allow)
+            .with_tool_mode("web_search", PermissionMode::Allow)
+            .with_tool_mode("todo_write", PermissionMode::Allow)
+            .with_tool_mode("verify_graphics", PermissionMode::Allow)
+            .with_tool_mode("ask_user", PermissionMode::Allow)
+            .with_tool_mode("write_file", PermissionMode::Prompt)
+            .with_tool_mode("edit_file", PermissionMode::Prompt)
+            .with_tool_mode("apply_patch", PermissionMode::Prompt)
+            .with_prompt_gate(spec_gate_for(workspace)),
+        // Loop: the full-permission autonomous drive; the mission-ledger
+        // machinery (roadmap C-1) hangs off this in a later phase.
+        "loop" => PermissionPolicy::new(PermissionMode::Allow)
+            .with_tool_mode("web_fetch", PermissionMode::Allow)
+            .with_tool_mode("web_search", PermissionMode::Allow),
         // `workspace-write`, the default interactive mode. Writers are `Prompt`
         // rather than `Allow` so the gate sees them at all — an `Allow` tool
         // never consults the gate, which is how writes outside the workspace
@@ -116,7 +139,7 @@ pub(crate) fn permission_policy_for_mode_in(
     // The Deny-default modes must still reach read-only MCP tools; Allow modes
     // already permit them, so adding them again is a harmless no-op there.
     match mode {
-        "read-only" | "plan" => mcp_read_only.iter().fold(base, |policy, name| {
+        "read-only" | "plan" | "spec" => mcp_read_only.iter().fold(base, |policy, name| {
             policy.with_tool_mode(name.clone(), PermissionMode::Allow)
         }),
         _ => base,
@@ -238,6 +261,29 @@ fn plan_gate_for(
         Some(
             "planning mode writes only a Markdown plan under .heartflow/plans/; anything else \
              needs `/plan approve` first"
+                .to_string(),
+        )
+    }
+}
+
+/// Prompt gate for `spec` mode: a write passes only when it resolves into
+/// `.heartflow/specs/` as Markdown — the design doc and nothing else.
+fn spec_gate_for(
+    workspace: &Path,
+) -> impl Fn(&str, &str) -> Option<String> + Send + Sync + 'static {
+    let workspace = workspace.to_path_buf();
+    move |tool_name, input| {
+        let specs = workspace.join(".heartflow").join("specs");
+        let targets = write_targets(tool_name, input);
+        let all_are_spec_docs = !targets.is_empty()
+            && targets
+                .iter()
+                .all(|target| is_markdown(target) && resolves_into(&workspace, &specs, target));
+        if all_are_spec_docs {
+            return None;
+        }
+        Some(
+            "spec mode writes only a Markdown spec under .heartflow/specs/; implementation              happens after the spec is approved"
                 .to_string(),
         )
     }

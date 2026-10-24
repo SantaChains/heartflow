@@ -74,6 +74,13 @@ pub(crate) struct SessionState {
     pub(crate) session_id: Option<String>,
     /// Full text of tool outputs folded during rendering, indexed for `/expand`.
     pub(crate) expandable: Vec<String>,
+    /// 联网三态 (roadmap C-1): web tool advertisement + call gating for the
+    /// session; the runtime is rebuilt on change so the model sees the swap.
+    pub(crate) web_access: crate::tool_exec::WebAccess,
+    /// Session permission mode ("workspace-write" default); mirrored here so
+    /// `run_turn_interactive` can inject the mode's prompt segment without
+    /// threading the string through every call site.
+    pub(crate) mode: String,
 }
 
 /// Shared handle to one conversation's mutable state.

@@ -836,6 +836,7 @@ async fn run_repl(
         core::QueueLoad::Fresh => {}
     }
     let mut model = HeartModel::with_queue(restored_queue);
+    lock_state(state).mode = mode.clone();
     // §1 subagent jobs: the supervisor (this REPL session) owns a registry of
     // context-isolated worker jobs. Slots/pending caps come from env with the
     // roadmap defaults; job records persist under sessions/jobs and any
@@ -1314,6 +1315,16 @@ async fn dispatch_slash_command(
         }
         _ if trimmed == "/model" || trimmed.starts_with("/model ") => {
             handle_model_command(state, trimmed, selection, runtime, mode, catalog);
+            *planning = false;
+            LoopControl::Continue
+        }
+        _ if trimmed == "/web" || trimmed.starts_with("/web ") => {
+            handle_web_command(state, trimmed, selection, runtime, mode);
+            *planning = false;
+            LoopControl::Continue
+        }
+        _ if trimmed == "/effort" || trimmed.starts_with("/effort ") => {
+            handle_effort_command(state, trimmed, selection, runtime, mode);
             *planning = false;
             LoopControl::Continue
         }
@@ -2657,6 +2668,100 @@ async fn reorganize_memory(state: &SessionShared, runtime: &mut AgentRuntime) {
     }
 }
 
+/// `/web on|off|local` — 联网三态 (roadmap C-1). Rebuilds the runtime so the
+/// model sees the tool set change; memory and transcript are unaffected.
+fn handle_web_command(
+    state: &SessionShared,
+    input: &str,
+    selection: &ProviderSelection,
+    runtime: &mut AgentRuntime,
+    mode: &str,
+) {
+    let requested = input
+        .strip_prefix("/web")
+        .map(str::trim)
+        .unwrap_or_default();
+    let Some(access) = crate::tool_exec::WebAccess::parse(requested) else {
+        let current = lock_state(state).web_access;
+        println!(
+            "usage: /web on|off|local   (current: {}; local keeps document/knowledge-base retrieval)",
+            current.label()
+        );
+        return;
+    };
+    lock_state(state).web_access = access;
+    match build_runtime(
+        state,
+        runtime.session().clone(),
+        selection.clone(),
+        true,
+        mode,
+    ) {
+        Ok(rebuilt) => {
+            *runtime = rebuilt;
+            println!("web access -> {}", access.label());
+        }
+        Err(error) => println!("failed to apply web access: {error}"),
+    }
+}
+
+/// `/effort [none|low|medium|high|max]` — reasoning depth switch. Rebuilds the
+/// runtime; `none` turns thinking off (reasoning_effort cleared).
+fn handle_effort_command(
+    state: &SessionShared,
+    input: &str,
+    selection: &mut ProviderSelection,
+    runtime: &mut AgentRuntime,
+    mode: &str,
+) {
+    let requested = input
+        .strip_prefix("/effort")
+        .map(str::trim)
+        .unwrap_or_default();
+    let current = match selection {
+        ProviderSelection::Profile(profile) => profile.reasoning_effort.clone(),
+        ProviderSelection::Env { .. } => None,
+    };
+    if requested.is_empty() {
+        println!(
+            "reasoning effort: {}",
+            current.as_deref().unwrap_or("none (off)")
+        );
+        println!("switch with: /effort none|low|medium|high|max");
+        return;
+    }
+    let normalized = requested.to_ascii_lowercase();
+    if !matches!(
+        normalized.as_str(),
+        "none" | "low" | "medium" | "high" | "max"
+    ) {
+        println!("unknown effort '{requested}'; choose none, low, medium, high or max.");
+        return;
+    }
+    let mut next = selection.clone();
+    match &mut next {
+        ProviderSelection::Profile(profile) => {
+            profile.reasoning_effort = if normalized == "none" {
+                None
+            } else {
+                Some(normalized.clone())
+            };
+        }
+        ProviderSelection::Env { .. } => {
+            println!("env-driven selection has no reasoning-effort knob; nothing switched.");
+            return;
+        }
+    }
+    match build_runtime(state, runtime.session().clone(), next.clone(), true, mode) {
+        Ok(rebuilt) => {
+            *runtime = rebuilt;
+            *selection = next;
+            println!("reasoning effort -> {normalized}");
+        }
+        Err(error) => println!("failed to switch effort: {error}"),
+    }
+}
+
 fn handle_model_command(
     state: &SessionShared,
     input: &str,
@@ -2822,7 +2927,14 @@ fn humanize_tokens(tokens: u64) -> String {
 }
 
 /// Permission modes exposed to `/mode`, ordered from most to least restrictive.
-const KNOWN_PERMISSION_MODES: &[&str] = &["read-only", "workspace-write", "full"];
+const KNOWN_PERMISSION_MODES: &[&str] = &[
+    "read-only",
+    "workspace-write",
+    "full",
+    "plan",
+    "spec",
+    "loop",
+];
 
 /// Re-read config from disk and rebuild the runtime in place, preserving the
 /// live conversation and permission mode. Used for between-turn hot reload.
@@ -3189,9 +3301,53 @@ fn handle_mode_command(
         Ok(rebuilt) => {
             *runtime = rebuilt;
             *mode = normalized.to_string();
+            lock_state(state).mode = normalized.to_string();
             println!("mode -> {normalized}");
         }
         Err(error) => println!("failed to switch mode: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod mode_segment_tests {
+    use super::mode_prompt_segment;
+
+    #[test]
+    fn mode_segments_cover_the_three_contract_modes_and_skip_the_default() {
+        assert!(mode_prompt_segment("plan")
+            .expect("plan")
+            .contains(".heartflow/plans/"));
+        assert!(mode_prompt_segment("plan")
+            .expect("plan")
+            .contains("token-frugal"));
+        assert!(mode_prompt_segment("spec")
+            .expect("spec")
+            .contains(".heartflow/specs/"));
+        assert!(mode_prompt_segment("spec")
+            .expect("spec")
+            .contains("Do NOT implement"));
+        assert!(mode_prompt_segment("loop")
+            .expect("loop")
+            .contains("full permissions"));
+        assert_eq!(mode_prompt_segment("workspace-write"), None);
+        assert_eq!(mode_prompt_segment("full"), None);
+        assert_eq!(mode_prompt_segment("read-only"), None);
+        assert_eq!(mode_prompt_segment(""), None);
+    }
+}
+
+fn mode_prompt_segment(mode: &str) -> Option<&'static str> {
+    match mode {
+        "plan" => Some(
+            "You are in plan mode: read and research freely (web search included), but the only writable location is .heartflow/plans/ as Markdown. Be token-frugal: answer directly, avoid reading large files end-to-end, outline rather than implement, and never modify existing files.",
+        ),
+        "spec" => Some(
+            "You are in spec mode: research the topic with web search first, then write a self-consistent, minimal design spec as Markdown under .heartflow/specs/ plus a task list via todo_write. Do NOT implement anything - implementation happens only after the spec is approved. When the spec is complete, stop and present it.",
+        ),
+        "loop" => Some(
+            "You are in loop mode: you hold full permissions and drive autonomously. Work toward the mission in large verified steps, consult the task ledger, persist durable findings to memory, avoid repeating known pitfalls, and keep going until the mission completes or you are genuinely blocked - then say exactly what is blocked and why.",
+        ),
+        _ => None,
     }
 }
 
@@ -3831,7 +3987,7 @@ fn build_runtime_with_mcp(
     Ok(ConversationRuntime::new(
         session,
         client,
-        AgentToolExecutor::new(mcp, questioner),
+        AgentToolExecutor::new(mcp, questioner, lock_state(state).web_access),
         permission_policy_for_mode(mode, &mcp_read_only),
         system_prompt,
     )
@@ -3934,7 +4090,7 @@ mod tests {
     fn native_read_only_tools_are_the_only_concurrent_safe_ones() {
         use super::NativeToolExecutor;
         use runtime::ToolExecutor;
-        let exec = NativeToolExecutor::new(None);
+        let exec = NativeToolExecutor::new(None, crate::tool_exec::WebAccess::On);
         // Pure reads/searches/fetches may overlap.
         for tool in [
             "read_file",
