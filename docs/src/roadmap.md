@@ -683,6 +683,11 @@ pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript �
 用户构想六束，逐束取舍（网络检索定案）：
 
 - **ONNX/小模型赛道（新开，评估项）**：用户构想——hf 可调用**大模型 + 非 LLM 的 ONNX 小模型**（翻译/OCR/NLP/图像语义），场景样例：一个英文词 + 几个候选翻译，小模型做语义优选、JSON 规范输出、直接替换执行，大模型只做监督。**取舍**：① **Ollama 接口零新代码**——其 OpenAI 兼容端点 + 本仓 openai-compatible provider + 回环防代理保护天然齐备，`/bootstrap ollama http://localhost:11434/v1` 即用（文档化即可）；② **ONNX 直连（ort crate）是评估项**：绑定重、模型分发（OCR=检测+识别双模型、embedding、NER 各一套）与「翻译优选」场景的收益需先以单实验验证（用 ollama 跑 embedding/翻译小模型替代 ort，零绑定成本先试场景价值）；③ **大小模型协作模式**（小模型快速分类/评分出 JSON、大模型监督裁决）记为模式设计资产，与 spec/loop 同族——小模型做「快而糙」，大模型做「慢而对」；④ **ds4 引擎本体不采维持**（Metal/CUDA 重栈判决），但其「引擎内部压缩与洗涤」的方法论已在 §4 compaction 七相落地。
+- **向量/重排序接入设计（2026-10-24 网络研究定案，用户点名「不堵塞」为第一约束）**：
+  - **两条接入路**：① **Ollama REST**——embeddings 端点原生（nomic-embed-text/mxbai-embed-large/Qwen3-embed），重排模型覆盖不全（上游 issue #17129 活跃）；② **fastembed-rs**——进程内 ONNX（dense/sparse/multivector + TextRerank cross-encoder），HF tokenizers，重依赖评估项。裁决：**先 ① 后 ②**——零绑定成本试场景，fastembed 的 TextRerank 作重排补位候选。
+  - **非阻塞架构（本仓积木直配）**：小模型推理走 spawn_blocking/专职 worker **旁路通道**——与 JobRegistry + SteerMailbox 同构，结果以注解/工具结果落回，**大模型热路径永不等待**。2026 业界收敛趋势正是此形态。
+  - **五用例（映射已录项）**：① 长期记忆语义检索（C 组「向量记忆」具体化：MEMORY.md/sessions 建 embedding 索引，语义召回增强/替代 FTS5 trigram）；② 翻译优选（用户点名场景）；③ §2 搜索结果 embed-then-rerank 两段式（Cursor 同款）；④ C-2 双轨清洗的相关性打分；⑤ 代码库语义索引——Cursor 架构（AST 分块 + Merkle 增量同步 + embeddings）与 §10.8 tree-sitter 判决联动。
+  - **vendor 特色借鉴**：Cursor（AST 分块 + Merkle 增量同步 + 两段式重排）、Continue（embedder/reranker 全可配置全本地最彻底）、本地 RAG 作 **MCP 工具**暴露（检索旁路通道的工具化形态，与 §10.3 MCP host 判决合流）。
 - **工具输出清洗（双轨制，采纳）**：省 token 清理 vs 保障原始——**呈现层/上下文层清洗、原始层保底可回取**（本仓 expand/fold 工具输出折叠机制已备双轨骨架）：① `!CMD` 与 bash 捕获输出统一 **ANSI 剥离 + NO_COLOR=1 注入子进程**（KI-004，防御性净化）；② 网页内容正文提取（去导航/标签/脚本——§2 web_fetch 补 readability 层）；③ md 过度符号压缩（表格/链接转紧凑形，原始可展开）；④ 剥离仅进上下文，磁盘 transcript 恒存原始。
 - **其他 AI 调用 hf**：判决已录（§10.3 loopback MCP host 按需采纳）+ **现状已可用**：`hf prompt --json`/pipe 模式即 CLI 工具形态（rg/edit/diff 同类），MCP host 是把「全套工具面」暴露给外部 agent 的升级路径。
 - **LSP/tree-sitter/ast-grep**：§6 写后诊断（cargo check）已落地；**LSP 不采维持**（进程寿命+误报治理是另一量级，用户对误报污染上下文的顾虑正是当年判决依据）；**ast-grep 轻采纳**——已装则经外部工具注入机制（prompt.rs render_external_tools）天然可用，零代码；**tree-sitter 自研集成缓**（依赖评估，等结构定位真实需求）；语法高亮（edit 工具）缓——markdown IR 管线可扩展非核心。

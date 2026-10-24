@@ -96,6 +96,8 @@ CI 有三条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/**`
 
 `[provider]`：`name`、`protocol`（`anthropic` | `openai`/`openai-compatible`/`openai_compat` | `openai-responses`/`responses`/`openai_responses`）、`base_url`、`api_key_env`、`api_key`（内联明文，导出时永不写出）、`auth_token_env`、`model`、`max_tokens`、`reasoning_effort`、`context_window`（`crates/provider/src/config.rs:123-140`、`:165-181`）。字段全可选，未识别字段仅 debug 记录，坏字段跳过不阻断。缺省模型 `mimo-v2.5-pro`、缺省 `max_tokens` 4096（`crates/provider/src/config.rs:7-8`）。
 
+`[provider]` 采样参数：`temperature`、`top_p`、`top_k`、`frequency_penalty`、`presence_penalty`、`seed`——全部默认省略（=不改服务端默认，请求 JSON 不含这些键），逐项经 `SamplingParams`（`crates/api/src/types.rs`）落到请求；按方言过滤透传：Anthropic 只透传 temperature/top_p/top_k，OpenAI chat 只透传 temperature/top_p/frequency_penalty/presence_penalty/seed（无 top_k），Responses 只透传 temperature/top_p。
+
 `[proxy]`：`mode`（`direct` | `global` | `auto`，默认 `auto`）、`address`（如 `http://127.0.0.1:7890`、`socks5://…`）、`rules`（Clash 风格 `TYPE,VALUE,ACTION` 行数组）、`no_proxy`（绕过列表）；解析归 `crates/proxy`（`ProxyConfig::from_table`），空表折叠为「无意见」。生效链：`[proxy]` config.toml（项目层盖用户层，字段级）> `HEARTFLOW_PROXY*` env > `HTTPS_PROXY→ALL_PROXY→HTTP_PROXY` + `NO_PROXY` > Windows WinINET 注册表（`crates/proxy/src/system.rs`，仅 Windows）> direct。回环/RFC1918/link-local/IPv6 ULA 永不走代理；启动时 1s TCP 探测，死代理降级 direct 并 `tracing::warn`。所有 reqwest 客户端构造点（`api/retry.rs`、`tools/web.rs`、`tools/image.rs`、`mcp/http.rs`）一律 `.no_proxy()` + `hfproxy::resolution()` 闭包，**禁止**裸 `Client::new()`。
 
 `[mcp.servers.NAME]`：`command`、`args`、`env`、`url`、`headers`（值支持 `${VAR}` 展开）、`bearer_token_env`、`read_only`。`url` 与 `command` 二选一，两者皆缺则跳过并告警；`url` 存在即走 Streamable-HTTP/SSE（`crates/cli/src/config.rs:12-29`、`:55-110`）。
