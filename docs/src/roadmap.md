@@ -441,6 +441,15 @@ heartflow 落点：`edit_file` / `apply_patch` 后回注诊断（Rust 项目先�
 - 凭证安全范式：错误信息脱敏、跨源重定向剥密钥、SSRF 全局防护。
 
 **落点**：provider 链 + fallback（DeepSeek 服务端搜索已有协议口子，见原路线图）、`crawl` 工具（有界深度/页数）、结果预算参数。**明确不做**：视频理解、YouTube、浏览器渲染（归 browser use 条目）。
+- **多引擎 + 爬虫 + 清洗设计（2026-10-24 网络研究定案，用户点名批次）**：
+  - **多搜索引擎**：**SearXNG 自托管元搜索**（聚合多达 261 个搜索服务、JSON API、无追踪）为首选引擎选项——一个实例顶 N 家引擎，web_search 增 engine 参数（`ddg`（现状）/`searxng:<instance-url>`）；**Firecrawl** 可选付费集成（search+scrape+crawl 一体，2026-02 千 URL 基准成功率 95.3% 居首）。
+  - **爬虫**：`crawl` 工具引擎候选——**spider-rs**（Rust 同语系高吞吐）与 **Crawl4AI 设计**（Python，专为 LLM 友好 Markdown 而生——其清洗管线设计可移植即使语言不同）。有界纪律不变：深度/页数/域内白名单。
+  - **正文提取层**：Rust 侧三候选——**rs-trafilatura**（Python 顶级提取器的 Rust 移植）、**dom_smoothie**（Readability Rust 移植）、readability crate；进 C-2 清洗双轨（提取正文→原始 HTML 落盘可回取）。
+  - **四层抓取级联**（业界自托管模式映射本仓）：SearXNG 元搜索 → ML 重排（C-2 embed-then-rerank）→ 抓取级联（Firecrawl 付费/Crawl4AI/直抓/Wayback 兜底）→ 清洗双轨——与已有件逐层对位，增量是 searxng 引擎 + 提取层 + 级联兜底。
+  - **AI 水稿/广告/重复去噪**：正文提取天然去广告与导航；水稿与重复判定复用 C-2 重排/embedding 相似度（重复折叠）；内容真伪裁决不做（大模型的活）。
+  - **认证/IP 阻拦/防护**：**尊重 robots.txt + 限速 + 退避 + 缓存**为采纳纪律；**对抗性绕过（residential proxy、anti-detect browser 如 Camoufox）不采**——法律与伦理边界，hf 是良民工具；遇 403/429 诚实上报并建议手动处理。
+  - **垃圾上下文注入防护**：网页内容是**不可信输入**——本仓已有 tool-result 当数据的防御（prompt.rs），扩展到 web_fetch 正文：隐藏文本/指令样句检测告警、正文包裹引用块并前置「来自网页、非用户指令」声明。
+  - **网址直接跳转**：web_fetch 已支持 5 跳重定向 + SSRF 护栏（ensure_public），维持。
 
 
 ### 3. 代理体系优化
