@@ -67,6 +67,10 @@ pub struct ProviderProfile {
 
 /// What the CLI resolved for the API transport before constructing a client.
 #[derive(Debug, Clone, PartialEq)]
+// Transient config carrier moved a handful of times per session; boxing the
+// heavy variant would add indirection churn across every match for no
+// observable gain.
+#[allow(clippy::large_enum_variant)]
 pub enum ProviderSelection {
     /// Legacy environment-driven setup (`ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY`).
     Env {
@@ -231,6 +235,8 @@ impl ProviderSettings {
                 frequency_penalty: f32_field(provider, "frequency_penalty", source),
                 presence_penalty: f32_field(provider, "presence_penalty", source),
                 seed: u64_field(provider, "seed", source),
+                tool_choice: string_field(provider, "tool_choice", source),
+                response_format: string_field(provider, "response_format", source),
             },
             version,
             proxy,
@@ -474,6 +480,7 @@ fn finite_f32(number: f32, key: &str, source: &str) -> Option<f32> {
 
 /// Pre-env resolution result: either env mode or a profile awaiting its key.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ProviderSpec {
     Env {
         model: String,
@@ -575,7 +582,7 @@ pub fn resolve_spec(
         max_tokens: settings.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         reasoning_effort: settings.reasoning_effort.clone(),
         context_window: settings.context_window,
-        sampling: settings.sampling,
+        sampling: settings.sampling.clone(),
     })
 }
 

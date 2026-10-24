@@ -268,10 +268,29 @@ pub struct ChatRequest {
     /// `DeepSeek`/`OpenAI` reasoning effort ("low" | "medium" | "high").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Forced output shape ("json_object" guarantees valid JSON); None keeps
+    /// the provider default plain text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<ChatResponseFormat>,
     // Flatten sits last so existing keys keep their JSON order; an all-None
     // sampling emits no entries at all.
     #[serde(flatten)]
     pub sampling: SamplingParams,
+}
+
+/// OpenAI/DeepSeek `response_format`; JSON mode only for now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChatResponseFormat {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+}
+impl ChatResponseFormat {
+    #[must_use]
+    pub const fn json_object() -> Self {
+        Self {
+            kind: "json_object",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -290,7 +309,12 @@ impl ThinkingControl {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatToolChoice {
+    #[serde(rename = "auto")]
     Auto,
+    #[serde(rename = "required")]
+    Required,
+    #[serde(rename = "none")]
+    None,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -543,6 +567,7 @@ mod tests {
             stream_options: None,
             thinking: None,
             reasoning_effort: None,
+            response_format: None,
             sampling: SamplingParams::default(),
         };
 
@@ -585,6 +610,7 @@ mod tests {
             stream: false,
             tools: None,
             tool_choice: None,
+            response_format: None,
             stream_options: None,
             thinking: Some(ThinkingControl::enabled()),
             reasoning_effort: Some("high".to_string()),
@@ -611,6 +637,7 @@ mod tests {
             stream: true,
             tools: None,
             tool_choice: None,
+            response_format: None,
             stream_options: None,
             thinking: None,
             reasoning_effort: None,

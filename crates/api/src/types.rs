@@ -4,7 +4,7 @@ use serde_json::Value;
 /// User-configurable sampling knobs shared by every request dialect. Each
 /// field is optional and omitted from the wire JSON when unset, so a default
 /// `SamplingParams` changes nothing a server can observe.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SamplingParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
@@ -18,6 +18,14 @@ pub struct SamplingParams {
     pub presence_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
+    /// Tool-selection policy ("auto" | "required" | "none"); each dialect
+    /// maps it onto its own wire shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<String>,
+    /// Forced output shape ("json_object"); dialects without the concept
+    /// leave it off the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

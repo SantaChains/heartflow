@@ -63,7 +63,7 @@ impl AnthropicStreamClient {
             max_tokens: profile.max_tokens,
             enable_tools,
             reasoning_effort: profile.reasoning_effort.clone(),
-            sampling: profile.sampling,
+            sampling: profile.sampling.clone(),
         }
     }
 }
@@ -78,7 +78,7 @@ impl ApiClient for AnthropicStreamClient {
             self.max_tokens,
             self.enable_tools,
             self.reasoning_effort.as_deref(),
-            self.sampling,
+            self.sampling.clone(),
         );
 
         let handle = tokio::spawn(async move {
@@ -118,7 +118,7 @@ impl OpenAiStreamClient {
             max_tokens: profile.max_tokens,
             enable_tools,
             reasoning_effort: profile.reasoning_effort.clone(),
-            sampling: profile.sampling,
+            sampling: profile.sampling.clone(),
         }
     }
 }
@@ -133,7 +133,7 @@ impl ApiClient for OpenAiStreamClient {
             self.max_tokens,
             self.enable_tools,
             self.reasoning_effort.clone(),
-            self.sampling,
+            self.sampling.clone(),
         );
 
         let handle = tokio::spawn(async move {
@@ -357,23 +357,32 @@ fn build_message_request(
     reasoning_effort: Option<&str>,
     sampling: SamplingParams,
 ) -> MessageRequest {
+    // "none" keeps tools off the wire entirely; "required" maps to Anthropic's
+    // `any`; unset/unknown falls back to `auto` when tools are enabled.
+    let tool_policy = sampling.tool_choice.as_deref();
+    let tools_enabled = enable_tools && tool_policy != Some("none");
+    let tools = tools_enabled.then(|| {
+        request
+            .tools
+            .iter()
+            .map(|spec: &ToolSpec| ToolDefinition {
+                name: spec.name.clone(),
+                description: Some(spec.description.clone()),
+                input_schema: spec.input_schema.clone(),
+            })
+            .collect()
+    });
     MessageRequest {
         model: model.to_string(),
         max_tokens,
         messages: convert_messages(&request.messages),
         system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-        tools: enable_tools.then(|| {
-            request
-                .tools
-                .iter()
-                .map(|spec: &ToolSpec| ToolDefinition {
-                    name: spec.name.clone(),
-                    description: Some(spec.description.clone()),
-                    input_schema: spec.input_schema.clone(),
-                })
-                .collect()
-        }),
-        tool_choice: enable_tools.then_some(ToolChoice::Auto),
+        tools,
+        tool_choice: match tool_policy {
+            Some("required") if tools_enabled => Some(ToolChoice::Any),
+            Some("auto") if tools_enabled => Some(ToolChoice::Auto),
+            _ => None,
+        },
         stream: true,
         thinking: anthropic_thinking(reasoning_effort, max_tokens),
         // Anthropic's messages API only knows these three knobs; the rest of
@@ -613,6 +622,11 @@ fn build_chat_request(
             .as_ref()
             .map(|_| ThinkingControl::enabled()),
         reasoning_effort,
+        response_format: sampling
+            .response_format
+            .as_deref()
+            .filter(|shape| *shape == "json_object")
+            .map(|_| api::ChatResponseFormat::json_object()),
         // The OpenAI chat dialect has no `top_k`; keep it off the wire.
         sampling: SamplingParams {
             top_k: None,
@@ -756,7 +770,7 @@ impl ResponsesStreamClient {
             model: profile.model.clone(),
             max_tokens: profile.max_tokens,
             enable_tools,
-            sampling: profile.sampling,
+            sampling: profile.sampling.clone(),
         }
     }
 }
@@ -770,7 +784,7 @@ impl ApiClient for ResponsesStreamClient {
             &self.model,
             self.max_tokens,
             self.enable_tools,
-            self.sampling,
+            self.sampling.clone(),
         );
         let handle = tokio::spawn(async move {
             if let Err(error) = drive_responses_stream(&client, body, &tx).await {
@@ -1299,6 +1313,8 @@ mod tests {
             frequency_penalty: Some(0.5),
             presence_penalty: Some(0.1),
             seed: Some(42),
+            tool_choice: None,
+            response_format: None,
         };
         let request = ApiRequest {
             system_prompt: vec![],
@@ -1307,7 +1323,7 @@ mod tests {
         };
 
         // Anthropic carries only temperature/top_p/top_k.
-        let anthropic = build_message_request(&request, "m", 8192, false, None, sampling);
+        let anthropic = build_message_request(&request, "m", 8192, false, None, sampling.clone());
         assert_eq!(anthropic.sampling.temperature, Some(0.7));
         assert_eq!(anthropic.sampling.top_p, Some(0.9));
         assert_eq!(anthropic.sampling.top_k, Some(40));
@@ -1321,7 +1337,7 @@ mod tests {
         assert!(json.get("seed").is_none());
 
         // OpenAI chat carries everything except top_k.
-        let chat = build_chat_request(&request, "m", 4096, false, None, sampling);
+        let chat = build_chat_request(&request, "m", 4096, false, None, sampling.clone());
         assert_eq!(chat.sampling.temperature, Some(0.7));
         assert_eq!(chat.sampling.seed, Some(42));
         assert_eq!(chat.sampling.top_k, None);
