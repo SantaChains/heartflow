@@ -21,6 +21,12 @@ impl SseParser {
         Self::default()
     }
 
+    /// Split one received chunk into complete frames, buffering partial input.
+    ///
+    /// # Errors
+    /// Never fails today: every code path returns `Ok` — bytes are buffered or
+    /// drained and non-UTF-8 fragments are lossily decoded. The `Result`
+    /// reserves room for frame-level errors without changing call sites.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>, ApiError> {
         self.buffer.extend_from_slice(chunk);
         let mut frames = Vec::new();
@@ -32,6 +38,12 @@ impl SseParser {
         Ok(frames)
     }
 
+    /// Drain a trailing partial frame once the stream has ended.
+    ///
+    /// # Errors
+    /// Never fails today: an empty buffer returns `Ok(vec![])` and a leftover
+    /// partial frame is lossily decoded and parsed. The `Result` reserves room
+    /// for frame-level errors without changing call sites.
     pub fn finish(&mut self) -> Result<Vec<SseFrame>, ApiError> {
         if self.buffer.is_empty() {
             return Ok(Vec::new());
@@ -100,6 +112,10 @@ pub fn parse_frame(frame: &str) -> SseFrame {
 /// Decode an Anthropic protocol frame into a typed stream event.
 ///
 /// Comment frames, `ping` events, and the `[DONE]` sentinel yield `None`.
+///
+/// # Errors
+/// Fails when the frame's `data` payload is not a valid `StreamEvent` JSON
+/// document (`Json`); the `None` cases above never error.
 pub fn anthropic_event(frame: &SseFrame) -> Result<Option<StreamEvent>, ApiError> {
     if frame.data.is_empty() || matches!(frame.event.as_deref(), Some("ping")) {
         return Ok(None);

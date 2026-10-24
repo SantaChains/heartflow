@@ -510,6 +510,13 @@ fn read_catalog_file(path: &Path) -> ProviderCatalog {
 /// never clobbered, resolves the key against the *merged* catalog (so a recorded
 /// `DeepSeek` model lands under the seed `deepseek` key, not a host-derived
 /// duplicate), then writes atomically. Errors are non-fatal to the caller.
+///
+/// # Errors
+/// Fails when no provider key can be derived from `base_url` (empty host), or
+/// when the atomic write fails: creating `~/.heartflow`, writing the sibling
+/// temp file, or the final rename (transient Windows `PermissionDenied` gets
+/// three attempts before surfacing). Catalog read failures degrade to the
+/// seed and are never an error.
 pub fn persist_model(
     home: &Path,
     base_url: &str,
@@ -535,6 +542,13 @@ pub fn persist_model(
 
 /// Persist several discovered models at once (one `hf models` call), with a
 /// single read and a single atomic write.
+///
+/// # Errors
+/// Fails when no provider key can be derived from `base_url` (empty host), or
+/// when the atomic write fails: creating `~/.heartflow`, writing the sibling
+/// temp file, or the final rename (transient Windows `PermissionDenied` gets
+/// three attempts before surfacing). An empty `models` slice writes the
+/// catalog unchanged and succeeds.
 pub fn persist_discovered(
     home: &Path,
     base_url: &str,

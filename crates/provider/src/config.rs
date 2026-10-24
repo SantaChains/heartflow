@@ -391,6 +391,13 @@ pub enum ProviderSpec {
 /// Pure precedence resolution: CLI flags beat the merged config files, which
 /// beat built-in provider defaults. Env mode survives only when nothing
 /// configures an explicit transport.
+///
+/// # Errors
+/// Returns the diagnostic text when a named provider is neither builtin nor
+/// backed by any `[provider]` transport field, or when a resolved transport
+/// would lack `base_url`, a credential source (`api_key_env` or inline
+/// `api_key`), or a model; each message names the config key (or `--model`)
+/// that would fix it.
 pub fn resolve_spec(
     provider_flag: Option<&str>,
     model_flag: Option<&str>,
@@ -467,6 +474,14 @@ pub fn resolve_spec(
     })
 }
 
+/// Source the credential (env var named by `api_key_env` wins over the inline
+/// config key) and turn a resolved spec into an active selection.
+///
+/// # Errors
+/// Fails for a `Resolved` spec whose credential ends up empty: the env var
+/// named by `api_key_env` is unset (or empty) and no inline `[provider]
+/// api_key` is configured. The message distinguishes a missing env name from
+/// an unset env var. `Env` specs never fail.
 pub fn materialize(spec: ProviderSpec) -> Result<ProviderSelection, String> {
     // Credential-sourcing policy (guardrail): a key may originate from exactly
     // two places and nowhere else -- (1) the environment variable *named* by

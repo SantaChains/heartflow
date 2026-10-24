@@ -56,6 +56,12 @@ impl ResponsesClient {
     }
 
     /// One non-streaming request (fallback path).
+    ///
+    /// # Errors
+    /// Fails on transport errors (`Http`: connect, timeout, request), a
+    /// non-success status (`Api`, or `RetriesExhausted` wrapping the last
+    /// transient failure once the retry policy gives up), or a response body
+    /// that is not a valid `ResponsesResponse` (`Json`).
     pub async fn send(&self, body: &serde_json::Value) -> Result<ResponsesResponse, ApiError> {
         let body = with_flag(body, false);
         let response = self.send_with_retry(&body).await?;
@@ -66,6 +72,12 @@ impl ResponsesClient {
     }
 
     /// Start a streaming request; typed events arrive as they are emitted.
+    ///
+    /// # Errors
+    /// Fails on transport errors (`Http`) or a non-success status (`Api`, or
+    /// `RetriesExhausted` wrapping the last transient failure). Later event
+    /// loops never fail on payloads: frames that do not decode as
+    /// `ResponsesEvent` are skipped by [`ResponsesStream::next_event`].
     pub async fn stream(&self, body: &serde_json::Value) -> Result<ResponsesStream, ApiError> {
         let body = with_flag(body, true);
         let response = self.send_with_retry(&body).await?;
@@ -145,6 +157,12 @@ pub struct ResponsesStream {
 }
 
 impl ResponsesStream {
+    /// Next decoded Responses event, or `None` once the stream ends.
+    ///
+    /// # Errors
+    /// Fails only on transport errors while reading the body (`Http`);
+    /// frames whose payload does not decode as `ResponsesEvent` are skipped,
+    /// not errors.
     pub async fn next_event(&mut self) -> Result<Option<ResponsesEvent>, ApiError> {
         loop {
             if let Some(event) = self.pending.pop_front() {

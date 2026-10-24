@@ -34,6 +34,11 @@ pub struct AnthropicStreamClient {
 
 impl AnthropicStreamClient {
     /// Legacy environment-driven construction (`ANTHROPIC_*` variables).
+    ///
+    /// # Errors
+    /// Fails when `AnthropicClient::from_env` cannot source a credential:
+    /// neither `ANTHROPIC_API_KEY` nor `ANTHROPIC_AUTH_TOKEN` is set (or both
+    /// are empty), or an environment variable read fails (non-UTF-8 value).
     pub fn from_env(model: impl Into<String>, enable_tools: bool) -> Result<Self, ApiError> {
         Ok(Self {
             client: AnthropicClient::from_env()?,

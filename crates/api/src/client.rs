@@ -35,6 +35,14 @@ impl AnthropicClient {
         }
     }
 
+    /// Environment-driven construction (`ANTHROPIC_API_KEY` /
+    /// `ANTHROPIC_AUTH_TOKEN`).
+    ///
+    /// # Errors
+    /// Fails with `MissingApiKey` when neither `ANTHROPIC_API_KEY` nor
+    /// `ANTHROPIC_AUTH_TOKEN` is set (or both are empty), and with
+    /// `InvalidApiKeyEnv` when an environment variable read fails
+    /// (non-UTF-8 value).
     pub fn from_env() -> Result<Self, ApiError> {
         Ok(Self::new(read_api_key()?)
             .with_auth_token(read_auth_token())
@@ -64,6 +72,13 @@ impl AnthropicClient {
         self
     }
 
+    /// One non-streaming `POST /v1/messages` completion.
+    ///
+    /// # Errors
+    /// Fails on transport errors (`Http`: connect, timeout, request), a
+    /// non-success status (`Api`, or `RetriesExhausted` wrapping the last
+    /// transient failure once the retry policy gives up), or a response body
+    /// that is not a valid `MessageResponse` (`Json`).
     pub async fn send_message(
         &self,
         request: &MessageRequest,
@@ -84,6 +99,13 @@ impl AnthropicClient {
         Ok(response)
     }
 
+    /// Start a streaming `POST /v1/messages`; events arrive via
+    /// [`MessageStream`].
+    ///
+    /// # Errors
+    /// Fails on transport errors (`Http`) or a non-success status (`Api`, or
+    /// `RetriesExhausted` wrapping the last transient failure). Per-event
+    /// decoding errors surface later through [`MessageStream::next_event`].
     pub async fn stream_message(
         &self,
         request: &MessageRequest,
@@ -182,6 +204,11 @@ impl MessageStream {
         self.request_id.as_deref()
     }
 
+    /// Next decoded Anthropic stream event, or `None` once the stream ends.
+    ///
+    /// # Errors
+    /// Fails on transport errors while reading the body (`Http`) or when an
+    /// SSE frame's `data` payload is not a valid `StreamEvent` JSON (`Json`).
     pub async fn next_event(&mut self) -> Result<Option<StreamEvent>, ApiError> {
         loop {
             if let Some(event) = self.pending.pop_front() {

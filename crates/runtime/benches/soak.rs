@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use runtime::estimate_tokens_from;
 use runtime::{
-    AgentEvent, ApiClient, ApiRequest, ContentBlock, ConversationRuntime, PermissionMode,
+    AgentEvent, ApiClient, ApiRequest, ConversationRuntime, PermissionMode,
     PermissionPolicy, RuntimeError, Session, StaticToolExecutor, SystemPromptBuilder, TokenUsage,
     TurnStream,
 };
@@ -75,7 +75,7 @@ impl ApiClient for Alternating {
     fn stream(&mut self, request: ApiRequest) -> Result<TurnStream, RuntimeError> {
         let n = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _ = black_box(&request);
-        if n % 2 == 0 {
+        if n.is_multiple_of(2) {
             SoakClient.stream(request)
         } else {
             ReplyClient.stream(request)

@@ -51,6 +51,12 @@ impl OpenAiClient {
     }
 
     /// One non-streaming completion (fallback path).
+    ///
+    /// # Errors
+    /// Fails on transport errors (`Http`: connect, timeout, request), a
+    /// non-success status (`Api`, or `RetriesExhausted` wrapping the last
+    /// transient failure once the retry policy gives up), or a response body
+    /// that is not a valid `ChatResponse` (`Json`).
     pub async fn send_chat(&self, request: &ChatRequest) -> Result<ChatResponse, ApiError> {
         let request = ChatRequest {
             stream: false,
@@ -65,6 +71,11 @@ impl OpenAiClient {
     }
 
     /// Start a streaming completion; chunks arrive as they are emitted.
+    ///
+    /// # Errors
+    /// Fails on transport errors (`Http`) or a non-success status (`Api`, or
+    /// `RetriesExhausted` wrapping the last transient failure). Per-chunk
+    /// decoding errors surface later through [`ChatStream::next_chunk`].
     pub async fn stream_chat(&self, request: &ChatRequest) -> Result<ChatStream, ApiError> {
         let request = ChatRequest {
             stream: true,
@@ -111,6 +122,11 @@ impl OpenAiClient {
     }
 
     /// Self-discovery: list the models an endpoint advertises (`GET {base}/models`).
+    ///
+    /// # Errors
+    /// Fails on transport errors (`Http`), a non-success status (`Api`, or
+    /// `RetriesExhausted` wrapping the last transient failure), or a response
+    /// body that is not a valid model list (`Json`).
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>, ApiError> {
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
         let response = self.get(&url).await?;
@@ -120,6 +136,11 @@ impl OpenAiClient {
 
     /// `DeepSeek` account balance (`GET {root}/user/balance`). Not part of the
     /// generic `OpenAI` surface; callers gate on the provider before invoking.
+    ///
+    /// # Errors
+    /// Fails on transport errors (`Http`), a non-success status (`Api`, or
+    /// `RetriesExhausted` wrapping the last transient failure), or a response
+    /// body that is not a valid balance envelope (`Json`).
     pub async fn get_balance(&self) -> Result<Balance, ApiError> {
         let url = format!("{}/user/balance", self.root_url());
         let response = self.get(&url).await?;
@@ -190,6 +211,11 @@ pub struct ChatStream {
 }
 
 impl ChatStream {
+    /// Next streamed chunk, or `None` once the server closes the stream.
+    ///
+    /// # Errors
+    /// Fails on transport errors while reading the body (`Http`) or when an
+    /// SSE frame's `data` payload is not a valid `ChatChunk` JSON (`Json`).
     pub async fn next_chunk(&mut self) -> Result<Option<ChatChunk>, ApiError> {
         loop {
             if let Some(chunk) = self.pending.pop_front() {
