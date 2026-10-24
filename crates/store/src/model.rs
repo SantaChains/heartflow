@@ -71,6 +71,10 @@ pub fn role_str(role: MessageRole) -> &'static str {
 }
 
 /// Parse a stored role string back into `MessageRole`.
+///
+/// # Errors
+/// Fails with [`crate::error::StoreError::Format`] for any string other than
+/// `system`, `user`, `assistant`, or `tool`.
 pub fn role_from_str(s: &str) -> Result<MessageRole, crate::error::StoreError> {
     Ok(match s {
         "system" => MessageRole::System,

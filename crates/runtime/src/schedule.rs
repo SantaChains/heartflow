@@ -256,6 +256,11 @@ impl ScheduleStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Register a new enabled schedule with the next sequential id.
+    ///
+    /// # Errors
+    /// Fails with [`ScheduleError::Full`] when the store already holds
+    /// `MAX_SCHEDULES` entries.
     pub fn add(
         &self,
         name: &str,
@@ -313,14 +318,26 @@ impl ScheduleStore {
             .cloned()
     }
 
+    /// Disable a schedule without deleting it.
+    ///
+    /// # Errors
+    /// Fails with [`ScheduleError::NotFound`] for an unknown id.
     pub fn pause(&self, id: u64) -> Result<Schedule, ScheduleError> {
         self.mutate(id, |s| s.enabled = false)
     }
 
+    /// Re-enable a paused schedule.
+    ///
+    /// # Errors
+    /// Fails with [`ScheduleError::NotFound`] for an unknown id.
     pub fn resume(&self, id: u64) -> Result<Schedule, ScheduleError> {
         self.mutate(id, |s| s.enabled = true)
     }
 
+    /// Remove a schedule and its history, returning the removed entry.
+    ///
+    /// # Errors
+    /// Fails with [`ScheduleError::NotFound`] for an unknown id.
     pub fn delete(&self, id: u64) -> Result<Schedule, ScheduleError> {
         let removed = self
             .schedules
@@ -520,6 +537,11 @@ use crate::epoch_ms as now_ms;
 
 /// Parse a duration spec for the CLI: `90` / `90s` / `30m` / `2h` / `1d`,
 /// or a relative `+30m` for `Once`. Returns seconds.
+///
+/// # Errors
+/// Fails with [`ScheduleError::BadSpec`] when the text is not a bare number
+/// or a number with one of the `s`/`m`/`h`/`d` unit suffixes, or when the
+/// numeric part overflows `u64`.
 pub fn parse_duration_spec(raw: &str) -> Result<u64, ScheduleError> {
     let raw = raw.trim().trim_start_matches('+');
     let (digits, unit) = raw.split_at(raw.len().saturating_sub(1));

@@ -141,6 +141,13 @@ impl StopFlag {
 /// (own session, own client) and run the prompt to completion. `emit` is the
 /// live channel to the supervisor; the return value is the final result text.
 pub trait JobRunner: Send + 'static {
+    /// Run the prompt to completion, reporting progress through `emit`.
+    ///
+    /// # Errors
+    /// Fails with a human-readable reason when the job cannot finish: the
+    /// runner's model or infrastructure call fails, or a stop-aware runner
+    /// bails after the stop flag is set (the registry records that as a
+    /// stop, not a failure).
     fn run(
         &mut self,
         prompt: &str,

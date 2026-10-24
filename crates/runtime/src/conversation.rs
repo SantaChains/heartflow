@@ -138,10 +138,23 @@ pub trait ApiClient: Send {
     ///
     /// The returned stream must be producing events by the time it is polled;
     /// providers run their transport on a spawned task internally.
+    ///
+    /// # Errors
+    /// Fails when the request cannot be handed to the provider: transport
+    /// setup, authentication, or a request rejected up front (e.g. context
+    /// overflow). Failures mid-stream arrive as events on the returned
+    /// [`TurnStream`], not here.
     fn stream(&mut self, request: ApiRequest) -> Result<TurnStream, RuntimeError>;
 }
 
 pub trait ToolExecutor: Send + Sync + 'static {
+    /// Execute one tool call with its raw JSON `input`, returning the output
+    /// text handed back to the model.
+    ///
+    /// # Errors
+    /// Fails when the tool is unknown, its arguments are invalid, permission
+    /// is denied, or the tool's own operation fails; the message is the
+    /// tool-facing error text.
     fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError>;
 
     /// Tool advertisements forwarded with each API request. Scripted and
@@ -168,6 +181,11 @@ pub trait ToolExecutor: Send + Sync + 'static {
     /// Seed the plan ledger deterministically from a plan document, bypassing
     /// the model. `input` uses the same JSON shape as `todo_write`. Executors
     /// without a plan ledger reject the request.
+    ///
+    /// # Errors
+    /// The default implementation always fails with "no plan ledger to seed";
+    /// implementations fail when `input` does not match the `todo_write` JSON
+    /// shape.
     fn seed_plan(&self, _input: &str) -> Result<String, ToolError> {
         Err(ToolError::new("no plan ledger to seed"))
     }
@@ -560,6 +578,9 @@ where
     ///
     /// `notify` observes every event as it happens; `cancel` aborts the turn
     /// at the next await point while keeping the session API-consistent.
+    ///
+    /// # Errors
+    /// Fails under the same conditions as [`Self::run_turn_with_blocks`].
     pub async fn run_turn(
         &mut self,
         user_input: impl Into<String>,
@@ -580,6 +601,14 @@ where
 
     /// Same turn loop as [`Self::run_turn`], for user input that carries more
     /// than text (image attachments ride along as sibling blocks).
+    ///
+    /// # Errors
+    /// Fails when the provider request cannot be started or the stream
+    /// reports an error (a context-overflow rejection is compacted-and-
+    /// retried once; a second one fails the turn), when the stream ends
+    /// without a message stop or produces no content, when the loop exceeds
+    /// `max_iterations`, or when the turn is cancelled. Tool failures do not
+    /// error the turn; they are recorded as error `tool_result` messages.
     pub async fn run_turn_with_blocks(
         &mut self,
         blocks: Vec<ContentBlock>,
@@ -1295,6 +1324,10 @@ where
     /// Deterministically seed the todo ledger from an approved plan document so
     /// execution follows the checked-in task list rather than the model's
     /// re-reading of it.
+    ///
+    /// # Errors
+    /// Fails when the underlying executor has no plan ledger or rejects
+    /// `input` (same semantics as [`ToolExecutor::seed_plan`]).
     pub fn seed_plan(&self, input: &str) -> Result<String, ToolError> {
         self.tool_executor.seed_plan(input)
     }

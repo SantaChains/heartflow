@@ -60,6 +60,13 @@ pub struct BashCommandOutput {
     pub persisted_output_size: Option<u64>,
 }
 
+/// Run a shell command and capture its bounded output, or detach it as a
+/// background task with a sidecar status file.
+///
+/// # Errors
+/// Fails when the tokio runtime cannot be built, the shell cannot be spawned,
+/// or a background run cannot create its log file. Non-zero exit codes and
+/// command timeouts are reported in the output, not as errors.
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     // Foreground no-output watchdog (2026-10-21 research batch): a command
     // that emits nothing on either stream for this long is killed as hung.

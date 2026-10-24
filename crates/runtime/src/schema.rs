@@ -52,6 +52,11 @@ fn compiled_validator(schema: &Value) -> Option<jsonschema::Validator> {
 /// Validate `input` (a tool's raw JSON arguments) against `schema`. `Ok(())`
 /// means "acceptable" (including when the schema is empty or unknown); `Err`
 /// carries a short human-readable reason for a definite mismatch.
+///
+/// # Errors
+/// Returns the input's JSON parse error, or a one-line mismatch reason from
+/// the compiled validator. A permissive (null, boolean, or empty) or
+/// uncompilable schema never returns `Err`.
 pub fn validate_tool_input(schema: &Value, input: &str) -> Result<(), String> {
     // No usable schema (null, an empty object, or a boolean form): the contract
     // asserts nothing, so advertise-and-run and do not even require the input

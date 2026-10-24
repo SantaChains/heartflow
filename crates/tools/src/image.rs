@@ -60,6 +60,11 @@ pub fn attachment_media_type(path: &str) -> Option<&'static str> {
 /// [`shrink_to_vision_grid`]): a transcript is rewritten, mirrored, and
 /// re-uploaded on every single turn, so an oversized photo would cost its full
 /// size per turn for pixels the provider discards anyway.
+///
+/// # Errors
+/// Fails when the extension has no accepted media type, the file cannot be
+/// stat'd or read (missing, permission, not a regular file), or it exceeds the
+/// 4 MiB attachment cap.
 pub fn read_image_attachment(path: &str) -> Result<ContentBlock, ImageError> {
     let media_type = attachment_media_type(path)
         .ok_or_else(|| ImageError::Invalid(format!("unsupported image type: {path}")))?;
@@ -291,6 +296,13 @@ pub fn resolve_output_path(output_path: Option<&str>) -> String {
 /// Generate an image with an OpenAI-compatible `/images/generations` endpoint and
 /// write the bytes to disk. Network + credentials required; guarded against SSRF
 /// when the provider returns a hosted URL.
+///
+/// # Errors
+/// Fails when the prompt is empty, `HEARTFLOW_IMAGE_API_KEY` is unset, the
+/// HTTP client cannot be built or the request/JSON round-trip fails
+/// (including provider-reported errors), the provider returns no image data,
+/// a hosted URL fails the SSRF check or its payload exceeds the 25 MiB cap,
+/// or the output directory/file cannot be written.
 pub fn generate_image(input: &GenerateImageInput) -> Result<GenerateImageReport, ImageError> {
     let config = ImageConfig::from_env(input.model.as_deref(), input.size.as_deref());
     if input.prompt.trim().is_empty() {

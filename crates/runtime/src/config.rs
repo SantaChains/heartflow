@@ -75,6 +75,13 @@ impl ConfigLoader {
         ]
     }
 
+    /// Merge the user, project, and local settings layers into one config.
+    ///
+    /// # Errors
+    /// Fails with [`ConfigError::Io`] when a settings file exists but cannot
+    /// be read (a missing file is skipped), and with [`ConfigError::Parse`]
+    /// when its contents are not valid JSON or its top level is not an
+    /// object.
     pub fn load(&self) -> Result<RuntimeConfig, ConfigError> {
         let mut merged = Map::new();
         let mut loaded_entries = Vec::new();

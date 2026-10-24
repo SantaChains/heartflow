@@ -29,6 +29,12 @@ pub struct GraphicsReport {
 #[error("{0}")]
 pub struct GraphicsError(String);
 
+/// Structurally verify one graphic file on disk.
+///
+/// # Errors
+/// Fails when the file cannot be stat'd or read (missing, permission), exceeds
+/// the 2 MiB verification cap, or carries an extension outside the supported
+/// set (png/jpg/gif/webp/bmp/svg/html).
 pub fn verify_graphics(path: &str) -> Result<GraphicsReport, GraphicsError> {
     let metadata = fs::metadata(path)
         .map_err(|error| GraphicsError(format!("cannot stat {path}: {error}")))?;

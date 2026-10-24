@@ -50,6 +50,11 @@ impl TodoLedger {
 
     /// Replace the whole list; the model always writes the full plan.
     /// Returns a compact transcript summary.
+    ///
+    /// # Errors
+    /// Fails when the input is not valid JSON for the todo schema, an entry
+    /// has empty content or an unknown status, or the list exceeds the
+    /// per-ledger cap.
     pub fn write(&self, input: &str) -> Result<String, TodoError> {
         let parsed: TodoWriteInput = serde_json::from_str(input)
             .map_err(|error| TodoError(format!("invalid todo input: {error}")))?;

@@ -363,6 +363,12 @@ pub fn web_search_tool_spec() -> ToolSpec {
     }
 }
 
+/// Dispatch one tool by wire name and return its serialized output.
+///
+/// # Errors
+/// Fails when the tool name is unknown, the input JSON does not deserialize
+/// into the tool's schema, or the underlying tool execution fails (each tool
+/// reports its own failure modes as the error string).
 pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
     match name {
         "bash" => from_value::<BashCommandInput>(input).and_then(run_bash),

@@ -74,6 +74,12 @@ pub enum WebError {
 /// allowing only http/https, rejecting loopback/private/link-local/metadata
 /// addresses (by literal IP, DNS resolution, and final-redirect re-check), and
 /// capping body size and wall-clock time.
+///
+/// # Errors
+/// Fails when the URL does not parse, the SSRF guard rejects the host
+/// (non-http(s) scheme, loopback/private/link-local/metadata address --
+/// re-checked after every redirect), or the client cannot be built, the
+/// request cannot be sent, or the body cannot be read.
 pub fn web_fetch(input: &WebFetchInput) -> Result<WebFetchReport, WebError> {
     let url =
         reqwest::Url::parse(&input.url).map_err(|error| WebError::InvalidUrl(error.to_string()))?;
@@ -859,6 +865,11 @@ const SEARCH_MAX_RESULTS: usize = 25;
 /// agent then fetches the URL it wants. Deliberately lean: a single engine and a
 /// pure, unit-tested parser, not a multi-engine consensus/rerank stack. Empty
 /// results are reported honestly (never a fabricated answer).
+///
+/// # Errors
+/// Fails when the HTTP client cannot be built, the request to the search
+/// engine cannot be sent or its body read, or the engine returns a non-2xx
+/// status.
 pub fn web_search(input: &WebSearchInput) -> Result<WebSearchReport, WebError> {
     let limit = input
         .max_results

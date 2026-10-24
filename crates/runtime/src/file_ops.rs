@@ -204,6 +204,14 @@ fn with_read_retry<T>(op: impl Fn() -> io::Result<T>) -> io::Result<T> {
     })
 }
 
+/// Read a text file whole (optionally windowed by line offset/limit), decoding
+/// legacy encodings instead of rejecting non-UTF-8 bytes.
+///
+/// # Errors
+/// Fails when the path cannot be canonicalized or resolved, the file does not
+/// exist or cannot be read (permission, transient lock — retried once), or
+/// its size exceeds the read cap (`InvalidData`). Transient
+/// `Interrupted`/`WouldBlock` OS failures are retried once before surfacing.
 pub fn read_file(
     path: &str,
     offset: Option<usize>,
@@ -279,6 +287,15 @@ fn decode_text(bytes: &[u8]) -> String {
     detector.guess(None, false).decode(bytes).0.into_owned()
 }
 
+/// Create or fully replace a text file, writing atomically via a sibling temp
+/// file. Reports an "update" or "create" kind plus a structured patch against
+/// the original content.
+///
+/// # Errors
+/// Fails when the parent directory cannot be created or the atomic write
+/// cannot complete (temp file creation, write, fsync, or rename — disk full,
+/// permission denied). A missing target file is not an error; that is a
+/// create.
 pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     // Checkpoint before the first mutation (roadmap §6): runs only after the
     // permission gate approved this call, so the snapshot always captures the
@@ -312,6 +329,15 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     })
 }
 
+/// Replace the first occurrence of `old_string` with `new_string` in a text
+/// file (all occurrences with `replace_all`), writing the result atomically.
+///
+/// # Errors
+/// Fails when the file does not exist or cannot be read, is not valid UTF-8
+/// (`InvalidInput`), when `old_string` equals `new_string` (`InvalidInput`),
+/// when `old_string` does not occur in the file (`NotFound`), when it occurs
+/// more than once without `replace_all` (`InvalidInput`), or when the
+/// atomic rewrite fails (disk full, permission denied).
 pub fn edit_file(
     path: &str,
     old_string: &str,
@@ -432,6 +458,14 @@ struct PreparedFile {
 /// disk. An empty `old_string` creates or overwrites the file with `new_string`.
 /// Multiple changes may target the same file and are applied in order. Each
 /// written file reports real unified-diff hunks.
+///
+/// # Errors
+/// Fails with `InvalidInput` when the batch is empty, `old_string` equals
+/// `new_string`, a target file is not valid UTF-8, or `old_string` matches
+/// more than once without `replace_all`; with `NotFound` when `old_string`
+/// does not occur. A write failure partway through the batch is rolled back
+/// (previously written files restored, created files removed) and returned
+/// with the failed path and any rollback failures in the message.
 pub fn apply_patch(changes: &[PatchChange]) -> io::Result<ApplyPatchOutput> {
     if changes.is_empty() {
         return Err(invalid_input("no changes supplied"));
@@ -661,6 +695,12 @@ fn write_bytes_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
 /// `globset` semantics). A single pattern keeps the literal-prefix walk-root
 /// optimization; several patterns walk the common base and match with one
 /// `GlobSet`, so cost grows with files visited, not with pattern count.
+///
+/// # Errors
+/// Fails with `InvalidInput` when no pattern is supplied or a pattern is not
+/// valid glob syntax, and when the base path or the current directory cannot
+/// be resolved. Transient `Interrupted`/`WouldBlock` OS failures are retried
+/// once before surfacing; unreadable entries inside the walk are skipped.
 pub fn glob_search(patterns: &[String], path: Option<&str>) -> io::Result<GlobSearchOutput> {
     with_read_retry(|| glob_search_once(patterns, path))
 }
@@ -800,6 +840,11 @@ fn collect_multi_glob<I: IntoIterator<Item = String>>(
 /// path (nucleo is the library the fzf engine is built on) and returns the best
 /// `limit` absolute paths, best match first. It reuses the shared `ignore`
 /// crawler, so `.gitignore`/build caches are respected without a human TTY.
+///
+/// # Errors
+/// Fails with `InvalidInput` when the query is empty, and when the base path
+/// or the current directory cannot be resolved. Transient
+/// `Interrupted`/`WouldBlock` OS failures are retried once before surfacing.
 pub fn search_files(
     query: &str,
     path: Option<&str>,
@@ -862,6 +907,17 @@ fn search_files_once(
     })
 }
 
+/// Regex content search over the workspace via the shared `ignore` walker,
+/// with ripgrep-shaped options (glob/file-type filters, output modes,
+/// context lines) and bounded parallel scanning.
+///
+/// # Errors
+/// Fails with `InvalidInput` when the pattern is not a valid regex, the glob
+/// filter is not a valid `Pattern`, or `output_mode` is not one of
+/// `files_with_matches`, `content`, `count`; and when the base path or the
+/// current directory cannot be resolved. Transient
+/// `Interrupted`/`WouldBlock` OS failures are retried once before surfacing;
+/// unreadable entries inside the walk are skipped.
 pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     with_read_retry(|| grep_search_once(input))
 }

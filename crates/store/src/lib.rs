@@ -81,12 +81,21 @@ pub struct Store {
 impl Store {
     /// Open (creating if needed) the database at `path`, apply pragmas, and run
     /// migrations. Parent directories are NOT created (caller decides layout).
+    ///
+    /// # Errors
+    /// Fails when the file cannot be opened or created as a SQLite database,
+    /// a pragma batch is rejected, or a migration step fails (e.g. the file is
+    /// locked beyond the busy timeout or its schema is unreadable).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
         Self::init(conn, true)
     }
 
     /// Open an in-memory database (used by tests and ephemeral tooling).
+    ///
+    /// # Errors
+    /// Fails when the connection cannot be opened, a pragma batch is rejected,
+    /// or a migration step fails.
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
         Self::init(conn, true)
@@ -96,6 +105,11 @@ impl Store {
     /// a read path can never mutate (or damage) the history file; it does not run
     /// migrations either, so a missing schema surfaces as a query error rather
     /// than being silently created.
+    ///
+    /// # Errors
+    /// Fails when the file does not exist or cannot be opened as a SQLite
+    /// database (a read-only handle never creates it), or when a pragma batch
+    /// is rejected. No migrations run on this path.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         Self::init(conn, false)
@@ -138,6 +152,12 @@ impl Store {
     /// Everything happens in one transaction: the old message rows (and their
     /// FTS entries) are dropped and rewritten, so a crash mid-save leaves the
     /// prior version intact. `session_id` is the stable external key.
+    ///
+    /// # Errors
+    /// Fails when the connection lock is poisoned, the transaction cannot be
+    /// started or committed, any statement fails (locked beyond the busy
+    /// timeout, disk I/O, constraint violation), or a message's blocks cannot
+    /// be serialized to JSON.
     pub fn save_session(
         &self,
         session_id: &str,
@@ -176,6 +196,14 @@ impl Store {
     /// back to the proven full [`save_session`](Self::save_session). The JSON
     /// transcript stays authoritative, so a rejected append never loses or
     /// duplicates history; it only defers to the rewrite.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Drift`] when `first_seq` differs from
+    /// `expected_existing`, or when the stored row count no longer matches the
+    /// caller's base. Fails when the connection lock is poisoned, the
+    /// transaction cannot be started or committed, a statement fails (locked
+    /// beyond the busy timeout, disk I/O), or a tail message's blocks cannot
+    /// be serialized to JSON.
     pub fn append_messages(
         &self,
         session_id: &str,
@@ -215,6 +243,11 @@ impl Store {
     }
 
     /// Reconstruct a stored session, or `None` if no such session exists.
+    ///
+    /// # Errors
+    /// Fails when the connection lock is poisoned, the query cannot be
+    /// prepared or stepped, a stored `blocks_json` is not valid JSON, or a
+    /// stored role string is unknown.
     pub fn load_session(&self, session_id: &str) -> Result<Option<Session>, StoreError> {
         let conn = self.lock()?;
         let exists: Option<i64> = conn
@@ -262,6 +295,10 @@ impl Store {
     }
 
     /// List sessions, newest activity first.
+    ///
+    /// # Errors
+    /// Fails when the connection lock is poisoned or the aggregate query
+    /// cannot be prepared or stepped.
     pub fn list_sessions(&self, limit: i64) -> Result<Vec<SessionSummary>, StoreError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
@@ -290,6 +327,11 @@ impl Store {
     }
 
     /// Full-text / substring search across all (or one) session's messages.
+    ///
+    /// # Errors
+    /// Fails when the connection lock is poisoned, the statement cannot be
+    /// prepared or stepped (e.g. a corrupt FTS index rejects `MATCH`), or a
+    /// stored role string is unknown.
     pub fn search(
         &self,
         query: &str,
@@ -301,6 +343,10 @@ impl Store {
     }
 
     /// Aggregate token usage across all sessions, or one if `session_id` given.
+    ///
+    /// # Errors
+    /// Fails when the connection lock is poisoned or the aggregate query
+    /// cannot be prepared or stepped.
     pub fn usage_totals(&self, session_id: Option<&str>) -> Result<UsageTotals, StoreError> {
         let conn = self.lock()?;
         let (with_usage, input, output, cache_create, cache_read): UsageRow = conn.query_row(
@@ -330,6 +376,10 @@ impl Store {
 
     /// Delete a session; its messages cascade and its FTS rows are removed first.
     /// Returns whether a row was deleted.
+    ///
+    /// # Errors
+    /// Fails when the connection lock is poisoned or the transaction cannot be
+    /// started, its delete statements executed, or committed.
     pub fn delete_session(&self, session_id: &str) -> Result<bool, StoreError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
@@ -349,6 +399,10 @@ impl Store {
     }
 
     /// All stored session ids (unordered).
+    ///
+    /// # Errors
+    /// Fails when the connection lock is poisoned or the query cannot be
+    /// prepared or stepped.
     pub fn session_ids(&self) -> Result<Vec<String>, StoreError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare("SELECT session_id FROM sessions;")?;
@@ -362,6 +416,10 @@ impl Store {
 
     /// Fold the WAL back into the main database file (for clean shutdowns),
     /// first refreshing the query planner's statistics.
+    ///
+    /// # Errors
+    /// Fails when the connection lock is poisoned or either pragma is
+    /// rejected (e.g. another process still holds the WAL).
     pub fn checkpoint(&self) -> Result<(), StoreError> {
         let conn = self.lock()?;
         conn.execute_batch("PRAGMA optimize; PRAGMA wal_checkpoint(TRUNCATE);")?;
@@ -372,6 +430,11 @@ impl Store {
     /// checks every page, index, and FTS5 shadow table; `Integrity::Ok` means the
     /// file is sound. Cost is a full O(size) scan, so callers gate it to on-demand
     /// diagnostics (see `quick_check` for the cheaper variant).
+    ///
+    /// # Errors
+    /// Fails when the connection lock is poisoned or the pragma cannot be
+    /// prepared or stepped. Corruption itself is reported as
+    /// [`Integrity::Corrupt`], not an error.
     pub fn integrity_check(&self) -> Result<Integrity, StoreError> {
         self.run_integrity("PRAGMA integrity_check;")
     }
@@ -379,6 +442,11 @@ impl Store {
     /// A faster scan that skips cross-checking index keys against table rows.
     /// Catches page/logical corruption and FTS drift but can miss a corrupt
     /// index; used when the database is large enough that a full scan is slow.
+    ///
+    /// # Errors
+    /// Fails when the connection lock is poisoned or the pragma cannot be
+    /// prepared or stepped. Corruption itself is reported as
+    /// [`Integrity::Corrupt`], not an error.
     pub fn quick_check(&self) -> Result<Integrity, StoreError> {
         self.run_integrity("PRAGMA quick_check;")
     }
@@ -398,6 +466,10 @@ impl Store {
     }
 
     /// Current schema version stored in the database.
+    ///
+    /// # Errors
+    /// Fails when the connection lock is poisoned or the `PRAGMA user_version`
+    /// query cannot be prepared or stepped.
     pub fn schema_version(&self) -> Result<i64, StoreError> {
         let conn = self.lock()?;
         let version: i64 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;

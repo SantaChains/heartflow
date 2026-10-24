@@ -132,6 +132,13 @@ impl Session {
 
     /// Persist atomically: write a sibling temp file, then rename over the
     /// target so a crash never leaves a truncated session transcript.
+    ///
+    /// # Errors
+    /// Fails with [`SessionError::Format`] when the transcript cannot be
+    /// serialized or the path has no file name, and with
+    /// [`SessionError::Io`] when the temp file cannot be written or the
+    /// rename over the target fails (transient `PermissionDenied` on Windows
+    /// is retried three times first). The temp file is removed on failure.
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), SessionError> {
         let path = path.as_ref();
         // simd-json's SIMD string classification dominates serde_json on the
@@ -163,6 +170,14 @@ impl Session {
         }
     }
 
+    /// Load a session snapshot saved by [`Self::save_to_path`], skipping a
+    /// leading UTF-8 BOM.
+    ///
+    /// # Errors
+    /// Fails with [`SessionError::Io`] when the file cannot be read (missing,
+    /// permission, non-UTF-8 bytes), [`SessionError::Json`] when its contents
+    /// are not valid JSON, and [`SessionError::Format`] when the structure is
+    /// not a valid session (see [`Self::from_json`]).
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, SessionError> {
         let contents = fs::read_to_string(path)?;
         // Windows editors may leave a UTF-8 BOM; the JSON parser would reject it.
@@ -179,6 +194,11 @@ impl Session {
     /// segment degrades to the snapshot and is reported in the returned
     /// [`SegmentRead`], so this call succeeds whenever
     /// [`load_from_path`](Self::load_from_path) would.
+    ///
+    /// # Errors
+    /// Fails exactly when [`load_from_path`](Self::load_from_path) does (the
+    /// snapshot is authoritative); segment problems never error — they come
+    /// back as a degraded [`SegmentRead`] instead.
     pub fn load_with_segment(path: impl AsRef<Path>) -> Result<(Self, SegmentRead), SessionError> {
         let path = path.as_ref();
         let mut session = Self::load_from_path(path)?;
@@ -215,6 +235,14 @@ impl Session {
         Ok((session, outcome))
     }
 
+    /// Rebuild a session from a parsed JSON value: an object with a `version`
+    /// and a `messages` array.
+    ///
+    /// # Errors
+    /// Fails with [`SessionError::Format`] when the value is not an object,
+    /// has no/invalid `version`, or lacks a `messages` array, and with
+    /// [`SessionError::Json`] when any message entry does not deserialize
+    /// into a [`ConversationMessage`].
     pub fn from_json(value: &Value) -> Result<Self, SessionError> {
         let object = value
             .as_object()

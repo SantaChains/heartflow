@@ -32,6 +32,13 @@ pub struct ProjectContext {
 }
 
 impl ProjectContext {
+    /// Walk the cwd's ancestors up to the repo root collecting AGENTS.md /
+    /// AGENTS.local.md (falling back to legacy CLAUDE.md only where the
+    /// primary file is absent).
+    ///
+    /// # Errors
+    /// Fails when an instruction file that exists on disk cannot be read
+    /// (permission or other I/O error); missing files are skipped.
     pub fn discover(
         cwd: impl Into<PathBuf>,
         current_date: impl Into<String>,
@@ -46,6 +53,12 @@ impl ProjectContext {
         })
     }
 
+    /// Same as [`Self::discover`], with the repo's `git status --short`
+    /// attached when git succeeds; git failures degrade to `None` silently.
+    ///
+    /// # Errors
+    /// Same as [`Self::discover`]: fails when an existing instruction file
+    /// cannot be read.
     pub fn discover_with_git(
         cwd: impl Into<PathBuf>,
         current_date: impl Into<String>,
@@ -366,6 +379,14 @@ fn render_skills_section(skills: &[SkillSummary]) -> String {
     sections.join("\n")
 }
 
+/// Build the full system prompt as ordered sections: project context, rules,
+/// skills, memory, and runtime config overlays.
+///
+/// # Errors
+/// Fails with [`PromptBuildError::Io`] when an existing instruction file
+/// cannot be read (see [`ProjectContext::discover_with_git`]), and with
+/// [`PromptBuildError::Config`] when a settings file exists but cannot be
+/// read or parsed.
 pub fn load_system_prompt(
     cwd: impl Into<PathBuf>,
     home: impl Into<PathBuf>,

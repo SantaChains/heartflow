@@ -66,6 +66,15 @@ pub struct DocSearchOutput {
     pub hits: Vec<DocHit>,
 }
 
+/// Search documents and archives by driving the external `rga` binary and
+/// parsing its ripgrep-style JSON output.
+///
+/// # Errors
+/// Fails with `InvalidInput` when the pattern exceeds 4,096 characters or a
+/// pattern/path would be read as a flag, and with `NotFound` when `rga` is
+/// not on PATH. Fails when the `rga` process cannot be spawned or its output
+/// cannot be read, and with the captured stderr summary when rga exits with
+/// an error status. Zero matches is a success with no hits.
 pub fn search_documents(input: &DocSearchInput) -> io::Result<DocSearchOutput> {
     let started = Instant::now();
     if input.pattern.chars().count() > MAX_PATTERN_CHARS {

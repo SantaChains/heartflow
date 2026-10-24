@@ -410,6 +410,11 @@ impl MissionLedger {
     }
 
     /// Pause (Active or Blocked → Paused).
+    ///
+    /// # Errors
+    /// Fails with [`MissionError::NotFound`] for an unknown id, or
+    /// [`MissionError::NotActive`] when the mission is neither Active nor
+    /// Blocked.
     pub fn pause(&self, id: u64) -> Result<Mission, MissionError> {
         self.transition(id, |m| {
             if !matches!(m.status, MissionStatus::Active | MissionStatus::Blocked) {
@@ -425,6 +430,11 @@ impl MissionLedger {
 
     /// Resume (Paused or Blocked → Active); a blocked streak does not survive
     /// a resume — the intervention resets the give-up counter.
+    ///
+    /// # Errors
+    /// Fails with [`MissionError::NotFound`] for an unknown id, or
+    /// [`MissionError::NotActive`] when the mission is neither Paused nor
+    /// Blocked.
     pub fn resume(&self, id: u64) -> Result<Mission, MissionError> {
         self.transition(id, |m| {
             if !matches!(m.status, MissionStatus::Paused | MissionStatus::Blocked) {
@@ -445,6 +455,10 @@ impl MissionLedger {
     /// needs-attention reminder when a budget axis crosses 90% — including the
     /// turn that exhausts it (the supervisor must hear "wrap up" once); after
     /// that, reminders stop but the mission stays open (D1.2 "停提醒但不关").
+    ///
+    /// # Errors
+    /// Fails with [`MissionError::NotFound`] for an unknown id, or
+    /// [`MissionError::NotActive`] when the mission is not Active.
     pub fn record_turn(
         &self,
         id: u64,
@@ -482,6 +496,11 @@ impl MissionLedger {
 
     /// Claim the mission is blocked. Only the third *consecutive* claim flips
     /// the status (D1.1 anti-early-give-up); earlier claims are receipts.
+    ///
+    /// # Errors
+    /// Fails with [`MissionError::NotFound`] for an unknown id, or
+    /// [`MissionError::NotActive`] when the mission is not Active. Earlier
+    /// claims (below the streak) succeed and return `flipped: false`.
     pub fn mark_blocked(&self, id: u64, reason: &str) -> Result<(Mission, bool), MissionError> {
         let mut flipped = false;
         let mission = self.transition(id, |m| {
@@ -513,6 +532,12 @@ impl MissionLedger {
     /// Record explicit evidence for a *manual* criterion. Mechanical criteria
     /// refuse approvals — they re-verify at complete time, and an approval
     /// receipt for a self-verifying criterion would be fake evidence.
+    ///
+    /// # Errors
+    /// Fails with [`MissionError::NotFound`] for an unknown id,
+    /// [`MissionError::NotApprovable`] when the index is out of range or the
+    /// criterion is mechanical, or [`MissionError::NotActive`] when the
+    /// mission is not Active.
     pub fn approve_criterion(
         &self,
         id: u64,
@@ -555,6 +580,10 @@ impl MissionLedger {
 
     /// Add a criterion to an Active mission (CLI authoring path). Returns the
     /// new criterion's index.
+    ///
+    /// # Errors
+    /// Fails with [`MissionError::NotFound`] for an unknown id, or
+    /// [`MissionError::NotActive`] when the mission is not Active.
     pub fn add_criterion(
         &self,
         id: u64,
@@ -583,6 +612,13 @@ impl MissionLedger {
     /// Complete the mission — the anti-early-complete gate. Mechanical
     /// criteria re-verify *now*; manual criteria must already carry an
     /// approval; weak-only missions (or criteria-less ones) refuse.
+    ///
+    /// # Errors
+    /// Fails with [`MissionError::NotFound`] for an unknown id,
+    /// [`MissionError::NotActive`] when the mission is not Active,
+    /// [`MissionError::WeakOnly`] when no strong criterion exists, or
+    /// [`MissionError::Unsatisfied`] listing the criteria that failed
+    /// re-verification.
     pub fn complete(&self, id: u64) -> Result<Mission, MissionError> {
         let mission = self.transition(id, |m| {
             if m.status != MissionStatus::Active {
