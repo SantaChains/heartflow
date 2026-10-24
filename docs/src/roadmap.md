@@ -678,6 +678,19 @@ pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript �
 - **spec 执行确认流（用户细化）**：spec 文档写好后**展示在界面上**（overlay 预览全文），并询问三选：**立即执行 / 取消 / 添加修改（type something）**——用户可改文档或附加内容，agent 结合情况合理修订 spec；已完成的 spec **不必立即执行**，可留在 `.heartflow/specs/` 由用户后续在 spec 模式选择执行。**模式纪律**：其他模式（agent/plan/loop）下要求做 spec 工作时，agent 须提示「这是 spec 模式的工作」并拒绝越界执行（模式职责不串）。
 - **粘贴截断缺陷**：见 known-issues.md KI-003（bracketed paste 已启用仍截断——终端未回传粘贴标记假设，待实机复现）。
 
+#### C-2. 本地小模型赛道 + 工具输出清洗（2026-10-24 用户构想批次，取舍归位）
+
+用户构想六束，逐束取舍（网络检索定案）：
+
+- **ONNX/小模型赛道（新开，评估项）**：用户构想——hf 可调用**大模型 + 非 LLM 的 ONNX 小模型**（翻译/OCR/NLP/图像语义），场景样例：一个英文词 + 几个候选翻译，小模型做语义优选、JSON 规范输出、直接替换执行，大模型只做监督。**取舍**：① **Ollama 接口零新代码**——其 OpenAI 兼容端点 + 本仓 openai-compatible provider + 回环防代理保护天然齐备，`/bootstrap ollama http://localhost:11434/v1` 即用（文档化即可）；② **ONNX 直连（ort crate）是评估项**：绑定重、模型分发（OCR=检测+识别双模型、embedding、NER 各一套）与「翻译优选」场景的收益需先以单实验验证（用 ollama 跑 embedding/翻译小模型替代 ort，零绑定成本先试场景价值）；③ **大小模型协作模式**（小模型快速分类/评分出 JSON、大模型监督裁决）记为模式设计资产，与 spec/loop 同族——小模型做「快而糙」，大模型做「慢而对」；④ **ds4 引擎本体不采维持**（Metal/CUDA 重栈判决），但其「引擎内部压缩与洗涤」的方法论已在 §4 compaction 七相落地。
+- **工具输出清洗（双轨制，采纳）**：省 token 清理 vs 保障原始——**呈现层/上下文层清洗、原始层保底可回取**（本仓 expand/fold 工具输出折叠机制已备双轨骨架）：① `!CMD` 与 bash 捕获输出统一 **ANSI 剥离 + NO_COLOR=1 注入子进程**（KI-004，防御性净化）；② 网页内容正文提取（去导航/标签/脚本——§2 web_fetch 补 readability 层）；③ md 过度符号压缩（表格/链接转紧凑形，原始可展开）；④ 剥离仅进上下文，磁盘 transcript 恒存原始。
+- **其他 AI 调用 hf**：判决已录（§10.3 loopback MCP host 按需采纳）+ **现状已可用**：`hf prompt --json`/pipe 模式即 CLI 工具形态（rg/edit/diff 同类），MCP host 是把「全套工具面」暴露给外部 agent 的升级路径。
+- **LSP/tree-sitter/ast-grep**：§6 写后诊断（cargo check）已落地；**LSP 不采维持**（进程寿命+误报治理是另一量级，用户对误报污染上下文的顾虑正是当年判决依据）；**ast-grep 轻采纳**——已装则经外部工具注入机制（prompt.rs render_external_tools）天然可用，零代码；**tree-sitter 自研集成缓**（依赖评估，等结构定位真实需求）；语法高亮（edit 工具）缓——markdown IR 管线可扩展非核心。
+- **nushell 借鉴**：轻采纳——工具输出的**结构化形态**（JSON mode 可选）与表格渲染可取；nushell 语言本身不实现。
+- **搜索/爬虫/正文提取**：§2 已有判决（MergeSearch provider 链 + crawl 工具），本轮补：readability 正文提取并入 web_fetch 清洗双轨。
+- **测试异常自动分析**：§6 写后诊断已是雏形（cargo check 失败自动回注）；扩展 = loop 模式相（测试失败 → 自动分析回合）。
+- **管道能力**：已具（`hf prompt`/pipe/`--json`/cassette 录放），增强随 §2。
+
 ## C. 功能增强候选（轻量，待评估）
 
 > C 组为轻量功能候选，待评估是否纳入路线。

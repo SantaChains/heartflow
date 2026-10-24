@@ -1323,7 +1323,7 @@ pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript �
 
 用户要求的四模式（Tab 切换）、采样参数、强度显示、联网开关，分层设计如下。
 
-**采样参数**（实现中，子代理执行）：config `[provider]` 新键 temperature/top_p/top_k/frequency_penalty/presence_penalty/seed → `SamplingParams` 共享体 serde(flatten) 进 MessageRequest/ChatRequest → 三协议 adapter 贯通（responses 仅 temperature/top_p）。全 None 时请求 JSON 逐字节不变（cassette 夹具仲裁）。**beam search 不适用判决**：chat API 解码在服务端，num_beams 是本地推理概念——如实记录不实现。**第二个 TUI 判决：不需要**——参数属配置面（config + `hf config export`），TUI 加参数浮层是界面税；强度用状态行显示（见下）。
+**采样参数**（实现中，子代理执行）：config `[provider]` 新键 temperature/top_p/top_k/frequency_penalty/presence_penalty/seed → `SamplingParams` 共享体 serde(flatten) 进 MessageRequest/ChatRequest → 三协议 adapter 贯通（responses 仅 temperature/top_p）。全 None 时请求 JSON 逐字节不变（cassette 夹具仲裁）。**beam search 不适用判决**：chat API 解码在服务端，num_beams 是本地推理概念——如实记录不实现。**补遗（2026-10-24 用户核对发现的遗漏，并入采样战役）**：① **Tool Choice**（auto/required/none）——API 基础设施已在（ChatRequest.tool_choice + ChatToolChoice，当前硬编码 Auto），缺 config 键 `[provider] tool_choice` 贯通；② **Response Format**（json_object/json_schema 强制输出）——ChatRequest 尚无该字段，需加 `response_format` 贯通；两者与 SamplingParams 同战役补齐。③ **强度级别集更正**：/effort 取值按用户点名扩为 **none（关）/ low / medium / high / max（深推理）**——模型相关映射（DeepSeek/GLM 各自支持子集，不支持的态度诚实降级），非早前写的固定三档。**第二个 TUI 判决：不需要**——参数属配置面（config + `hf config export`），TUI 加参数浮层是界面税；强度用状态行显示（见下）。
 
 **四态模式**（同构复用：全部建立在现有 permission-mode + 系统提示段 + 工具过滤三件套上，不造新机制）：
 - **agent** = 现默认（workspace-write/full）——已存在。
@@ -1335,6 +1335,19 @@ pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript �
 - **联网开关（开/关/本地，2026-10-24 用户细化）**：工具面过滤——开=web_search/web_fetch 正常；关=从工具集剔除；本地=web 剔除但保留 doc_search（rga 本地文档/知识库检索，clone 仓库研读属本地读）。**plan 可搜索**（用户更正：plan 也保留 web）。shape = build_runtime 时的工具注册过滤 + 模式默认值（spec 开、loop 开、plan 开、agent 开；用户可 `/web on|off|local` 覆盖）。**界面显示**：联网态与思维强度一起进状态行（如 `web:local · effort:high`），并配 keymap 动作（联网建议 Ctrl+O、强度轮换 Ctrl+E，均可重映射；Tab 已被补全/折叠占用不参与）。
 - **spec 执行确认流（用户细化）**：spec 文档写好后**展示在界面上**（overlay 预览全文），并询问三选：**立即执行 / 取消 / 添加修改（type something）**——用户可改文档或附加内容，agent 结合情况合理修订 spec；已完成的 spec **不必立即执行**，可留在 `.heartflow/specs/` 由用户后续在 spec 模式选择执行。**模式纪律**：其他模式（agent/plan/loop）下要求做 spec 工作时，agent 须提示「这是 spec 模式的工作」并拒绝越界执行（模式职责不串）。
 - **粘贴截断缺陷**：见 known-issues.md KI-003（bracketed paste 已启用仍截断——终端未回传粘贴标记假设，待实机复现）。
+
+#### C-2. 本地小模型赛道 + 工具输出清洗（2026-10-24 用户构想批次，取舍归位）
+
+用户构想六束，逐束取舍（网络检索定案）：
+
+- **ONNX/小模型赛道（新开，评估项）**：用户构想——hf 可调用**大模型 + 非 LLM 的 ONNX 小模型**（翻译/OCR/NLP/图像语义），场景样例：一个英文词 + 几个候选翻译，小模型做语义优选、JSON 规范输出、直接替换执行，大模型只做监督。**取舍**：① **Ollama 接口零新代码**——其 OpenAI 兼容端点 + 本仓 openai-compatible provider + 回环防代理保护天然齐备，`/bootstrap ollama http://localhost:11434/v1` 即用（文档化即可）；② **ONNX 直连（ort crate）是评估项**：绑定重、模型分发（OCR=检测+识别双模型、embedding、NER 各一套）与「翻译优选」场景的收益需先以单实验验证（用 ollama 跑 embedding/翻译小模型替代 ort，零绑定成本先试场景价值）；③ **大小模型协作模式**（小模型快速分类/评分出 JSON、大模型监督裁决）记为模式设计资产，与 spec/loop 同族——小模型做「快而糙」，大模型做「慢而对」；④ **ds4 引擎本体不采维持**（Metal/CUDA 重栈判决），但其「引擎内部压缩与洗涤」的方法论已在 §4 compaction 七相落地。
+- **工具输出清洗（双轨制，采纳）**：省 token 清理 vs 保障原始——**呈现层/上下文层清洗、原始层保底可回取**（本仓 expand/fold 工具输出折叠机制已备双轨骨架）：① `!CMD` 与 bash 捕获输出统一 **ANSI 剥离 + NO_COLOR=1 注入子进程**（KI-004，防御性净化）；② 网页内容正文提取（去导航/标签/脚本——§2 web_fetch 补 readability 层）；③ md 过度符号压缩（表格/链接转紧凑形，原始可展开）；④ 剥离仅进上下文，磁盘 transcript 恒存原始。
+- **其他 AI 调用 hf**：判决已录（§10.3 loopback MCP host 按需采纳）+ **现状已可用**：`hf prompt --json`/pipe 模式即 CLI 工具形态（rg/edit/diff 同类），MCP host 是把「全套工具面」暴露给外部 agent 的升级路径。
+- **LSP/tree-sitter/ast-grep**：§6 写后诊断（cargo check）已落地；**LSP 不采维持**（进程寿命+误报治理是另一量级，用户对误报污染上下文的顾虑正是当年判决依据）；**ast-grep 轻采纳**——已装则经外部工具注入机制（prompt.rs render_external_tools）天然可用，零代码；**tree-sitter 自研集成缓**（依赖评估，等结构定位真实需求）；语法高亮（edit 工具）缓——markdown IR 管线可扩展非核心。
+- **nushell 借鉴**：轻采纳——工具输出的**结构化形态**（JSON mode 可选）与表格渲染可取；nushell 语言本身不实现。
+- **搜索/爬虫/正文提取**：§2 已有判决（MergeSearch provider 链 + crawl 工具），本轮补：readability 正文提取并入 web_fetch 清洗双轨。
+- **测试异常自动分析**：§6 写后诊断已是雏形（cargo check 失败自动回注）；扩展 = loop 模式相（测试失败 → 自动分析回合）。
+- **管道能力**：已具（`hf prompt`/pipe/`--json`/cassette 录放），增强随 §2。
 
 ## C. 功能增强候选（轻量，待评估）
 
@@ -1401,6 +1414,16 @@ pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript �
 - **修复方向（待验证）**：① 粘连启发式——相邻键事件间隔 <10ms 且含 Enter 的突发序列按粘贴整块处理；② 终端能力探测降级提示；③ 「粘贴模式」显式开关。需用户真机复现区分假设。
 - **登记日期**：2026-10-24
 - **状态**：登记未修复（等待用户实机复现：终端程序与版本 + 复现步骤）
+
+---
+
+## KI-004 · `!eza` 等现代 CLI 工具的输出经 !CMD 不可读
+
+- **现象**：`!eza`（及管道接 bat）的输出无法读取/不可读。
+- **疑点·待查位置（假设，未核实）**：eza/bat 按 isatty 决定是否着色——管道下本应纯文本（工具自身规范），但用户的 eza 配置（EZA_CONFIG_OPTIONS）或 PowerShell profile 可能强制 `--color=always`，ANSI 转义序列进入捕获输出后污染渲染（业界通案：Unix SE 10823、bat #3257）；Windows 下还可能混入 VT 序列与代码页双重问题。
+- **修复方向（待验证）**：① 捕获输出统一 **ANSI 转义剥离层**（防御性净化，与既有 chardetng 编码嗅探同族——不动原始字节只净呈现）；② 为子进程注入 `NO_COLOR=1` + `TERM=dumb`（no-color.org 规约，eza/bat 均遵守）；③ doctor 显示子进程 env 策略。
+- **登记日期**：2026-10-24
+- **状态**：登记未修复
 
 ---
 
