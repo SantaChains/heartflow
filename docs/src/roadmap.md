@@ -642,6 +642,22 @@ pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript �
 - 不引入 pandacode 的 `host_tools` 全套（team delegate/browser/moodboard/VM），只暴露 heartflow 自有能力。
 
 
+#### 10.8 Microsoft Edit（archive/edit，2026-10-24 深挖，只记录不执行）
+
+微软的 Rust TUI 编辑器（MS-DOS Editor 致敬，MIT）。**自研即时模式 TUI 框架**（非 ratatui）：`framebuffer.rs` 保留上帧 + `last_attr ^ attr` 位掩码属性差分 + 最小 VT 发射——与本仓 CompanionTerminal「只写变更格」+ render_cache 同设计族，**互相验证而非互抄**；其 `TODO: properly diff contents`（:516）说明连它都觉得字符级差分可再进一步。
+
+| 面 | 判决 | 依据 |
+|---|---|---|
+| unicode/measurement.rs：UAX #11 East Asian Width + **ambiguous-width 可配置**（进程单次设定，`static mut`+SAFETY 注释——本仓 forbid unsafe 会用 OnceLock） | **采纳（改造，低优先）** | CJK/IME 宽度的正确模型。本仓 CJK 宽度对齐已做，ambiguous 宽字符（·×°等按语境 1/2 格）是精化位；实现载体现成——unicode-width crate 已在依赖树，无需自研表 |
+| simd/（lines_fwd/bwd、memchr2、memset：MB 级缓冲的 SIMD 行扫描） | **不做** | 适用前提是编辑器级巨型缓冲；本仓工具输出 32K 截断、markdown 按段解析，基准已证热点在 µs 级——无该形状的热循环 |
+| fuzzy.rs（自研模糊匹配，提及 Sublime/fzf） | **已有** | 本仓 nucleo 覆盖同面 |
+| icu.rs：**dlopen 动态加载 ICU** + 优雅降级 | **记录（方法论）** | 可选原生依赖的第三条路（静态链接/运行时加载/不依赖）——直接关联 §7.1 recipe 评估（tokenizers 重依赖的替代形态参考） |
+| i18n/edit.toml（FTS 本地化） | **记录不做** | CLI 单语现状，等真实多语言需求 |
+| fuzz/ 目录 | **已同构** | 本仓抗冲击三 fuzzer 已落地 |
+| framebuffer 差分位掩码 | **记录** | render_cache 粒度（version+generation 键）已覆盖本仓需求；属性位掩码是更细一档，待渲染成为实测瓶颈再取 |
+
+**版权纪律**：Microsoft 代码 MIT——本条目仅取设计判据，无代码移植，无 NOTICE 义务；将来移植任何片段须按 AGENTS 追加 NOTICE。
+
 ## C. 功能增强候选（轻量，待评估）
 
 > C 组为轻量功能候选，待评估是否纳入路线。
