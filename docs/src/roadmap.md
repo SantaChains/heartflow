@@ -665,7 +665,7 @@ pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript �
 
 用户要求的四模式（Tab 切换）、采样参数、强度显示、联网开关，分层设计如下。
 
-**采样参数**（实现中，子代理执行）：config `[provider]` 新键 temperature/top_p/top_k/frequency_penalty/presence_penalty/seed → `SamplingParams` 共享体 serde(flatten) 进 MessageRequest/ChatRequest → 三协议 adapter 贯通（responses 仅 temperature/top_p）。全 None 时请求 JSON 逐字节不变（cassette 夹具仲裁）。**beam search 不适用判决**：chat API 解码在服务端，num_beams 是本地推理概念——如实记录不实现。**第二个 TUI 判决：不需要**——参数属配置面（config + `hf config export`），TUI 加参数浮层是界面税；强度用状态行显示（见下）。
+**采样参数**（实现中，子代理执行）：config `[provider]` 新键 temperature/top_p/top_k/frequency_penalty/presence_penalty/seed → `SamplingParams` 共享体 serde(flatten) 进 MessageRequest/ChatRequest → 三协议 adapter 贯通（responses 仅 temperature/top_p）。全 None 时请求 JSON 逐字节不变（cassette 夹具仲裁）。**beam search 不适用判决**：chat API 解码在服务端，num_beams 是本地推理概念——如实记录不实现。**补遗（2026-10-24 用户核对发现的遗漏，并入采样战役）**：① **Tool Choice**（auto/required/none）——API 基础设施已在（ChatRequest.tool_choice + ChatToolChoice，当前硬编码 Auto），缺 config 键 `[provider] tool_choice` 贯通；② **Response Format**（json_object/json_schema 强制输出）——ChatRequest 尚无该字段，需加 `response_format` 贯通；两者与 SamplingParams 同战役补齐。③ **强度级别集更正**：/effort 取值按用户点名扩为 **none（关）/ low / medium / high / max（深推理）**——模型相关映射（DeepSeek/GLM 各自支持子集，不支持的态度诚实降级），非早前写的固定三档。**第二个 TUI 判决：不需要**——参数属配置面（config + `hf config export`），TUI 加参数浮层是界面税；强度用状态行显示（见下）。
 
 **四态模式**（同构复用：全部建立在现有 permission-mode + 系统提示段 + 工具过滤三件套上，不造新机制）：
 - **agent** = 现默认（workspace-write/full）——已存在。

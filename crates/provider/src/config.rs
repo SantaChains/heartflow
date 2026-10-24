@@ -447,7 +447,7 @@ fn u64_field(table: &toml::Table, key: &str, source: &str) -> Option<u64> {
 fn f32_field(table: &toml::Table, key: &str, source: &str) -> Option<f32> {
     let value = table.get(key)?;
     if let Some(number) = value.as_float() {
-        return finite_f32(number, key, source);
+        return finite_f32(number as f32, key, source);
     }
     if let Some(number) = value.as_integer() {
         return finite_f32(number as f32, key, source);

@@ -7,4 +7,4 @@
 # 并重跑一次 cargo fmt 与 workspace 测试。
 [toolchain]
 channel = "1.93.1"
-components = ["rustfmt", "clippy"]
+components = ["rustfmt", "clippy", "rust-analyzer"]

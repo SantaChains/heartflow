@@ -1060,7 +1060,7 @@ mod tests {
         build_responses_body, chat_content, convert_chat_messages, convert_messages,
         responses_input_items,
     };
-    use api::{ChatContent, ChatContentPart, ChatRole, ChatToolCallType};
+    use api::{ChatContent, ChatContentPart, ChatRole, ChatToolCallType, SamplingParams};
     use runtime::{ApiRequest, ContentBlock, ConversationMessage, MessageRole, ToolSpec};
 
     #[test]
@@ -1120,7 +1120,7 @@ mod tests {
             }],
         };
 
-        let wire = build_message_request(&request, "deepseek-v4-flash", 8192, true, None);
+        let wire = build_message_request(&request, "deepseek-v4-flash", 8192, true, None, SamplingParams::default());
         assert_eq!(wire.max_tokens, 8192);
         assert_eq!(wire.model, "deepseek-v4-flash");
         let tools = wire.tools.expect("tools should be advertised");
@@ -1128,7 +1128,7 @@ mod tests {
         assert_eq!(tools[0].name, "bash");
         assert_eq!(tools[0].description.as_deref(), Some("run shell"));
 
-        let bare = build_message_request(&request, "m", 4096, false, None);
+        let bare = build_message_request(&request, "m", 4096, false, None, SamplingParams::default());
         assert!(bare.tools.is_none());
         assert!(bare.tool_choice.is_none());
     }
@@ -1151,7 +1151,7 @@ mod tests {
             messages: vec![],
             tools: vec![],
         };
-        let wire = build_message_request(&request, "m", 8192, false, Some("medium"));
+        let wire = build_message_request(&request, "m", 8192, false, Some("medium"), SamplingParams::default());
         assert_eq!(wire.thinking, Some(Thinking::enabled(4096)));
         let json = serde_json::to_value(&wire).expect("serialize");
         assert_eq!(json["thinking"]["type"], "enabled");
@@ -1170,7 +1170,7 @@ mod tests {
             }],
         };
 
-        let wire = build_chat_request(&request, "deepseek-v4-flash", 8192, true, None);
+        let wire = build_chat_request(&request, "deepseek-v4-flash", 8192, true, None, SamplingParams::default());
         assert_eq!(wire.messages.len(), 2);
         assert_eq!(wire.messages[0].role, ChatRole::System);
         assert_eq!(
@@ -1248,7 +1248,7 @@ mod tests {
                 input_schema: serde_json::json!({ "type": "object" }),
             }],
         };
-        let body = build_responses_body(&request, "deepseek-reasoner", 4096, true);
+        let body = build_responses_body(&request, "deepseek-reasoner", 4096, true, SamplingParams::default());
         assert_eq!(body["model"], "deepseek-reasoner");
         assert_eq!(body["instructions"], "be terse");
         assert_eq!(body["max_output_tokens"], 4096);
@@ -1257,9 +1257,73 @@ mod tests {
         assert_eq!(body["tools"][0]["name"], "bash");
         assert_eq!(body["tools"][0]["type"], "function");
         // Without tools, no tools/tool_choice keys are emitted.
-        let bare = build_responses_body(&request, "m", 1024, false);
+        let bare = build_responses_body(&request, "m", 1024, false, SamplingParams::default());
         assert!(bare.get("tools").is_none());
         assert!(bare.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn sampling_maps_per_dialect_and_stays_off_the_wire_when_unset() {
+        let sampling = SamplingParams {
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            top_k: Some(40),
+            frequency_penalty: Some(0.5),
+            presence_penalty: Some(0.1),
+            seed: Some(42),
+        };
+        let request = ApiRequest {
+            system_prompt: vec![],
+            messages: vec![],
+            tools: vec![],
+        };
+
+        // Anthropic carries only temperature/top_p/top_k.
+        let anthropic = build_message_request(&request, "m", 8192, false, None, sampling);
+        assert_eq!(anthropic.sampling.temperature, Some(0.7));
+        assert_eq!(anthropic.sampling.top_p, Some(0.9));
+        assert_eq!(anthropic.sampling.top_k, Some(40));
+        assert_eq!(anthropic.sampling.frequency_penalty, None);
+        assert_eq!(anthropic.sampling.presence_penalty, None);
+        assert_eq!(anthropic.sampling.seed, None);
+        let json = serde_json::to_value(&anthropic).expect("serialize");
+        assert_eq!(json["temperature"], 0.7);
+        assert!(json.get("frequency_penalty").is_none());
+        assert!(json.get("seed").is_none());
+
+        // OpenAI chat carries everything except top_k.
+        let chat = build_chat_request(&request, "m", 4096, false, None, sampling);
+        assert_eq!(chat.sampling.temperature, Some(0.7));
+        assert_eq!(chat.sampling.seed, Some(42));
+        assert_eq!(chat.sampling.top_k, None);
+        let json = serde_json::to_value(&chat).expect("serialize");
+        assert_eq!(json["temperature"], 0.7);
+        assert_eq!(json["seed"], 42);
+        assert!(json.get("top_k").is_none());
+
+        // Responses carries only temperature/top_p, injected into the body.
+        let body = build_responses_body(&request, "m", 4096, false, sampling);
+        assert_eq!(body["temperature"], 0.7);
+        assert_eq!(body["top_p"], 0.9);
+        assert!(body.get("top_k").is_none());
+        assert!(body.get("frequency_penalty").is_none());
+
+        // Default sampling keeps every dialect's wire unchanged.
+        let plain = build_message_request(&request, "m", 8192, false, None, SamplingParams::default());
+        let json = serde_json::to_value(&plain).expect("serialize");
+        for key in [
+            "temperature",
+            "top_p",
+            "top_k",
+            "frequency_penalty",
+            "presence_penalty",
+            "seed",
+        ] {
+            assert!(json.get(key).is_none(), "unset {key} must stay off the wire");
+        }
+        let bare = build_responses_body(&request, "m", 4096, false, SamplingParams::default());
+        assert!(bare.get("temperature").is_none());
+        assert!(bare.get("top_p").is_none());
     }
 
     #[test]
