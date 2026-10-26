@@ -23,6 +23,7 @@
 # 附录
 
 - [路线图](roadmap.md)
+- [路线图存档（先不做）](roadmap-deferred.md)
 - [已知问题登记](known-issues.md)
 - [贡献与质量门](contributing.md)
 - [发布前 QA 清单](release-qa.md)
