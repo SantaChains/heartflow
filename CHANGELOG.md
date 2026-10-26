@@ -1,4 +1,62 @@
 
+# heartflow 1.5.0 - 2026-10-26
+
+## 其他
+
+- **toolchain**: 撤回 rust-analyzer 组件——用户裁决不装非必需/旧工具，IDE 警告属外观性质接受 (`d6aca29`)
+
+
+## 新功能
+
+- 新增 spec 模式并实现迭代限制软终止 (`3c62a8d`)
+
+- **tui**: C-1 下相——cycle_mode(Shift+Tab)/toggle_web(Ctrl+O) 键位 + 联网三态共享原子即时生效（roadmap C-1） (`49cf7fd`)
+
+- **cli**: C-1 模式系统核心落地——spec/loop 权限档 + /mode 六值 + /web 三态 + /effort + 模式提示段（roadmap C-1） (`491b0db`)
+
+- **api,provider**: Tool Choice + Response Format 贯通（采样战役两补遗收口） (`8cf0276`)
+
+- **provider**: 采样参数全链贯通收尾——SamplingParams 六键 config→profile→三协议 adapter（790 测试） (`d7a1b97`)
+
+- **cli**: /bootstrap DeepSeek 特殊优化——flash 自动选择 + 余额请求 + 上下文自动填入（真机验证） (`7b65d04`)
+
+- **cli**: 模型自举落地——/bootstrap <provider> [model] [--reorganize]（用户点名，roadmap §C） (`1034d80`)
+
+- **runtime**: 基准套件第一片——零依赖 hot-path harness（真实夹具输入，roadmap §9） (`eecc72b`)
+
+- **cli**: 启动横幅加「心狭」中文像素 wordmark——同源 half-block 管线 (`f127bfc`)
+
+- **runtime**: Compaction 改造收尾——Phase 1b 硬触发 + Phase 3b 摘要模式（roadmap §4 D4.2/D4.5） (`0989631`)
+
+- **tui**: Per-section 泳道递送轮转落地（roadmap §11.4）——跨 section 公平轮转 + 逐条递送 + 回合中导航解禁 (`1303294`)
+
+- **tui**: P-C 三件套落地——队列编辑面板 + guide 两栏可编辑 + mode 分流计数（roadmap §11.1） (`e98e98e`)
+
+- **runtime**: D1.3 mission 续跑驱动器——每回合提醒注入 + 单活跃自动记账（roadmap §11.3） (`bde7a43`)
+
+- **tui**: P-D Steer 落地——在飞回合迭代边界注入（roadmap §11.2） (`e9d63cf`)
+
+
+## 缺陷修复
+
+- **tui,jobs**: 审计修复——轮转守卫臂条目丢失 + 对账写锁纪律（复查 6156912/1303294/3294c42） (`f0e8ece`)
+
+- **jobs**: 跨进程 job 互踩修复——pid 命名空间 + 探活对账（roadmap §4 遗留/§11.5） (`3294c42`)
+
+- **tui**: KI-001/002——多行续行键对齐 REPL + 打断提示状态派生持久化 (`b9d2f9a`)
+
+- **runtime**: 修复 compact 统计损坏测试的并行竞态 + clippy 未使用绑定 (`0f3ecf5`)
+
+- **ci**: 修复发布流水线因二进制 git 依赖导致的空壳 Release (`5554faa`)
+
+
+## 重构
+
+- **cli**: 质量审计——/compact 语义修正 + 死代码清除 (`5ce7335`)
+
+- **tui**: 三相事件循环重构(roadmap §11.0 根因锁) (`4b4e67c`)
+
+
 # heartflow 1.4.0 - 2026-10-21
 
 ## 新功能
