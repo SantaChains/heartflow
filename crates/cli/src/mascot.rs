@@ -882,52 +882,73 @@ fn write_cells<W: Write>(out: &mut W, cells: &[Vec<Cell>], color: bool) -> io::R
     Ok(())
 }
 
-// ---- 「心狭」wordmark ------------------------------------------------------
-// The project's Chinese mark, drawn beside the head through the same
-// pixel-buffer -> half-block pipeline. The two glyphs are embedded 16x16
-// bitmaps (bit 15 = leftmost column, one row per `u16`), rasterised offline
-// from a system 黑体 face; the mark is data, not a font dependency.
+// ---- "Hiraeth" wordmark --------------------------------------------------
+// The project's Latin mark, drawn beside the head through the same
+// pixel-buffer -> half-block pipeline. A 3x5 pixel font (Tom Thumb lineage)
+// scaled 2x at raster time - each font dot becomes a 2x2 pixel block, so the
+// mark reads at banner weight without a font dependency. `I` is the narrow
+// single-column stem; the other letters are 3 columns wide. The glyph source
+// is literal dot rows (not packed u16s) so the letterforms stay reviewable
+// in place; 7 glyphs at 2x + gaps total 50 px, keeping the composed banner
+// (24 + 3 + 50 = 77 cells) inside an 80-column terminal.
 
-/// 心
-const GLYPH_XIN: [u16; 16] = [
-    0x100, 0x300, 0x180, 0x0c0, 0x000, 0x400, 0x660c, 0x660c, 0x6606, 0x4603, 0xc602, 0xc600,
-    0x608, 0x608, 0x7f8, 0x7f0,
+/// One wordmark glyph per array slot: five font rows, `#` a lit dot.
+const HIRAETH: [&[&str; 5]; 7] = [
+    &["#.#", "#.#", "###", "#.#", "#.#"], // H
+    &["#", "#", "#", "#", "#"],           // I (narrow stem)
+    &["##.", "#.#", "##.", "#.#", "#.#"], // R
+    &[".#.", "#.#", "###", "#.#", "#.#"], // A
+    &["###", "#..", "##.", "#..", "###"], // E
+    &["###", ".#.", ".#.", ".#.", ".#."], // T
+    &["#.#", "#.#", "###", "#.#", "#.#"], // H
 ];
 
-/// 狭
-const GLYPH_XIA: [u16; 16] = [
-    0x20, 0x6c20, 0x39fc, 0x33fe, 0x7020, 0xd924, 0x192c, 0x1820, 0x3fff, 0x6fff, 0xc870, 0x858,
-    0x8c8, 0x198c, 0x7307, 0x2202,
-];
+/// Scale factor of the font at raster time: each dot is a 2x2 pixel block.
+const WORDMARK_SCALE: usize = 2;
+/// Font rows per glyph (5 rows x 2 = 10 pixel rows = 5 half-block rows).
+const WORDMARK_ROWS: usize = 5;
+/// Blank pixel columns between glyphs (1 logical pixel at 2x).
+const WORDMARK_GAP: usize = 2;
+/// Blank cells between the head and the wordmark - wider than the inner gap
+/// so the mark reads as one word set beside the figure, not glued to it.
+const HEAD_GAP: usize = 3;
 
-/// Blank columns between the head and the mark, and between the two glyphs.
-const WORDMARK_GAP: usize = 3;
+/// Pixel width of the whole mark: glyph widths at 2x plus the inner gaps.
+fn wordmark_width() -> usize {
+    HIRAETH
+        .iter()
+        .map(|glyph| glyph[0].len() * WORDMARK_SCALE)
+        .sum::<usize>()
+        + (HIRAETH.len() - 1) * WORDMARK_GAP
+}
 
-/// Pixel width of the whole mark: two 16px glyphs plus the inner gap.
-const WORDMARK_W: usize = 32 + WORDMARK_GAP;
-
-/// Render the mark as half-block cells: `16/2` rows of [`WORDMARK_W`] cells,
-/// painted in a slightly softened accent so the wordmark sits beside the head
-/// without outshining it.
+/// Render the mark as half-block cells: `10/2` rows of [`wordmark_width()`]
+/// cells, painted in a slightly softened accent so the wordmark sits beside
+/// the head without outshining it.
 fn wordmark_cells(theme: &Theme) -> Vec<Vec<Cell>> {
     let ink = col_from(theme.accent()).mix(Col::WHITE, 0.15);
-    let mut buf = HalfBuf::new(WORDMARK_W, 16);
-    for (index, glyph) in [GLYPH_XIN, GLYPH_XIA].iter().enumerate() {
-        let offset = index * (16 + WORDMARK_GAP);
-        for (y, row) in glyph.iter().enumerate() {
-            for x in 0..16 {
-                if (row >> (15 - x)) & 1 == 1 {
-                    buf.set(offset + x, y, ink);
+    let mut buf = HalfBuf::new(wordmark_width(), WORDMARK_ROWS * WORDMARK_SCALE);
+    let mut x = 0;
+    for glyph in HIRAETH {
+        for (fy, row) in glyph.iter().enumerate() {
+            for (fx, dot) in row.chars().enumerate() {
+                if dot == '#' {
+                    for dy in 0..WORDMARK_SCALE {
+                        for dx in 0..WORDMARK_SCALE {
+                            buf.set(x + fx * WORDMARK_SCALE + dx, fy * WORDMARK_SCALE + dy, ink);
+                        }
+                    }
                 }
             }
         }
+        x += glyph[0].len() * WORDMARK_SCALE + WORDMARK_GAP;
     }
     buf.encode()
 }
 
-/// Place the wordmark beside the rendered head. The head is `HEAD_H / 2` rows
-/// tall, the mark one row shorter, so the mark gets one blank lead row and
-/// both bottoms align — visually centered against the head.
+/// Place the wordmark beside the rendered head, vertically centred: the head
+/// is `HEAD_H / 2` rows tall and the mark shorter, so the blank rows split
+/// evenly above and below and both centrelines align.
 fn with_wordmark(head: Vec<Vec<Cell>>, mark: &[Vec<Cell>]) -> Vec<Vec<Cell>> {
     let blank_gap = || {
         vec![
@@ -936,17 +957,16 @@ fn with_wordmark(head: Vec<Vec<Cell>>, mark: &[Vec<Cell>]) -> Vec<Vec<Cell>> {
                 fg: None,
                 bg: None
             };
-            WORDMARK_GAP
+            HEAD_GAP
         ]
     };
+    let lead = head.len().saturating_sub(mark.len()) / 2;
     head.into_iter()
         .enumerate()
         .map(|(row, mut line)| {
             line.extend(blank_gap());
-            if row > 0 {
-                if let Some(mark_row) = mark.get(row - 1) {
-                    line.extend(mark_row.iter().cloned());
-                }
+            if let Some(mark_row) = row.checked_sub(lead).and_then(|index| mark.get(index)) {
+                line.extend(mark_row.iter().cloned());
             }
             line
         })
@@ -992,17 +1012,28 @@ mod tests {
     #[test]
     fn wordmark_renders_on_the_half_block_grid() {
         let mark = wordmark_cells(&Theme::current());
-        assert_eq!(mark.len(), 8, "16 pixel rows encode to 8 half-block rows");
-        assert!(mark.iter().all(|row| row.len() == WORDMARK_W));
-        // Both glyphs carry ink: count lit cells via the foreground channel.
+        assert_eq!(
+            mark.len(),
+            WORDMARK_ROWS * WORDMARK_SCALE / 2,
+            "10 pixel rows encode to 5 half-block rows"
+        );
+        assert!(mark.iter().all(|row| row.len() == wordmark_width()));
+        // The glyphs carry ink: count lit cells via the foreground channel.
+        // 64 font dots at 2x spread over 5 rows - the top-half coverage lands
+        // well inside this band.
         let lit: usize = mark
             .iter()
             .flat_map(|row| row.iter())
             .filter(|cell| cell.fg.is_some())
             .count();
         assert!(
-            (60..=220).contains(&lit),
-            "the two 16x16 glyphs should have a sane ink budget, got {lit}"
+            (40..=180).contains(&lit),
+            "the seven glyphs should have a sane ink budget, got {lit}"
+        );
+        // Banner fits an 80-column terminal without wrapping.
+        assert!(
+            HEAD_W + HEAD_GAP + wordmark_width() <= 80,
+            "composed banner must fit 80 columns"
         );
     }
 
@@ -1014,30 +1045,41 @@ mod tests {
         let head_rows = head.len();
         let composed = with_wordmark(head, &wordmark_cells(&Theme::current()));
         assert_eq!(composed.len(), head_rows, "banner height is unchanged");
-        let expected = WORDMARK_GAP + WORDMARK_W;
-        // The lead row carries only the gap; every other row carries the mark.
-        assert_eq!(composed[0].len(), HEAD_W + WORDMARK_GAP);
-        for row in &composed[1..] {
-            assert_eq!(row.len(), HEAD_W + expected);
+        // Rows outside the mark's band carry only the head gap; rows inside
+        // carry gap + mark width.
+        let mark_rows = WORDMARK_ROWS * WORDMARK_SCALE / 2;
+        let lead = (head_rows - mark_rows.min(head_rows)) / 2;
+        for (row, line) in composed.iter().enumerate() {
+            let inside = row >= lead && row < lead + mark_rows;
+            let expected = HEAD_W + HEAD_GAP + if inside { wordmark_width() } else { 0 };
+            assert_eq!(line.len(), expected, "row {row}");
         }
-        // Bottoms align: the mark's last row lands on the head's last row.
-        let tail_ink = composed[head_rows - 1]
+        // Vertically centred: the mark's first inked row is the lead row
+        // itself, not the banner's top or bottom edge.
+        let inked_rows: Vec<usize> = composed
             .iter()
-            .skip(HEAD_W + WORDMARK_GAP)
-            .filter(|cell| cell.fg.is_some())
-            .count();
-        assert!(tail_ink > 0, "the glyph bottoms ride the head's last row");
+            .enumerate()
+            .filter(|(_, line)| {
+                line.iter()
+                    .skip(HEAD_W + HEAD_GAP)
+                    .any(|cell| cell.fg.is_some())
+            })
+            .map(|(row, _)| row)
+            .collect();
+        assert!(inked_rows.contains(&lead), "ink starts at the lead row");
+        assert_eq!(
+            *inked_rows.last().unwrap_or(&usize::MAX),
+            lead + mark_rows - 1,
+            "ink ends on the mark's last row"
+        );
     }
 
-    /// Visual check of the embedded bitmaps: `cargo test wordmark_preview -- --nocapture`.
+    /// Visual check of the pixel font: `cargo test wordmark_preview -- --nocapture`.
     #[test]
     fn wordmark_preview() {
-        for glyph in [GLYPH_XIN, GLYPH_XIA] {
+        for glyph in HIRAETH {
             for row in glyph {
-                let line: String = (0..16)
-                    .map(|x| if (row >> (15 - x)) & 1 == 1 { '#' } else { '.' })
-                    .collect();
-                println!("{line}");
+                println!("{row}");
             }
             println!();
         }

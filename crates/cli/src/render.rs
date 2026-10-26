@@ -23,8 +23,8 @@ pub struct ColorTheme {
     quote: Color,
     muted: Color,
     spinner_active: Color,
-    spinner_done: Color,
-    spinner_failed: Color,
+    success: Color,
+    error: Color,
 }
 
 impl ColorTheme {
@@ -40,8 +40,8 @@ impl ColorTheme {
             quote: theme.quote().crossterm(),
             muted: theme.muted().crossterm(),
             spinner_active: theme.accent().crossterm(),
-            spinner_done: theme.success().crossterm(),
-            spinner_failed: theme.error().crossterm(),
+            success: theme.success().crossterm(),
+            error: theme.error().crossterm(),
         }
     }
 
@@ -79,6 +79,11 @@ impl ColorTheme {
     #[must_use]
     pub fn muted(&self) -> Color {
         self.muted
+    }
+    /// Failure color, the spinner's failed hue.
+    #[must_use]
+    pub fn error(&self) -> Color {
+        self.error
     }
 }
 
@@ -133,7 +138,7 @@ impl Spinner {
             out,
             MoveToColumn(0),
             Clear(ClearType::CurrentLine),
-            SetForegroundColor(theme.spinner_done),
+            SetForegroundColor(theme.success),
             Print(format!("{} {label}\n", glyphs::DONE)),
             ResetColor
         )?;
@@ -151,7 +156,7 @@ impl Spinner {
             out,
             MoveToColumn(0),
             Clear(ClearType::CurrentLine),
-            SetForegroundColor(theme.spinner_failed),
+            SetForegroundColor(theme.error),
             Print(format!("{} {label}\n", glyphs::FAILED)),
             ResetColor
         )?;

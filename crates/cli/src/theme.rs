@@ -23,6 +23,7 @@
 //! which hands back a copy so a live edit can be swapped in without a restart
 //! and the effective palette can be re-serialized via [`Theme::to_toml_string`].
 
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -172,6 +173,68 @@ impl Theme {
     }
 }
 
+/// Light-background variants of the text-bearing roles: same hue family,
+/// darkened to clear a white-ish background (the built-in `muted` gold leaf
+/// is ~1.9:1 on white — far under any readability floor).
+const LIGHT_MUTED: Rgb = Rgb::new(0x8a, 0x6a, 0x1c); // 深金 deep gold (~5:1 on white)
+const LIGHT_SUCCESS: Rgb = Rgb::new(0x3e, 0x7a, 0x1e); // 深苔 deep moss (~4.6:1)
+const LIGHT_QUOTE: Rgb = Rgb::new(0x5a, 0x64, 0x74); // 深雾 deep fog (~5.5:1)
+
+/// Whether the terminal declares a light background, via the de-facto
+/// `COLORFGBG` convention (`"fg;bg"` or `"default;bg;default"`, 0-15 indexes).
+/// Absent or unparseable means "unknown", which keeps the dark-tuned palette —
+/// the conservative default, since forcing light adaptation on a dark terminal
+/// would be the worse failure.
+fn background_is_light() -> bool {
+    parse_colorfgbg_light(env::var("COLORFGBG").ok().as_deref())
+}
+
+/// Pure core of [`background_is_light`] (kept separate so tests can drive it
+/// without touching process-global environment variables).
+fn parse_colorfgbg_light(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    // The background is the last *numeric* field: two-field form is `fg;bg`,
+    // three-field form is `default;bg;default` — a trailing `default` is
+    // skipped, and the first field that parses as a number (from the right)
+    // is the background index.
+    let Some(bg) = value
+        .rsplit(';')
+        .map(str::trim)
+        .find_map(|field| field.parse::<u8>().ok())
+    else {
+        return false;
+    };
+    // 0-6/8 are dark ANSI indexes; 7 (light gray) and 9-15 (bright) read as a
+    // light background.
+    bg == 7 || (9..=15).contains(&bg)
+}
+
+/// Whether an on-disk override names any of the adapted roles, in which case
+/// the adaptation stands down for the whole palette: an operator who writes a
+/// theme.toml hue means it, and a half-adapted palette would be the worst of
+/// both worlds.
+fn light_background_overridden(cwd: &Path, home: &Path) -> bool {
+    theme_file_paths(cwd, home).iter().any(|path| {
+        let Ok(contents) = fs::read_to_string(path) else {
+            return false;
+        };
+        let Ok(table) = toml::from_str::<toml::Table>(&contents) else {
+            return false;
+        };
+        table
+            .get("theme")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|theme| {
+                theme.contains_key("muted")
+                    || theme.contains_key("strong")
+                    || theme.contains_key("success")
+                    || theme.contains_key("quote")
+            })
+    })
+}
+
 /// Process-wide resolved theme, populated on the first [`Theme::current`] call
 /// and reused thereafter (terminal rendering happens on every frame, so the
 /// files are read once, not per line). Behind an [`RwLock`] so a config watcher
@@ -196,7 +259,28 @@ impl Theme {
         for path in theme_file_paths(cwd, home) {
             read_theme_file(&path).apply_to(&mut theme);
         }
+        // Background adaptivity (roadmap C-1/P4): the built-in hues are tuned
+        // for the default dark terminal; a detected light background darkens
+        // the text-bearing roles so secondary lines stay readable. Applied
+        // after the file overrides so an explicit theme.toml hue for a role
+        // still wins over the adaptation — an operator who names a color
+        // means it.
+        if !light_background_overridden(cwd, home) && background_is_light() {
+            theme.adapt_for_light_background();
+        }
         theme
+    }
+
+    /// Darken the text-bearing roles for a light terminal background. Only the
+    /// roles that carry running prose (muted/strong/success/quote) are adapted;
+    /// emphasis roles (heading/error/accent/...) keep their hue — they mark
+    /// structure and events, and their usage is bold enough to survive either
+    /// background.
+    fn adapt_for_light_background(&mut self) {
+        self.muted = LIGHT_MUTED;
+        self.strong = LIGHT_MUTED;
+        self.success = LIGHT_SUCCESS;
+        self.quote = LIGHT_QUOTE;
     }
 
     /// The active palette for this process: [`Theme::load`] of the on-disk
@@ -445,6 +529,53 @@ pub mod glyphs {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn colorfgbg_detects_light_backgrounds_only_by_declared_value() {
+        // Absent/unparseable -> unknown -> keeps the dark-tuned palette.
+        assert!(!parse_colorfgbg_light(None));
+        assert!(!parse_colorfgbg_light(Some("")));
+        assert!(!parse_colorfgbg_light(Some("garbage")));
+        // Dark backgrounds: 0-6 and 8.
+        assert!(!parse_colorfgbg_light(Some("15;0")));
+        assert!(!parse_colorfgbg_light(Some("0;8")));
+        // Light backgrounds: 7 and the bright range 9-15, in both the two-field
+        // and three-field forms.
+        assert!(parse_colorfgbg_light(Some("0;15")));
+        assert!(parse_colorfgbg_light(Some("0;7")));
+        assert!(parse_colorfgbg_light(Some("default;7;default")));
+        assert!(parse_colorfgbg_light(Some("15;9")));
+    }
+
+    #[test]
+    fn light_adaptation_darkens_text_roles_and_leaves_emphasis_alone() {
+        let mut theme = Theme::default();
+        let before = theme;
+        theme.adapt_for_light_background();
+        // Text-bearing roles swap to their deep variants.
+        assert_eq!(theme.muted(), LIGHT_MUTED);
+        assert_eq!(theme.strong(), LIGHT_MUTED);
+        assert_eq!(theme.success(), LIGHT_SUCCESS);
+        assert_eq!(theme.quote(), LIGHT_QUOTE);
+        // Emphasis roles keep their hue (usage is bold enough on either side).
+        assert_eq!(theme.heading(), before.heading());
+        assert_eq!(theme.error(), before.error());
+        assert_eq!(theme.accent(), before.accent());
+    }
+
+    #[test]
+    fn explicit_theme_overrides_stand_down_the_light_adaptation() {
+        // A theme.toml that names any adapted role wins over adaptation: the
+        // operator named a hue, they get that hue verbatim.
+        let project = TempDir::new("light-override");
+        project.write_theme("[theme]\nmuted = \"#e8b44a\"\n");
+        let home = TempDir::new("light-override-home");
+        // load() consults the environment, so this asserts the override path
+        // only; the env-dependent branch is covered by the pure parser test.
+        let theme = Theme::load(project.path(), home.path());
+        assert_eq!(theme.muted(), Rgb::new(0xe8, 0xb4, 0x4a));
+        assert_eq!(theme.quote(), Theme::default().quote());
+    }
 
     #[test]
     fn rgb_projects_identical_hue_to_both_backends() {

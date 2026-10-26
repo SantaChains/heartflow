@@ -365,3 +365,24 @@ impl PermissionPrompter for BlockPrompter {
         })
     }
 }
+
+/// Prompter used while writing a spec: the spec-policy mirror of
+/// [`BlockPrompter`]. A write outside the spec document is refused outright;
+/// spec-document writes never reach here because `spec_gate` auto-allows them.
+pub(crate) struct SpecPrompter;
+
+impl PermissionPrompter for SpecPrompter {
+    fn decide<'a>(
+        &'a mut self,
+        request: &'a PermissionRequest,
+    ) -> Pin<Box<dyn Future<Output = PermissionPromptDecision> + 'a>> {
+        Box::pin(async move {
+            PermissionPromptDecision::Deny {
+                reason: format!(
+                    "spec mode: `{}` is blocked. Only the spec document under .heartflow/specs/ may be written; choose `execute` in the review or `/spec end` before making real changes.",
+                    request.tool_name
+                ),
+            }
+        })
+    }
+}

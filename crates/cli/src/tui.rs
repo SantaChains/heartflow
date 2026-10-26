@@ -84,6 +84,7 @@ use runtime::{
     TokenUsage, ToolExecutor, TurnSummary,
 };
 
+use crate::autopilot::{continue_nudge, single_active_mission_id};
 use crate::config::ConfigWatcher;
 use crate::core::{
     guide_context, guide_draft, DeliveryMode, GuideContext, HeartModel, QueueSource,
@@ -1014,9 +1015,7 @@ impl App {
                 true
             }
             AgentEvent::Truncated(reason) => {
-                self.push_line(muted_line(format!(
-                    "· truncated by the provider ({reason})"
-                )));
+                self.push_line(muted_line(format!("· turn truncated ({reason})")));
                 true
             }
             AgentEvent::Steered(text) => {
@@ -2452,6 +2451,10 @@ fn set_section_mode_policy<C: ApiClient, T: ToolExecutor>(
     ));
 }
 
+/// C项 TUI autopilot cap: auto-continue nudges per mission, matching the
+/// blocking REPL's `MAX_AUTOPILOT_TURNS`.
+const MAX_TUI_AUTOPILOT_NUDGES: usize = 64;
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_loop<C, T, F, D, S>(
     shell: &mut Shell,
@@ -2505,6 +2508,9 @@ where
     // poisoned entry forever.
     let mut turn_entry: Option<crate::core::QueueEntry> = None;
     let mut last_failed_entry: Option<u64> = None;
+    // C项 TUI autopilot state: per-mission auto-continue counts (cap below),
+    // so an unsatisfiable mission cannot spin the queue forever.
+    let mut loop_nudges: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
 
     while !shell.section().quit {
         // ---- Phase R: render ----
@@ -2737,6 +2743,44 @@ where
                 if let Some(attention) = mission_attention.take() {
                     app.push_line(muted_line(format!("· {attention}")));
                 }
+                // C项 TUI autopilot: a loop-mode section whose turn settled OK
+                // auto-continues the single active mission — the same drive
+                // the blocking REPL's `run_loop_autopilot` provides, shaped
+                // for the event loop: instead of awaiting turns inline, the
+                // continue-nudge is queued and the Phase-T pickup runs it as
+                // the next turn. Guards mirror the REPL: a completed mission
+                // stops, a failed turn does not re-nudge, and a per-mission
+                // cap prevents an unsatisfiable mission from spinning the
+                // queue forever.
+                if ok
+                    && crate::storage::lock_state(&states[section]).mode == "loop"
+                {
+                    let ledger = MissionLedger::load(
+                        &crate::storage::sessions_dir().join("missions"),
+                    );
+                    if let Some(mission_id) = single_active_mission_id(&ledger) {
+                        match ledger.complete(mission_id) {
+                            Ok(_) => {
+                                app.push_line(muted_line(format!(
+                                    "· loop: mission m{mission_id} complete"
+                                )));
+                            }
+                            Err(runtime::MissionError::Unsatisfied { .. }) => {
+                                let nudges = loop_nudges.entry(mission_id).or_insert(0);
+                                if *nudges < MAX_TUI_AUTOPILOT_NUDGES {
+                                    *nudges += 1;
+                                    queue.push_back(continue_nudge(mission_id));
+                                } else {
+                                    app.push_line(muted_line(format!(
+                                        "· loop: mission m{mission_id} hit the auto-continue cap ({MAX_TUI_AUTOPILOT_NUDGES})"
+                                    )));
+                                }
+                            }
+                            // WeakOnly / NotActive / NotFound: stop honestly.
+                            Err(_) => {}
+                        }
+                    }
+                }
                 let recovered = app.model.queue_mut().recover_pending_steers();
                 if !recovered.is_empty() {
                     app.push_line(muted_line(format!(
@@ -2960,6 +3004,15 @@ where
     Ok(())
 }
 
+/// KI-003 paste-burst window (see `pump_events`): key events within this gap
+/// of the previous key belong to one input burst; real pastes land
+/// sub-millisecond apart, human typing never under ~30ms.
+const PASTE_BURST_WINDOW: std::time::Duration = std::time::Duration::from_millis(10);
+/// An Enter is rewritten to a newline only once the burst has this many
+/// events — two fast taps are plausible typing, three-plus inside 10ms is a
+/// paste stream.
+const PASTE_BURST_MIN: usize = 3;
+
 /// Blocking crossterm event pump. Translates terminal events into [`Msg`]s and
 /// forwards them; exits on shutdown, send failure, or read error. Runs on a
 /// blocking thread because crossterm's `poll`/`read` are synchronous. `budget`
@@ -2967,13 +3020,41 @@ where
 /// draw (see the `dirty` flag), and bursts of input coalesce into one repaint,
 /// so a quiet session costs nothing.
 fn pump_events(tx: mpsc::UnboundedSender<Msg>, shutdown: &AtomicBool, budget: Duration) {
+    // KI-003 paste-burst heuristic (same shape as the REPL editor): without
+    // bracketed-paste support a multi-line paste arrives as a sub-10ms burst
+    // of key events whose newlines are bare Enters — the first one would
+    // submit the half-pasted draft. Rewrite a mid-burst Enter as
+    // Shift+Enter, which the reducer treats as a newline.
+    let mut last_key_at: Option<std::time::Instant> = None;
+    let mut burst_len = 0usize;
     while !shutdown.load(Ordering::Relaxed) {
         match event::poll(budget) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) => {
                     // Ignore key-release repeats some terminals emit; only act
                     // on press to avoid double-processing held keys.
-                    if key.kind != KeyEventKind::Release && tx.send(Msg::Key(key)).is_err() {
+                    if key.kind == KeyEventKind::Release {
+                        continue;
+                    }
+                    let now = std::time::Instant::now();
+                    let in_burst =
+                        last_key_at.is_some_and(|at| now.duration_since(at) < PASTE_BURST_WINDOW);
+                    burst_len = if in_burst {
+                        burst_len.saturating_add(1)
+                    } else {
+                        1
+                    };
+                    last_key_at = Some(now);
+                    let mut key = key;
+                    if key.code == KeyCode::Enter
+                        && burst_len >= PASTE_BURST_MIN
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    {
+                        key.modifiers |= KeyModifiers::SHIFT;
+                    }
+                    if tx.send(Msg::Key(key)).is_err() {
                         break;
                     }
                 }

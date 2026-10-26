@@ -225,6 +225,10 @@ pub(crate) struct CompletionContext {
     pub(crate) sessions: Vec<CompletionItem>,
     pub(crate) current_model: Option<String>,
     pub(crate) current_mode: Option<String>,
+    /// Idle status line (`model · mode · web · effort`, roadmap C-1): shown
+    /// in the hint row when nothing else owns it, so mode/web/effort flips
+    /// are visible without a command. `None` falls back to the key hints.
+    pub(crate) status_line: Option<String>,
 }
 
 /// Where completion applies in the current input: the command head itself, or
@@ -757,6 +761,11 @@ impl ReplEditor {
         exit: &mut Exit,
         ctx: &CompletionContext,
     ) -> io::Result<()> {
+        // KI-003 paste-burst tracker: `last_key_at` stamps the previous key;
+        // `burst_len` counts the current sub-10ms run (see the heuristic at
+        // the read site below).
+        let mut last_key_at: Option<std::time::Instant> = None;
+        let mut burst_len = 0usize;
         loop {
             let text = textarea.lines().join("\n");
             let hint = build_hint(
@@ -821,6 +830,33 @@ impl ReplEditor {
                 }
                 _ => continue,
             };
+            // KI-003 burst heuristic: terminals without bracketed-paste
+            // support deliver a multi-line paste as a tight burst of key
+            // events (sub-10ms apart), and each pasted newline arrives as a
+            // bare Enter — the first one used to submit the half-pasted
+            // draft. Human typing cannot produce such runs (even key-repeat
+            // is ~30ms), so an Enter inside an established burst is treated
+            // as a pasted newline: the draft grows instead of submitting,
+            // and the operator presses Enter once more to send it.
+            let now = std::time::Instant::now();
+            let in_burst =
+                last_key_at.is_some_and(|at| now.duration_since(at) < Self::PASTE_BURST_WINDOW);
+            burst_len = if in_burst {
+                burst_len.saturating_add(1)
+            } else {
+                1
+            };
+            last_key_at = Some(now);
+            let bare_enter = key.code == KeyCode::Enter
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            if bare_enter && burst_len >= Self::PASTE_BURST_MIN {
+                self.mascot.resume_idle();
+                textarea.insert_newline();
+                *completion_idx = None;
+                continue;
+            }
             // Any key means the user is engaging again: clear the lingering
             // Done/Error badge so the companion returns to its idle baseline.
             self.mascot.resume_idle();
@@ -837,6 +873,15 @@ impl ReplEditor {
             }
         }
     }
+
+    /// KI-003 paste-burst window: key events arriving within this gap of the
+    /// previous key belong to one input burst. Real pastes land sub-millisecond
+    /// apart; human typing and key-repeat never get under ~30ms.
+    const PASTE_BURST_WINDOW: std::time::Duration = std::time::Duration::from_millis(10);
+    /// An Enter counts as a pasted newline only once the burst has at least this
+    /// many events — two fast taps are still plausible typing, three-plus inside
+    /// 10ms is a paste stream.
+    const PASTE_BURST_MIN: usize = 3;
 
     /// Handle one key press; returns `true` when the edit session should end.
     #[allow(clippy::too_many_arguments)]
@@ -1280,9 +1325,17 @@ fn build_hint(
         // so the viewport height and dropdown rows follow the current input.
         completions.clear();
         *completion_idx = None;
-        return String::from(
-            "Enter send · Alt+Enter newline · / commands · ↑/↓ select · Tab complete · Ctrl+D quit",
-        );
+        // Idle hint = the status line (model · mode · web · effort); the raw
+        // key map stays in the startup preamble, where it is already printed
+        // once, instead of occupying the permanent row.
+        return ctx
+            .status_line
+            .clone()
+            .unwrap_or_else(|| {
+                String::from(
+                    "Enter send · Alt+Enter newline · / commands · ↑/↓ select · Tab complete · Ctrl+D quit",
+                )
+            });
     };
     // Recompute only when the candidate set actually changed, so cycling the
     // highlight survives a redraw without snapping back to the top.
@@ -1779,6 +1832,7 @@ mod tests {
             ],
             current_model: Some("deepseek-v4-flash".to_string()),
             current_mode: Some("workspace-write".to_string()),
+            status_line: None,
         }
     }
 
@@ -1794,6 +1848,34 @@ mod tests {
         // A bare `/` lists every command; the head is what completes.
         assert!(complete("/", &ctx()).len() > 5);
         assert!(labels(&complete("/model", &ctx())).contains(&"/model"));
+    }
+
+    #[test]
+    fn idle_hint_shows_the_status_line_over_key_hints() {
+        use super::build_hint;
+        let mut completions = Vec::new();
+        let mut idx = None;
+        // No status line configured: the classic key-map hint stays.
+        let plain = build_hint("", &ctx(), &mut completions, &mut idx, None);
+        assert!(plain.contains("Enter send"));
+        // A status line (model · mode · web · effort) takes the idle row.
+        let mut with_status = ctx();
+        with_status.status_line =
+            Some("glm-5.3 · workspace-write · web:on · effort:high".to_string());
+        let hint = build_hint("", &with_status, &mut completions, &mut idx, None);
+        assert_eq!(hint, "glm-5.3 · workspace-write · web:on · effort:high");
+        // A one-shot status message still outranks both.
+        let flash = build_hint(
+            "",
+            &with_status,
+            &mut completions,
+            &mut idx,
+            Some("mode -> loop"),
+        );
+        assert_eq!(flash, "mode -> loop");
+        // Completion state outranks the status line (the row is doing work).
+        let comp = build_hint("/mod", &with_status, &mut completions, &mut idx, None);
+        assert!(comp.contains("/model"), "completion hint wins: {comp}");
     }
 
     #[test]

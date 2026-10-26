@@ -691,16 +691,20 @@ fn attr(tag: &str, key: &str) -> Option<String> {
 /// degrades to its text content.
 #[allow(clippy::too_many_lines)] // one cohesive linear HTML scanner
 fn html_to_markdown(html: &str) -> String {
-    const SKIP: [&str; 6] = ["script", "style", "head", "noscript", "template", "svg"];
-    const BLOCK: [&str; 22] = [
+    // Whole-document skip list: non-content containers whose entire subtree
+    // is noise for the model. The first six are structural (script/style...);
+    // the readability six (roadmap C-2 ②) drop page chrome — navigation,
+    // banners, footers, side rails, form widgets, embedded frames — before
+    // any text extraction, so the article body is what survives.
+    const SKIP: [&str; 12] = [
+        "script", "style", "head", "noscript", "template", "svg", "nav", "header", "footer",
+        "aside", "form", "iframe",
+    ];
+    const BLOCK: [&str; 17] = [
         "p",
         "div",
         "section",
         "article",
-        "header",
-        "footer",
-        "nav",
-        "aside",
         "main",
         "blockquote",
         "table",
@@ -714,7 +718,6 @@ fn html_to_markdown(html: &str) -> String {
         "dd",
         "figure",
         "figcaption",
-        "form",
     ];
     let lower = html.to_ascii_lowercase();
     let bytes = html.as_bytes();
@@ -807,7 +810,83 @@ fn html_to_markdown(html: &str) -> String {
             i = k;
         }
     }
-    finalize_markdown(&out)
+    // Readability pass: after extraction, boilerplate link lists (nav bars
+    // that survived inline, "related posts" rails, tag clouds) read as runs
+    // of link-dominant lines; collapse them so the article prose stands out.
+    collapse_link_runs(&finalize_markdown(&out))
+}
+
+/// Replace `[text](url)` spans with just `text`, so a line's non-link residue
+/// can be measured. Hand-written (no regex dep): finds the `](` + `)` pair.
+fn strip_md_links(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(open) = rest.find('[') {
+        let after_open = &rest[open + 1..];
+        if let Some(bracket) = after_open.find("](") {
+            let url_part = &after_open[bracket + 2..];
+            if let Some(close) = url_part.find(')') {
+                out.push_str(&rest[..open]);
+                out.push_str(&after_open[..bracket]);
+                rest = &url_part[close + 1..];
+                continue;
+            }
+        }
+        out.push_str(&rest[..open + 1]);
+        rest = &rest[open + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A link-dominant line: mostly one or more markdown links with a nav-label
+/// residue around them — a bare word or two (≤12 non-whitespace chars),
+/// and crucially no sentence punctuation (prose that carries a link reads
+/// "See the [guide](..) for details.", nav reads "Careers").
+fn link_dominant(line: &str) -> bool {
+    if !line.contains("](") {
+        return false;
+    }
+    let stripped = strip_md_links(line);
+    let trimmed = stripped.trim();
+    if trimmed
+        .chars()
+        .any(|ch| ".,;:!?，。；：！？、".contains(ch))
+    {
+        return false;
+    }
+    trimmed.chars().filter(|ch| !ch.is_whitespace()).count() <= 12
+}
+
+/// Collapse runs of `MIN_LINK_RUN`+ consecutive link-dominant lines into one
+/// marker line; shorter runs and prose-with-links lines pass through.
+fn collapse_link_runs(markdown: &str) -> String {
+    const MIN_LINK_RUN: usize = 4;
+    let mut out: Vec<String> = Vec::new();
+    let mut run: Vec<String> = Vec::new();
+    for line in markdown.lines() {
+        if link_dominant(line) {
+            run.push(line.to_string());
+        } else {
+            flush_link_run(&mut out, &mut run, MIN_LINK_RUN);
+            out.push(line.to_string());
+        }
+    }
+    flush_link_run(&mut out, &mut run, MIN_LINK_RUN);
+    let mut joined = out.join("\n");
+    if markdown.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
+}
+
+fn flush_link_run(out: &mut Vec<String>, run: &mut Vec<String>, min: usize) {
+    if run.len() >= min {
+        out.push(format!("[collapsed {} boilerplate links]", run.len()));
+    } else {
+        out.append(run);
+    }
+    run.clear();
 }
 
 /// Collapse runs of newlines to at most one blank line and trim the ends.
@@ -1350,5 +1429,77 @@ mod tests {
             0,
             "empty SERP"
         );
+    }
+}
+
+#[cfg(test)]
+mod readability_tests {
+    use super::{collapse_link_runs, html_to_markdown, link_dominant, strip_md_links};
+
+    #[test]
+    fn page_chrome_containers_drop_and_article_body_survives() {
+        let html = concat!(
+            "<html><body>",
+            "<nav><a href=\"https://x/home\">Home</a> <a href=\"https://x/docs\">Docs</a></nav>",
+            "<header><h1>Site Banner</h1><p>promo text</p></header>",
+            "<article><h2>Real Title</h2><p>The actual article body talks about ownership.</p>",
+            "<p>Second paragraph with <a href=\"https://rust-lang.org\">a real link</a> inline.</p></article>",
+            "<footer>© 2026 <a href=\"https://x/about\">About</a></footer>",
+            "</body></html>"
+        );
+        let md = html_to_markdown(html);
+        assert!(md.contains("Real Title"), "article heading survives");
+        assert!(md.contains("actual article body"), "article prose survives");
+        assert!(
+            md.contains("[a real link](https://rust-lang.org)"),
+            "inline prose link survives"
+        );
+        assert!(!md.contains("Site Banner"), "header dropped");
+        assert!(!md.contains("Home"), "nav dropped");
+        assert!(!md.contains("promo"), "header prose dropped");
+        assert!(!md.contains("About"), "footer dropped");
+        assert!(!md.contains("© 2026"), "footer text dropped");
+    }
+
+    #[test]
+    fn forms_and_iframes_drop_whole() {
+        let html = concat!(
+            "<body><form><label>Search</label><input placeholder=\"query\"></form>",
+            "<iframe src=\"https://ads.example\"></iframe>",
+            "<p>Body after widgets.</p></body>"
+        );
+        let md = html_to_markdown(html);
+        assert!(md.contains("Body after widgets"));
+        assert!(!md.contains("Search"));
+        assert!(!md.contains("ads.example"));
+    }
+
+    #[test]
+    fn link_runs_collapse_but_prose_links_do_not() {
+        // Six link-only lines collapse to one marker.
+        let rail = "[Home](https://x/)\n[Docs](https://x/d)\n[Blog](https://x/b)\n[About](https://x/a)\n[Careers](https://x/c)\n[Contact](https://x/t)\n";
+        let collapsed = collapse_link_runs(rail);
+        assert_eq!(collapsed, "[collapsed 6 boilerplate links]\n");
+        // Three lines stay (under the threshold).
+        let short = "[A](https://a)\n[B](https://b)\n[C](https://c)\n";
+        assert_eq!(collapse_link_runs(short), short);
+        // Prose sentences carrying a link are never link-dominant.
+        let prose = "Read the [ownership chapter](https://doc.rust-lang.org/book/ch04-01-what-is-ownership.html) for the full rules, it is worth it.\n";
+        assert_eq!(collapse_link_runs(prose), prose);
+    }
+
+    #[test]
+    fn strip_md_links_measures_residue_and_keeps_text() {
+        assert_eq!(strip_md_links("[text](https://u)"), "text");
+        assert_eq!(
+            strip_md_links("see [a](https://a) and [b](https://b)"),
+            "see a and b"
+        );
+        // Unclosed bracket passes through untouched.
+        assert_eq!(strip_md_links("array[0] value"), "array[0] value");
+        assert!(link_dominant("[x](https://x)"));
+        assert!(link_dominant("[Careers](https://x/c)"));
+        assert!(!link_dominant("see [docs](https://d) for the full guide"));
+        assert!(!link_dominant("plain text no links"));
     }
 }

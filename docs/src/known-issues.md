@@ -42,7 +42,7 @@
 - **疑点·待查位置（假设，未核实）**：两面均已启用 bracketed paste（editor.rs:680、tui.rs:2175）且有 `Event::Paste` 整块插入处理——代码面看似完备。用户仍见截断，最可能假设：**所用终端未回传粘贴标记**（bracketed paste 需终端支持；终端不支持时 crossterm 的 Enable 静默无效，每行回车以裸 Key事件到达 → 首行 Enter 立即提交）。次级假设：REPL 编辑器整块插入后仍把内部换行当作后续提交点。
 - **修复方向（待验证）**：① 粘连启发式——相邻键事件间隔 <10ms 且含 Enter 的突发序列按粘贴整块处理；② 终端能力探测降级提示；③ 「粘贴模式」显式开关。需用户真机复现区分假设。
 - **登记日期**：2026-10-24
-- **状态**：登记未修复（等待用户实机复现：终端程序与版本 + 复现步骤）
+- **状态**：✅ 已修复（2026-10-24，方向① 落地）：REPL 编辑器（`editor.rs` edit_loop）与 TUI 事件泵（`tui.rs` pump_events）同型粘连启发式——键事件间隔 <10ms 判为同一突发（真人打字与 key-repeat 均 ≥~30ms），突发 ≥3 键后的裸 Enter 按粘贴换行处理（REPL 插入换行不提交；TUI 重写为 Shift+Enter），首行误提交从根上消除；粘贴内容整体变多行草稿，用户再按一次 Enter 发送。方向②③ 未做（启发式已覆盖根因，探测/开关属冗余面）。待用户在原复现终端验证。
 
 ---
 
@@ -52,7 +52,7 @@
 - **疑点·待查位置（假设，未核实）**：eza/bat 按 isatty 决定是否着色——管道下本应纯文本（工具自身规范），但用户的 eza 配置（EZA_CONFIG_OPTIONS）或 PowerShell profile 可能强制 `--color=always`，ANSI 转义序列进入捕获输出后污染渲染（业界通案：Unix SE 10823、bat #3257）；Windows 下还可能混入 VT 序列与代码页双重问题。
 - **修复方向（待验证）**：① 捕获输出统一 **ANSI 转义剥离层**（防御性净化，与既有 chardetng 编码嗅探同族——不动原始字节只净呈现）；② 为子进程注入 `NO_COLOR=1` + `TERM=dumb`（no-color.org 规约，eza/bat 均遵守）；③ doctor 显示子进程 env 策略。
 - **登记日期**：2026-10-24
-- **状态**：登记未修复
+- **状态**：✅ 已修复（2026-10-24，双层防御，真机验证）：① `strip_ansi`（`runtime/bash.rs`，CSI/OSC-BEL/OSC-ST/三字节 charset 选择器全覆盖，CJK 逐字节保真）；② `inject_no_color` 前台+后台两条路径注入 `NO_COLOR=1`（用户已设则不覆盖；`TERM=dumb` 有副作用弃用）。剥离落在前台捕获边界（bash 工具与 `!CMD` 同一 `execute_bash`），后台 sidecar 日志仍存原始（双轨保底）。真机验证：pwsh 强制色码输出 → stdout 干净 + 子进程回显 `NO_COLOR=1`。
 
 ---
 

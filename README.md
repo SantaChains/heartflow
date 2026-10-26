@@ -28,9 +28,9 @@ Rust 实现的终端 AI agent。二进制命令 `hf`，在 REPL 中通过流式�
 - Unix 管道组合：stdin 被管道时读入为上下文，`git diff | hf prompt "评审这次改动"`；`--quiet` 只输出答案、`--json` 输出结构化结果，方便脚本串联
 - 外部 CLI 工具按需感知：系统提示词只广播主机上确已安装的非交互文本过滤器（jq/yq/gron/jc/rg/fd/tree/tokei/hyperfine/difft/xsv/gh），并约定首次使用前先 `<tool> --help` 学当前 flag 而非臆测；交互式/装饰性 TTY 工具（fzf、git-delta、less）归人类终端，不进 agent 提示（其能力已由原生 search_files 模糊检索与 apply_patch/真实 diff 覆盖）
 - 配置热重载：REPL 每回合边界按 mtime 探测 config/theme/keymap/settings/provider 五面变更——config 自动重建 provider 并保留会话，theme/keymap/settings 就地生效，provider 重载模型目录供 /model 与补全（绝不动活动传输）（零依赖轮询，逐面上报，改 theme 不触发 config 重载）
-- 模型目录与参数补全：`~/.heartflow/provider.toml` 是 provider/模型**目录**（已知宇宙的注册表，非活动配置——选路仍由 `config.toml` 决定），内置国内常用 OpenAI 兼容供应商种子（DeepSeek/Kimi/GLM/Qwen/…），`hf models` 自举发现与 `/model` 切换即时回写并热更；REPL 补全从命令名升级到参数值，`/model `/`/mode `/`/open ` 后敲空格弹出对齐表格下拉（模型附上下文窗口与来源）
+- 模型目录与参数补全：`~/.heartflow/provider.toml` 是 provider/模型**目录**（已知宇宙的注册表，非活动配置——选路仍由 `config.toml` 决定），内置国内常用 OpenAI 兼容供应商种子（DeepSeek/Kimi/GLM/Qwen/…，2026-10 已刷新至 GLM-5.3/Kimi-K3.1/Qwen3.8/deepseek-flash 一代），`hf models` 自举发现与 `/model` 切换即时回写并热更；`/bootstrap` 的端点探测同样把发现清单回写目录（种子过时失效时的自动兜底），三协议（openai/openai-responses/anthropic）都有真实凭据+可达性预检——验证不过绝不切换；点名模型永不自动更改，智能选择（flash 档自动选）仅作用于未点名时；REPL 补全从命令名升级到参数值，`/model `/`/mode `/`/open ` 后敲空格弹出对齐表格下拉（模型附上下文窗口与来源）
 - 自检自愈：`hf doctor [--fix]` 校验配置解析、目录可写、provider 与密钥，并对历史库跑 `PRAGMA integrity_check`（库体过大时自动降级 `quick_check`）；`--fix` 建缺失目录、坏配置备份移开
-- 权限模型：read-only / workspace-write / full 三档，REPL 内 `/mode` 热切换（`auto` 归一为 full；`HEARTFLOW_PERMISSION_MODE` 另接受 `plan`，其硬门禁只允许写 `.heartflow/plans/*.md`），工具级覆盖；/plan 规划模式（硬门禁：仅可写 `.heartflow/plans/*.md`，其余写/bash 一律拒绝），审批后进入 Hermes 任务环逐任务新鲜上下文执行，收尾把复盘写入 `.heartflow/reflections/`（可选沉淀为 `.agent/skills`）；read-only 与 plan 两档自动放行标注为只读的 MCP 工具（`readOnlyHint`/`read_only`），让远程只读 MCP 在受限模式下亦可用
+- 权限模型：read-only / workspace-write / full 三档，REPL 内 `/mode` 热切换（`auto` 归一为 full；`HEARTFLOW_PERMISSION_MODE` 另接受 `plan`，其硬门禁只允许写 `.heartflow/plans/*.md`），工具级覆盖；/plan 规划模式（硬门禁：仅可写 `.heartflow/plans/*.md`，其余写/bash 一律拒绝），审批后进入 Hermes 任务环逐任务新鲜上下文执行，收尾把复盘写入 `.heartflow/reflections/`（可选沉淀为 `.agent/skills`）；六档模式再含 `spec`（硬门禁只写 `.heartflow/specs/*.md`，先搜后设计，写毕三选确认）与 `loop`（full + mission 自动续跑：判据未满足即自动下一回合，blocked 三连停机，Ctrl+C 可中断）；read-only 与 plan/spec 两档自动放行标注为只读的 MCP 工具（`readOnlyHint`/`read_only`），让远程只读 MCP 在受限模式下亦可用
 - 健壮性：connect/read 双超时、子进程 kill_on_drop、UTF-8 全链路（BOM 剥除、PowerShell 编码前缀，非 UTF-8 字节经 `chardetng` 嗅探 + `encoding_rs` 解码 GBK 等遗留码页、不再 lossy 碎字、CJK 宽度对齐）、工具输出 32K 截断、缓存目录剪枝；工具入参执行前用 `jsonschema` crate 做完整 JSON-Schema 校验（draft 全能力；空/布尔/无法编译的 schema 一律放行，绝不误拦合法调用），转发给 provider 前对（MCP）schema 做规整（object 补 `properties`、array 补 `items`、单元素 `type` 联合折叠），MCP 握手（initialize+tools/list）失败按 200/400ms 退避重试 3 次（幂等），工具调用本身不自动重试（非幂等危险）交由模型层决策
 
 ## 安装
@@ -129,6 +129,7 @@ hf -v | -V | --version                            打印版本号
 /schedule [sub]  定时任务：add interval|once 注册 / run-due 外部触发到期工作（无常驻 daemon，overlap=skip，--quiet 成功不唤醒监工）
 !CMD  不经模型直接跑一条 shell 命令取输出（Windows 走 pwsh，危险命令先确认，输出同工具一样可折叠/展开）
 /plan GOAL 规划先行（写仅门禁到 plans/）  /plan approve 逐任务新鲜上下文执行+收尾复盘  /plan end 退出规划
+/spec GOAL 设计先行（写仅门禁到 specs/）  /spec approve 三选确认（立即执行/取消/添加修改）  /spec list 列已存 spec  /spec end 退出
 /restart 以全新的配置与 MCP 装载重启进程（链式重启受深度上限约束）
 ```
 
@@ -250,7 +251,7 @@ frame_budget_ms = 80     # 重绘节流窗口（毫秒）；启动时读取，�
 
 ### 终端伴侣（mascot）
 
-REPL 内置一个纯几何、零素材、零第三方动画库的小机器形象（`crates/cli/src/mascot.rs`），呼应 agent 状态：启动横幅用 **braille 点阵**（每格 2×4 子像素，与 ratatui `Canvas`/`Marker::Braille` 同源编码）绘出会呼吸/浮动的圆脸 blob，随节律眨眼；右侧以同一 half-block 管线绘制项目中文标识「心狭」（两枚内嵌 16×16 黑体位图，纯数据零字体依赖）；空闲输入框右端有一枚单行眼睛伴侣（终端过窄时自动隐藏，从不挤占输入）；工具运行的状态行用扫描表情替代通用 spinner。渲染借鉴 TermAVG 的「像素缓冲 → 终端格点编码」分层，动画由一个临界阻尼弹簧积分器驱动（与所参考的 JS 实现同一类数学），仅在时钟或状态变化时重算，配合 ratatui diff 使静帧开销近零。造型全为自绘几何/点阵，不含任何外部素材/商标，配色沿用上面的主题。半块真彩合成（更高分辨率）作为 ratatui 全屏重构（P4）的升级路径预留。完整的 `idle/thinking/busy/done/error` 状态机与多行彩色投影是就绪的公共 API，随 ratatui 状态栏（P4-c.3）接入后全量点亮。
+REPL 内置一个纯几何、零素材、零第三方动画库的小机器形象（`crates/cli/src/mascot.rs`），呼应 agent 状态：启动横幅用 **braille 点阵**（每格 2×4 子像素，与 ratatui `Canvas`/`Marker::Braille` 同源编码）绘出会呼吸/浮动的圆脸 blob，随节律眨眼；右侧以同一 half-block 管线绘制项目标识「Hiraeth」（3×5 像素字体 @2× 光栅化，I 用窄形单列茎，纯点阵数据零字体依赖，整幅横幅 77 列内不折行）；空闲输入框右端有一枚单行眼睛伴侣（终端过窄时自动隐藏，从不挤占输入）；工具运行的状态行用扫描表情替代通用 spinner。渲染借鉴 TermAVG 的「像素缓冲 → 终端格点编码」分层，动画由一个临界阻尼弹簧积分器驱动（与所参考的 JS 实现同一类数学），仅在时钟或状态变化时重算，配合 ratatui diff 使静帧开销近零。造型全为自绘几何/点阵，不含任何外部素材/商标，配色沿用上面的主题。半块真彩合成（更高分辨率）作为 ratatui 全屏重构（P4）的升级路径预留。完整的 `idle/thinking/busy/done/error` 状态机与多行彩色投影是就绪的公共 API，随 ratatui 状态栏（P4-c.3）接入后全量点亮。
 
 ## Agent 资产
 

@@ -1,3 +1,4 @@
+mod autopilot;
 mod config;
 mod core;
 mod doctor;
@@ -11,6 +12,7 @@ mod plan;
 mod render;
 mod settings;
 mod shell;
+mod spec;
 mod storage;
 mod theme;
 mod tool_exec;
@@ -33,7 +35,7 @@ use std::process;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use api::OpenAiClient;
+use api::{AnthropicClient, OpenAiClient};
 use clap::Parser;
 use crossterm::style::Stylize;
 use inquire::Confirm;
@@ -84,6 +86,15 @@ pub(crate) use permissions::*;
 // `/plan` dispatch sites and `super::` test paths keep resolving.
 #[allow(clippy::wildcard_imports)]
 pub(crate) use plan::*;
+// Spec mode confirmation flow (cli-thinning): the spec-path reservation, the
+// research-first brief and the three-way confirmation overlay, re-exported so
+// the `/spec` dispatch sites resolve.
+#[allow(clippy::wildcard_imports)]
+pub(crate) use spec::*;
+// Loop-mode auto-continue driver (cli-thinning): the mission-driven autopilot
+// that keeps running turns until the mission completes or blocks.
+#[allow(clippy::wildcard_imports)]
+pub(crate) use autopilot::*;
 // Interactive turn rendering + driving (cli-thinning): `TurnRenderer`,
 // `TurnOutcome` and `run_turn_interactive`, re-exported so the REPL, `plan.rs`,
 // `doctor` and `super::` test paths keep resolving.
@@ -480,6 +491,7 @@ fn report_unknown_command(input: &str) {
 
 /// Reset the live session to a fresh runtime, dropping planning state. Extracted
 /// so `/clear` stays a one-token arm and `run_repl` remains under the line cap.
+#[allow(clippy::too_many_arguments)]
 fn handle_clear_command(
     state: &SessionShared,
     selection: &ProviderSelection,
@@ -487,12 +499,16 @@ fn handle_clear_command(
     runtime: &mut AgentRuntime,
     planning: &mut bool,
     plan_path: &mut Option<PathBuf>,
+    speccing: &mut bool,
+    spec_path: &mut Option<PathBuf>,
 ) {
     match build_runtime(state, Session::new(), selection.clone(), true, mode) {
         Ok(fresh) => {
             *runtime = fresh;
             *planning = false;
             *plan_path = None;
+            *speccing = false;
+            *spec_path = None;
             // A cleared session is a new conversation: give it a fresh file and
             // history row instead of appending onto the one just wiped.
             rotate_session_id(state);
@@ -595,10 +611,36 @@ fn write_agents_skeleton(cwd: &Path, force: bool) -> Result<String, String> {
     Ok(format!("wrote AGENTS.md -> {}", path.display()))
 }
 
+/// Credential + endpoint probe shared by `/bootstrap` and `hf models`: list
+/// the models an endpoint advertises. Returns the list plus whether the
+/// provider is the DeepSeek-shaped surface that also exposes `/user/balance`.
+async fn probe_models(
+    profile: &provider::ProviderProfile,
+) -> Result<(Vec<api::ModelInfo>, bool), api::ApiError> {
+    match profile.protocol {
+        // OpenAI-compatible chat and Responses share the same base_url and
+        // credential, so `/models` proves both.
+        ProviderProtocol::OpenAi | ProviderProtocol::OpenAiResponses => {
+            let client =
+                OpenAiClient::new(profile.api_key.clone()).with_base_url(profile.base_url.clone());
+            client.list_models().await.map(|models| (models, true))
+        }
+        // Anthropic exposes the same discovery surface with its own auth
+        // headers; a provider without the endpoint fails the probe, which is
+        // the honest outcome (unverified credentials do not switch).
+        ProviderProtocol::Anthropic => {
+            let client = AnthropicClient::new(profile.api_key.clone())
+                .with_auth_token(profile.auth_token.clone())
+                .with_base_url(profile.base_url.clone());
+            client.list_models().await.map(|models| (models, false))
+        }
+    }
+}
+
 /// Provider self-bootstrap (`hf models`): list advertised models, report the
 /// current model's context window when the server discloses it, and (for
 /// `DeepSeek`) fetch the account balance. Read-only; requires an explicit
-/// provider so the transport is known. Other protocols are reported as pending.
+/// provider so the transport is known.
 async fn run_models(
     provider: Option<String>,
     model: Option<String>,
@@ -608,14 +650,6 @@ async fn run_models(
     let ProviderSelection::Profile(profile) = &selection else {
         return Err("model self-discovery needs an explicit provider (e.g. `hf --provider deepseek models`); env-driven Anthropic exposes no model endpoint".into());
     };
-    if profile.protocol != ProviderProtocol::OpenAi {
-        return Err(format!(
-            "self-bootstrap is only wired for the OpenAI-compatible (DeepSeek) protocol right now; '{}' speaks {}",
-            profile.model,
-            profile.protocol.as_str()
-        )
-        .into());
-    }
     let client = OpenAiClient::new(profile.api_key.clone()).with_base_url(profile.base_url.clone());
 
     println!(
@@ -625,8 +659,10 @@ async fn run_models(
     );
     println!("current model: {}", profile.model);
 
-    match client.list_models().await {
-        Ok(models) => {
+    let mut supports_balance = false;
+    match probe_models(profile).await {
+        Ok((models, flag)) => {
+            supports_balance = flag;
             println!("\nmodels ({}):", models.len());
             for info in &models {
                 let context = info.context_length.map_or_else(
@@ -669,7 +705,7 @@ async fn run_models(
         Err(error) => println!("\nmodel list unavailable: {error}"),
     }
 
-    if profile.base_url.contains("deepseek") {
+    if supports_balance && profile.base_url.contains("deepseek") {
         if !balance {
             // Balance queries hit a quota-consuming endpoint, so they are opt-in.
             println!("\nbalance: skipped (re-run with `--balance` to query; this uses API quota)");
@@ -814,6 +850,10 @@ async fn run_repl(
     // is the exact document the CLI reserved for the current planning session.
     let mut planning = false;
     let mut plan_path: Option<PathBuf> = None;
+    // Spec writing mirrors planning: same-runtime policy swap, with `spec_path`
+    // the exact document the CLI reserved for the current spec-writing session.
+    let mut speccing = false;
+    let mut spec_path: Option<PathBuf> = None;
     let history_path = home_dir().join(".heartflow").join("history.txt");
     let mut editor = editor::ReplEditor::new(&history_path);
     editor.set_reduced_motion(settings::Settings::load(&cwd, &home_dir()).reduced_motion);
@@ -966,14 +1006,23 @@ async fn run_repl(
             &mut runtime,
             &mut model,
             planning,
+            speccing,
             &mut prompter,
             &mut editor,
+            &mode,
         )
         .await;
         // Ctrl+D / EOF is a documented quit path (see the banner): save the
         // session and print the resume command just like `/exit`, so the
         // conversation is never silently dropped on the EOF path.
-        let ctx = build_completion_context(&selection, &catalog, &mode);
+        let ctx = build_completion_context(
+            &selection,
+            &catalog,
+            &mode,
+            lock_state(state)
+                .web_access
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
         let Some(line) = editor.read_line(&ctx)? else {
             exit_with_resume_hint(state, &runtime).await;
             break;
@@ -987,6 +1036,7 @@ async fn run_repl(
         if changed.config {
             reload_config(state, &cwd, &mut selection, &mut runtime, &mode);
             planning = false;
+            speccing = false;
         }
         if changed.theme {
             theme::Theme::reload(&cwd, &home_dir());
@@ -1004,6 +1054,8 @@ async fn run_repl(
                 &mut mode,
                 &mut planning,
                 &mut plan_path,
+                &mut speccing,
+                &mut spec_path,
                 &mut model,
                 &mut prompter,
                 &cwd,
@@ -1031,10 +1083,17 @@ async fn run_repl(
                 let outcome = if planning {
                     run_turn_interactive(state, &mut runtime, trimmed, Some(&mut BlockPrompter))
                         .await?
+                } else if speccing {
+                    run_turn_interactive(state, &mut runtime, trimmed, Some(&mut SpecPrompter))
+                        .await?
                 } else {
                     run_turn_interactive(state, &mut runtime, trimmed, Some(&mut prompter)).await?
                 };
                 editor.note_turn(outcome.ok);
+                // Loop mode: after a kickoff turn, drive the single active
+                // mission to a terminal state autonomously (criteria
+                // unsatisfied -> next turn; blocked 3-consecutive -> stop).
+                maybe_autopilot(state, &mut runtime, &mut prompter, &mode).await?;
             }
             maybe_auto_compact(state, &mut runtime);
             LoopControl::Continue
@@ -1105,13 +1164,16 @@ async fn save_and_report(state: &SessionShared, runtime: &AgentRuntime) {
 /// injection message here (locked semantics: never interrupt, always deliver
 /// after the turn). A refused/failed injection is re-queued by the caller, so
 /// nothing is lost.
+#[allow(clippy::too_many_arguments)]
 async fn deliver_queued_injection(
     state: &SessionShared,
     runtime: &mut AgentRuntime,
     model: &mut HeartModel,
     planning: bool,
+    speccing: bool,
     prompter: &mut CliPermissionPrompter,
     editor: &mut editor::ReplEditor,
+    mode: &str,
 ) {
     // Merged mode (opt-in, D2.2): the legacy whole-queue injection. Kept
     // because combining N related follow-ups into one turn saves context.
@@ -1122,6 +1184,8 @@ async fn deliver_queued_injection(
         model.begin_turn();
         let delivery = if planning {
             run_turn_interactive(state, runtime, &injection, Some(&mut BlockPrompter)).await
+        } else if speccing {
+            run_turn_interactive(state, runtime, &injection, Some(&mut SpecPrompter)).await
         } else {
             run_turn_interactive(state, runtime, &injection, Some(prompter)).await
         };
@@ -1130,6 +1194,11 @@ async fn deliver_queued_injection(
             Ok(outcome) => {
                 maybe_auto_compact(state, runtime);
                 editor.note_turn(outcome.ok);
+                // A loop-mode session auto-continues from ANY delivered turn,
+                // not just direct input (semantic completeness, B项).
+                if !planning && !speccing {
+                    let _ = maybe_autopilot(state, runtime, prompter, mode).await;
+                }
             }
             Err(error) => {
                 println!("queued delivery failed: {error}");
@@ -1148,6 +1217,8 @@ async fn deliver_queued_injection(
     model.begin_turn();
     let delivery = if planning {
         run_turn_interactive(state, runtime, &entry.text, Some(&mut BlockPrompter)).await
+    } else if speccing {
+        run_turn_interactive(state, runtime, &entry.text, Some(&mut SpecPrompter)).await
     } else {
         run_turn_interactive(state, runtime, &entry.text, Some(prompter)).await
     };
@@ -1156,12 +1227,17 @@ async fn deliver_queued_injection(
         Ok(outcome) => {
             maybe_auto_compact(state, runtime);
             editor.note_turn(outcome.ok);
-            let state = if outcome.ok {
+            let terminal_state = if outcome.ok {
                 core::QueueEntryState::Delivered
             } else {
                 core::QueueEntryState::Failed
             };
-            model.queue_mut().finish_entry(entry, state);
+            model.queue_mut().finish_entry(entry, terminal_state);
+            // A loop-mode session auto-continues from ANY delivered turn,
+            // not just direct input (semantic completeness, B项).
+            if !planning && !speccing {
+                let _ = maybe_autopilot(state, runtime, prompter, mode).await;
+            }
         }
         Err(error) => {
             println!("queued delivery failed for #{}: {error}", entry.id);
@@ -1183,6 +1259,8 @@ async fn dispatch_slash_command(
     mode: &mut String,
     planning: &mut bool,
     plan_path: &mut Option<PathBuf>,
+    speccing: &mut bool,
+    spec_path: &mut Option<PathBuf>,
     model: &mut HeartModel,
     prompter: &mut CliPermissionPrompter,
     cwd: &Path,
@@ -1214,7 +1292,9 @@ async fn dispatch_slash_command(
             LoopControl::Continue
         }
         "/clear" => {
-            handle_clear_command(state, selection, mode, runtime, planning, plan_path);
+            handle_clear_command(
+                state, selection, mode, runtime, planning, plan_path, speccing, spec_path,
+            );
             LoopControl::Continue
         }
         "/sessions" => {
@@ -1298,7 +1378,10 @@ async fn dispatch_slash_command(
             LoopControl::Continue
         }
         _ if trimmed == "/guide" || trimmed.starts_with("/guide ") => {
-            handle_guide_command(state, runtime, model, *planning, prompter, editor, trimmed).await;
+            handle_guide_command(
+                state, runtime, model, *planning, prompter, editor, mode, trimmed,
+            )
+            .await;
             LoopControl::Continue
         }
         "/init" => {
@@ -1311,31 +1394,48 @@ async fn dispatch_slash_command(
         _ if trimmed == "/mode" || trimmed.starts_with("/mode ") => {
             handle_mode_command(state, trimmed, mode, selection, runtime);
             *planning = false;
+            *speccing = false;
+            *spec_path = None;
             LoopControl::Continue
         }
         _ if trimmed == "/model" || trimmed.starts_with("/model ") => {
             handle_model_command(state, trimmed, selection, runtime, mode, catalog);
             *planning = false;
+            *speccing = false;
+            *spec_path = None;
             LoopControl::Continue
         }
         _ if trimmed == "/web" || trimmed.starts_with("/web ") => {
             handle_web_command(state, trimmed);
             *planning = false;
+            *speccing = false;
+            *spec_path = None;
             LoopControl::Continue
         }
         _ if trimmed == "/effort" || trimmed.starts_with("/effort ") => {
             handle_effort_command(state, trimmed, selection, runtime, mode);
             *planning = false;
+            *speccing = false;
+            *spec_path = None;
             LoopControl::Continue
         }
         _ if trimmed == "/bootstrap" || trimmed.starts_with("/bootstrap ") => {
             handle_bootstrap_command(state, trimmed, selection, runtime, mode, catalog).await;
             *planning = false;
+            *speccing = false;
+            *spec_path = None;
             LoopControl::Continue
         }
         _ if trimmed == "/plan" || trimmed.starts_with("/plan ") => {
             handle_plan_command(
                 state, trimmed, planning, plan_path, cwd, mode, runtime, prompter,
+            )
+            .await?;
+            LoopControl::Continue
+        }
+        _ if trimmed == "/spec" || trimmed.starts_with("/spec ") => {
+            handle_spec_command(
+                state, trimmed, speccing, spec_path, cwd, mode, runtime, prompter,
             )
             .await?;
             LoopControl::Continue
@@ -2168,10 +2268,11 @@ async fn handle_guide_command(
     planning: bool,
     prompter: &mut CliPermissionPrompter,
     editor: &mut editor::ReplEditor,
+    mode: &str,
     input: &str,
 ) {
     let arg = input.trim().strip_prefix("/guide").unwrap_or("").trim();
-    let (mode, task) = if let Some(rest) = arg.strip_prefix("draft ") {
+    let (route, task) = if let Some(rest) = arg.strip_prefix("draft ") {
         ("draft", rest.trim())
     } else if let Some(rest) = arg.strip_prefix("queue ") {
         ("queue", rest.trim())
@@ -2191,7 +2292,7 @@ async fn handle_guide_command(
         runtime.executor().todo_ledger().pending_tasks(),
     );
     let draft = guide_draft(&context, task);
-    match mode {
+    match route {
         "draft" => {
             println!("guide draft (edit and resend, or paste into the next message):\n");
             println!("{draft}\n");
@@ -2215,6 +2316,11 @@ async fn handle_guide_command(
                 Ok(outcome) => {
                     maybe_auto_compact(state, runtime);
                     editor.note_turn(outcome.ok);
+                    // A loop-mode session auto-continues from a guided turn
+                    // too (semantic completeness, B项).
+                    if !planning {
+                        let _ = maybe_autopilot(state, runtime, prompter, mode).await;
+                    }
                 }
                 Err(error) => {
                     println!("guide delivery failed: {error}");
@@ -2275,11 +2381,18 @@ async fn handle_bang_command(state: &SessionShared, mode: &str, input: &str) {
     let output = match joined {
         Ok(Ok(output)) => output,
         Ok(Err(error)) => {
-            println!("{}", format!("shell error: {error}").red());
+            println!(
+                "{}",
+                format!("shell error: {error}").with(theme::Theme::current().error().crossterm())
+            );
             return;
         }
         Err(task) => {
-            println!("{}", format!("shell task failed: {task}").red());
+            println!(
+                "{}",
+                format!("shell task failed: {task}")
+                    .with(theme::Theme::current().error().crossterm())
+            );
             return;
         }
     };
@@ -2291,15 +2404,24 @@ async fn handle_bang_command(state: &SessionShared, mode: &str, input: &str) {
         body.push_str(&output.stderr);
     }
     if body.trim().is_empty() {
-        println!("{}", "(no output)".dark_grey());
+        println!(
+            "{}",
+            "(no output)".with(theme::Theme::current().muted().crossterm())
+        );
     } else {
         let markdown = fold_tool_output(state, "shell", &body, FOLD_TOOL_OUTPUT_LINES);
         println!("{}", TerminalRenderer::new().render_markdown(&markdown));
     }
     if output.interrupted {
-        println!("{}", "! interrupted (timeout)".yellow());
+        println!(
+            "{}",
+            "! interrupted (timeout)".with(theme::Theme::current().strong().crossterm())
+        );
     } else if let Some(interpretation) = &output.return_code_interpretation {
-        println!("{}", format!("! {interpretation}").dark_grey());
+        println!(
+            "{}",
+            format!("! {interpretation}").with(theme::Theme::current().muted().crossterm())
+        );
     }
 }
 
@@ -2453,10 +2575,10 @@ async fn handle_bootstrap_command(
     if requested.is_empty() {
         println!("usage: /bootstrap <provider> [model] [--token <key>] [--reorganize]");
         println!(
-            "       validates the new provider (credentials reachable) BEFORE switching, then swaps the live runtime; memory carries over automatically."
+            "       validates the new provider (credentials + endpoint reachability) BEFORE switching, then swaps the live runtime; memory carries over automatically."
         );
         println!(
-            "       DeepSeek-optimized: auto-picks the flash model when none is named, verifies a named model against the endpoint's list, requests the account balance, and fills the server-reported context window into the catalog."
+            "       an explicitly named model is never changed; when none is named the flash tier is auto-selected; the endpoint's own model list and context windows are cached into the catalog."
         );
         return;
     }
@@ -2490,81 +2612,96 @@ async fn handle_bootstrap_command(
             return;
         }
     };
-    // Pre-flight 2: reachability. The OpenAI-compatible models list doubles as
-    // a credential + endpoint proof; protocols without a probe fall back to
-    // build-time validation with an honest note.
+    // Pre-flight 2: reachability. The models list doubles as a credential +
+    // endpoint proof for every protocol; a probe failure aborts before the
+    // live runtime is touched. This is the gate that makes "switched" mean
+    // "verified": without it a bad token or wrong base_url still reports
+    // bootstrap complete and fails on first use.
     let mut server_context: Option<u64> = None;
     if let ProviderSelection::Profile(profile) = &mut next {
         if let Some(token) = &inline_token {
             profile.api_key = token.clone();
         }
-        if profile.protocol == ProviderProtocol::OpenAi {
-            let client =
-                OpenAiClient::new(profile.api_key.clone()).with_base_url(profile.base_url.clone());
-            let models = match client.list_models().await {
-                Ok(models) => models,
-                Err(error) => {
-                    println!(
-                        "bootstrap aborted (nothing switched): endpoint check failed: {error}"
-                    );
-                    return;
-                }
-            };
-            println!(
-                "pre-flight ok: endpoint reachable, {} models listed",
-                models.len()
-            );
-            // DeepSeek-specialized selection: a named model is verified against
-            // the endpoint's own list (warned, not refused — some endpoints
-            // under-report); unnamed defaults to the flash tier.
-            let picked = if let Some(requested_model) = model {
-                if models.iter().any(|info| info.id == requested_model) {
-                    println!("model `{requested_model}` verified against the endpoint list");
-                } else {
-                    println!(
-                        "note: `{requested_model}` is not in the endpoint's list; keeping your explicit choice"
-                    );
-                }
-                Some(requested_model.to_string())
-            } else if let Some(flash) = models
-                .iter()
-                .map(|info| info.id.as_str())
-                .find(|id| id.contains("flash"))
-            {
-                println!("no model named; auto-selected the flash tier: {flash}");
-                Some(flash.to_string())
-            } else {
-                let fallback = models.first().map(|info| info.id.clone());
-                match &fallback {
-                    Some(id) => println!("no model named and no flash tier; selected: {id}"),
-                    None => println!("endpoint listed no models; keeping the catalog default"),
-                }
-                fallback
-            };
-            if let Some(picked) = picked {
-                server_context = models
-                    .iter()
-                    .find(|info| info.id == picked)
-                    .and_then(|info| info.context_length.map(u64::from));
-                next.set_model(picked);
-            }
-            // Balance is a best-effort extra (DeepSeek's /user/balance); a
-            // provider without that endpoint just skips the line.
-            if let Ok(balance) = client.get_balance().await {
-                for info in &balance.balance_infos {
-                    println!("balance: {} {}", info.total_balance, info.currency);
-                }
-            }
-        } else {
-            if inline_token.is_some() {
+        // Snapshot the profile so the probe/discovery/balance reads below do
+        // not hold the `&mut next` borrow alive across `next.set_model`.
+        let snapshot = profile.clone();
+        match probe_models(&snapshot).await {
+            Ok((models, supports_balance)) => {
                 println!(
-                    "note: --token applies to OpenAI-compatible profiles; this protocol resolves its credential from the environment"
+                    "pre-flight ok: endpoint reachable, {} models listed",
+                    models.len()
                 );
+                // An explicitly named model is NEVER changed: it is verified
+                // against the endpoint's own list and kept either way (some
+                // endpoints under-report). Autonomous choice (flash tier / first
+                // listed) applies only when the operator named no model.
+                let picked = if let Some(requested_model) = model {
+                    if models.iter().any(|info| info.id == requested_model) {
+                        println!("model `{requested_model}` verified against the endpoint list");
+                    } else {
+                        println!(
+                            "note: `{requested_model}` is not in the endpoint's list; your explicit choice is kept unchanged"
+                        );
+                    }
+                    Some(requested_model.to_string())
+                } else if let Some(flash) = models
+                    .iter()
+                    .map(|info| info.id.as_str())
+                    .find(|id| id.contains("flash"))
+                {
+                    println!("no model named; auto-selected the flash tier: {flash}");
+                    Some(flash.to_string())
+                } else {
+                    let fallback = models.first().map(|info| info.id.clone());
+                    match &fallback {
+                        Some(id) => println!("no model named and no flash tier; selected: {id}"),
+                        None => println!("endpoint listed no models; keeping the catalog default"),
+                    }
+                    fallback
+                };
+                if let Some(picked) = picked {
+                    server_context = models
+                        .iter()
+                        .find(|info| info.id == picked)
+                        .and_then(|info| info.context_length.map(u64::from));
+                    next.set_model(picked);
+                }
+                // Balance is a DeepSeek-only extra (`/user/balance`); other
+                // providers without that endpoint just skip the line.
+                if supports_balance && snapshot.base_url.contains("deepseek") {
+                    let client = OpenAiClient::new(snapshot.api_key.clone())
+                        .with_base_url(snapshot.base_url.clone());
+                    if let Ok(balance) = client.get_balance().await {
+                        for info in &balance.balance_infos {
+                            println!("balance: {} {}", info.total_balance, info.currency);
+                        }
+                    }
+                }
+                // Discovery cache: file the endpoint's own list into the catalog
+                // so `/model` completion stays fresh even when the compiled-in
+                // seed is stale (models retire and rename over time).
+                let discovered: Vec<(String, Option<u64>)> = models
+                    .iter()
+                    .map(|info| (info.id.clone(), info.context_length.map(u64::from)))
+                    .collect();
+                if !discovered.is_empty() {
+                    if let Err(error) = persist_discovered(
+                        &home_dir(),
+                        &snapshot.base_url,
+                        snapshot.protocol,
+                        &discovered,
+                    ) {
+                        println!("(could not cache discovered models: {error})");
+                    }
+                }
             }
-            println!(
-                "note: {} has no reachability probe; validation is build-time only",
-                profile.protocol.as_str()
-            );
+            Err(error) => {
+                println!("bootstrap aborted (nothing switched): endpoint check failed: {error}");
+                println!(
+                    "hint: verify the token and base_url; if the model id is new, name it explicitly (`/bootstrap <provider> <model>`) — an explicit id is passed through verbatim and can be checked against the vendor's docs via web search"
+                );
+                return;
+            }
         }
     }
     // Pre-flight 3: build the replacement runtime. On any failure the live
@@ -2849,6 +2986,7 @@ fn build_completion_context(
     selection: &ProviderSelection,
     catalog: &ProviderCatalog,
     mode: &str,
+    web: u8,
 ) -> editor::CompletionContext {
     let models = match selection {
         ProviderSelection::Profile(profile) => catalog
@@ -2879,12 +3017,30 @@ fn build_completion_context(
             editor::CompletionItem::new((index + 1).to_string(), detail)
         })
         .collect();
+    let effort = match selection {
+        ProviderSelection::Profile(profile) => profile.reasoning_effort.clone(),
+        ProviderSelection::Env { .. } => None,
+    };
+    // C-1 status line: model · mode · web · effort. Segments the session has
+    // no opinion on (no effort configured) drop out rather than show `none`.
+    let web_label = crate::tool_exec::WebAccess::from_u8(web)
+        .label()
+        .to_string();
+    let mut segments = vec![
+        selection.model().to_string(),
+        mode.to_string(),
+        format!("web:{web_label}"),
+    ];
+    if let Some(effort) = effort {
+        segments.push(format!("effort:{effort}"));
+    }
     editor::CompletionContext {
         models,
         modes,
         sessions,
         current_model: Some(selection.model().to_string()),
         current_mode: Some(mode.to_string()),
+        status_line: Some(segments.join(" · ")),
     }
 }
 
@@ -3546,6 +3702,307 @@ async fn approve_plan(
     Ok(())
 }
 
+/// Handle `/spec [goal|approve|end|status|list]`. The spec-mode mirror of
+/// `/plan`: reserve a spec path, run the research-first turn, then present the
+/// three-way confirmation overlay (execute / cancel / revise). Execution reuses
+/// the plan task loop verbatim.
+#[allow(clippy::too_many_arguments)]
+async fn handle_spec_command(
+    state: &SessionShared,
+    input: &str,
+    speccing: &mut bool,
+    spec_path: &mut Option<PathBuf>,
+    cwd: &Path,
+    mode: &str,
+    runtime: &mut AgentRuntime,
+    prompter: &mut CliPermissionPrompter,
+) -> io::Result<()> {
+    let arg = input
+        .strip_prefix("/spec")
+        .map(str::trim)
+        .unwrap_or_default();
+    match arg {
+        "" => {
+            println!("spec-writing is {}", if *speccing { "ON" } else { "off" });
+            println!(
+                "  /spec <goal>       research and draft a spec (writes gated to the spec file)"
+            );
+            println!("  /spec approve      review the spec and choose execute/cancel/revise");
+            println!("  /spec list         list saved specs under .heartflow/specs/");
+            println!("  /spec end          leave spec-writing without executing");
+        }
+        "status" => {
+            println!("spec-writing is {}", if *speccing { "ON" } else { "off" });
+            if let Some(path) = spec_path {
+                println!("spec file: {}", path.display());
+                match fs::read_to_string(path) {
+                    Ok(markdown) => {
+                        let tasks = parse_plan_tasks(&markdown);
+                        let pending = tasks
+                            .iter()
+                            .filter(|(_, status)| *status == "pending")
+                            .count();
+                        println!("tasks: {} total, {pending} pending", tasks.len());
+                    }
+                    Err(_) => println!("spec file not written yet."),
+                }
+            }
+        }
+        "list" => match list_specs(cwd) {
+            Ok(specs) if specs.is_empty() => println!("no specs under .heartflow/specs/ yet."),
+            Ok(specs) => {
+                println!("specs under .heartflow/specs/ (newest first):");
+                for (index, path) in specs.iter().enumerate() {
+                    println!("  [{index}] {}", path.display());
+                }
+                println!("review one with `/spec approve <path>`.");
+            }
+            Err(error) => println!("cannot list specs: {error}"),
+        },
+        "end" => end_spec(speccing, spec_path, mode, runtime),
+        "approve" => {
+            let Some(path) = spec_path.clone() else {
+                println!("no spec to approve; `/spec <goal>` or `/spec approve <path>`.");
+                return Ok(());
+            };
+            spec_review_loop(state, runtime, prompter, &path, speccing, spec_path, mode).await?;
+        }
+        _ if arg.starts_with("approve ") => {
+            let target = arg.strip_prefix("approve ").unwrap_or_default().trim();
+            let path = match resolve_spec_path(cwd, target) {
+                Ok(path) => path,
+                Err(error) => {
+                    println!("{error}");
+                    return Ok(());
+                }
+            };
+            spec_review_loop(state, runtime, prompter, &path, speccing, spec_path, mode).await?;
+        }
+        goal => {
+            start_spec(
+                state, goal, speccing, spec_path, cwd, mode, runtime, prompter,
+            )
+            .await?
+        }
+    }
+    Ok(())
+}
+
+/// Begin a spec-writing session: reserve the spec document, engage the gated
+/// policy, run the first research-and-design turn under `SpecPrompter`, then
+/// present the confirmation overlay.
+#[allow(clippy::too_many_arguments)]
+async fn start_spec(
+    state: &SessionShared,
+    goal: &str,
+    speccing: &mut bool,
+    spec_path: &mut Option<PathBuf>,
+    cwd: &Path,
+    mode: &str,
+    runtime: &mut AgentRuntime,
+    prompter: &mut CliPermissionPrompter,
+) -> io::Result<()> {
+    let path = match spec_file_path(cwd, goal) {
+        Ok(path) => path,
+        Err(error) => {
+            println!("cannot start spec: {error}");
+            return Ok(());
+        }
+    };
+    *speccing = true;
+    *spec_path = Some(path.clone());
+    set_runtime_mode_policy(runtime, "spec");
+    println!("spec mode ON - writes are blocked except the spec document.");
+    println!("spec file: {}", path.display());
+    run_turn_interactive(
+        state,
+        runtime,
+        &spec_brief(goal, &path),
+        Some(&mut SpecPrompter),
+    )
+    .await?;
+    println!();
+    spec_review_loop(state, runtime, prompter, &path, speccing, spec_path, mode).await?;
+    Ok(())
+}
+
+/// Leave spec-writing and restore the session's normal permission policy.
+fn end_spec(
+    speccing: &mut bool,
+    spec_path: &mut Option<PathBuf>,
+    mode: &str,
+    runtime: &mut AgentRuntime,
+) {
+    if !*speccing {
+        println!("not spec-writing.");
+        return;
+    }
+    set_runtime_mode_policy(runtime, mode);
+    *speccing = false;
+    *spec_path = None;
+    println!("spec mode off - back to {mode}.");
+}
+
+/// The confirmation overlay loop: show the full spec, then act on the
+/// three-way decision. `Revise` runs a revision turn and re-reviews; `Execute`
+/// and `Cancel` exit the loop.
+async fn spec_review_loop(
+    state: &SessionShared,
+    runtime: &mut AgentRuntime,
+    prompter: &mut CliPermissionPrompter,
+    path: &Path,
+    speccing: &mut bool,
+    spec_path: &mut Option<PathBuf>,
+    mode: &str,
+) -> io::Result<()> {
+    loop {
+        let markdown = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) => {
+                println!("cannot read spec {}: {error}", path.display());
+                return Ok(());
+            }
+        };
+        if markdown.trim().is_empty() {
+            println!(
+                "spec {} is empty - refine it by typing notes (still spec-writing), then `/spec approve` to review.",
+                path.display()
+            );
+            return Ok(());
+        }
+        match spec_confirmation(path, &markdown) {
+            SpecDecision::Execute => {
+                execute_spec(
+                    state, runtime, prompter, path, &markdown, speccing, spec_path, mode,
+                )
+                .await?;
+                return Ok(());
+            }
+            SpecDecision::Cancel => {
+                // Restore the session policy only if this was an active
+                // spec-writing session; a later `/spec approve <path>` review
+                // never changed the policy in the first place.
+                if *speccing {
+                    end_spec(speccing, spec_path, mode, runtime);
+                }
+                println!("spec kept at {}; execution deferred.", path.display());
+                return Ok(());
+            }
+            SpecDecision::Revise(notes) => {
+                run_turn_interactive(
+                    state,
+                    runtime,
+                    &spec_revision_brief(&notes, path),
+                    Some(&mut SpecPrompter),
+                )
+                .await?;
+                println!();
+            }
+        }
+    }
+}
+
+/// Execute a spec: parse its checkbox tasks, seed the todo ledger, restore the
+/// execution policy, and run the plan task loop. Mirrors `approve_plan`.
+#[allow(clippy::too_many_arguments)]
+async fn execute_spec(
+    state: &SessionShared,
+    runtime: &mut AgentRuntime,
+    prompter: &mut CliPermissionPrompter,
+    path: &Path,
+    markdown: &str,
+    speccing: &mut bool,
+    spec_path: &mut Option<PathBuf>,
+    mode: &str,
+) -> io::Result<()> {
+    let tasks = parse_plan_tasks(markdown);
+    if tasks.is_empty() {
+        println!(
+            "no `- [ ]` tasks found in {} - add checkbox tasks before executing.",
+            path.display()
+        );
+        return Ok(());
+    }
+    let pending = tasks
+        .iter()
+        .filter(|(_, status)| *status == "pending")
+        .count();
+    if let Err(error) = runtime.seed_plan(&plan_seed_json(&tasks)) {
+        println!("failed to load tasks into the ledger: {error}");
+        return Ok(());
+    }
+    set_runtime_mode_policy(runtime, mode);
+    *speccing = false;
+    *spec_path = None;
+    println!(
+        "spec approved - {} tasks ({pending} pending), execution mode {mode}. Each task runs in a fresh context.",
+        tasks.len()
+    );
+    let mut memory: Vec<String> = Vec::new();
+    let mut escalation = InteractiveEscalation;
+    let status = run_task_loop(
+        state,
+        runtime,
+        path,
+        &tasks,
+        prompter,
+        &mut escalation,
+        &mut memory,
+    )
+    .await?;
+    if status == TaskLoopStatus::Aborted {
+        println!("task loop stopped early.");
+    }
+
+    // Reflect: same tail as `approve_plan` — durable recap + optional skill.
+    let cwd = env::current_dir()?;
+    let final_markdown = fs::read_to_string(path).unwrap_or_else(|_| markdown.to_string());
+    let fallback = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("spec")
+        .to_string();
+    let goal = extract_plan_goal(&final_markdown, &fallback);
+    let final_tasks = parse_plan_tasks(&final_markdown);
+    let usage = runtime.usage().cumulative_usage();
+    match write_reflection(&cwd, path, &final_tasks, &memory, &usage, &goal) {
+        Ok(reflection_path) => {
+            println!("reflection saved to {}", reflection_path.display());
+            record_pitfalls(&home_dir(), &memory);
+            let has_experience = memory.iter().any(|note| !note.contains("SKIPPED"));
+            let mut confirm = || {
+                Confirm::new("Distill a reusable skill from this run into .agent/skills?")
+                    .with_default(false)
+                    .prompt()
+                    .unwrap_or(false)
+            };
+            match maybe_sink_skill(&cwd, &goal, &reflection_path, has_experience, &mut confirm) {
+                Ok(Some(skill_path)) => println!("skill written to {}", skill_path.display()),
+                Ok(None) => {}
+                Err(error) => println!("(note) could not write a skill: {error}"),
+            }
+        }
+        Err(error) => println!("(note) could not write the reflection: {error}"),
+    }
+    Ok(())
+}
+
+/// Resolve a `/spec approve <target>` argument to an existing spec file: an
+/// existing path as written, else a filename under `.heartflow/specs/`.
+fn resolve_spec_path(cwd: &Path, target: &str) -> Result<PathBuf, String> {
+    let direct = Path::new(target);
+    if direct.is_file() {
+        return Ok(direct.to_path_buf());
+    }
+    let in_specs = cwd.join(".heartflow").join("specs").join(target);
+    if in_specs.is_file() {
+        return Ok(in_specs);
+    }
+    Err(format!(
+        "no spec found at `{target}` (checked the path and .heartflow/specs/)"
+    ))
+}
+
 fn print_repl_help() {
     println!("Available commands:");
     println!("  /help          Show help");
@@ -3555,6 +4012,7 @@ fn print_repl_help() {
     println!("                 over (--reorganize lets the new model rewrite MEMORY.md)");
     println!("  /mode [NAME]   Show or switch the permission mode");
     println!("  /plan <GOAL>   Plan first (writes gated to .heartflow/plans), then /plan approve to execute");
+    println!("  /spec <GOAL>   Design first (writes gated to .heartflow/specs), then review execute/cancel/revise");
     println!("  /compact       Compact session history");
     println!("  /pin           Toggle never-compacted on the last message (survives /compact)");
     println!("  /checkpoints   List shadow-git snapshots taken before write-class tools");
@@ -4476,6 +4934,40 @@ mod tests {
     }
 
     #[test]
+    fn usage_line_reports_cache_hit_and_session_total() {
+        use super::usage_line;
+        use runtime::TokenUsage;
+        let current = TokenUsage {
+            input_tokens: 2800,
+            output_tokens: 120,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 8400,
+        };
+        let session = TokenUsage {
+            input_tokens: 50_000,
+            output_tokens: 900,
+            cache_creation_input_tokens: 200,
+            cache_read_input_tokens: 120_000,
+        };
+        // hit = 8400 / (2800 + 8400) = 75%; session total sums all four axes.
+        assert_eq!(
+            usage_line(&current, &session),
+            "[in 2800 / out 120 / cache 75% · session 171100]"
+        );
+        // Zero input guards the divide; no cache reads report 0%.
+        let empty = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        assert_eq!(
+            usage_line(&empty, &empty),
+            "[in 0 / out 0 / cache 0% · session 0]"
+        );
+    }
+
+    #[test]
     fn turn_outcome_scans_tool_errors_and_conclusion() {
         use super::{count_tool_errors, last_assistant_conclusion, task_memory_note, TurnOutcome};
         use runtime::{ContentBlock, ConversationMessage};
@@ -4503,6 +4995,7 @@ mod tests {
             ok: true,
             tool_errors: 0,
             conclusion: Some("shipped the endpoint".to_string()),
+            interrupted: false,
         };
         assert_eq!(
             task_memory_note("t3", "add auth", &outcome),

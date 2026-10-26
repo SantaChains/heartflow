@@ -350,9 +350,14 @@ pub fn default_catalog() -> ProviderCatalog {
                 "https://api.deepseek.com/v1",
                 "DEEPSEEK_API_KEY",
                 &[
-                    ("deepseek-v4.1-flash", None, Some("newest")),
-                    ("deepseek-v4-pro", None, Some("flagship")),
-                    ("deepseek-v4-flash", None, None),
+                    // 2026-10 refresh: official ids are `deepseek-flash`
+                    // (V4.1-Flash-1017, 1M ctx, 384K out) and `deepseek-v4-pro`
+                    // (V4-Pro-0813, 1M). The old `deepseek-v4-flash` name is
+                    // retired but still served (billed as flash) — kept as a
+                    // legacy alias for configs that name it.
+                    ("deepseek-flash", Some(1_048_576), Some("newest")),
+                    ("deepseek-v4-pro", Some(1_048_576), Some("flagship")),
+                    ("deepseek-v4-flash", Some(1_048_576), Some("legacy")),
                     ("deepseek-v3.2", None, None),
                 ],
             ),
@@ -363,10 +368,15 @@ pub fn default_catalog() -> ProviderCatalog {
                 "https://api.moonshot.cn/v1",
                 "MOONSHOT_API_KEY",
                 &[
-                    ("kimi-k3", Some(1_048_576), Some("flagship")),
+                    // 2026-10 refresh: K3.1 Pro (flagship, native vision, 1M
+                    // context) and its highspeed twin lead; K3 and the K2.7
+                    // coding pair follow. Kimi's /v1/models also reports
+                    // context_length, so discovery keeps these honest.
+                    ("kimi-k3.1-pro", Some(1_048_576), Some("flagship")),
+                    ("kimi-k3.1-pro-highspeed", Some(1_048_576), None),
+                    ("kimi-k3", Some(1_048_576), None),
                     ("kimi-k2.7-code", Some(262_144), Some("coding")),
                     ("kimi-k2.7-code-highspeed", Some(262_144), None),
-                    ("kimi-k2.6", Some(262_144), None),
                 ],
             ),
         ),
@@ -376,13 +386,15 @@ pub fn default_catalog() -> ProviderCatalog {
                 "https://open.bigmodel.cn/api/paas/v4",
                 "ZHIPU_API_KEY",
                 &[
-                    ("glm-5.2", None, Some("flagship")),
-                    ("glm-5.1", None, None),
-                    ("glm-4.7", None, None),
-                    ("glm-4.6", None, None),
-                    ("glm-4.5", Some(131_072), None),
-                    ("glm-4.5-air", Some(131_072), None),
-                    ("glm-4.7-flash", None, Some("free")),
+                    // 2026-10 refresh: GLM-5.3 family (2026-08) — 5.3 flagship,
+                    // 5.3-flash free multimodal tier, 5.3-flashx fast tier —
+                    // all 1M context; GLM-5.2 (1M) and GLM-5 base (200K) keep
+                    // serving long-horizon work.
+                    ("glm-5.3", Some(1_048_576), Some("flagship")),
+                    ("glm-5.3-flash", Some(1_048_576), Some("free")),
+                    ("glm-5.3-flashx", Some(1_048_576), Some("fast")),
+                    ("glm-5.2", Some(1_048_576), None),
+                    ("glm-5", Some(204_800), None),
                 ],
             ),
         ),
@@ -392,11 +404,12 @@ pub fn default_catalog() -> ProviderCatalog {
                 "https://dashscope.aliyuncs.com/compatible-mode/v1",
                 "DASHSCOPE_API_KEY",
                 &[
+                    // 2026-10 refresh: qwen3.8-max / qwen3.8-flash lead, qwen3.7-plus
+                    // as the balanced tier; qwen3-max kept while it serves.
                     ("qwen3.8-max", None, Some("flagship")),
+                    ("qwen3.8-flash", None, Some("fast")),
+                    ("qwen3.7-plus", None, None),
                     ("qwen3-max", Some(262_144), None),
-                    ("qwen-max", None, None),
-                    ("qwen-plus", None, None),
-                    ("qwen-flash", None, None),
                 ],
             ),
         ),
@@ -703,27 +716,31 @@ mod tests {
         assert!(deepseek
             .models
             .iter()
-            .any(|model| model.id == "deepseek-v4-flash"));
-        // The phantom `deepseek-flash` id never existed on the platform and must
-        // not be seeded; the current V4 line is present instead.
-        assert!(
-            !deepseek.models.iter().any(|m| m.id == "deepseek-flash"),
-            "deepseek-flash is not a real model and must not be seeded"
-        );
+            .any(|model| model.id == "deepseek-flash"));
         assert!(deepseek
             .models
             .iter()
-            .any(|model| model.id == "deepseek-v4.1-flash"));
-        // Retired Kimi ids are dropped; the current flagship carries its exact
-        // 1M (2^20) window.
+            .any(|model| model.id == "deepseek-v4-pro"));
+        // Retired Kimi ids are dropped; the K3.1 flagship and K3 carry the
+        // exact 1M (2^20) window.
         let moonshot = catalog.providers.get("moonshot").expect("moonshot seeded");
         assert!(!moonshot.models.iter().any(|m| m.id == "kimi-k2.5"));
+        let k31 = moonshot
+            .models
+            .iter()
+            .find(|model| model.id == "kimi-k3.1-pro")
+            .expect("kimi-k3.1-pro seeded");
+        assert_eq!(k31.context_window, Some(1_048_576));
         let k3 = moonshot
             .models
             .iter()
             .find(|model| model.id == "kimi-k3")
             .expect("kimi-k3 seeded");
         assert_eq!(k3.context_window, Some(1_048_576));
+        // GLM-5.3 family (2026-08) leads with the 1M window.
+        let zhipu = catalog.providers.get("zhipu").expect("zhipu seeded");
+        assert!(zhipu.models.iter().any(|m| m.id == "glm-5.3"));
+        assert!(zhipu.models.iter().any(|m| m.id == "glm-5.3-flash"));
         // Qianfan gained confirmed ERNIE ids; qwen-turbo (retired line) is gone.
         assert!(catalog.providers["qianfan"]
             .models

@@ -538,7 +538,7 @@ where
             tool_executor: Arc::new(tool_executor),
             permission_policy,
             system_prompt,
-            max_iterations: 16,
+            max_iterations: 64,
             max_continuations: 3,
             usage_tracker,
             compaction: CompactionConfig::default(),
@@ -644,9 +644,18 @@ where
         loop {
             iterations += 1;
             if iterations > self.max_iterations {
-                return Err(RuntimeError::new(
-                    "conversation loop exceeded the maximum number of iterations",
-                ));
+                // Soft landing: the previous iteration finished (its tool
+                // results are in the transcript and the session is
+                // consistent), so the turn ends as a success carrying all
+                // completed work — not as an error that discards the run.
+                // Long agentic turns (dozens of tool batches over minutes)
+                // hit the old hard error mid-task; the follow-up turn
+                // continues naturally from the preserved transcript.
+                notify(&AgentEvent::Truncated(format!(
+                    "iteration limit ({}) reached - the turn stops here with all completed work preserved; send a follow-up to continue",
+                    self.max_iterations
+                )));
+                break;
             }
             // Honor a Ctrl+C that landed between iterations (e.g. right after a
             // tool batch) instead of spending another request before noticing it.
@@ -3298,5 +3307,73 @@ mod tests {
             println!("  fs::write                {write:>8} us");
             let _ = std::fs::remove_file(&path);
         }
+    }
+}
+
+#[cfg(test)]
+mod iteration_limit_tests {
+    use super::{
+        AgentEvent, ApiClient, ApiRequest, ConversationRuntime, RuntimeError, StaticToolExecutor,
+        TurnStream,
+    };
+    use crate::permissions::{PermissionMode, PermissionPolicy};
+    use crate::session::Session;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A client that always answers with one tool call: the loop never ends on
+    /// its own, so the iteration limit is the only exit.
+    struct EverCallingClient {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ApiClient for EverCallingClient {
+        fn stream(&mut self, _request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(TurnStream::from_events(vec![
+                AgentEvent::TextDelta("working".to_string()),
+                AgentEvent::ToolUse {
+                    id: format!("t-{call}"),
+                    name: "tick".to_string(),
+                    input: "{}".to_string(),
+                },
+                AgentEvent::MessageStop,
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn iteration_limit_soft_lands_with_preserved_work() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = EverCallingClient {
+            calls: Arc::clone(&calls),
+        };
+        let executor = StaticToolExecutor::new().register("tick", |_| Ok("ok".to_string()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            client,
+            executor,
+            PermissionPolicy::new(PermissionMode::Allow),
+            Vec::new(),
+        )
+        .with_max_iterations(3);
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut notify = |event: &AgentEvent| events.push(event.clone());
+        let summary = runtime
+            .run_turn("keep going", None, &mut notify, &cancel)
+            .await
+            .expect("soft landing returns Ok, not an error");
+        // The counter includes the limit probe (incremented before the
+        // check), so it reads one past the completed iterations; the real
+        // work count is the API call figure above.
+        assert_eq!(summary.iterations, 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        // Every completed iteration's work is preserved in the summary.
+        assert_eq!(summary.tool_results.len(), 3);
+        // The truncation note explains the stop instead of an error.
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Truncated(reason) if reason.contains("iteration limit (3)"))));
     }
 }

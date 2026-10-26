@@ -208,6 +208,7 @@ fn spawn_background(
     if !input.dangerously_disable_sandbox.unwrap_or(false) {
         scrub_credential_env(&mut spawn);
     }
+    inject_no_color(&mut spawn);
     hide_console_window(&mut spawn);
     // The log file must be openable before spawn (both output streams point
     // at it), so it gets a unique pre-generated name; the PID is returned as
@@ -577,8 +578,20 @@ fn build_shell_command(wrapped: &str, disable_sandbox: bool) -> TokioCommand {
     if !disable_sandbox {
         scrub_credential_env(command.as_std_mut());
     }
+    inject_no_color(command.as_std_mut());
     hide_console_window(command.as_std_mut());
     command
+}
+
+/// Ask children not to colorize (KI-004 / no-color.org convention, honored by
+/// eza, bat, ripgrep, most modern CLIs): a piped child should already detect
+/// the non-tty, but a user profile or `--color=always` config can force ANSI
+/// into the captured stream. An operator-set `NO_COLOR` wins (never override
+/// an explicit choice); only the unset case gets the default.
+fn inject_no_color(command: &mut std::process::Command) {
+    if std::env::var_os("NO_COLOR").is_none() {
+        command.env("NO_COLOR", "1");
+    }
 }
 
 async fn execute_bash_async(
@@ -638,8 +651,8 @@ async fn execute_bash_async(
             let status = status_res.ok();
             (
                 status,
-                with_truncation_note(decode_output(&out_bytes), out_dropped),
-                with_truncation_note(decode_output(&err_bytes), err_dropped),
+                with_truncation_note(strip_ansi(&decode_output(&out_bytes)), out_dropped),
+                with_truncation_note(strip_ansi(&decode_output(&err_bytes)), err_dropped),
             )
         }),
     )
@@ -715,6 +728,80 @@ async fn execute_bash_async(
 /// Only when the bytes are *not* UTF-8 do we sniff the charset (e.g. GBK on a
 /// legacy zh-CN console) and decode through it, so CJK output survives intact
 /// instead of collapsing into replacement characters under `from_utf8_lossy`.
+/// Strip ANSI escape sequences from captured child output (KI-004 defensive
+/// scrub, the second layer after `NO_COLOR` injection). Handles CSI sequences
+/// (colors, cursor moves, clears), OSC strings (hyperlinks, window titles,
+/// BEL- or ST-terminated), and solo-ESC charset selectors. Plain text —
+/// including CJK — passes through byte-identical.
+#[must_use]
+pub fn strip_ansi(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte != 0x1b {
+            // Copy one full UTF-8 scalar (multibyte starts with 0xC0+).
+            let end = if byte < 0x80 {
+                index + 1
+            } else {
+                let len = utf8_len(byte);
+                (index + len).min(bytes.len())
+            };
+            out.push_str(&text[index..end]);
+            index = end;
+            continue;
+        }
+        // ESC sequence: classify by the byte after ESC.
+        let Some(&next) = bytes.get(index + 1) else {
+            break; // trailing lone ESC: drop it
+        };
+        match next {
+            b'[' => {
+                // CSI: parameters/intermediates 0x20-0x3F, final byte 0x40-0x7E.
+                let mut scan = index + 2;
+                while scan < bytes.len() && !(0x40..=0x7e).contains(&bytes[scan]) {
+                    scan += 1;
+                }
+                index = (scan + 1).min(bytes.len());
+            }
+            b']' => {
+                // OSC: until BEL (0x07) or ST (ESC \).
+                let mut scan = index + 2;
+                while scan < bytes.len() {
+                    if bytes[scan] == 0x07 {
+                        scan += 1;
+                        break;
+                    }
+                    if bytes[scan] == 0x1b && bytes.get(scan + 1) == Some(&b'\\') {
+                        scan += 2;
+                        break;
+                    }
+                    scan += 1;
+                }
+                index = scan;
+            }
+            // Charset selectors ESC ( X / ESC ) X are three bytes; every
+            // other solo-ESC sequence is two.
+            b'(' | b')' => index += 3,
+            _ => index += 2,
+        }
+    }
+    out
+}
+
+/// UTF-8 sequence length from a leading byte (invalid leads clamp to 1; the
+/// input came from a `&str` so they cannot occur, but the clamp keeps the
+/// copy loop from ever panicking).
+fn utf8_len(byte: u8) -> usize {
+    match byte {
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        _ => 1,
+    }
+}
+
 fn decode_output(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF][..]) {
         return String::from_utf8_lossy(rest).into_owned();
@@ -1390,5 +1477,52 @@ mod tests {
         })
         .expect("shell command should execute");
         assert_eq!(output.stdout.trim(), "中文输出测试");
+    }
+}
+
+#[cfg(test)]
+mod strip_ansi_tests {
+    use super::strip_ansi;
+
+    #[test]
+    fn plain_text_and_cjk_pass_through_byte_identical() {
+        assert_eq!(strip_ansi("hello world"), "hello world");
+        assert_eq!(
+            strip_ansi("中文输出保持原样\u{1f9e1}"),
+            "中文输出保持原样\u{1f9e1}"
+        );
+        assert_eq!(strip_ansi(""), "");
+    }
+
+    #[test]
+    fn csi_color_and_cursor_sequences_are_removed() {
+        // SGR color on/off, 256-color, cursor movement, full-screen clear.
+        assert_eq!(strip_ansi("\u{1b}[31mred\u{1b}[0m"), "red");
+        assert_eq!(strip_ansi("\u{1b}[38;5;196mX\u{1b}[39m"), "X");
+        assert_eq!(strip_ansi("a\u{1b}[2Kbc"), "abc");
+        assert_eq!(strip_ansi("\u{1b}[2J\u{1b}[Hclean"), "clean");
+    }
+
+    #[test]
+    fn osc_hyperlinks_and_titles_terminate_on_bel_or_st() {
+        // OSC 8 hyperlink (BEL-terminated) and a window title (ST-terminated).
+        assert_eq!(
+            strip_ansi("\u{1b}]8;;https://x\u{7}link\u{1b}]8;;\u{7}"),
+            "link"
+        );
+        assert_eq!(strip_ansi("pre\u{1b}]0;title\u{1b}\\post"), "prepost");
+    }
+
+    #[test]
+    fn charset_selectors_and_trailing_lone_esc_drop() {
+        assert_eq!(strip_ansi("\u{1b}(Btext"), "text");
+        // A trailing lone ESC at end of input is dropped, not copied.
+        assert_eq!(strip_ansi("tail\u{1b}"), "tail");
+    }
+
+    #[test]
+    fn real_world_eza_like_stream_is_cleaned() {
+        let noisy = "\u{1b}[1;34m.cargo\u{1b}[0m\n\u{1b}[1;32msrc\u{1b}[0m\n";
+        assert_eq!(strip_ansi(noisy), ".cargo\nsrc\n");
     }
 }

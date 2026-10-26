@@ -16,6 +16,7 @@ use runtime::{
 use tokio_util::sync::CancellationToken;
 
 use crate::render::{ColorTheme, Spinner, TerminalRenderer};
+use crate::theme::glyphs;
 use crate::{
     expand_attachments, fold_tool_output, mode_prompt_segment, save_session_async, AgentRuntime,
     SessionShared, FOLD_TOOL_OUTPUT_LINES,
@@ -34,6 +35,57 @@ impl Drop for AbortGuard {
     }
 }
 
+/// Byte length of the settled portion of `pending` streamed markdown, if
+/// any: everything up to (and including) the last blank line, provided the
+/// code fences in that span are balanced (an open fence keeps the whole tail
+/// live, since the blank line inside a fence is not a block boundary).
+/// Returns `None` when nothing is settled yet.
+#[must_use]
+fn settle_ready(pending: &str) -> Option<usize> {
+    let boundary = pending.rfind("\n\n")? + 2;
+    let settled = &pending[..boundary];
+    let fences = settled
+        .lines()
+        .filter(|line| line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~"))
+        .count();
+    (fences % 2 == 0).then_some(boundary)
+}
+
+/// Incremental block-wise markdown streamer (the known "double-write" fix):
+/// deltas accumulate into `pending`; each time a block boundary (blank line,
+/// balanced fences) appears, that portion is handed out once as settled text,
+/// rendered immediately and never redrawn. The trailing live block stays
+/// unprinted until it settles or the message stops — no cursor moves, no line
+/// accounting, no whole-message reflow jump.
+#[derive(Debug, Default)]
+struct StreamingMarkdown {
+    pending: String,
+}
+
+impl StreamingMarkdown {
+    /// Absorb one delta; returns the newly settled text (render and print it
+    /// once), if any.
+    fn push_delta(&mut self, delta: &str) -> Option<String> {
+        self.pending.push_str(delta);
+        let cut = settle_ready(&self.pending)?;
+        let settled = self.pending[..cut].to_string();
+        self.pending.drain(..cut);
+        Some(settled)
+    }
+
+    /// The still-live tail (render at `MessageStop`, or print raw when the
+    /// turn fails mid-stream).
+    #[must_use]
+    fn live_tail(&self) -> &str {
+        &self.pending
+    }
+
+    /// Drop the live tail after it has been handled (stop or incomplete).
+    fn clear(&mut self) {
+        self.pending.clear();
+    }
+}
+
 /// Terminal-side rendering state for one interactive turn.
 struct TurnRenderer {
     state: SessionShared,
@@ -49,6 +101,8 @@ struct TurnRenderer {
     /// Accumulated assistant text for the current message segment; rendered
     /// as finished markdown on `MessageStop`.
     assistant_text: String,
+    /// Block-wise streamer: settled blocks print once, the live tail waits.
+    stream: StreamingMarkdown,
 }
 
 impl TurnRenderer {
@@ -65,6 +119,7 @@ impl TurnRenderer {
             last_usage: None,
             tool_step: 0,
             assistant_text: String::new(),
+            stream: StreamingMarkdown::default(),
         }
     }
 
@@ -78,8 +133,15 @@ impl TurnRenderer {
                 }
                 self.saw_text = true;
                 self.assistant_text.push_str(delta.as_ref());
-                print!("{}", delta.as_str().with(self.theme.muted()));
-                out.flush().ok();
+                // Block-wise streaming (the double-write fix): each settled
+                // block (blank-line boundary, balanced fences) is rendered and
+                // printed exactly once — never followed by a whole-message
+                // reflow. The live tail stays unprinted until it settles or
+                // the message stops.
+                if let Some(settled) = self.stream.push_delta(delta.as_ref()) {
+                    print!("{}", self.renderer.render_markdown(&settled));
+                    out.flush().ok();
+                }
             }
             AgentEvent::ThinkingDelta(delta) => {
                 print!("{}", delta.as_str().with(self.theme.muted()).italic());
@@ -127,19 +189,27 @@ impl TurnRenderer {
                 self.last_usage = Some(*usage);
             }
             AgentEvent::MessageStop => {
-                if !self.assistant_text.is_empty() {
-                    writeln!(out).ok();
-                    writeln!(
-                        out,
-                        "{}",
-                        self.renderer.render_markdown(&self.assistant_text)
-                    )
-                    .ok();
-                    self.assistant_text.clear();
+                // Only the still-live tail renders here — settled blocks were
+                // already printed as finished markdown during streaming, so
+                // the message never appears twice and nothing jumps.
+                let tail = self.stream.live_tail().to_string();
+                self.stream.clear();
+                if !tail.is_empty() {
+                    print!("{}", self.renderer.render_markdown(&tail));
                     out.flush().ok();
                 }
+                self.assistant_text.clear();
             }
             AgentEvent::Truncated(reason) => {
+                // Flush the live tail first: an iteration-limit stop can arrive
+                // mid-paragraph, and the streamed-but-unsettled text must not
+                // vanish behind the truncation note.
+                let tail = self.stream.live_tail().to_string();
+                self.stream.clear();
+                if !tail.is_empty() {
+                    print!("{}", self.renderer.render_markdown(&tail));
+                    self.assistant_text.clear();
+                }
                 if self.spinner_active {
                     self.spinner.finish("Truncated", &self.theme, &mut out).ok();
                     self.spinner_active = false;
@@ -147,8 +217,7 @@ impl TurnRenderer {
                 writeln!(
                     out,
                     "{}",
-                    format!("· response truncated by the provider ({reason})")
-                        .with(self.theme.muted())
+                    format!("· turn truncated ({reason})").with(self.theme.muted())
                 )
                 .ok();
                 out.flush().ok();
@@ -177,23 +246,23 @@ impl TurnRenderer {
     /// block can break fences/tables, so raw text with a clear label is
     /// safer and faster.
     fn render_incomplete(&mut self) {
-        if self.assistant_text.is_empty() {
+        // Settled blocks were already rendered on arrival; only the live tail
+        // is left, printed raw (muted, clearly labelled) because a truncated
+        // block can break fences/tables and the full markdown pipeline would
+        // garble it.
+        let tail = self.stream.live_tail().to_string();
+        self.stream.clear();
+        if tail.is_empty() {
             return;
         }
         let mut out = io::stdout();
-        // Ensure we start on a fresh line regardless of where the last
-        // delta left the cursor.
         writeln!(out).ok();
         let label = "· incomplete response";
         writeln!(out, "{}", label.with(self.theme.muted()).italic()).ok();
-        // Render the partial text as muted raw text. We intentionally
-        // skip full markdown rendering here because a mid-stream failure
-        // can leave unclosed code fences, broken tables, etc.
-        let trimmed = self.assistant_text.trim_end_matches('\n');
+        let trimmed = tail.trim_end_matches('\n');
         for line in trimmed.lines() {
             writeln!(out, "{}", format!("  {line}").with(self.theme.muted())).ok();
         }
-        self.assistant_text.clear();
         out.flush().ok();
     }
 }
@@ -206,6 +275,10 @@ pub(crate) struct TurnOutcome {
     pub(crate) ok: bool,
     pub(crate) tool_errors: usize,
     pub(crate) conclusion: Option<String>,
+    /// The operator cancelled the turn with Ctrl+C. Distinct from `ok == false`
+    /// (a real error) so the loop autopilot can stop on interrupt instead of
+    /// counting the cancel as a blocked claim.
+    pub(crate) interrupted: bool,
 }
 
 /// Count tool results flagged as errors across a turn's transcript entries.
@@ -237,6 +310,27 @@ pub(crate) fn last_assistant_conclusion(messages: &[ConversationMessage]) -> Opt
         .map(|joined| joined.trim().to_string())
         .filter(|joined| !joined.is_empty())?;
     Some(truncate_chars(&text, 240))
+}
+
+/// The per-turn usage line: current turn tokens with the cache hit rate and
+/// the session cumulative total, so cost trajectories are visible at a glance
+/// (`cache 72%` = cache_read share of this turn's input).
+#[must_use]
+pub(crate) fn usage_line(current: &TokenUsage, session: &TokenUsage) -> String {
+    let read = u64::from(current.cache_read_input_tokens);
+    let input = u64::from(current.input_tokens);
+    let hit = if input + read > 0 {
+        read * 100 / (input + read)
+    } else {
+        0
+    };
+    format!(
+        "[in {} / out {} / cache {}% · session {}]",
+        current.input_tokens,
+        current.output_tokens,
+        hit,
+        session.total_tokens()
+    )
 }
 
 /// Run one interactive turn: stream events to the terminal, abort on Ctrl+C,
@@ -303,7 +397,7 @@ pub(crate) async fn run_turn_interactive(
         let tokens = u64::from(summary.usage.input_tokens)
             .saturating_add(u64::from(summary.usage.output_tokens));
         if let Some(attention) = auto_record_turn(&missions_root, tokens) {
-            println!("{}", format!("· {attention}").dark_grey());
+            println!("{}", format!("· {attention}").with(turn.theme.muted()));
         }
     }
 
@@ -318,6 +412,7 @@ pub(crate) async fn run_turn_interactive(
                 ok: true,
                 tool_errors: count_tool_errors(&summary.tool_results),
                 conclusion: last_assistant_conclusion(&summary.assistant_messages),
+                interrupted: false,
             }
         }
         Err(error) => {
@@ -337,44 +432,108 @@ pub(crate) async fn run_turn_interactive(
                 println!(
                     "{}",
                     "turn interrupted; the transcript stays consistent - give the next instruction or /exit to quit"
-                        .dark_grey()
+                        .with(turn.theme.muted())
                 );
             } else {
-                println!("{}", format!("\u{2718} {error}").red());
+                println!(
+                    "{}",
+                    format!("{} {error}", glyphs::FAILED).with(turn.theme.error())
+                );
                 // If the error carries a human-readable suggestion (common
                 // failure modes like auth errors, rate limits, connection
                 // issues), surface it as a muted hint so users know what to
                 // try next without having to parse a raw status code.
                 if let Some(hint) = error.hint() {
-                    println!("{}", format!("  hint: {hint}").dark_grey());
+                    println!("{}", format!("  hint: {hint}").with(turn.theme.muted()));
                 }
             }
             if let Ok(path) = save_session_async(state, runtime.session()).await {
                 println!(
                     "{}",
-                    format!("· session saved to {}", path.display()).dark_grey()
+                    format!("· session saved to {}", path.display()).with(turn.theme.muted())
                 );
             }
             return Ok(TurnOutcome {
                 ok: false,
                 tool_errors: 0,
                 conclusion: None,
+                interrupted,
             });
         }
     };
 
     if let Some(usage) = turn.last_usage {
+        let cumulative = runtime.usage().cumulative_usage();
         println!(
             "{}",
-            format!(
-                "[in {} / out {} / cache read {}]",
-                usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens
-            )
-            .dark_grey()
+            usage_line(&usage, &cumulative).with(turn.theme.muted())
         );
     }
-    if let Ok(path) = save_session_async(state, runtime.session()).await {
-        println!("{}", format!("· saved {}", path.display()).dark_grey());
+    // Silent-save discipline: a successful turn saves without a line (the
+    // path is knowable via /status, /sessions and the exit resume hint); only
+    // a failed save earns a warning, because that is the anomaly.
+    if let Err(error) = save_session_async(state, runtime.session()).await {
+        println!(
+            "{}",
+            format!("· session save failed: {error}").with(turn.theme.error())
+        );
     }
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{settle_ready, StreamingMarkdown};
+
+    #[test]
+    fn settle_waits_for_a_blank_line_and_includes_it() {
+        // No blank line yet: everything stays live.
+        assert_eq!(settle_ready("hello wor"), None);
+        assert_eq!(settle_ready("first line\nstill first"), None);
+        // A blank line settles everything up to and including it.
+        assert_eq!(settle_ready("para one\n\n"), Some("para one\n\n".len()));
+        // Only the LAST boundary counts; later live text rides along unsettled.
+        let pending = "para one\n\npara two still grow";
+        assert_eq!(settle_ready(pending), Some("para one\n\n".len()));
+    }
+
+    #[test]
+    fn an_open_fence_keeps_the_whole_tail_live() {
+        // The blank line inside an unclosed fence is not a block boundary.
+        let fenced = "intro\n\n```rust\nfn a() {}\n\nstill inside";
+        assert_eq!(settle_ready(fenced), None);
+        // Once the fence closes and a blank line follows, settling resumes.
+        let closed = "intro\n\n```rust\nfn a() {}\n```\n\ntail";
+        assert_eq!(
+            settle_ready(closed),
+            Some("intro\n\n```rust\nfn a() {}\n```\n\n".len())
+        );
+    }
+
+    #[test]
+    fn tilde_fences_are_boundaries_too_and_cjk_is_safe() {
+        let pending = "段落一\n\n~~~\ncode\n";
+        assert_eq!(settle_ready(pending), Some("段落一\n\n".len()));
+    }
+
+    #[test]
+    fn streamer_hands_out_settled_blocks_in_order_and_keeps_the_tail() {
+        let mut stream = StreamingMarkdown::default();
+        // Grow a first paragraph across deltas: nothing settles until the
+        // blank line arrives.
+        assert_eq!(stream.push_delta("Hel"), None);
+        assert_eq!(stream.push_delta("lo\n\n"), Some("Hello\n\n".to_string()));
+        // A fenced block stays live across its internal blank line...
+        assert_eq!(stream.push_delta("```sh\nls\n\nmore"), None);
+        assert_eq!(stream.live_tail(), "```sh\nls\n\nmore");
+        // ...and settles once closed plus a trailing blank line.
+        assert_eq!(
+            stream.push_delta("\n```\n\nafter"),
+            Some("```sh\nls\n\nmore\n```\n\n".to_string())
+        );
+        assert_eq!(stream.live_tail(), "after");
+        // Clear drops the tail (handled by stop/incomplete).
+        stream.clear();
+        assert_eq!(stream.live_tail(), "");
+    }
 }

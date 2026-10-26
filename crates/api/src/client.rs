@@ -5,6 +5,7 @@ use serde::Deserialize;
 use tracing::debug;
 
 use crate::error::ApiError;
+use crate::openai::{ModelInfo, ModelList};
 use crate::retry::{build_http, is_retryable_status, parse_retry_after, RetryPolicy};
 use crate::sse::{anthropic_event, SseParser};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
@@ -129,6 +130,38 @@ impl AnthropicClient {
         self.retry
             .run(|| self.send_raw_request(request), expect_success)
             .await
+    }
+
+    /// Self-discovery / pre-flight probe: list the models the endpoint
+    /// advertises (`GET {base}/v1/models`). Doubles as a credential + endpoint
+    /// proof for `/bootstrap`, so a bad key or unreachable base never switches
+    /// the live runtime.
+    ///
+    /// # Errors
+    /// Fails on transport errors (`Http`), a non-success status (`Api`, or
+    /// `RetriesExhausted` wrapping the last transient failure), or a response
+    /// body that is not a valid model list (`Json`).
+    pub async fn list_models(&self) -> Result<Vec<ModelInfo>, ApiError> {
+        let url = format!("{}/v1/models", self.base_url.trim_end_matches('/'));
+        let response = self
+            .retry
+            .run(
+                || async {
+                    let mut builder = self
+                        .http
+                        .get(&url)
+                        .header("x-api-key", &self.api_key)
+                        .header("anthropic-version", ANTHROPIC_VERSION);
+                    if let Some(auth_token) = &self.auth_token {
+                        builder = builder.bearer_auth(auth_token);
+                    }
+                    builder.send().await.map_err(ApiError::from)
+                },
+                expect_success,
+            )
+            .await?;
+        let list: ModelList = response.json().await.map_err(ApiError::from)?;
+        Ok(list.data)
     }
 
     async fn send_raw_request(
@@ -326,6 +359,25 @@ mod tests {
         };
 
         assert!(request.with_streaming().stream);
+    }
+
+    #[test]
+    fn anthropic_model_list_parses_without_optional_fields() {
+        // Anthropic's /v1/models returns id/display_name/created_at only; the
+        // shared ModelInfo tolerates the missing OpenAI-only fields.
+        let payload = serde_json::json!({
+            "data": [
+                {"id": "claude-sonnet-5", "display_name": "Claude Sonnet 5", "created_at": "2026-01-01T00:00:00Z"},
+                {"id": "claude-haiku-4-5", "type": "model", "display_name": "Claude Haiku 4.5"}
+            ],
+            "first_id": "claude-haiku-4-5", "last_id": "claude-sonnet-5", "has_more": false
+        });
+        let list: crate::openai::ModelList =
+            serde_json::from_value(payload).expect("anthropic model list parses");
+        assert_eq!(list.data.len(), 2);
+        assert_eq!(list.data[0].id, "claude-sonnet-5");
+        assert_eq!(list.data[0].owned_by, None);
+        assert_eq!(list.data[0].context_length, None);
     }
 
     #[test]

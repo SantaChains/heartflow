@@ -507,9 +507,9 @@ pub struct ModelInfo {
 }
 
 #[derive(Debug, Deserialize)]
-struct ModelList {
+pub(crate) struct ModelList {
     #[serde(default)]
-    data: Vec<ModelInfo>,
+    pub(crate) data: Vec<ModelInfo>,
 }
 
 /// `DeepSeek` account balance per currency. Amounts are strings on the wire to

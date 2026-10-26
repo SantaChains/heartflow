@@ -663,11 +663,11 @@ cd wiki-checkout && git add -A && git commit -m "docs: seed wiki" && git push
 > **kimi-code 自研度结论（源码核实）**：agent 核心 `packages/agent-core-v2` 是**一方自研包**，**非 gemini-cli / claude-code / codex 二改**（grep 三家零命中）；仅 TUI 层源自外部 `pi-tui`（入库为 `@moonshot-ai/pi-tui`，README 致谢），并采纳行业开放协议 MCP/ACP 与 Agent Skills 约定。另有一方包可对标 heartflow：`@moonshot-ai/kosong`（"LLM abstraction layer"，直接包 `@anthropic-ai/sdk` + `openai` SDK ≈ heartflow `api`+`provider`）、`@moonshot-ai/kimi-telemetry`（一方遥测）、`acp-server`。**下面标注「源码实证」的条目均已对照 `.workbuddy/kimi-code` 当前 HEAD 核实行号。**
 
 
-> **分组索引（2026-10-22 重排）**：本文按性质分三组——**A. 执行路线图**（要改 heartflow 自身代码的硬骨头，按依赖排序，含 §1/§4/§6 落地方向与 §11 执行序列）、**B. 外部调研与借鉴**（只记录不执行，§2/§3/§5/§7/§8/§9/§10）、**C. 功能增强候选**（轻量待评估，原有小项）。原 §1–§11 编号保留作交叉引用锚点，组内子标题整体降级一级。
+> **分组索引（2026-10-22 重排）**：本文按性质分三组——**A. 执行路线图**（要改 heartflow 自身代码的硬骨头，按依赖排序，含 §1/§4/§6 落地方向与 §11 执行序列）、**B. 外部调研与借鉴**（只记录不执行，§2/§3/§5/§7/§8/§9/§10）、**C. 功能增强候选**（轻量待评估，原有小项）。原 §1–§11 编号保留作交叉引用锚点，组内子标题整体降级一级。2026-10-24 批次新增 §12（provider 身份与凭据链完备化）、§13（提示词内参数自举）、§14（TUI 视觉体系），编号续接，旧锚点不重排。
 
 ## A. 执行路线图（要改 heartflow 代码的硬骨头，按依赖排序）
 
-> A 组为落地任务：双 Agent 架构（§1）、工程稳定性与持久性（§4）、编辑后反馈（§6）三方向的设计规格与已落地状态，以及把「要动大代码」条目抽出的执行序列（§11）。B 组调研是 A 组的依据来源。
+> A 组为落地任务：双 Agent 架构（§1）、工程稳定性与持久性（§4）、编辑后反馈（§6）三方向的设计规格与已落地状态，以及把「要动大代码」条目抽出的执行序列（§11）。B 组调研是 A 组的依据来源。2026-10-24 批次追加 §12–§14 三份设计规格（provider 身份/凭据链、提示词内参数自举、TUI 视觉体系）：细节与边界已想透，尚未落地，落地与否由用户裁决。
 
 ### 1. 双 Agent 架构：监工 / 工人
 
@@ -1076,6 +1076,94 @@ heartflow 落点：`edit_file` / `apply_patch` 后回注诊断（Rust 项目先�
 4. **11.4**（per-section 轮转，前置 11.1）。
 
 
+### 12. Provider 身份与凭据链完备化（2026-10-24 批次，设计规格，未落地）
+
+**实测事故（本机，2026-10-24）**：`/bootstrap deepseek` 返回 401「令牌已过期或验证不正确」。链路还原：用户级 `config.toml` 的 `[provider]` 指向 `https://open.bigmodel.cn/api/coding/paas/v4`（model `glm-5.3`，inline api_key 在），同时 `DEEPSEEK_API_KEY` 在 User/Process 两层非空。`resolve_spec` 是**逐字段合并**：base_url 取 config 层、protocol 取 builtin、`api_key_env` 取 builtin 的 `DEEPSEEK_API_KEY`（`config.rs:544-562`）；`materialize` 里 env 优先于 inline（`config.rs:622-627`）。于是「智谱端点 + DeepSeek 环境键」被交叉成对，401 由 bigmodel 的方言返回。**key 没过期，是三件身份各自漂移**。
+
+**现状（代码实证）**：
+- 逐字段合并，builtin 只提供四个默认值（protocol/base_url/api_key_env/model，`config.rs:108-124` 与 `512-584`）；config 任意一层可静默覆盖任一项。
+- 凭据二来源 env > inline（`config.rs:597-654`），但**来源信息在合并后丢失**——`ProviderProfile` 不带来源字段，调用方无法说「这把 key 来自哪个变量」。
+- 预检只报模型数量（`main.rs:2608-2613`）；401 的 hint 却指向 model id 与 web search（`main.rs:2678-2684`），对 auth error 是错向。
+- 分类能力已存在：`ApiError::kind()` 把 401/403 归为 `auth error`（`error.rs:57-62`）。
+- 身份展示面已存在：`/model` 已打印 provider/protocol/base_url（`main.rs:2916-2937`），不必新造命令。
+
+**设计判据（三条需裁决）**：
+1. **名字即身份**：显式点名 builtin 时锁定 protocol/base_url/api_key_env 三项；config 覆盖只允许显式旗标（`--base-url`/`--api-key-env`）或自定义 `[provider] name`。逐字段静默覆盖正是混线根因。这是 breaking change，代理/网关场景必须留出口，故走「配置门控 + 版本化默认」，不硬切。
+2. **凭据来源是身份的一部分**：`CredentialSource` 进 Profile，所有展示面（启动一行、`/model`、bootstrap 预检、doctor、错误分类）都打印「来源 + 变量名 + 掩码」，绝不打印值。
+3. **诊断按失败轴分流**：auth error（401/403）→ 端点 host + 凭据来源 + `--token/--token-stdin` 出路；connect/timeout → base_url 可达性；404/400 → 协议或模型；网络类不再提 model id。
+
+**数据结构（设计，未实现）**：
+
+```rust
+struct ProviderIdentity {
+    name: String,
+    protocol: ProviderProtocol,
+    base_url: String,
+    model: String,
+    credential: CredentialSource,
+}
+
+enum CredentialSource {
+    Env { var: String },
+    Inline { file: PathBuf },
+    Prompt { scope: SessionId }, // 见 §13
+    Missing,                     // env 空且 inline 空，独立类型而非空串
+}
+```
+
+**推进相**：P-A 身份可见（Profile 增 source 字段，启动/预检/`/model`/doctor 打印，纯加法零语义变更）→ P-B 诊断分流（按 `kind()` 重写 401 分支，补 `--base-url`/`--api-key-env`/`--token-stdin`）→ P-C 语义收敛（builtin 锁全量，`HEARTFLOW_PROVIDER_STRICT=1` 先行，下一主版本默认；旧配置由 doctor 报 override 行）→ P-D 回归矩阵（builtin × config × env × inline 的组合表测试 + 401 文案快照）。
+
+**回退**：P-A/P-B 纯加法；P-C 挂 env 开关，关掉即回逐字段合并；`config.toml` 结构不变。
+
+**明确不做**：不扫 keychain / 浏览器 / 其他工具 dotfiles（沿 `config.rs:598-604` 纪律）；不自动改写 `config.toml`；不做跨供应商自动择优；错误里不回显 key 的任何片段。
+
+### 13. 提示词内参数自举（in-prompt provisioning，2026-10-24 批次，设计规格，未落地）
+
+**需求**：一条消息内带 provider/base_url/api_key/model 即完成自举，不改 `config.toml`、不重启。既有能力边界：`/bootstrap ... --token <key>`（`main.rs:2569-2579`、`2600-2608`）与各 provider 的 env 变量。
+
+**威胁模型（代码实证，四条泄漏路径）**：
+1. **会话落盘**：保存时脱敏有两层——结构形规则（URL userinfo / Bearer / 标注 `api_key` / `sk-`、`ghp_`、`AKIA` 前缀，`redact.rs:33-96`）与启动时已知凭据的精确字面量（`main.rs:4378-4392` → `storage.rs:199-222`）。**新粘贴、未登记且不匹配前缀的 key（如智谱 `32hex.16+` 形）不被覆盖**。
+2. **cassette**：`RecordedEntry` 保存 system_prompt + messages（`cassette.rs:126-143`），回放逐字比对（`:410-438`）；夹具扫描只查 `sk-` 形（§11.5）——智谱形会入库。
+3. **系统提示词通道**：key 一旦进 system prompt，会随每次请求发送并被录制；§11.3 的 mission reminder 正是**追加到 system_prompt 末尾**的通道，任何 key 进该通道等于永久随行。
+4. **日志/遥测/argv**：`--token` 进 shell 历史与进程参数；stderr tracing 无脱敏层。
+
+**设计裁决**：提示词**携带**，客户端**截获**，永不上线。新增输入边界解析：`/connect <provider> [model] --base-url <url> --key <secret>`（或同义结构化围栏）在 REPL/TUI **提交前**被本地消费；命中后该行不进 messages，transcript 只留 `[connect: provider=X base=Y key=#N masked]`；key 进内存 `SecretStore`（session 作用域，进程退出即失），并在消费点立刻 `register_secret` 参与落盘脱敏。
+- 语义：prompt 是命令解析面，不是上下文面。模型看不到明文；cassette / compact / 日志零暴露。
+- 与 §12 合流：`CredentialSource::Prompt{scope}` 参与身份展示，bootstrap 预检复用同一套 diagnostic。
+- 残余风险：用户把裸 key 粘进普通聊天行时只能靠形扫描兜底——新增智谱形（`[0-9a-f]{32}\.[A-Za-z0-9]{16,}`）与「≥32 字符、字母数字混合、无常见词」的高熵保守规则；误报以 doctor 计数呈现；漏报仍可能，故 `/connect` 路径强制「只用结构化入口」。
+
+**推进相**：P-A 离线解析器 + 掩码投影（纯函数，可测）→ P-B 接 REPL/TUI 输入边界 + 消费点立即 `register_secret` → P-C `--token-stdin`（不经 argv）与 §12 身份展示合流 → P-D 真机冒烟（粘贴 key 后 transcript / 日志 / 会话文件 / cassette 四处零明文）。
+
+**回退**：整条挂 `HEARTFLOW_PROMPT_PROVISION=1`，默认关；`/bootstrap --token` 旧语义不变。
+
+**明确不做**：不把 key 写任何磁盘文件；不持久化进 mission/session；不让模型看见原文；不做 keychain；不做跨会话复用。
+
+### 14. TUI 视觉体系（nvim 借鉴，2026-10-24 批次，设计规格，未落地）
+
+**现状（代码实证，回答「色块都一样」）**：Theme 只有 10 个前景语义色（`theme.rs:90-101`），无背景/表面/边框/选中 token；所有 `Block` 边框走默认前景（`tui.rs:1411`/`1808`/`1968`/`2039`/`2119`/`2190`），仅权限浮层给了 accent（`:1967-1970`）；顶栏一行 spans（`:1644-1682`）、状态栏一行 spans（`:1823-1900`），都没有分区底色；banner 是三分色平面调色（`mascot.rs:272-283`）。即系统里只有「文字该是什么色」，没有「窗口/面板/状态分区是什么层」——换色相解决不了层次问题。
+
+**nvim 三件可借鉴（机制而非配色）**：
+1. highlight group 分层：Normal / StatusLine(NC) / TabLine(Sel) / Pmenu(Sel) / WinSeparator / FloatBorder——主题是「角色 → 样式」的映射表，不是散落常量。
+2. 模式即颜色：状态栏底色随 mode 变，不看文字也知道处于什么态。
+3. 主次与边框语法：活动/非活动分区明暗差 + 边框字符集（rounded/single/double）区分容器、浮层、分隔。
+
+**设计**：
+- Theme v2 增 surfaces：`bar_bg` / `panel_bg` / `popup_bg` / `border` / `border_focus` / `selection_bg` / `tab_active_bg` / `tab_inactive_bg`；保持「一角色一色 + 亮度阶梯」纪律，surface 由现有 Kurosawa 调色板同 hue 暗阶派生，不引第二套色相。
+- ModePalette：Normal / Insert / Plan / Approval 四态映射状态栏底色与提示字形（复用现有 `●/○` 语义）。
+- BorderGlyph：`rounded`（容器）/ `plain`（分隔）/ `heavy`（焦点浮层），与 `border_focus` 成对使用。
+- 降级链：truecolor → 256 → 16，按 `COLORTERM` 探测；无 truecolor 时禁用 bg 色块，退回「前景 + 边框字形 + 主次明暗」三件（nvim termguicolors 同款判据）。
+- 兼容：`theme.toml` 新字段全可选，缺省从现有 10 色派生并随 `hf config export theme` 输出，旧文件零改动可载。
+
+**测试（无 TTY 可验）**：样式投影纯函数返回 `Style` 矩阵做快照断言（角色 × 状态），并断言前景/背景相对亮度差 ≥ 阈值；真机只验观感，不验逻辑。
+
+**推进相**：P-A surfaces/border token + 派生默认 + 快照测试 → P-B ModePalette 接状态栏与权限弹层 → P-C 边框字形三档 + tab 主次 + 浮层底色 → P-D 真机陪测（四态 × 三档边框截图对照）。
+
+**回退**：新字段默认派生自旧 10 色，等价旧观感；单项 token 可单独回退。
+
+**明确不做**：不做 GUI/图片渲染；不做主题市场；不引第三方配色库；不改 markdown 语义色的既有映射（REPL 与 TUI 同源纪律）。
+
+**三节执行顺序**：§12 P-A 与 §13 P-A 可并行（都是纯加法 + 纯函数）；§14 P-A 独立；P-C 语义收敛与 P-D 真机均须用户裁决/陪测。
+
 ## B. 外部调研与借鉴（只记录不执行）
 
 > B 组为外部项目源码研读与设计判据锁定，当前**不落地、只作 A 组的依据来源**。
@@ -1327,7 +1415,7 @@ pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript �
 
 **版权纪律**：Microsoft 代码 MIT——本条目仅取设计判据，无代码移植，无 NOTICE 义务；将来移植任何片段须按 AGENTS 追加 NOTICE。
 
-- **模型自举 ✅ 已落地（2026-10-24，`/bootstrap <provider> [model] [--reorganize]`，REPL）**：一条命令完成「换 provider/token → 热重载 → 记忆随行」。**积木已在**：`/model` 切换（自记 provider.toml）、ConfigWatcher 回合边界重建 runtime（新 base_url/api_key 生效）、MEMORY.md 模型无关自动随行。**三缺口全部补齐（2026-10-24 真机验证）**：① 编排命令 `/bootstrap <provider> [model] [--token <key>] [--reorganize]`——三段预检（resolve/可达性/runtime build）全过才切换；② `--reorganize` 由新模型在会话内重写 MEMORY.md（.bak 备份+原子写+transcript 可审计）；③ REPL 斜杠命令天然回合间隙执行（在飞处置不适用，TUI 无斜杠面为诚实边界）。**DeepSeek 特殊优化**：models list 自动选 flash 档（点名模型先对照端点清单验证，不在清单则警告保留用户选择）、余额 best-effort 请求（/user/balance）、**服务端上报的 context window 自动填入目录**（persist_model source=User）；`--token <key>` 支持内联凭据（config api_key 同形）。**真机验证**：endpoint 可达 2 模型 → 自动选 deepseek-flash → 余额 43.46 CNY → 切换完成。web_search 兜底（端点不报 context 时查网填参）记为后续。
+- **模型自举 ✅ 已落地（2026-10-24，`/bootstrap <provider> [model] [--reorganize]`，REPL；2026-10-24 晚补强）**：一条命令完成「换 provider/token → 热重载 → 记忆随行」。**积木已在**：`/model` 切换（自记 provider.toml）、ConfigWatcher 回合边界重建 runtime（新 base_url/api_key 生效）、MEMORY.md 模型无关自动随行。**三缺口全部补齐（2026-10-24 真机验证）**：① 编排命令 `/bootstrap <provider> [model] [--token <key>] [--reorganize]`——三段预检（resolve/可达性/runtime build）全过才切换；② `--reorganize` 由新模型在会话内重写 MEMORY.md（.bak 备份+原子写+transcript 可审计）；③ REPL 斜杠命令天然回合间隙执行（在飞处置不适用，TUI 无斜杠面为诚实边界）。**2026-10-24 晚补强（用户反馈：非 OpenAI 协议未验证就切换）**：可达性预检从「仅 OpenAI 协议、其余 build-time only」升级为**三协议全覆盖**（openai/openai-responses 同用 `/v1/models`，anthropic 走 `GET /v1/models` 带 x-api-key/anthropic-version/auth_token 头——`AnthropicClient::list_models` 新增）；探测失败 abort 不切换（真机验证：坏 token 401 → aborted，活动配置原封不动）。**点名纪律**：点名模型永不更改（仅对照端点清单验证并警告），智能选择（flash 档自动选/首模型兑底）仅作用于未点名时；probe 收敛为 `probe_models` 共享函数（`/bootstrap` 与 `hf models` 同一验证面，`hf models` 的 openai-only 限制同步放开）。**发现缓存**：bootstrap 探测后把端点自身模型清单+context 回写目录（persist_discovered），种子清单过时失效时的自动兑底；失败提示引导显式点名模型 id（透传不变）。**种子刷新（2026-10 网络核实）**：deepseek-flash（V4.1-Flash-1017，1M，官方现行 id；旧断言「deepseek-flash 不存在」已过时并修正）+ deepseek-v4-pro（1M）+ v4-flash（legacy 兼容受理）；Kimi K3.1-Pro/-highspeed（1M）；GLM-5.3/-flash/-flashx（1M，2026-08 上线）+ 5.2（1M）+ 5（200K）；Qwen3.8-max/-flash + 3.7-plus。余额查询仍为 DeepSeek base_url 限定（supports_balance 门）。`--token <key>` 支持内联凭据。**待后续**：web_search 自动查网填参（会话内模型已可用 web_search 查最新清单，工具面已就绪）。
 #### C-1. 模式系统四态 + 采样参数面（2026-10-24 用户点名设计，采样管道实现中，模式分相落地）
 
 用户要求的四模式（Tab 切换）、采样参数、强度显示、联网开关，分层设计如下。
@@ -1339,7 +1427,7 @@ pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript �
 - **plan** = 现有 plan 权限档（写门禁到 `.heartflow/plans/*.md`——正是「不能动已有文件但可写想法」）；「省 token 强约束」补一段 plan 系统提示（禁读大文件、答案直给）。
 - **spec（自研新范式）**：网络搜索先行（web 工具保留）→ 产出 spec 文档（写门禁到 `.heartflow/specs/*.md`）+ task/todo 列表（todo_write）→ **不实现**。落点 = plan 档的姊妹权限档 + 「先搜后写」系统提示段 + spec 模板。与 §1 的 `/guide` 三段草稿同族。
 - **loop（hermes/harness 闭环，按研究定案）**：网络研究定案 = Anthropic generator-evaluator 循环 + Hermes 闭环（持久记忆→执行→自纠→避坑）。**本仓积木已全**：mission 账本（四态+判据+预算）+ 自动记账（§11.3）+ 续跑 nudge + full 权限 + MEMORY.md 避坑注入 + 停机守卫（double-Ctrl+C 仍可达）。loop 模式 = full 权限 + mission 自动续跑驱动（判据未满足即自动下一回合）+ blocked 三连检测停机。**分相**：等当前批真机测试后再建（它是权限最高的模式，需要测试过的基础）。
-- **Tab 切换判决**：Tab 已绑 toggle_fold——模式轮换用新 keymap 动作 `cycle_mode`（默认 **BackTab/Shift+Tab**，可重映射），折叠保持 Tab。轮换序 agent→plan→spec→loop。**✅ 已落地（2026-10-24）**：keymap 动作 `cycle_mode`（BackTab）+ `toggle_web`（Ctrl+O）入默认键位与可重映射面；drive_loop 消费（mode 走 `set_section_mode_policy` 泛型策略热切换 idle-only，回合中按键诚实提示完成后再切；web 走共享 AtomicU8 即时生效）；App 暂存→loop 消费的两段式与 take_submit 同构。**待下相**：spec overlay 确认流（展示全文→执行/取消/添加修改）+ loop 自动续跑驱动（mission 积木已备）。
+- **Tab 切换判决**：Tab 已绑 toggle_fold——模式轮换用新 keymap 动作 `cycle_mode`（默认 **BackTab/Shift+Tab**，可重映射），折叠保持 Tab。轮换序 agent→plan→spec→loop。**✅ 已落地（2026-10-24）**：keymap 动作 `cycle_mode`（BackTab）+ `toggle_web`（Ctrl+O）入默认键位与可重映射面；drive_loop 消费（mode 走 `set_section_mode_policy` 泛型策略热切换 idle-only，回合中按键诚实提示完成后再切；web 走共享 AtomicU8 即时生效）；App 暂存→loop 消费的两段式与 take_submit 同构。**✅ 已落地（2026-10-24 C-1 末相）**：`/spec <goal|approve [path]|end|status|list>` 镜像 `/plan`——预留 `.heartflow/specs/` 路径、研究先行 brief、`SpecPrompter` 硬门禁、三选确认 overlay（立即执行→复用 plan 任务循环 `run_task_loop` + 反射沉淀；取消→留盘后可 `/spec approve <path>` 再执行；添加修改→`inquire::Text` 回收修订回合再审）；loop 自动续跑驱动 `crates/cli/src/autopilot.rs`——单一 active mission 判据未满足即自动下一回合（`complete` 前置门禁：机械判据复验/WeakOnly 停机），失败回合计 blocked claim（`mark_blocked` 三连翻 Blocked 停机），Ctrl+C 中断停机，硬上限 64 回合防失控。`TurnOutcome` 增 `interrupted` 区分 Ctrl+C 与真错误。
 - **思考强度**：reasoning_effort 已在 profile 贯通到请求；补 `/effort [low|medium|high]` REPL 命令（镜像 /model 重建）+ TUI 状态行显示（chrome 扩展一字段）+ keymap `cycle_effort`（默认 Ctrl+E）。
 - **联网开关（开/关/本地，2026-10-24 用户细化）**：工具面过滤——开=web_search/web_fetch 正常；关=从工具集剔除；本地=web 剔除但保留 doc_search（rga 本地文档/知识库检索，clone 仓库研读属本地读）。**plan 可搜索**（用户更正：plan 也保留 web）。shape = build_runtime 时的工具注册过滤 + 模式默认值（spec 开、loop 开、plan 开、agent 开；用户可 `/web on|off|local` 覆盖）。**界面显示**：联网态与思维强度一起进状态行（如 `web:local · effort:high`），并配 keymap 动作（联网建议 Ctrl+O、强度轮换 Ctrl+E，均可重映射；Tab 已被补全/折叠占用不参与）。
 - **spec 执行确认流（用户细化）**：spec 文档写好后**展示在界面上**（overlay 预览全文），并询问三选：**立即执行 / 取消 / 添加修改（type something）**——用户可改文档或附加内容，agent 结合情况合理修订 spec；已完成的 spec **不必立即执行**，可留在 `.heartflow/specs/` 由用户后续在 spec 模式选择执行。**模式纪律**：其他模式（agent/plan/loop）下要求做 spec 工作时，agent 须提示「这是 spec 模式的工作」并拒绝越界执行（模式职责不串）。
@@ -1355,7 +1443,7 @@ pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript �
   - **非阻塞架构（本仓积木直配）**：小模型推理走 spawn_blocking/专职 worker **旁路通道**——与 JobRegistry + SteerMailbox 同构，结果以注解/工具结果落回，**大模型热路径永不等待**。2026 业界收敛趋势正是此形态。
   - **五用例（映射已录项）**：① 长期记忆语义检索（C 组「向量记忆」具体化：MEMORY.md/sessions 建 embedding 索引，语义召回增强/替代 FTS5 trigram）；② 翻译优选（用户点名场景）；③ §2 搜索结果 embed-then-rerank 两段式（Cursor 同款）；④ C-2 双轨清洗的相关性打分；⑤ 代码库语义索引——Cursor 架构（AST 分块 + Merkle 增量同步 + embeddings）与 §10.8 tree-sitter 判决联动。
   - **vendor 特色借鉴**：Cursor（AST 分块 + Merkle 增量同步 + 两段式重排）、Continue（embedder/reranker 全可配置全本地最彻底）、本地 RAG 作 **MCP 工具**暴露（检索旁路通道的工具化形态，与 §10.3 MCP host 判决合流）。
-- **工具输出清洗（双轨制，采纳）**：省 token 清理 vs 保障原始——**呈现层/上下文层清洗、原始层保底可回取**（本仓 expand/fold 工具输出折叠机制已备双轨骨架）：① `!CMD` 与 bash 捕获输出统一 **ANSI 剥离 + NO_COLOR=1 注入子进程**（KI-004，防御性净化）；② 网页内容正文提取（去导航/标签/脚本——§2 web_fetch 补 readability 层）；③ md 过度符号压缩（表格/链接转紧凑形，原始可展开）；④ 剥离仅进上下文，磁盘 transcript 恒存原始。
+- **工具输出清洗（双轨制，采纳）**：省 token 清理 vs 保障原始——**呈现层/上下文层清洗、原始层保底可回取**（本仓 expand/fold 工具输出折叠机制已备双轨骨架）：① ✅ `!CMD` 与 bash 捕获输出统一 **ANSI 剥离 + NO_COLOR=1 注入子进程**（KI-004，防御性净化；2026-10-24 落地：`strip_ansi` 剥 CSI/OSC/charset 序列，前台捕获边界净化，后台 sidecar 存原始，真机验证）；② ✅ 网页内容正文提取（去导航/标签/脚本——readability 层；2026-10-24 落地：`html_to_markdown` SKIP 扩容 nav/header/footer/aside/form/iframe 整块剔除 + `collapse_link_runs` 链接簇折叠（≥4 连续链接主导行→单行标记，句法标点判据保护正文带链接句），零新依赖；真机验证 DeepSeek 定价页无导航残留）；③ md 过度符号压缩（表格/链接转紧凑形，原始可展开）；④ 剥离仅进上下文，磁盘 transcript 恒存原始（后台日志已保原始，前台工具边界的完整双轨待 ContentBlock 双版，现阶段原始保底 = checkpoint + 后台日志）。
 - **其他 AI 调用 hf**：判决已录（§10.3 loopback MCP host 按需采纳）+ **现状已可用**：`hf prompt --json`/pipe 模式即 CLI 工具形态（rg/edit/diff 同类），MCP host 是把「全套工具面」暴露给外部 agent 的升级路径。
 - **LSP/tree-sitter/ast-grep**：§6 写后诊断（cargo check）已落地；**LSP 不采维持**（进程寿命+误报治理是另一量级，用户对误报污染上下文的顾虑正是当年判决依据）；**ast-grep 轻采纳**——已装则经外部工具注入机制（prompt.rs render_external_tools）天然可用，零代码；**tree-sitter 自研集成缓**（依赖评估，等结构定位真实需求）；语法高亮（edit 工具）缓——markdown IR 管线可扩展非核心。
 - **nushell 借鉴**：轻采纳——工具输出的**结构化形态**（JSON mode 可选）与表格渲染可取；nushell 语言本身不实现。
@@ -1439,7 +1527,7 @@ pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript �
 - **疑点·待查位置（假设，未核实）**：两面均已启用 bracketed paste（editor.rs:680、tui.rs:2175）且有 `Event::Paste` 整块插入处理——代码面看似完备。用户仍见截断，最可能假设：**所用终端未回传粘贴标记**（bracketed paste 需终端支持；终端不支持时 crossterm 的 Enable 静默无效，每行回车以裸 Key事件到达 → 首行 Enter 立即提交）。次级假设：REPL 编辑器整块插入后仍把内部换行当作后续提交点。
 - **修复方向（待验证）**：① 粘连启发式——相邻键事件间隔 <10ms 且含 Enter 的突发序列按粘贴整块处理；② 终端能力探测降级提示；③ 「粘贴模式」显式开关。需用户真机复现区分假设。
 - **登记日期**：2026-10-24
-- **状态**：登记未修复（等待用户实机复现：终端程序与版本 + 复现步骤）
+- **状态**：✅ 已修复（2026-10-24，方向① 落地）：REPL 编辑器（`editor.rs` edit_loop）与 TUI 事件泵（`tui.rs` pump_events）同型粘连启发式——键事件间隔 <10ms 判为同一突发（真人打字与 key-repeat 均 ≥~30ms），突发 ≥3 键后的裸 Enter 按粘贴换行处理（REPL 插入换行不提交；TUI 重写为 Shift+Enter），首行误提交从根上消除；粘贴内容整体变多行草稿，用户再按一次 Enter 发送。方向②③ 未做（启发式已覆盖根因，探测/开关属冗余面）。待用户在原复现终端验证。
 
 ---
 
@@ -1449,7 +1537,7 @@ pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript �
 - **疑点·待查位置（假设，未核实）**：eza/bat 按 isatty 决定是否着色——管道下本应纯文本（工具自身规范），但用户的 eza 配置（EZA_CONFIG_OPTIONS）或 PowerShell profile 可能强制 `--color=always`，ANSI 转义序列进入捕获输出后污染渲染（业界通案：Unix SE 10823、bat #3257）；Windows 下还可能混入 VT 序列与代码页双重问题。
 - **修复方向（待验证）**：① 捕获输出统一 **ANSI 转义剥离层**（防御性净化，与既有 chardetng 编码嗅探同族——不动原始字节只净呈现）；② 为子进程注入 `NO_COLOR=1` + `TERM=dumb`（no-color.org 规约，eza/bat 均遵守）；③ doctor 显示子进程 env 策略。
 - **登记日期**：2026-10-24
-- **状态**：登记未修复
+- **状态**：✅ 已修复（2026-10-24，双层防御，真机验证）：① `strip_ansi`（`runtime/bash.rs`，CSI/OSC-BEL/OSC-ST/三字节 charset 选择器全覆盖，CJK 逐字节保真）；② `inject_no_color` 前台+后台两条路径注入 `NO_COLOR=1`（用户已设则不覆盖；`TERM=dumb` 有副作用弃用）。剥离落在前台捕获边界（bash 工具与 `!CMD` 同一 `execute_bash`），后台 sidecar 日志仍存原始（双轨保底）。真机验证：pwsh 强制色码输出 → stdout 干净 + 子进程回显 `NO_COLOR=1`。
 
 ---
 
