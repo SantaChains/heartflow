@@ -33,3 +33,7 @@ openmemory copy.md
 
 panic_budget.json
 heartflow-ui-optimization.design
+
+# 夹具录制产物(HEARTFLOW_CASSETTE),本地回放用;入库会让 git status 快照
+# 进入 system prompt,破坏 replay 的严格相等校验
+fixtures/

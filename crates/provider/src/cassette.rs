@@ -18,8 +18,12 @@
 //! re-test provider parsing.
 //!
 //! **Replay contract.** Entries are consumed in order, and each incoming
-//! [`ApiRequest`] must equal the recorded one. Divergence fails loudly and names
-//! the first differing section, which makes a cassette double as a
+//! [`ApiRequest`] must match the recorded one. Tools and messages are strict;
+//! the system prompt is split at [`SYSTEM_PROMPT_DYNAMIC_BOUNDARY`]: the
+//! static prefix must be equal, while the dynamic tail (environment state —
+//! git status snapshot, date, cwd — that legitimately drifts between runs)
+//! only has its block count compared. Divergence fails loudly and names the
+//! first differing section, which makes a cassette double as a
 //! prompt/tool-assembly regression fixture: if prompt construction drifts, the
 //! replay says so instead of silently accepting a request nothing recorded.
 //!
@@ -34,7 +38,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use runtime::{AgentEvent, ApiClient, ApiRequest, RuntimeError, TurnStream};
+use runtime::{
+    AgentEvent, ApiClient, ApiRequest, RuntimeError, TurnStream, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -310,7 +316,7 @@ impl<C: ApiClient> ApiClient for CassetteClient<C> {
                         turn - 1
                     )));
                 };
-                if entry.request != request {
+                if !replay_compatible(&entry.request, &request) {
                     return Err(RuntimeError::new(format!(
                         "cassette {} turn {turn} does not match this run: {}",
                         path.display(),
@@ -403,15 +409,65 @@ fn unix_secs() -> u64 {
         .as_secs()
 }
 
+/// Whether a recorded request can serve a live one.
+///
+/// The system prompt's static prefix — every block before
+/// [`SYSTEM_PROMPT_DYNAMIC_BOUNDARY`] — must match exactly: drift there means
+/// prompt assembly actually changed. Blocks after the boundary carry
+/// environment state (git status snapshot, date, cwd) that drifts by design —
+/// one untracked file is enough to shift the snapshot — so only their count is
+/// compared. Tools and messages stay strict: they are session-scoped and
+/// stable, and a mismatch there would silently corrupt the replay.
+fn replay_compatible(recorded: &ApiRequest, live: &ApiRequest) -> bool {
+    fn split_at_boundary(prompt: &[String]) -> (&[String], &[String]) {
+        match prompt
+            .iter()
+            .position(|block| block == SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+        {
+            Some(index) => (&prompt[..index], &prompt[index + 1..]),
+            // No boundary: treat the whole prompt as static, i.e. strict.
+            None => (prompt, &[]),
+        }
+    }
+    let (recorded_static, recorded_dynamic) = split_at_boundary(&recorded.system_prompt);
+    let (live_static, live_dynamic) = split_at_boundary(&live.system_prompt);
+    recorded_static == live_static
+        && recorded_dynamic.len() == live_dynamic.len()
+        && recorded.tools == live.tools
+        && recorded.messages == live.messages
+}
+
 /// Name the first structural difference. Deliberately coarse — section and
 /// index, not a diff — because the useful signal is *that* prompt assembly
 /// drifted, and a full dump of two message trees would bury it.
+///
+/// Uses the same static/dynamic split as [`replay_compatible`], so a
+/// dynamic-only drift reports as a block-count difference rather than a false
+/// positive on the whole prompt.
 fn explain_mismatch(recorded: &ApiRequest, live: &ApiRequest) -> String {
-    if recorded.system_prompt != live.system_prompt {
+    fn split_at_boundary(prompt: &[String]) -> (&[String], &[String]) {
+        match prompt
+            .iter()
+            .position(|block| block == SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+        {
+            Some(index) => (&prompt[..index], &prompt[index + 1..]),
+            None => (prompt, &[]),
+        }
+    }
+    let (recorded_static, recorded_dynamic) = split_at_boundary(&recorded.system_prompt);
+    let (live_static, live_dynamic) = split_at_boundary(&live.system_prompt);
+    if recorded_static != live_static {
         return format!(
-            "system prompt differs (recorded {} blocks, live {})",
-            recorded.system_prompt.len(),
-            live.system_prompt.len()
+            "static system prompt differs (recorded {} blocks, live {})",
+            recorded_static.len(),
+            live_static.len()
+        );
+    }
+    if recorded_dynamic.len() != live_dynamic.len() {
+        return format!(
+            "dynamic system prompt block count differs (recorded {}, live {})",
+            recorded_dynamic.len(),
+            live_dynamic.len()
         );
     }
     if recorded.tools != live.tools {

@@ -147,6 +147,83 @@ async fn divergent_request_is_reported_not_ignored() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A request whose dynamic prompt tail (environment state after
+/// `SYSTEM_PROMPT_DYNAMIC_BOUNDARY`) drifted must still replay: the git
+/// status snapshot, date, and cwd legitimately change between recording and
+/// replaying, and a cassette that expires on the first untracked file is
+/// useless as a regression fixture.
+#[tokio::test]
+async fn dynamic_prompt_drift_still_replays() {
+    let path = temp_path("dynamic-drift");
+    let inner = ScriptedClient {
+        turns: vec![text_turn("x")],
+    };
+    let mut recorded_request = request("first");
+    recorded_request.system_prompt = vec![
+        "static head".to_string(),
+        runtime::SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
+        "recorded git snapshot".to_string(),
+    ];
+    let mut recorder = CassetteClient::live(inner, CassetteMode::Record(path.clone()));
+    drain(&mut recorder.stream(recorded_request).expect("record")).await;
+
+    // Same static head, no boundary at all: block counts differ, must not
+    // silently match.
+    let mut boundaryless = request("first");
+    boundaryless.system_prompt = vec!["static head".to_string()];
+    let mut replayer = CassetteClient::<ScriptedClient>::replay(path.clone());
+    let error = replayer
+        .stream(boundaryless)
+        .err()
+        .expect("a missing boundary must not silently match");
+    assert!(
+        error.to_string().contains("dynamic system prompt"),
+        "the report should name the dynamic block-count difference: {error}"
+    );
+
+    // Same shape, different dynamic content: must replay.
+    let mut compatible = request("first");
+    compatible.system_prompt = vec![
+        "static head".to_string(),
+        runtime::SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
+        "live git snapshot".to_string(),
+    ];
+    let mut replayer = CassetteClient::<ScriptedClient>::replay(path.clone());
+    drain(&mut replayer.stream(compatible).expect("replays")).await;
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// Drift in the static prompt head (before the boundary) must still fail: that
+/// means prompt assembly itself changed, which is exactly what the fixture
+/// exists to catch.
+#[tokio::test]
+async fn static_prompt_drift_is_reported() {
+    let path = temp_path("static-drift");
+    let inner = ScriptedClient {
+        turns: vec![text_turn("x")],
+    };
+    let mut recorder = CassetteClient::live(inner, CassetteMode::Record(path.clone()));
+    drain(&mut recorder.stream(request("first")).expect("record")).await;
+
+    let mut drifted = request("first");
+    drifted.system_prompt = vec![
+        "rewritten identity".to_string(),
+        runtime::SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
+        "git snapshot".to_string(),
+    ];
+    let mut replayer = CassetteClient::<ScriptedClient>::replay(path.clone());
+    let error = replayer.stream(drifted).err().expect("static head changed");
+    let message = error.to_string();
+    assert!(message.contains("does not match"), "{message}");
+    assert!(
+        message.contains("static system prompt differs"),
+        "the report should name the static section: {message}"
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
 #[tokio::test]
 async fn replaying_more_turns_than_recorded_is_an_error() {
     let path = temp_path("exhaust");
