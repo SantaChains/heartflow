@@ -72,10 +72,10 @@
 - `crates/api/src/client.rs:263` 流读 chunk().await 无 idle 超时（S1，本批 ST-1 修）。
 
 结合点：
-- **W1（做，随 ST-1 批次顺手）pwsh stderr 包装治理**：wrap 前缀追加 `$ErrorActionPreference='Continue'; $PSNativeCommandUseErrorActionPreference=$false;`——防模型写的命令在 7.4 特定配置下 stderr 升级为终止错误中断捕获；同时 `$ProgressPreference='SilentlyContinue'` 提速。落点 bash.rs:833 prefix 字符串。代价：3 个变量注入，无行为回归风险（显式续行本来就是默认值，防的是用户 profile 改过——但我们已经 -NoProfile，此项为防御纵深，可与 W2 合并评估后择一）。
-- **W2（做，小）退出码诚实化**：BashCommandOutput 已有 exit_code 字段（bash.rs:329 经 return_code_interpretation bash.rs:699 生成 `exit_code:N` 注记）。补一条约定文档进工具 description：**141/143 类信号退出码提示为「管道下游关闭/超时信号」而非命令逻辑失败**，防模型误判重试。落点 tools/src/lib.rs:141 description。
-- **W3（做，小）`2>&1` 指导**：pwsh 7.2+ 下 `2>&1` 语义漂移（不进 $Error）。工具 description 增一句「Windows 下避免依赖 2>&1 解析错误，输出已分字段返回」——heartflow 已分字段捕获（bash.rs:156 双流），模型根本不需要 2>&1。落点同 W2。
-- **W4（做，中）nushell 作为一等 shell**：resolve_shell(850) 已支持 HEARTFLOW_SHELL=nu，但参数走 `-lc` 分支（nu 实际用 `-c`）+ 编码包装只认 -Command。补：`lowered.contains("nu")` → `["-c"]`；nu 自带 UTF-8 无需前缀。测试钉死三 shell 的 args 选择。落点 bash.rs:850-864。
+- **W1（✅ 已落地 2026-11-21）pwsh stderr 包装治理**：wrap 前缀追加 `$ErrorActionPreference='Continue'; $PSNativeCommandUseErrorActionPreference=$false; $ProgressPreference='SilentlyContinue';`——防模型写的命令在 7.3+ 特定配置下 stderr 升级为终止错误中断捕获，并阻进度条刷 stderr。真机验证 pwsh 7.6.9 三变量全兼容。测试 `powershell_wrapper_pins_stderr_and_progress`。
+- **W2（✅ 已落地）退出码诚实化**：bash 工具 description 补约定——**141/143 类信号退出码提示为「管道下游关闭/超时信号」而非命令逻辑失败**，先查输出字段再决定重试。
+- **W3（✅ 已落地）`2>&1` 指导**：description 补「stdout/stderr 已分字段返回 + 真实退出码，勿用 `2>&1`」（pwsh 7.2+ 下 `2>&1` 会重路由错误记录致丢失）。W2/W3 同一句 description。
+- **W4（✅ 已落地）nushell 作为一等 shell**：`resolve_shell` 识别 `nu`/`nu.exe`/`nushell`/含路径形态 → `["-c"]`（nu 无 `-l` 登录模式）；nu 原生 UTF-8，编码包装只认 `-Command` 故天然不触碰。本机未装 nu，真机冒烟不可用——以 5 形态单测钉死（`resolves_nushell_to_dash_c`），装机后需补一次 `nu -c` 实跑。
 - **W5（做，中）LabeledError 式工具错误**：nushell labels[{text,span}] 映射到 heartflow 工具失败输出——失败时附「定位线索」（文件+行+最近似代码段）。已有先例：runtime/file_ops 的 failed_edit_hints_at_the_closest_snippet 测试（编辑失败给最近似 snippet）。推广为工具错误输出通用约定：`{error, hint, at:{path,line}}`。渐进做，不强制全工具。
 - **W6（只记录）插件协议 Call-ID 配对 ↔ jobs.rs append_event 事件流**：nushell 用自增 ID 配对请求/响应防乱序；heartflow jobs 事件流是追加式 status 序列，无配对校验。若将来做 MCP 并发调用去耦，Call-ID 模式可直接抄。记入 roadmap 工程稳定性节。
 - **W7（否决）结构化对象管道**：pwsh/nushell 式「工具间传对象」对 heartflow 是过度工程——LLM 上下文就是文本，工具边界天然是文本+结构注记（BashCommandOutput JSON）。否决理由：加一层对象总线不减少 token 反增复杂度。

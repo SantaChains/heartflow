@@ -829,12 +829,23 @@ fn decode_with(bytes: &[u8], encoding: &'static encoding_rs::Encoding) -> String
 }
 
 /// Force UTF-8 output encoding for `PowerShell` so Chinese text survives the
-/// pipe (`Windows PowerShell` defaults to the console code page, often GBK).
+/// pipe (`Windows PowerShell` defaults to the console code page, often GBK),
+/// and pin stderr semantics for the wrapped run (W1, shell-streams.dev.md):
+/// `$PSNativeCommandUseErrorActionPreference=$false` keeps native stderr from
+/// escalating into a terminating error under a 7.3+ host whose preference was
+/// flipped (which would abort capture mid-command), and
+/// `$ProgressPreference='SilentlyContinue'` stops progress bars from flooding
+/// stderr (and stalling output) on long operations. All three values are the
+/// documented defaults — this is belt-and-suspenders over `-NoProfile`, not a
+/// behavior change.
 fn wrap_command_for_encoding(args: &[&str], command: &str) -> String {
     let is_power_shell = args.iter().any(|arg| arg.eq_ignore_ascii_case("-Command"));
     if is_power_shell {
         let prefix = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; \
-                      $OutputEncoding=[System.Text.Encoding]::UTF8; ";
+                      $OutputEncoding=[System.Text.Encoding]::UTF8; \
+                      $ErrorActionPreference='Continue'; \
+                      $PSNativeCommandUseErrorActionPreference=$false; \
+                      $ProgressPreference='SilentlyContinue'; ";
         format!("{prefix}{command}")
     } else {
         command.to_string()
@@ -849,7 +860,9 @@ fn current_shell() -> (String, Vec<&'static str>) {
 
 /// Windows defaults to `pwsh` when installed and falls back to `powershell`;
 /// other platforms use `sh -lc`. PowerShell-like programs get
-/// `-NoLogo -NoProfile -Command`; everything else gets `-lc`.
+/// `-NoLogo -NoProfile -Command`; nushell (W4) gets `-c` — it has no login
+/// mode (`-l` is not a nu flag) and emits UTF-8 natively, so it needs no
+/// encoding wrapper; everything else gets `-lc`.
 fn resolve_shell(explicit: Option<&str>, windows: bool) -> (String, Vec<&'static str>) {
     let program = match explicit.map(str::trim).filter(|shell| !shell.is_empty()) {
         Some(shell) => shell.to_string(),
@@ -860,6 +873,9 @@ fn resolve_shell(explicit: Option<&str>, windows: bool) -> (String, Vec<&'static
     let lowered = program.to_ascii_lowercase();
     let args = if lowered.contains("pwsh") || lowered.contains("powershell") {
         vec!["-NoLogo", "-NoProfile", "-Command"]
+    } else if lowered.contains("nushell") || lowered.ends_with("nu") || lowered.ends_with("nu.exe")
+    {
+        vec!["-c"]
     } else {
         vec!["-lc"]
     };
@@ -1241,6 +1257,50 @@ mod tests {
         let (program, args) = resolve_shell(Some("bash"), true);
         assert_eq!(program, "bash");
         assert_eq!(args, vec!["-lc"]);
+    }
+
+    /// W4 (shell-streams.dev.md): nushell is first-class — `-c` (no `-l`, nu
+    /// has no login mode), matched across the name shapes `nu`, `nu.exe`,
+    /// `nushell`, and a full path ending in either.
+    #[test]
+    fn resolves_nushell_to_dash_c() {
+        for name in [
+            "nu",
+            "nu.exe",
+            "nushell",
+            "C:\\Tools\\nu.exe",
+            "/usr/bin/nushell",
+        ] {
+            let (program, args) = resolve_shell(Some(name), true);
+            assert_eq!(program, name, "{name}");
+            assert_eq!(args, vec!["-c"], "{name}");
+        }
+        // `nu` as a substring must not hijack other shells.
+        let (_, args) = resolve_shell(Some("bash"), false);
+        assert_eq!(args, vec!["-lc"]);
+    }
+
+    /// W1 (shell-streams.dev.md): the PowerShell wrapper pins stderr/progress
+    /// semantics and UTF-8; non-PowerShell shells are untouched.
+    #[test]
+    fn powershell_wrapper_pins_stderr_and_progress() {
+        let wrapped = super::wrap_command_for_encoding(&["-Command"], "Get-ChildItem");
+        assert!(wrapped.contains("[Console]::OutputEncoding"), "{wrapped}");
+        assert!(
+            wrapped.contains("$PSNativeCommandUseErrorActionPreference=$false"),
+            "native stderr must not escalate under a flipped 7.3+ preference: {wrapped}"
+        );
+        assert!(
+            wrapped.contains("$ProgressPreference='SilentlyContinue'"),
+            "{wrapped}"
+        );
+        assert!(wrapped.ends_with("Get-ChildItem"), "{wrapped}");
+
+        let untouched = super::wrap_command_for_encoding(&["-lc"], "ls -la");
+        assert_eq!(untouched, "ls -la");
+        // nu (W4) uses `-c`, so it never matches the `-Command` wrapper check.
+        let nu_untouched = super::wrap_command_for_encoding(&["-c"], "ls | length");
+        assert_eq!(nu_untouched, "ls | length");
     }
 
     #[test]

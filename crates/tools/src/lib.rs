@@ -138,7 +138,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "bash",
-            description: "Execute a shell command in the current workspace. Uses PowerShell on Windows (pwsh preferred) and sh elsewhere; write portable commands. Match the real platform before assuming a binary exists: on Windows the interpreter is `python` (not `python3`) and the shell is PowerShell, elsewhere `python3`/sh; prefer `uv` for Python environments when present.",
+            description: "Execute a shell command in the current workspace. Uses PowerShell on Windows (pwsh preferred) and sh elsewhere; write portable commands. Match the real platform before assuming a binary exists: on Windows the interpreter is `python` (not `python3`) and the shell is PowerShell, elsewhere `python3`/sh; prefer `uv` for Python environments when present. stdout/stderr come back in separate fields with the real exit code: do NOT append `2>&1` to capture errors (on PowerShell 7.2+ that reroutes error records and can drop them). Exit code 141/143 usually means the downstream pipe closed or the timeout fired (SIGPIPE/SIGTERM), not that the command logic failed — check the output fields before retrying.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
