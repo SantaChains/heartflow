@@ -86,6 +86,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show help"),
     ("/status", "Show session status"),
     ("/model [NAME]", "Show or switch the model"),
+    (
+        "/provider [NAME] [MODEL]",
+        "Show or switch the provider (+ optional model)",
+    ),
     ("/mode [NAME]", "Show or switch the permission mode"),
     (
         "/plan <GOAL>",
@@ -223,8 +227,15 @@ pub(crate) struct CompletionContext {
     pub(crate) models: Vec<CompletionItem>,
     pub(crate) modes: Vec<CompletionItem>,
     pub(crate) sessions: Vec<CompletionItem>,
+    /// `/provider` first argument: the switchable provider names.
+    pub(crate) providers: Vec<CompletionItem>,
+    /// `/provider` second argument pool, keyed by the first argument: each
+    /// provider name maps to its catalog models, so `NAME <Tab>` offers that
+    /// provider's models specifically.
+    pub(crate) provider_models: Vec<(String, Vec<CompletionItem>)>,
     pub(crate) current_model: Option<String>,
     pub(crate) current_mode: Option<String>,
+    pub(crate) current_provider: Option<String>,
     /// Idle status line (`model · mode · web · effort`, roadmap C-1): shown
     /// in the hint row when nothing else owns it, so mode/web/effort flips
     /// are visible without a command. `None` falls back to the key hints.
@@ -232,12 +243,22 @@ pub(crate) struct CompletionContext {
 }
 
 /// Where completion applies in the current input: the command head itself, or
-/// the single argument of a chosen command. Multi-line drafts and text past a
-/// first argument (a `/search` query, a `/remember` note) yield no site.
+/// the argument of a chosen command (with `prior` holding an earlier argument
+/// for two-argument commands like `/provider NAME MODEL`). Multi-line drafts
+/// and free-text tails (a `/search` query, a `/remember` note) yield no site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompletionSite<'a> {
-    Command { prefix: &'a str },
-    Argument { command: &'a str, arg: &'a str },
+    Command {
+        prefix: &'a str,
+    },
+    Argument {
+        command: &'a str,
+        /// The first argument of a two-argument command (`/provider zhipu
+        /// <Tab>` carries `zhipu` so the second pool can be selected). `None`
+        /// while completing the first argument itself.
+        prior: Option<&'a str>,
+        arg: &'a str,
+    },
 }
 
 impl<'a> CompletionSite<'a> {
@@ -245,11 +266,13 @@ impl<'a> CompletionSite<'a> {
     fn noun(self) -> &'static str {
         match self {
             Self::Command { .. } => "command",
-            Self::Argument { command, .. } => match command {
-                "/model" => "model",
-                "/mode" => "mode",
-                "/open" => "session",
-                "/plan" | "/queue" => "action",
+            Self::Argument { command, prior, .. } => match (command, prior) {
+                ("/model", _) => "model",
+                ("/mode", _) => "mode",
+                ("/open", _) => "session",
+                ("/plan", _) | ("/queue", _) => "action",
+                ("/provider", Some(_)) => "model",
+                ("/provider", None) => "provider",
                 _ => "match",
             },
         }
@@ -264,18 +287,57 @@ impl<'a> CompletionSite<'a> {
     }
 }
 
-/// Parse `text` into a completion site, or `None` when completion does not apply
-/// (no leading `/`, a multi-line draft, or more than one argument token).
+/// Commands that take two enumerable arguments: the first argument selects the
+/// pool offered for the second. All other commands stop at one argument.
+const TWO_ARG_COMMANDS: &[&str] = &["/provider"];
+
+/// Parse `text` into a completion site, or `None` when completion does not
+/// apply (no leading `/`, a multi-line draft, or past the argument budget).
+/// A trailing space opens the next argument with an empty query (`/model `
+/// lists every model; on a two-argument command it opens the second one).
 fn completion_site(text: &str) -> Option<CompletionSite<'_>> {
     if !text.starts_with('/') || text.contains('\n') {
         return None;
     }
-    match text.split_once(char::is_whitespace) {
-        None => Some(CompletionSite::Command { prefix: text }),
-        // A second whitespace run means free text (a search query, a note), not
-        // an enumerable argument, so stop offering completions past the first.
-        Some((command, rest)) => (!rest.contains(char::is_whitespace))
-            .then_some(CompletionSite::Argument { command, arg: rest }),
+    // `split_whitespace` swallows a trailing run, so track it first: a
+    // trailing space is how the operator opens the next argument slot.
+    let trailing_space = text.ends_with(char::is_whitespace);
+    let mut tokens = text.split_whitespace();
+    let command = tokens.next()?;
+    let Some(first) = tokens.next() else {
+        return if trailing_space {
+            Some(CompletionSite::Argument {
+                command,
+                prior: None,
+                arg: "",
+            })
+        } else {
+            Some(CompletionSite::Command { prefix: text })
+        };
+    };
+    let two_arg = TWO_ARG_COMMANDS.contains(&command);
+    if trailing_space {
+        // The second argument has begun (empty query). Only two-argument
+        // commands with no third token offer a pool there; anything richer is
+        // free text.
+        return (two_arg && tokens.next().is_none()).then_some(CompletionSite::Argument {
+            command,
+            prior: Some(first),
+            arg: "",
+        });
+    }
+    match tokens.next() {
+        None => Some(CompletionSite::Argument {
+            command,
+            prior: None,
+            arg: first,
+        }),
+        Some(second) if two_arg && tokens.next().is_none() => Some(CompletionSite::Argument {
+            command,
+            prior: Some(first),
+            arg: second,
+        }),
+        _ => None,
     }
 }
 
@@ -290,7 +352,11 @@ pub(crate) fn complete(text: &str, ctx: &CompletionContext) -> Vec<CompletionIte
     match completion_site(text) {
         None => Vec::new(),
         Some(CompletionSite::Command { prefix }) => command_completions(prefix),
-        Some(CompletionSite::Argument { command, arg }) => match command {
+        Some(CompletionSite::Argument {
+            command,
+            prior,
+            arg,
+        }) => match command {
             "/model" => ranked_matches(
                 ctx.models
                     .iter()
@@ -314,6 +380,30 @@ pub(crate) fn complete(text: &str, ctx: &CompletionContext) -> Vec<CompletionIte
             ),
             "/plan" => ranked_matches(PLAN_ACTIONS.iter().copied(), arg, None),
             "/queue" => ranked_matches(QUEUE_ACTIONS.iter().copied(), arg, None),
+            "/provider" => match prior {
+                None => ranked_matches(
+                    ctx.providers
+                        .iter()
+                        .map(|item| (item.label.as_str(), item.detail.as_str())),
+                    arg,
+                    ctx.current_provider.as_deref(),
+                ),
+                Some(name) => {
+                    let empty: [(&str, &str); 0] = [];
+                    let pool = ctx
+                        .provider_models
+                        .iter()
+                        .find(|(provider, _)| provider == name)
+                        .map(|(_, items)| {
+                            items
+                                .iter()
+                                .map(|item| (item.label.as_str(), item.detail.as_str()))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_else(|| empty.to_vec());
+                    ranked_matches(pool, arg, None)
+                }
+            },
             _ => Vec::new(),
         },
     }
@@ -1830,8 +1920,27 @@ mod tests {
                 CompletionItem::new("1", "a.json"),
                 CompletionItem::new("2", "b.json"),
             ],
+            providers: vec![
+                CompletionItem::new("deepseek", "builtin"),
+                CompletionItem::new("anthropic", "builtin"),
+                CompletionItem::new("zhipu", "config.toml"),
+            ],
+            provider_models: vec![
+                (
+                    "deepseek".to_string(),
+                    vec![
+                        CompletionItem::new("deepseek-v4-flash", "1M ctx · seed"),
+                        CompletionItem::new("deepseek-v4-pro", "1M ctx · seed"),
+                    ],
+                ),
+                (
+                    "zhipu".to_string(),
+                    vec![CompletionItem::new("glm-5", "seed")],
+                ),
+            ],
             current_model: Some("deepseek-v4-flash".to_string()),
             current_mode: Some("workspace-write".to_string()),
+            current_provider: Some("deepseek".to_string()),
             status_line: None,
         }
     }
@@ -1905,6 +2014,40 @@ mod tests {
         assert!(complete("/model zzz", &ctx()).is_empty());
         // A command with no matching head.
         assert!(complete("/zzz", &ctx()).is_empty());
+    }
+
+    #[test]
+    fn provider_completes_in_two_stages() {
+        // First stage: the provider pool, current tagged by rank order.
+        assert_eq!(
+            labels(&complete("/provider ", &ctx())),
+            vec!["deepseek", "anthropic", "zhipu"]
+        );
+        assert_eq!(labels(&complete("/provider z", &ctx())), vec!["zhipu"]);
+        // Second stage (trailing space): only the chosen provider's models.
+        assert_eq!(labels(&complete("/provider zhipu ", &ctx())), vec!["glm-5"]);
+        assert_eq!(
+            labels(&complete("/provider deepseek ", &ctx())),
+            vec!["deepseek-v4-flash", "deepseek-v4-pro"]
+        );
+        // Second stage with a partial model query.
+        assert_eq!(
+            labels(&complete("/provider deepseek pro", &ctx())),
+            vec!["deepseek-v4-pro"]
+        );
+        // The current provider is tagged in the detail column.
+        assert_eq!(
+            complete("/provider deep", &ctx())[0].detail,
+            "builtin · (current)"
+        );
+        // A provider with no catalog models offers nothing for stage two.
+        assert!(complete("/provider anthropic ", &ctx()).is_empty());
+        // Three tokens (or unknown first arg) fall off the two-argument budget.
+        assert!(complete("/provider a b c", &ctx()).is_empty());
+        assert!(complete("/provider a b ", &ctx()).is_empty());
+        assert!(complete("/provider nobody ", &ctx()).is_empty());
+        // One-argument commands still stop after their first argument.
+        assert!(complete("/model a ", &ctx()).is_empty());
     }
 
     #[test]

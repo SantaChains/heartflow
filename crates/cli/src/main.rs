@@ -50,9 +50,10 @@ use tokio_util::sync::CancellationToken;
 use config::{load_merged_mcp, load_provider_selection, ConfigWatcher};
 use core::{guide_context, guide_draft, HeartModel};
 use provider::{
-    load_catalog, load_merged_settings, persist_discovered, persist_model, AnthropicStreamClient,
-    CassetteClient, CassetteMode, CatalogModel, ModelSource, ProviderCatalog, ProviderProtocol,
-    ProviderSelection, ProviderSettings, TransportClient, CONFIG_VERSION,
+    builtin_base_url, load_catalog, load_merged_settings, persist_discovered, persist_model,
+    AnthropicStreamClient, CassetteClient, CassetteMode, CatalogModel, ModelSource,
+    ProviderCatalog, ProviderProtocol, ProviderSelection, ProviderSettings, TransportClient,
+    CONFIG_VERSION,
 };
 use render::TerminalRenderer;
 // Persistence subsystem (Phase 1 thinning): re-exported crate-wide so existing
@@ -1427,6 +1428,10 @@ async fn dispatch_slash_command(
             plan.planning = false;
             plan.speccing = false;
             plan.spec_path = None;
+            LoopControl::Continue
+        }
+        _ if trimmed == "/provider" || trimmed.starts_with("/provider ") => {
+            handle_provider_command(state, trimmed, selection, runtime, mode, catalog);
             LoopControl::Continue
         }
         _ if trimmed == "/web" || trimmed.starts_with("/web ") => {
@@ -2903,6 +2908,86 @@ fn handle_effort_command(
     }
 }
 
+/// `/provider [NAME] [MODEL]` — show the active provider and the switchable
+/// list (no argument), or swap the live transport (name + optional model).
+/// Lighter than `/bootstrap`: no pre-flight probe, same swap-or-stay contract
+/// as `/model` — the runtime is rebuilt first and the selection only moves on
+/// success, so a failed switch never strands the session.
+fn handle_provider_command(
+    state: &SessionShared,
+    input: &str,
+    selection: &mut ProviderSelection,
+    runtime: &mut AgentRuntime,
+    mode: &str,
+    catalog: &ProviderCatalog,
+) {
+    let requested = input
+        .strip_prefix("/provider")
+        .map(str::trim)
+        .unwrap_or_default();
+    if requested.is_empty() {
+        print_provider_status(selection, catalog);
+        return;
+    }
+    let mut parts = requested.split_whitespace();
+    let Some(name) = parts.next() else {
+        return;
+    };
+    let model = parts.next();
+    if parts.next().is_some() {
+        println!("usage: /provider [NAME] [MODEL]");
+        return;
+    }
+    let next = match resolve_selection(Some(name), model) {
+        Ok(next) => next,
+        Err(error) => {
+            println!("provider switch aborted (nothing changed): {error}");
+            return;
+        }
+    };
+    match build_runtime(state, runtime.session().clone(), next.clone(), true, mode) {
+        Ok(rebuilt) => {
+            *runtime = rebuilt;
+            *selection = next;
+            println!("provider -> {name} (model {})", selection.model());
+        }
+        Err(error) => println!("failed to switch provider: {error}"),
+    }
+}
+
+/// `/provider` with no argument: the active provider (same report `/model`
+/// gives) plus every switchable name — the builtins and any `[provider]`
+/// transport configured in config.toml — so the command is discoverable
+/// without reading docs.
+fn print_provider_status(selection: &ProviderSelection, catalog: &ProviderCatalog) {
+    print_model_status(selection, catalog);
+    let settings = load_merged_settings(&cwd_dir(), &home_dir());
+    let mut names: Vec<String> = provider::builtin_provider_names()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    if settings.base_url.is_some() || settings.api_key_env.is_some() || settings.api_key.is_some() {
+        let custom = settings
+            .name
+            .clone()
+            .unwrap_or_else(|| "custom (config.toml [provider])".to_string());
+        if !names.contains(&custom) {
+            names.push(custom);
+        }
+    }
+    println!(
+        "switch with: /provider NAME [MODEL]  (available: {})",
+        names.join(", ")
+    );
+}
+
+/// `std::env::current_dir`, collapsing errors to a fallible-but-rare empty
+/// path. Only the provider-settings merge needs it here; the merge tolerates
+/// absent files, so an empty path just skips the project layer.
+fn cwd_dir() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_default()
+}
+
 fn handle_model_command(
     state: &SessionShared,
     input: &str,
@@ -3036,6 +3121,52 @@ fn build_completion_context(
         ProviderSelection::Profile(profile) => profile.reasoning_effort.clone(),
         ProviderSelection::Env { .. } => None,
     };
+    // `/provider` pools: switchable names (builtins + any config.toml
+    // transport) and, per name, that provider's catalog models keyed through
+    // its resolved base_url. Mirrors `resolve_spec` precedence — config
+    // base_url overrides a builtin endpoint of the same shape.
+    let settings = load_merged_settings(&cwd_dir(), &home_dir());
+    let mut providers: Vec<(String, String)> = provider::builtin_provider_names()
+        .iter()
+        .map(|name| ((*name).to_string(), "builtin".to_string()))
+        .collect();
+    if settings.base_url.is_some() || settings.api_key_env.is_some() || settings.api_key.is_some() {
+        let custom = settings
+            .name
+            .clone()
+            .unwrap_or_else(|| "custom".to_string());
+        if !providers.iter().any(|(name, _)| *name == custom) {
+            providers.push((custom, "config.toml".to_string()));
+        }
+    }
+    let provider_models = providers
+        .iter()
+        .map(|(name, _)| {
+            let models = builtin_base_url(name)
+                .map(str::to_string)
+                .or_else(|| settings.base_url.clone())
+                .and_then(|base_url| catalog.provider_by_host(&base_url))
+                .map(|entry| {
+                    entry
+                        .models
+                        .iter()
+                        .map(|model| {
+                            editor::CompletionItem::new(model.id.clone(), model_detail(model))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (name.clone(), models)
+        })
+        .collect();
+    let current_provider = match selection {
+        ProviderSelection::Env { .. } => Some("anthropic".to_string()),
+        ProviderSelection::Profile(profile) => Some(
+            catalog
+                .provider_key_by_host(&profile.base_url)
+                .unwrap_or_else(|| "custom".to_string()),
+        ),
+    };
     // C-1 status line: model · mode · web · effort. Segments the session has
     // no opinion on (no effort configured) drop out rather than show `none`.
     let web_label = crate::tool_exec::WebAccess::from_u8(web)
@@ -3053,8 +3184,14 @@ fn build_completion_context(
         models,
         modes,
         sessions,
+        providers: providers
+            .into_iter()
+            .map(|(name, detail)| editor::CompletionItem::new(name, detail))
+            .collect(),
+        provider_models,
         current_model: Some(selection.model().to_string()),
         current_mode: Some(mode.to_string()),
+        current_provider,
         status_line: Some(segments.join(" · ")),
     }
 }

@@ -123,6 +123,23 @@ fn builtin_provider(name: &str) -> Option<BuiltinProvider> {
     }
 }
 
+/// The builtin provider names, in presentation order. `/provider` lists these
+/// plus any `[provider]`-configured custom transport; completion draws the
+/// first-argument pool from this list, so a new builtin becomes switchable and
+/// completable without touching the CLI.
+#[must_use]
+pub fn builtin_provider_names() -> &'static [&'static str] {
+    &["deepseek", "anthropic"]
+}
+
+/// The endpoint a builtin provider name resolves to. The `/provider` completion
+/// uses it to key into the model catalog (`provider.toml` is host-keyed), so
+/// the second argument pool is that provider's known models.
+#[must_use]
+pub fn builtin_base_url(name: &str) -> Option<&'static str> {
+    builtin_provider(name).map(|provider| provider.base_url)
+}
+
 /// Source-level `[provider]` settings, safe to export: secret values never
 /// appear here, only the names of the environment variables holding them.
 ///
