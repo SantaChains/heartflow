@@ -4443,6 +4443,10 @@ fn build_runtime_with_mcp(
     if let Ok(key) = env::var("HEARTFLOW_IMAGE_API_KEY") {
         register_secret(state, &key);
     }
+    // D2 (security.dev.md §五): job persistence (`events.jsonl`,
+    // `status.json`) sits outside the save-path redaction boundary — feed it
+    // the same literal set so worker output reaching disk is scrubbed too.
+    runtime::set_job_redaction_secrets(registered_secrets(state));
     // A malformed `HEARTFLOW_CASSETTE` is fatal before any turn runs: silently
     // recording nothing would be worse than a clear startup error.
     let client = match CassetteMode::from_env()? {

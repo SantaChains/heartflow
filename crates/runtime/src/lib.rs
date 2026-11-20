@@ -57,9 +57,9 @@ pub use file_ops::{
 };
 pub use filelock::{lock_path, with_exclusive, LockError, DEFAULT_LOCK_TIMEOUT};
 pub use jobs::{
-    disk_write_failures, reconcile_stale_records, set_jobs_root, JobRecord, JobRegistry, JobRunner,
-    JobStatus, MessageKind, SpawnError, StopFlag, WorkerMessage, DEFAULT_JOB_SLOTS,
-    DEFAULT_JOB_WALL_TIMEOUT, DEFAULT_MAX_PENDING,
+    disk_write_failures, reconcile_stale_records, set_job_redaction_secrets, set_jobs_root,
+    JobRecord, JobRegistry, JobRunner, JobStatus, MessageKind, SpawnError, StopFlag,
+    WorkerMessage, DEFAULT_JOB_SLOTS, DEFAULT_JOB_WALL_TIMEOUT, DEFAULT_MAX_PENDING,
 };
 pub use mission::{
     auto_record_turn, budget_attention, command_succeeds, file_matches,

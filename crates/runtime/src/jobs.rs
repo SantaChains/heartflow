@@ -30,6 +30,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, PoisonError, RwLock};
 use std::time::SystemTime;
 
+use crate::redact::redact_text;
+
 /// Concurrent worker cap (semaphore semantics; pi enforces the same via its
 /// concurrency queue). Override with `HEARTFLOW_JOB_SLOTS`.
 pub const DEFAULT_JOB_SLOTS: usize = 3;
@@ -175,6 +177,31 @@ pub enum SpawnError {
 
 static JOBS_ROOT: RwLock<Option<PathBuf>> = RwLock::new(None);
 static DISK_WRITE_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Secrets scrubbed from every worker line that reaches disk (D2,
+/// security.dev.md §五): `events.jsonl` and `status.json`'s `result_head`
+/// were the last persistence surfaces outside the save-path `redact_for_save`
+/// boundary. Process-global like [`JOBS_ROOT`]: the REPL knows the concrete
+/// credentials only after provider selection, and workers must see them
+/// regardless of construction order. In-memory `WorkerMessage`s are NOT
+/// scrubbed — the terminal is the user's own surface.
+static PERSISTENCE_SECRETS: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+/// Replace the set of secret literals scrubbed from persisted job lines.
+/// Call once per runtime build with the active credentials (plus whatever
+/// the structural rules in `redact.rs` cannot shape-match, e.g. zhipu keys).
+pub fn set_job_redaction_secrets(secrets: Vec<String>) {
+    if let Ok(mut slot) = PERSISTENCE_SECRETS.write() {
+        *slot = secrets;
+    }
+}
+
+fn persistence_secrets() -> Vec<String> {
+    PERSISTENCE_SECRETS
+        .read()
+        .ok()
+        .map(|slot| slot.clone())
+        .unwrap_or_default()
+}
 
 /// Point the registry at a directory (e.g. `~/.heartflow/sessions/jobs`).
 /// `None` disables disk persistence (registry stays in-memory; tests).
@@ -383,10 +410,15 @@ impl JobRegistry {
             return Err(SpawnError::Saturated);
         }
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let prompt_head: String = prompt.trim().chars().take(80).collect();
+        // D2: `status.json` persists label and the prompt head verbatim, and
+        // both may quote secret material — scrub at record construction so
+        // every downstream persist inherits the cleaned text.
+        let secrets = persistence_secrets();
+        let redacted_prompt = redact_text(prompt, &secrets);
+        let prompt_head: String = redacted_prompt.trim().chars().take(80).collect();
         let record = JobRecord {
             id,
-            label: label.trim().to_string(),
+            label: redact_text(label.trim(), &secrets),
             status: JobStatus::Queued,
             prompt_head,
             pid: std::process::id(),
@@ -397,6 +429,8 @@ impl JobRegistry {
             serde_json::to_string_pretty(&record).unwrap_or_else(|_| "{}".to_string());
         let root = jobs_root();
         persist(&root, id, &status_json);
+        // Label is already scrubbed at record construction; the queued line
+        // re-serializes the same cleaned text.
         append_event(&root, id, "queued", &format!("label={}", record.label));
 
         let handle = Arc::new(JobHandle {
@@ -474,8 +508,17 @@ impl JobRegistry {
                 }
 
                 let tx = registry.inner.tx.clone();
+                // D2: snapshot the persistence secret set once per job — the
+                // set is fixed for the process after provider selection, and
+                // holding a copy across the runner avoids locking per line.
+                let persistence_secrets = persistence_secrets();
                 let mut emit = |kind: MessageKind, text: &str| {
-                    append_event(&jobs_root(), id, kind_label(kind), text);
+                    append_event(
+                        &jobs_root(),
+                        id,
+                        kind_label(kind),
+                        &redact_text(text, &persistence_secrets),
+                    );
                     let _ = tx.send(WorkerMessage {
                         job_id: id,
                         kind,
@@ -513,8 +556,12 @@ impl JobRegistry {
                         registry.terminalize(id, JobStatus::Stopped, None);
                     }
                     Ok(result) => {
-                        let head: String = result.trim().chars().take(160).collect();
-                        append_event(&jobs_root(), id, "result", &result);
+                        // Disk copy is scrubbed (D2); the in-memory supervisor
+                        // wake keeps the original — the terminal is the user's
+                        // own surface.
+                        let redacted = redact_text(&result, &persistence_secrets);
+                        let head: String = redacted.trim().chars().take(160).collect();
+                        append_event(&jobs_root(), id, "result", &redacted);
                         // The supervisor wake: a completed result becomes a
                         // message (Result/NeedDecision are the only two kinds
                         // that wake the supervisor loop).
@@ -526,7 +573,12 @@ impl JobRegistry {
                         registry.terminalize(id, JobStatus::Complete, Some(head));
                     }
                     Err(error) => {
-                        append_event(&jobs_root(), id, "failed", &error);
+                        append_event(
+                            &jobs_root(),
+                            id,
+                            "failed",
+                            &redact_text(&error, &persistence_secrets),
+                        );
                         let _ = tx.send(WorkerMessage {
                             job_id: id,
                             kind: MessageKind::NeedDecision,
@@ -1242,6 +1294,83 @@ mod tests {
             terminal_count <= TERMINAL_KEEP,
             "fleet view must stay bounded: {terminal_count}"
         );
+        clear_jobs_root_for_test();
+    }
+
+    /// D2 (security.dev.md §五): worker output reaching disk — events.jsonl,
+    /// status.json's result_head/prompt_head/label — must be scrubbed with
+    /// the registered secret set plus the structural rules; the in-memory
+    /// supervisor wake keeps the original (the terminal is the user's own
+    /// surface).
+    #[test]
+    fn persisted_job_lines_are_redacted_with_registered_secrets() {
+        let _guard = root_guard();
+        set_jobs_root_for_test("redact");
+        super::set_job_redaction_secrets(vec!["super-secret-literal".to_string()]);
+
+        struct Leaky;
+        impl JobRunner for Leaky {
+            fn run(
+                &mut self,
+                _prompt: &str,
+                _stop: &StopFlag,
+                emit: &mut dyn FnMut(MessageKind, &str),
+            ) -> Result<String, String> {
+                emit(
+                    MessageKind::Progress,
+                    "progress quotes super-secret-literal",
+                );
+                Ok(
+                    "done with super-secret-literal and sk-abcdefghijklmnopqrstuvwxyz123456"
+                        .to_string(),
+                )
+            }
+        }
+
+        let registry = JobRegistry::new(1, DEFAULT_MAX_PENDING);
+        let id = registry
+            .spawn(
+                "label super-secret-literal",
+                "prompt with super-secret-literal",
+                Box::new(Leaky),
+            )
+            .expect("spawn");
+        assert!(drain_until(&registry, id, JobStatus::Complete));
+
+        let root = super::JOBS_ROOT
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("jobs root set");
+        let events = std::fs::read_to_string(super::job_dir(&root, id).join("events.jsonl"))
+            .expect("events file");
+        assert!(!events.contains("super-secret-literal"), "{events}");
+        assert!(events.contains("[REDACTED]"), "{events}");
+
+        let status = std::fs::read_to_string(super::job_dir(&root, id).join("status.json"))
+            .expect("status file");
+        assert!(!status.contains("super-secret-literal"), "{status}");
+        assert!(
+            !status.contains("sk-abcdefghijklmnopqrstuvwxyz"),
+            "prefix-key shapes are scrubbed structurally: {status}"
+        );
+
+        // The disk record's head comes from the scrubbed text.
+        let record = registry
+            .list()
+            .into_iter()
+            .find(|record| record.id == id)
+            .expect("record");
+        assert!(
+            record
+                .result_head
+                .as_deref()
+                .is_some_and(|head| head.contains("[REDACTED]")),
+            "{:?}",
+            record.result_head
+        );
+
+        super::set_job_redaction_secrets(Vec::new());
         clear_jobs_root_for_test();
     }
 

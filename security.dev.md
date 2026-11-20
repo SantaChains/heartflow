@@ -44,7 +44,7 @@ L3 旁路落盘   jobs / cassette / checkpoint / 后台日志 ← 本批前无�
 
 | 通道 | 内容 | redact？ | 处置 |
 |---|---|---|---|
-| jobs `events.jsonl` / `status.json` | worker 结果全文 / 前 160 字符 | ❌（jobs.rs:515-526） | 【缓修 D2】需把 secrets 集传入 jobs 写点，动签名面，随下批 |
+| jobs `events.jsonl` / `status.json` | worker 结果全文 / result_head + prompt_head + label | ❌→✅【已修 D2】 | 全局 `set_job_redaction_secrets(Vec)`（jobs.rs，随 jobs_root 全局模式）——spawn 时 label/prompt_head 源头脱敏，worker emit/result/failed 写盘前过 `redact_text`（字面量+结构规则）；in-memory `WorkerMessage` 不脱敏（终端是用户自有表面）。CLI 在 build_runtime_with_mcp 注册凭据后同步 `registered_secrets(state)`。测试 `persisted_job_lines_are_redacted_with_registered_secrets` |
 | cassette record | AgentEvent 层请求+事件 | ❌（cassette.rs:71-74） | 【缓修 D7】用户显式开启，且 replay 校验依赖原文一致性——加 redact 会破坏回放；文档警示即可 |
 | checkpoint 影子 git | 工作区快照（尊重 .gitignore，排除 .heartflow/） | ❌ | 【缓修 D4】根源是用户未 gitignore 含密文件；建议 doctor 加一条检查项 |
 | 后台 bash 日志 `%TEMP%/heartflow-bg/*.log` | 子进程 stdout/stderr 3 天 | ❌ | 【可接受】子进程 env 已清洗，命令自身回显密钥属用户行为 |
@@ -64,7 +64,7 @@ L3 旁路落盘   jobs / cassette / checkpoint / 后台日志 ← 本批前无�
 ## 八、会话更安全/稳定/好用的行动清单（优先级序）
 
 1. ✅ D1/D3/D5/D10 本批已修（各带测试或共享实现）
-2. 【D2】jobs 写点接 redact：把 `registered_secrets` 传入 jobs worker 初始化，append_event 与 result_head 前过 `redact_text`
+2. ✅ D2 jobs 写点接 redact 已修：`set_job_redaction_secrets` 全局集 + spawn 源头脱敏 + worker 写点过滤，测试钉死
 3. 【D4】`hf doctor` 增加检查：工作区含 `.env`/`*key*` 等未 gitignore 文件时警告会进 checkpoint 影子库
 4. 【D9】save 路径 0600：Windows 侧用现有 ACL（用户目录默认私有，可降级处理），Unix `PermissionsExt::set_mode(0o600)`
 5. 【D8】`hf doctor` 警告 inline api_key 明文，提示改 `api_key_env`
