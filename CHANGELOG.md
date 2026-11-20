@@ -1,4 +1,36 @@
 
+# heartflow 1.6.0 - 2026-11-20
+
+## 新功能
+
+- **provider**: Builtin 表扩至 7 家(zai 智谱国际端点入列) + {NAME}_BASE_URL 基址重定向环境变量族(显式 config > env 重定向 > 内置默认) + AGENTS/docs/bucket/wiki/llms 接口面同步 (`0cce2bf`)
+
+- **st-3/w5/d4**: Mission resume 自动重启 loop 驱动(ST-3) + ToolError hint 字段与政策拒绝 hint(W5) + doctor 含密文件/inline key 检查(D4/D8) (`69c8af5`)
+
+- **provider**: Builtin 表扩至 6 家(zhipu/kimi/qwen/openai 入列,/provider 可切+两段补全) + deepseek 默认模型换代 deepseek-flash + REPL /models 在线刷新模型列表进 catalog + roadmap 收编 DeepSeek 全家桶/Harness 接线 (`8aec613`)
+
+- **repl**: /provider [NAME] [MODEL] 命令——列出/切换 provider(读 config.toml+env,轻量同 /model 契约) + 两段式补全(第一段补 provider 名,选定后第二段按该 provider 的 catalog 补 model 名) + editor 双参数 site 机制 (`cd62328`)
+
+- **w1-w4**: Shell 工具面小批——Windows shell stderr/进度治理前缀(W1) + 工具 description 退出码/2>&1 指导(W2/W3) + nushell 一等 shell 支持(W4) (`efc38f5`)
+
+- **st-2**: 步级传输重试(≤2线性退避,可禁用) + 压缩两级降级(overflow 二连夹具)——传输类流故障回合内恢复,溢出残留两级递进 (`c6f47bc`)
+
+- **st-1**: 流 idle timeout(S1) + 流错误已收 blocks 落 transcript(S7)——夹具先行纪律兑现 (`147fb41`)
+
+
+## 缺陷修复
+
+- **security**: D9 收口——runtime::private_fs 权限加固(Unix 0600/0700, Windows no-op)钉满六类 save 写点(会话快照/SQLite/影子 git/jobs/mission/cassette) + 诊断子进程 cargo --color=never 防 ANSI 污染解析 (`aee76c6`)
+
+- **security**: D2 收口——jobs 持久化面(events.jsonl/status.json)接 redaction——set_job_redaction_secrets 全局集,spawn 源头 label/prompt_head 脱敏,worker 写盘前过滤,测试钉死 (`336ad46`)
+
+- **security**: 代理凭据脱敏进日志/doctor(D1) + MCP stdio 子进程凭据清洗(D3) + image key 注册(D5) + 4xx body 截断(D10)；security.dev.md 安全面审计 (`0ed240f`)
+
+- **cassette**: Replay 匹配按 DYNAMIC_BOUNDARY 切分——静态段严格、动态段只比块数；.gitignore 忽略 fixtures/；新增动态漂移/静态漂移两测试 (`be28cd7`)
+
+- 稳定性批次——错误分级 R2/退避 S2/压缩护栏 R4/循环熔断 S6/热重载保态 S4/steer 落录 S5/锁污染收口 D4/SlotGuard J1/ReplPlanState 聚合 D1/桥接统一 D3；调研文档 agents/ai-rust-hygiene/stability 收编 (`f1a9391`)
+
+
 # heartflow 1.5.0 - 2026-10-26
 
 ## 其他
