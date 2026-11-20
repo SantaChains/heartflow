@@ -115,6 +115,9 @@ pub(crate) fn new_session_state() -> SessionShared {
 pub(crate) fn save_session(state: &SessionShared, session: &Session) -> io::Result<PathBuf> {
     let dir = sessions_dir();
     fs::create_dir_all(&dir)?;
+    // Owner-only traversal (security.dev.md D9): covers the snapshots plus
+    // missions/schedules/queue siblings under the same root. Best effort.
+    runtime::harden_dir(&dir);
     // Never persist a live credential: scrub the transcript that reaches disk
     // (both the authoritative JSON and the SQLite mirror) on a clone, so the
     // in-memory session that talks to the provider is left verbatim.

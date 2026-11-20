@@ -745,6 +745,7 @@ impl MissionLedger {
             DISK_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        crate::private_fs::harden_dir(&dir);
         let Ok(json) = serde_json::to_string_pretty(mission) else {
             DISK_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
             return;
@@ -769,7 +770,7 @@ impl MissionLedger {
             },
         );
         match write_ok {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => crate::private_fs::harden_file(&final_path),
             // Either the lock timed out (closure never ran) or the write
             // itself failed inside the lock; clean the tmp either way.
             Ok(Err(_)) | Err(_) => {
@@ -795,12 +796,20 @@ impl MissionLedger {
             &crate::filelock::lock_path(&path),
             crate::filelock::DEFAULT_LOCK_TIMEOUT,
             || {
-                std::fs::OpenOptions::new()
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir).ok();
+                    crate::private_fs::harden_dir(dir);
+                }
+                let ok = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(&path)
                     .and_then(|mut file| file.write_all(line.as_bytes()))
-                    .is_ok()
+                    .is_ok();
+                if ok {
+                    crate::private_fs::harden_file(&path);
+                }
+                ok
             },
         );
         if !matches!(appended, Ok(true)) {

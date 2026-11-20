@@ -182,11 +182,16 @@ pub fn run_post_edit_diagnostics(changed_files: &[PathBuf]) -> Option<PostEditDi
         return None;
     };
 
-    let command = "cargo check --message-format=short --quiet";
+    let command = "cargo check --message-format=short --quiet --color=never";
     let started = Instant::now();
     let deadline = Duration::from_secs(timeout_secs());
     let mut child = match std::process::Command::new(&cargo)
-        .args(["check", "--message-format=short", "--quiet"])
+        .args([
+            "check",
+            "--message-format=short",
+            "--quiet",
+            "--color=never",
+        ])
         .current_dir(&project_root)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

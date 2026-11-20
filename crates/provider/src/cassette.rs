@@ -399,7 +399,11 @@ fn persist(path: &Path, entries: &[RecordedEntry]) -> std::io::Result<()> {
     };
     let text = serde_json::to_string_pretty(&cassette)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
-    fs::write(path, text)
+    fs::write(path, text)?;
+    // Owner-only (security.dev.md D9): cassettes carry unredacted requests +
+    // event streams by design (D7); best effort, never fails the record.
+    runtime::harden_file(path);
+    Ok(())
 }
 
 fn unix_secs() -> u64 {

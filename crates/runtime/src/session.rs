@@ -161,6 +161,9 @@ impl Session {
             let _ = fs::remove_file(&temp);
             return Err(error.into());
         }
+        // Owner-only before the rename (mode survives it): the transcript is
+        // the most sensitive surface hf writes (security.dev.md D9).
+        crate::private_fs::harden_file(&temp);
         match rename_with_transient_retry(&temp, path) {
             Ok(()) => Ok(()),
             Err(error) => {

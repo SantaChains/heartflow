@@ -114,9 +114,15 @@ fn git_ok(output: &std::process::Output) -> bool {
 /// Initialize the bare shadow repo for `cwd` if it does not exist yet.
 fn ensure_shadow_repo(git_dir: &Path, _cwd: &Path) -> io::Result<()> {
     if git_dir.join("HEAD").exists() {
+        // Legacy repos created before D9 get tightened here too (idempotent).
+        crate::private_fs::harden_dir(git_dir);
         return Ok(());
     }
     std::fs::create_dir_all(git_dir)?;
+    // Owner-only traversal (security.dev.md D9): the shadow repo holds full
+    // workspace snapshots; 0o700 on the repo root covers every git object
+    // created inside it. Best effort, never blocks the snapshot.
+    crate::private_fs::harden_dir(git_dir);
     // `git init --bare` rejects `--work-tree` (fatal), so init gets its own
     // minimal invocation without the shared helper's work-tree flag; every
     // later call pins both flags explicitly.

@@ -253,6 +253,7 @@ fn persist_status_at(final_path: &Path, status_json: &str) {
         DISK_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
         return;
     }
+    crate::private_fs::harden_dir(dir);
     let tmp_path = final_path.with_extension("json.tmp");
     let write = || -> std::io::Result<()> {
         std::fs::write(&tmp_path, status_json)?;
@@ -264,7 +265,7 @@ fn persist_status_at(final_path: &Path, status_json: &str) {
         crate::filelock::DEFAULT_LOCK_TIMEOUT,
         write,
     ) {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => crate::private_fs::harden_file(final_path),
         Ok(Err(_)) | Err(_) => {
             let _ = std::fs::remove_file(&tmp_path);
             DISK_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -289,12 +290,20 @@ fn append_event(root: &Option<PathBuf>, id: u64, kind: &str, text: &str) {
         &crate::filelock::lock_path(&path),
         crate::filelock::DEFAULT_LOCK_TIMEOUT,
         || {
-            std::fs::OpenOptions::new()
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).ok();
+                crate::private_fs::harden_dir(dir);
+            }
+            let ok = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&path)
                 .and_then(|mut file| file.write_all(line.as_bytes()))
-                .is_ok()
+                .is_ok();
+            if ok {
+                crate::private_fs::harden_file(&path);
+            }
+            ok
         },
     );
     if !matches!(appended, Ok(true)) {

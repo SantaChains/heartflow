@@ -59,14 +59,14 @@ L3 旁路落盘   jobs / cassette / checkpoint / 后台日志 ← 本批前无�
 ## 七、明文存量与权限【缓修】
 
 - **D8**：inline `[provider] api_key` 用户自写明文落 config.toml（config.rs:137-141）。hf 自身导出不回写该字段（318-328，有测试），但存量明文无法由程序消除——文档建议：优先 `api_key_env`。
-- **D9**：sessions/SQLite/checkpoint 全默认权限继承（Unix 0644 可他用户读；Windows 用户 profile ACL 内单用户，风险有限）。全仓无 set_permissions；跨平台 0600 需处理 Windows ACL（无 winside 依赖），单列后批。
+- **D9**【已修 2026-11-21】：save 路径权限。`runtime::private_fs::{harden_file, harden_dir}`（Unix 0600/0700，Windows no-op 沿用用户 profile 单用户 ACL，无 ACL 依赖），best-effort 契约：加固失败绝不阻断写盘。钉点：会话快照 temp+rename 前（mode 随 rename 保留）、sessions 目录（storage.rs）、SQLite db+父目录（WAL/SHM 由 0700 目录遍历覆盖）、checkpoint 影子 git 目录（含 legacy 存量幂等收紧）、jobs/mission 的 events.jsonl+status.json+state.json+job 目录、cassette 录制文件。Unix 侧单测钉 0600/0700（Windows no-op 天然过）。
 
 ## 八、会话更安全/稳定/好用的行动清单（优先级序）
 
 1. ✅ D1/D3/D5/D10 本批已修（各带测试或共享实现）
 2. ✅ D2 jobs 写点接 redact 已修：`set_job_redaction_secrets` 全局集 + spawn 源头脱敏 + worker 写点过滤，测试钉死
 3. ✅ D4 已修（2026-11-21）：`hf doctor` 新增 `check_secret_exposure`——工作区深度 ≤2 扫描含密文件名形态（.env/.pem/.key/id_rsa/credentials/secret/token/.netrc/.npmrc），跳过 .git/node_modules/target/.venv，`git check-ignore` 判定是否被忽略（git 不可用则保守全部报告）
-4. 【D9】save 路径 0600：Windows 侧用现有 ACL（用户目录默认私有，可降级处理），Unix `PermissionsExt::set_mode(0o600)`
+4. ✅ D9 已修（2026-11-21）：save 路径 0600——`runtime::private_fs` 助手 + 六类写点钉死（见 §七 D9）；Windows 降级沿用用户 profile ACL（行动裁决兑现）。附带修复：诊断子进程 cargo 加 `--color=never`——`CARGO_TERM_COLOR=always` 环境下 ANSI 码曾污染 short-format 解析的 level 字段（真实产品缺陷，非测试问题）
 5. ✅ D8 已修（2026-11-21）：`hf doctor` 新增 `check_inline_api_key`——inline `[provider] api_key` 明文落盘时警告并建议 `api_key_env`
 6. 稳定面已由 ST-1/ST-2 覆盖：idle timeout、blocks 落 transcript、步级重试、压缩降级（见 stability.md）
 

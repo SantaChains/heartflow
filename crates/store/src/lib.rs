@@ -87,7 +87,15 @@ impl Store {
     /// a pragma batch is rejected, or a migration step fails (e.g. the file is
     /// locked beyond the busy timeout or its schema is unreadable).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
         let conn = Connection::open(path)?;
+        // Owner-only mirror (security.dev.md D9): the file plus its directory
+        // (0o700 traversal covers the WAL/SHM siblings SQLite creates later).
+        // Best effort — the mirror is disposable cache, never fail the open.
+        runtime::harden_file(path);
+        if let Some(parent) = path.parent() {
+            runtime::harden_dir(parent);
+        }
         Self::init(conn, true)
     }
 

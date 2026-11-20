@@ -859,6 +859,14 @@ mod tests {
 
     #[test]
     fn deepseek_builtin_sets_native_endpoint_and_model() {
+        // Ambient-var aware (see env_var_wins_over_inline_key): a sandbox
+        // carrying DEEPSEEK_BASE_URL proves the env layer outranking the
+        // builtin default; otherwise the compiled-in endpoint stands.
+        let expected_base_url = std::env::var("DEEPSEEK_BASE_URL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "https://api.deepseek.com/v1".to_string());
         let spec =
             resolve_spec(Some("deepseek"), None, &ProviderSettings::default()).expect("resolve");
         match spec {
@@ -871,7 +879,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(protocol, ProviderProtocol::OpenAi);
-                assert_eq!(base_url, "https://api.deepseek.com/v1");
+                assert_eq!(base_url, expected_base_url);
                 assert_eq!(api_key_env, "DEEPSEEK_API_KEY");
                 // 2026-11 refresh: the official current id is deepseek-flash
                 // (V4.1-Flash); deepseek-v4-flash is retired-but-served.

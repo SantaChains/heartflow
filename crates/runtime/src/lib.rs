@@ -11,6 +11,7 @@ mod filelock;
 mod jobs;
 mod mission;
 mod permissions;
+mod private_fs;
 mod prompt;
 mod redact;
 mod schedule;
@@ -72,6 +73,7 @@ pub use permissions::{
     PermissionMode, PermissionOutcome, PermissionPolicy, PermissionPromptDecision,
     PermissionPrompter, PermissionRequest,
 };
+pub use private_fs::{harden_dir, harden_file};
 pub use prompt::{
     load_system_prompt, ContextFile, ProjectContext, PromptBuildError, SystemPromptBuilder,
     FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
