@@ -59,7 +59,10 @@ pub(super) fn from_map(map: &BTreeMap<String, String>) -> Option<EnvProxy> {
                 break;
             }
             None => warnings.push(format!(
-                "{name}={raw:?} is not a supported proxy URL (want one of {SUPPORTED_SCHEMES:?}); ignored"
+                "{name} holds an unsupported proxy URL (want one of {SUPPORTED_SCHEMES:?}); ignored"
+                // The raw value is deliberately not echoed: proxy URLs may
+                // embed `user:password` credentials, and warnings surface in
+                // `hf doctor` output where they would leak verbatim.
             )),
         }
     }
@@ -161,7 +164,14 @@ mod tests {
         let found = from_map(&env).expect("env proxy");
         assert_eq!(found.url.as_str(), "http://plain:3/");
         assert_eq!(found.warnings.len(), 1);
-        assert!(found.warnings[0].contains("ftp://nope:1"));
+        // The raw value is deliberately withheld from warnings: proxy URLs may
+        // embed credentials, and warnings reach `hf doctor` output.
+        assert!(
+            found.warnings[0].contains("HTTPS_PROXY"),
+            "{:?}",
+            found.warnings
+        );
+        assert!(!found.warnings[0].contains("ftp://nope:1"));
     }
 
     #[test]

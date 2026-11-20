@@ -247,9 +247,11 @@ impl ProxyResolution {
         if let Some(raw) = config.as_ref().and_then(|config| config.address.as_deref()) {
             match env::parse_proxy_url(raw) {
                 Some(url) => picked = Some((url, ProxySource::Config, Vec::new())),
-                None => warnings.push(format!(
-                    "[proxy] address {raw:?} is not a supported proxy URL; ignored"
-                )),
+                None => warnings.push(
+                    // Raw value withheld: proxy addresses can embed userinfo
+                    // credentials, and warnings reach `hf doctor` output.
+                    "[proxy] address is not a supported proxy URL; ignored".to_string(),
+                ),
             }
         }
         if picked.is_none() {
@@ -452,7 +454,8 @@ impl ProxyResolution {
             ", probe ok"
         };
         format!(
-            "{address} ({source}, mode={:?}, rules={}, no_proxy={}{probe})",
+            "{} ({source}, mode={:?}, rules={}, no_proxy={}{probe})",
+            display_redacted(address),
             self.mode,
             self.rules.len(),
             self.no_proxy.len()
@@ -502,6 +505,19 @@ fn cidr_contains(entry: &str, host: &rules::HostKey) -> bool {
     cidr.contains(host)
 }
 
+/// Display form of a proxy URL with userinfo scrubbed. Proxy credentials are
+/// the one secret that reaches log and `hf doctor` surfaces, and `Url`'s
+/// `Display` prints `user:password@` verbatim.
+fn display_redacted(address: &Url) -> String {
+    if address.username().is_empty() && address.password().is_none() {
+        return address.as_str().to_string();
+    }
+    let mut scrubbed = address.clone();
+    let _ = scrubbed.set_username("[REDACTED]");
+    let _ = scrubbed.set_password(Some("[REDACTED]"));
+    scrubbed.to_string()
+}
+
 /// One TCP connect against the proxy endpoint. DNS is resolved first, so a
 /// hostname proxy costs one lookup; the connect itself is bounded by
 /// [`PROBE_TIMEOUT`].
@@ -542,7 +558,7 @@ pub fn init_global(config: Option<&ProxyConfig>) {
         } else {
             resolution.mark_dead();
             tracing::warn!(
-                proxy = %address,
+                proxy = %display_redacted(&address),
                 "proxy did not answer a {PROBE_TIMEOUT:?} TCP probe; requests will go direct",
             );
         }
@@ -842,5 +858,17 @@ mod tests {
         direct_cfg.mode = Some("direct".into());
         let direct = ProxyResolution::resolve(Some(&direct_cfg));
         assert!(direct.describe().contains("direct"));
+    }
+
+    #[test]
+    fn describe_never_echoes_proxy_userinfo() {
+        // `hf doctor` prints describe() verbatim; embedded credentials must be
+        // scrubbed at the source, not at each call site.
+        let resolution =
+            ProxyResolution::resolve(Some(&address_config("http://user:secret@127.0.0.1:7890")));
+        let text = resolution.describe();
+        assert!(!text.contains("secret"), "{text}");
+        assert!(!text.contains("user:secret"), "{text}");
+        assert!(text.contains("127.0.0.1:7890"), "{text}");
     }
 }

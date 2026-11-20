@@ -170,6 +170,23 @@ impl ApiError {
     }
 }
 
+/// Cap for the raw response body echoed through `Display` (error arms with no
+/// structured `error_type`/`message`). Server bodies are usually small JSON,
+/// but a misbehaving gateway can return megabytes; the echo lands on the user
+/// screen and in saved transcripts, so it must stay bounded. Truncation is
+/// char-boundary safe.
+fn truncate_body_echo(body: &str) -> &str {
+    const MAX_BODY_ECHO: usize = 2048;
+    if body.len() <= MAX_BODY_ECHO {
+        return body;
+    }
+    let mut end = MAX_BODY_ECHO;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    &body[..end]
+}
+
 impl Display for ApiError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -201,7 +218,7 @@ impl Display for ApiError {
                 (Some(error_type), Some(message)) => {
                     write!(f, "api returned {status} ({error_type}): {message}")
                 }
-                _ => write!(f, "api returned {status}: {body}"),
+                _ => write!(f, "api returned {status}: {}", truncate_body_echo(body)),
             },
             Self::RetriesExhausted {
                 attempts,
@@ -250,5 +267,26 @@ impl From<serde_json::Error> for ApiError {
 impl From<VarError> for ApiError {
     fn from(value: VarError) -> Self {
         Self::InvalidApiKeyEnv(value)
+    }
+}
+
+#[cfg(test)]
+mod body_echo_tests {
+    use super::*;
+
+    #[test]
+    fn short_body_passes_through_unchanged() {
+        assert_eq!(truncate_body_echo("plain error"), "plain error");
+    }
+
+    #[test]
+    fn oversized_body_is_truncated_on_char_boundary() {
+        let body = "x".repeat(4096);
+        assert_eq!(truncate_body_echo(&body).len(), 2048);
+        // Multi-byte characters must not be split mid-codepoint.
+        let multi = "长".repeat(2048);
+        let cut = truncate_body_echo(&multi);
+        assert!(cut.is_char_boundary(cut.len()));
+        assert!(cut.chars().count() <= 2048);
     }
 }

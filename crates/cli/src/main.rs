@@ -4438,6 +4438,11 @@ fn build_runtime_with_mcp(
             }
         }
     }
+    // The image tool has its own key that never appears in provider config;
+    // register it too or an error echo carrying it survives redaction.
+    if let Ok(key) = env::var("HEARTFLOW_IMAGE_API_KEY") {
+        register_secret(state, &key);
+    }
     // A malformed `HEARTFLOW_CASSETTE` is fatal before any turn runs: silently
     // recording nothing would be worse than a clear startup error.
     let client = match CassetteMode::from_env()? {

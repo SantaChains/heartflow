@@ -20,7 +20,9 @@ mod stop;
 mod usage;
 
 pub use agent_assets::{discover_rules, discover_skills, RuleFile, SkillSummary};
-pub use bash::{execute_bash, is_dangerous_command, BashCommandInput, BashCommandOutput};
+pub use bash::{
+    execute_bash, is_dangerous_command, scrub_credential_env, BashCommandInput, BashCommandOutput,
+};
 pub use checkpoint::{
     list_snapshots, purge_new_files_since, restore_snapshot, set_checkpoint_root,
     snapshot_failures, PurgeReport, Snapshot,

@@ -1140,6 +1140,7 @@ name = "heartflow-mcp"
 version = "1.5.0"
 dependencies = [
  "heartflow-proxy",
+ "heartflow-runtime",
  "reqwest",
  "serde_json",
  "thiserror 2.0.21",

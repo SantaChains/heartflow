@@ -456,8 +456,11 @@ fn is_credential_env_name(name: &str) -> bool {
 
 /// Remove every credential-bearing variable from a child's environment,
 /// inherited from the agent's own process. Absent variables are a no-op, so
-/// this is unconditional over whatever the host happens to export.
-fn scrub_credential_env(command: &mut Command) {
+/// this is unconditional over whatever the host happens to export. Shared by
+/// the bash tool and the MCP stdio transport: both spawn children that must
+/// not see provider keys, and the name-shape policy must not drift between
+/// them.
+pub fn scrub_credential_env(command: &mut Command) {
     for (name, _) in env::vars_os() {
         if name.to_str().is_some_and(is_credential_env_name) {
             command.env_remove(name);

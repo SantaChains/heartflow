@@ -69,6 +69,11 @@ impl StdioTransport {
             .stdout(Stdio::piped())
             // Server diagnostics must never reach our stdout/stderr.
             .stderr(Stdio::null());
+        // Same credential scrub the bash tool applies: a spawned MCP server
+        // must not see provider keys just because the parent process exports
+        // them. Config `env` additions are applied after the scrub, so an
+        // explicitly configured secret still reaches its own server.
+        runtime::scrub_credential_env(&mut command);
         for (key, value) in env {
             command.env(key, value);
         }
