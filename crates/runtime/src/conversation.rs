@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinSet};
@@ -639,7 +640,25 @@ pub struct ConversationRuntime<C, T> {
     /// last: the section is stable within a turn, so provider prompt
     /// caching only re-pays when the ledger actually changes.
     turn_context: Option<String>,
+    /// Base delay for the ST-2 step-level transport retry (1.5s, 3s by
+    /// attempts). Tunable only via builder so tests can shrink it to ~zero;
+    /// there is no env knob — the default is deliberately fixed.
+    transport_retry_backoff: Duration,
+    /// ST-2 step-level transport retry budget (default
+    /// [`MAX_TRANSPORT_RETRIES`]). Zero disables the step-level retry
+    /// entirely — hosts that already retry at their own layer (autopilot
+    /// transport backoff, jobs workers) can opt out to avoid double retries.
+    transport_retries_max: usize,
 }
+
+/// ST-2: transport-class stream faults are retried at the step level before
+/// the turn fails. Two attempts (three requests total) bounds the worst case
+/// a dead tunnel can stall a turn at roughly base + 2×base of pure backoff.
+const MAX_TRANSPORT_RETRIES: usize = 2;
+
+/// Base for the linear-in-attempt transport backoff: 1.5s after the first
+/// fault, 3s after the second.
+const TRANSPORT_RETRY_BACKOFF_BASE: Duration = Duration::from_millis(1500);
 
 impl<C, T> ConversationRuntime<C, T>
 where
@@ -669,6 +688,8 @@ where
             token_calibration: RefCell::new(TokenCalibration::default()),
             steer_mailbox: SteerMailbox::default(),
             turn_context: None,
+            transport_retry_backoff: TRANSPORT_RETRY_BACKOFF_BASE,
+            transport_retries_max: MAX_TRANSPORT_RETRIES,
         }
     }
 
@@ -705,6 +726,17 @@ where
     #[must_use]
     pub fn with_max_continuations(mut self, max_continuations: usize) -> Self {
         self.max_continuations = max_continuations;
+        self
+    }
+
+    /// Override the ST-2 step-level transport retry policy: `max` retry
+    /// attempts per turn (0 disables) with `base` backoff (multiplied by the
+    /// attempt number). Intended for tests (shrink to ~zero) and hosts that
+    /// retry at their own layer.
+    #[must_use]
+    pub fn with_transport_retry_policy(mut self, max: usize, base: Duration) -> Self {
+        self.transport_retries_max = max;
+        self.transport_retry_backoff = base;
         self
     }
 
@@ -763,9 +795,14 @@ where
         // S6 (roadmap §16 R2): behavior-level fuses for the turn loop.
         let mut stop_policy = StopPolicy::new();
         let mut consecutive_tool_error_batches = 0usize;
-        // D4.2: the hard-trigger retry happens at most once per turn; a
-        // second context-overflow rejection surfaces as a real error.
-        let mut hard_retried = false;
+        // D4.2 + ST-2: the hard-trigger escalation happens at most twice per
+        // turn — level 1 compacts with the configured policy, level 2 halves
+        // the preserved tail; a third overflow rejection surfaces as a real
+        // error, so a poisoned session can never loop here.
+        let mut hard_retries = 0usize;
+        // ST-2: transport-class stream faults are retried at the step level
+        // before the turn fails (see MAX_TRANSPORT_RETRIES).
+        let mut transport_retries = 0usize;
 
         loop {
             // Honor a Ctrl+C FIRST (C2, semantic review): cancellation must
@@ -842,28 +879,70 @@ where
                 Self::consume_stream(&mut stream, notify, cancel).await;
 
             if let Some(message) = stream_error {
-                // D4.2 hard trigger: a context-overflow rejection is the only
-                // ground truth that the session no longer fits (estimates
-                // drift; a 400 does not). Compact once and retry the request
-                // exactly once — a second rejection fails the turn for real,
-                // so a poisoned session can never loop here.
-                if !hard_retried
+                let kind = classify_stream_error(&message);
+                // D4.2 hard trigger with two-level degradation (ST-2): a
+                // context-overflow rejection is the only ground truth that the
+                // session no longer fits (estimates drift; a 400 does not).
+                // Level 1 compacts with the configured policy; level 2 halves
+                // the preserved tail and budget. A third rejection fails the
+                // turn for real, so a poisoned session can never loop here.
+                if kind == ErrorKind::Overflow
                     && self.compaction.hard_trigger
                     && self.compaction.context_window_tokens > 0
-                    && self.session.messages.len() > self.compaction.preserve_recent_messages
-                    && is_context_overflow_error(&message)
+                    && hard_retries < 2
                 {
-                    hard_retried = true;
-                    tracing::warn!(
-                        target: "heartflow::compact",
-                        "provider rejected the request as over the context window; compacting and retrying once (hard trigger)"
-                    );
-                    let result =
-                        self.compact_with(self.compaction, ThresholdKind::WindowFull, None);
+                    let (config, label) = if hard_retries == 0 {
+                        (self.compaction, "compacting")
+                    } else {
+                        (
+                            CompactionConfig {
+                                preserve_recent_messages: self
+                                    .compaction
+                                    .preserve_recent_messages
+                                    .saturating_sub(1),
+                                tail_budget_tokens: self.compaction.tail_budget_tokens / 2,
+                                ..self.compaction
+                            },
+                            "compacting harder (halved tail)",
+                        )
+                    };
+                    if self.session.messages.len() > config.preserve_recent_messages {
+                        hard_retries += 1;
+                        tracing::warn!(
+                            target: "heartflow::compact",
+                            "provider rejected the request as over the context window; {label} and retrying (hard trigger, level {hard_retries})"
+                        );
+                        let result = self.compact_with(config, ThresholdKind::WindowFull, None);
+                        notify(&AgentEvent::Truncated(format!(
+                            "context overflow (level {hard_retries}); {} older messages compacted, retrying",
+                            result.removed_message_count
+                        )));
+                        continue;
+                    }
+                    // Nothing left to drop under even the degraded policy:
+                    // fall through and fail the turn with the provider's
+                    // message rather than loop forever.
+                }
+                // ST-2 step-level transport retry: a transport-class fault
+                // (dead connection, idle timeout, mid-stream reset) is worth
+                // one clean regeneration — nothing has landed in the
+                // transcript yet on this path (S7 landing below happens only
+                // when the retry budget is exhausted), so a retry cannot
+                // duplicate content.
+                if kind == ErrorKind::Transport && transport_retries < self.transport_retries_max {
+                    transport_retries += 1;
+                    let delay = self.transport_retry_backoff * transport_retries as u32;
                     notify(&AgentEvent::Truncated(format!(
-                        "context overflow; {} older messages compacted, retrying once",
-                        result.removed_message_count
+                        "transport fault ({message}); retrying {transport_retries}/{MAX_TRANSPORT_RETRIES} after {delay:?}"
                     )));
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        () = cancel.cancelled() => {
+                            return Err(RuntimeError::cancelled(
+                                "turn cancelled during transport retry backoff",
+                            ));
+                        }
+                    }
                     continue;
                 }
                 // S7: the turn is about to fail, but the user already watched
@@ -2259,7 +2338,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_overflow_fails_the_turn_and_disabled_never_retries() {
+    async fn overflow_fails_after_two_degradation_levels_and_unarmed_never_retries() {
         use std::sync::{Arc, Mutex as StdMutex};
 
         #[derive(Clone)]
@@ -2278,7 +2357,8 @@ mod tests {
             }
         }
 
-        // Armed but the overflow repeats: one retry, then a real failure.
+        // Armed but the overflow repeats: level-1 compaction, then the ST-2
+        // level-2 degradation (halved tail), then a real failure.
         let calls = Arc::new(StdMutex::new(0usize));
         let mut runtime = ConversationRuntime::new(
             fat_session(3),
@@ -2296,14 +2376,14 @@ mod tests {
         let error = runtime
             .run_turn("go", None, &mut noop_notify(), &CancellationToken::new())
             .await
-            .expect_err("a repeated overflow must fail the turn");
+            .expect_err("overflow surviving both degradation levels must fail the turn");
         assert!(error.to_string().contains("prompt is too long"));
         assert_eq!(
             *calls
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-            2,
-            "no second retry loop"
+            3,
+            "two escalation levels, then the third rejection fails"
         );
 
         // Unarmed (the shipped default): the overflow surfaces immediately.
@@ -2331,6 +2411,178 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             1,
             "no retry when unarmed"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_overflow_degrades_the_tail_harder_and_recovers() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        #[derive(Clone)]
+        struct OverflowTwiceThenReply(Arc<StdMutex<Vec<ApiRequest>>>);
+        impl ApiClient for OverflowTwiceThenReply {
+            fn stream(&mut self, request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+                let call = {
+                    let mut guard = self
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard.push(request);
+                    guard.len()
+                };
+                match call {
+                    1 | 2 => Ok(TurnStream::from_events(vec![AgentEvent::Error {
+                        message: "this model's maximum context length is 1000 tokens. However, you requested 1200 tokens".to_string(),
+                        hint: None,
+                    }])),
+                    _ => Ok(TurnStream::from_events(vec![
+                        AgentEvent::TextDelta("recovered at level 2".to_string()),
+                        AgentEvent::MessageStop,
+                    ])),
+                }
+            }
+        }
+
+        let requests: Arc<StdMutex<Vec<ApiRequest>>> = Arc::new(StdMutex::new(Vec::new()));
+        let mut runtime = ConversationRuntime::new(
+            fat_session(3),
+            OverflowTwiceThenReply(Arc::clone(&requests)),
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::Allow),
+            Vec::new(),
+        )
+        .with_compaction(CompactionConfig {
+            context_window_tokens: 2_000,
+            soft_trigger: SoftTrigger::Ds4,
+            hard_trigger: true,
+            ..CompactionConfig::default()
+        });
+        let summary = runtime
+            .run_turn("go", None, &mut noop_notify(), &CancellationToken::new())
+            .await
+            .expect("the level-2 degradation recovers the turn");
+        assert_eq!(summary.iterations, 3, "overflow, compact, degrade, retry");
+
+        let guard = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(guard.len(), 3, "two escalations, then success");
+        assert!(
+            guard[1].messages.len() < guard[0].messages.len(),
+            "level-1 compaction shrank the request"
+        );
+        assert!(
+            guard[2].messages.len() < guard[1].messages.len(),
+            "level-2 degradation shrank it further"
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_error_retries_then_recovers() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        #[derive(Clone)]
+        struct TransportThenReply(Arc<StdMutex<usize>>);
+        impl ApiClient for TransportThenReply {
+            fn stream(&mut self, _request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+                let mut calls = self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *calls += 1;
+                if *calls == 1 {
+                    // A dead tunnel mid-stream, as the idle watchdog reports it
+                    // (the message must classify as Transport, not Other).
+                    return Ok(TurnStream::from_events(vec![AgentEvent::Error {
+                        message:
+                            "stream went silent for 2s mid-turn; the connection is presumed dead"
+                                .to_string(),
+                        hint: None,
+                    }]));
+                }
+                Ok(TurnStream::from_events(vec![
+                    AgentEvent::TextDelta("recovered".to_string()),
+                    AgentEvent::MessageStop,
+                ]))
+            }
+        }
+
+        let calls = Arc::new(StdMutex::new(0usize));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            TransportThenReply(Arc::clone(&calls)),
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::Allow),
+            Vec::new(),
+        )
+        .with_transport_retry_policy(2, std::time::Duration::from_millis(1));
+        let summary = runtime
+            .run_turn("go", None, &mut noop_notify(), &CancellationToken::new())
+            .await
+            .expect("one transport fault is retried, not terminal");
+        assert_eq!(summary.iterations, 2, "fault, backoff, retry");
+        assert_eq!(
+            *calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            2
+        );
+        let reply_text = summary
+            .assistant_messages
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            reply_text.contains("recovered"),
+            "the retry's reply is the turn's output: {reply_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_retry_exhausts_after_two_attempts() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        #[derive(Clone)]
+        struct AlwaysTransport(Arc<StdMutex<usize>>);
+        impl ApiClient for AlwaysTransport {
+            fn stream(&mut self, _request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+                let mut calls = self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *calls += 1;
+                Ok(TurnStream::from_events(vec![AgentEvent::Error {
+                    message: "connection reset by peer".to_string(),
+                    hint: None,
+                }]))
+            }
+        }
+
+        let calls = Arc::new(StdMutex::new(0usize));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            AlwaysTransport(Arc::clone(&calls)),
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::Allow),
+            Vec::new(),
+        )
+        .with_transport_retry_policy(2, std::time::Duration::from_millis(1));
+        let error = runtime
+            .run_turn("go", None, &mut noop_notify(), &CancellationToken::new())
+            .await
+            .expect_err("repeated transport faults exhaust the retry budget");
+        assert!(error.kind == super::ErrorKind::Transport, "{error}");
+        assert_eq!(
+            *calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            3,
+            "initial request plus MAX_TRANSPORT_RETRIES retries"
         );
     }
 

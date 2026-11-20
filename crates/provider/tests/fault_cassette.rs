@@ -60,7 +60,11 @@ async fn try_drive<C: ApiClient>(
         executor,
         PermissionPolicy::new(PermissionMode::Allow),
         SystemPromptBuilder::new().build(),
-    );
+    )
+    // Step-level transport retry (ST-2) would consume cassette turns the
+    // fixture does not have: these drills pin the S7 partial-block semantics
+    // on the *final* failure, so the retry layer is off here.
+    .with_transport_retry_policy(0, std::time::Duration::ZERO);
     let mut events = Vec::new();
     let result = runtime
         .run_turn(

@@ -191,3 +191,19 @@ REPL 主循环（`cli/main.rs:1047-1108`）→ `run_turn_interactive`（`cli/tur
 - `conversation.rs` stream_error 终态分支：`return Err` 前先落盘 `blocks`（`!finished` 分支原本就有，此为残留缺口）。**hard-trigger 重试路径刻意不落**——重试会重新生成该内容，且不得把它带进本已超限的请求。
 - 故障夹具测试 `provider/tests/fault_cassette.rs`（2 条）：真实录制→JSON 变异截断（删 Usage/MessageStop）/变异加 Error 事件→回放真实 runtime→断言 Transport 类错误 + `partial answer` 留存 transcript。物理演练夹具 `fixtures/truncated-turn1.json`（35 事件截断）手动回放：thinking 流到半句即断、回合失败、session 保存——行为与设计一致。
 - 铁律兑现：**先录夹具，再动流式路径**——本批所有流式改动均有夹具/真服务器测试背书。
+
+## 8. 落地记录（2026-11-20 第四批：ST-2）
+
+### 步级传输重试（≤2，线性退避）✅
+- `conversation.rs` stream_error 分支：`classify_stream_error == Transport` 时在回合内重试——预算 2 次（共 3 请求），退避 base 1.5s × 尝试序号（1.5s/3s），sleep 与取消令牌 `select!` 竞速，退避中 Ctrl+C 立即返回 Cancelled。
+- 重试路径**不落 S7 blocks**（重试重新生成），预算耗尽后的最终失败才落——零重复内容。
+- `StreamIdle` 的 Display 文案含 "connection"，classify 自然命中 Transport——S1 的 idle 挂死现在自动获得步级重试，两机制串联：120s 静默 → 检测 → 1.5s/3s 退避重试 → 仍死才失败（partial blocks 落盘）。
+- builder `with_transport_retry_policy(max, base)`：max=0 可整体禁用——宿主已在自己的层做传输重试时（autopilot 退避、jobs worker）避免双层重试叠加。`fault_cassette` 夹具测试即用 0 预算钉住 S7 语义。
+
+### 压缩两级降级（overflow 二连）✅
+- hard-trigger 从「一次重试」升级为两级：**L1** 配置压缩（原语义）→ 仍 overflow → **L2** 激进降级（`preserve_recent_messages` 减 1、`tail_budget_tokens` 减半）再重试 → 仍 overflow → 真失败。会话再坏也最多三次请求，无死循环。
+- 夹具测试（runtime 层，沿用 hard-trigger 既有模式；cassette replay 对 messages 严格校验，压缩后请求与录制不符，故溢出故障夹具放 runtime 层是唯一可行位置）：
+  - `second_overflow_degrades_the_tail_harder_and_recovers`：overflow→压缩→overflow→降级→成功，断言三请求逐级变小；
+  - `overflow_fails_after_two_degradation_levels...`：三连 overflow 断言 3 次请求后失败（原「二次即失败」语义更新）；
+  - `transport_error_retries_then_recovers` / `transport_retry_exhausts_after_two_attempts`：重试恢复 + 预算耗尽。
+- StopPolicy token 预算臂未随本批（仍待 usage_tracker 跨迭代口径）。
