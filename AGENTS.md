@@ -145,7 +145,7 @@ CI 有三条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/**`
 
 ## 发布流程
 
-三段式 `plan(dry) → publish → windows-zip`，零 Node；发布逻辑集中在 `scripts/release.sh`，CI 与本地共用同一事实源。
+三段式 `plan(dry) → publish → windows-zip`，零 Node；发布逻辑集中在 `scripts/release.sh`，CI 与本地共用同一事实源。**推送纪律（2026-10-22 事故铁律）：`release.yml` 挂在 `on: push: branches: [main]`——推 main 即自动 bump 版本 + 发 Release + 回写 bucket manifest，不可撤回；未经用户当次明确指令禁止 `git push`，commit 一律本地。**
 
 - 本地预检（必须先于 push，不得用 Actions 试错）：`bash scripts/release.sh plan`；`RELEASE_TAG=<tag> RELEASE_BUMP=<bump> RELEASE_DRY_RUN=1 bash scripts/release.sh publish`（只读预演，需本地 git-cliff；tag/bump 取 plan 输出——脚本不自动继承）。质量门本地全绿后才 push。
 - 版本语义：`feat:` → minor、`fix:` → patch、`!` 或 `BREAKING CHANGE:` → major；`chore/docs/test/ci/style/build` 不入正文且 plan job 秒级短路（规则见根 `cliff.toml`）。提交 scope 用 crate 名，如 `feat(tools): ...`。
