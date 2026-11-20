@@ -28,6 +28,13 @@ pub enum ApiError {
         attempt: u32,
         base_delay: Duration,
     },
+    /// S1: a live SSE stream produced no bytes for `idle` while the body was
+    /// still open — the tunnel is dead even though TCP says otherwise. Kept
+    /// distinct from `Http(timeout)` (request phase) so logs can tell "never
+    /// connected" from "went silent mid-stream".
+    StreamIdle {
+        idle: Duration,
+    },
 }
 
 impl ApiError {
@@ -80,6 +87,7 @@ impl ApiError {
             Self::Json(_) => "json decode error",
             Self::InvalidSseFrame(_) => "sse frame error",
             Self::BackoffOverflow { .. } => "backoff overflow",
+            Self::StreamIdle { .. } => "stream idle timeout",
         }
     }
 
@@ -95,6 +103,10 @@ impl ApiError {
             | Self::Json(_)
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. } => false,
+            // A mid-stream stall is a transport fault like any other: the
+            // caller may already hold partial blocks, but a fresh request is
+            // the only way to finish the turn.
+            Self::StreamIdle { .. } => true,
         }
     }
 
@@ -150,6 +162,9 @@ impl ApiError {
                 Some("check that the API key environment variable is set correctly")
             }
             Self::Json(_) => Some("unexpected response format — the provider API may have changed"),
+            Self::StreamIdle { .. } => Some(
+                "the stream went silent mid-turn — check network/proxy stability, or raise HEARTFLOW_STREAM_IDLE_TIMEOUT_MS if your provider legitimately thinks this long",
+            ),
             Self::Io(_) | Self::InvalidSseFrame(_) | Self::BackoffOverflow { .. } => None,
         }
     }
@@ -203,6 +218,10 @@ impl Display for ApiError {
             } => write!(
                 f,
                 "retry backoff overflowed on attempt {attempt} with base delay {base_delay:?}"
+            ),
+            Self::StreamIdle { idle } => write!(
+                f,
+                "stream went silent for {idle:?} mid-turn; the connection is presumed dead"
             ),
         }
     }

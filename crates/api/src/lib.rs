@@ -1,5 +1,6 @@
 mod client;
 mod error;
+mod idle;
 mod openai;
 mod responses;
 mod retry;
@@ -8,6 +9,7 @@ mod types;
 
 pub use client::{AnthropicClient, MessageStream};
 pub use error::ApiError;
+pub use idle::{stream_idle_timeout_from_env, DEFAULT_STREAM_IDLE_TIMEOUT, STREAM_IDLE_ENV};
 pub use openai::{
     Balance, BalanceInfo, ChatChoice, ChatChunk, ChatChunkChoice, ChatContent, ChatContentPart,
     ChatDelta, ChatDeltaFunction, ChatDeltaToolCall, ChatFunctionCall, ChatImageUrl, ChatMessage,

@@ -177,3 +177,17 @@ REPL 主循环（`cli/main.rs:1047-1108`）→ `run_turn_interactive`（`cli/tur
 - **S1/S7/R1 流式路径**（idle timeout、步级重试、blocks 落 transcript）：ST-0 夹具未录，铁律不动。
 - **ST-3 后半**（Blocked 恢复路径 `/jobs unblock`）：需要 mission 工具面扩展，下批。
 - **StopPolicy 的 token 预算臂**：需要 `usage_tracker` 跨迭代口径，随 ST-2。
+
+## 7. 落地记录（2026-11-20 第三批：ST-1，夹具先行纪律兑现）
+
+首条真实夹具 `fixtures/first.json`（4 回合，用户 PowerShell 实录）落地后，流式路径解禁。**期间夹具本身抓到一个真缺陷**：replay 对 ApiRequest 全等校验，而 system prompt 动态段含 git 快照/日期/cwd，任何文件改动都会让夹具永久失效——已修（cassette.rs `replay_compatible` 按 `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` 切分：静态段严格、动态段只比块数；commit 2f613e5）。
+
+### S1 · 流 idle timeout ✅
+- `api/src/idle.rs`（新）：`read_chunk_with_idle` 统一三个 transport（Anthropic `client.rs` / OpenAI `openai.rs` / Responses `responses.rs`）的 chunk 读取——默认 120s 静默预算，`HEARTFLOW_STREAM_IDLE_TIMEOUT_MS` 覆盖（0=关），builder `.with_stream_idle_timeout(Option<Duration>)` 供测试钉预算。
+- 新 `ApiError::StreamIdle { idle }`：kind "stream idle timeout"、retryable=true、带网络排查 hint；与 `Http(timeout)`（请求阶段）区分——日志可分辨「从未连上」与「流中沉默」。
+- 集成测试 `stalled_stream_fails_with_idle_timeout`：真 TCP 服务器发一个 SSE 事件后挂死（chunked 编码不终止），预算 150ms，实测 0.17s 报 StreamIdle。**坑**：content-length 声明满 body 会干净 EOF，必须 chunked 半途停发才能模拟挂死。
+
+### S7 · 流错误已收 blocks 落 transcript ✅
+- `conversation.rs` stream_error 终态分支：`return Err` 前先落盘 `blocks`（`!finished` 分支原本就有，此为残留缺口）。**hard-trigger 重试路径刻意不落**——重试会重新生成该内容，且不得把它带进本已超限的请求。
+- 故障夹具测试 `provider/tests/fault_cassette.rs`（2 条）：真实录制→JSON 变异截断（删 Usage/MessageStop）/变异加 Error 事件→回放真实 runtime→断言 Transport 类错误 + `partial answer` 留存 transcript。物理演练夹具 `fixtures/truncated-turn1.json`（35 事件截断）手动回放：thinking 流到半句即断、回合失败、session 保存——行为与设计一致。
+- 铁律兑现：**先录夹具，再动流式路径**——本批所有流式改动均有夹具/真服务器测试背书。

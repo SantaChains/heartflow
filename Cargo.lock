@@ -1119,6 +1119,7 @@ dependencies = [
 name = "heartflow-api"
 version = "1.5.0"
 dependencies = [
+ "bytes",
  "heartflow-proxy",
  "reqwest",
  "serde",

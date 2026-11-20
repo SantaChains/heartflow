@@ -5,6 +5,7 @@ use serde::Deserialize;
 use tracing::debug;
 
 use crate::error::ApiError;
+use crate::idle::{read_chunk_with_idle, stream_idle_timeout_from_env};
 use crate::retry::{build_http, is_retryable_status, parse_retry_after, RetryPolicy};
 use crate::sse::{SseFrame, SseParser};
 
@@ -21,6 +22,8 @@ pub struct ResponsesClient {
     api_key: String,
     base_url: String,
     retry: RetryPolicy,
+    /// S1: silence budget between stream chunks; `None` waits forever.
+    stream_idle: Option<Duration>,
 }
 
 impl ResponsesClient {
@@ -31,6 +34,7 @@ impl ResponsesClient {
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
             retry: RetryPolicy::default(),
+            stream_idle: stream_idle_timeout_from_env(),
         }
     }
 
@@ -48,6 +52,14 @@ impl ResponsesClient {
         max_backoff: Duration,
     ) -> Self {
         self.retry = RetryPolicy::new(max_retries, initial_backoff, max_backoff);
+        self
+    }
+
+    /// Pin the stream idle budget, overriding `HEARTFLOW_STREAM_IDLE_TIMEOUT_MS`.
+    /// `None` waits forever (the pre-S1 behavior).
+    #[must_use]
+    pub fn with_stream_idle_timeout(mut self, idle: Option<Duration>) -> Self {
+        self.stream_idle = idle;
         self
     }
 
@@ -86,6 +98,7 @@ impl ResponsesClient {
             parser: SseParser::new(),
             pending: VecDeque::new(),
             done: false,
+            idle: self.stream_idle,
         })
     }
 
@@ -154,6 +167,8 @@ pub struct ResponsesStream {
     parser: SseParser,
     pending: VecDeque<ResponsesEvent>,
     done: bool,
+    /// S1 silence budget between chunks; `None` waits forever.
+    idle: Option<Duration>,
 }
 
 impl ResponsesStream {
@@ -171,12 +186,13 @@ impl ResponsesStream {
             if self.done {
                 return Ok(None);
             }
-            let frames: Vec<SseFrame> = if let Some(chunk) = self.response.chunk().await? {
-                self.parser.push(&chunk)?
-            } else {
-                self.done = true;
-                self.parser.finish()?
-            };
+            let frames: Vec<SseFrame> =
+                if let Some(chunk) = read_chunk_with_idle(&mut self.response, self.idle).await? {
+                    self.parser.push(&chunk)?
+                } else {
+                    self.done = true;
+                    self.parser.finish()?
+                };
             for frame in frames {
                 if frame.data.is_empty() || frame.data == "[DONE]" {
                     continue;

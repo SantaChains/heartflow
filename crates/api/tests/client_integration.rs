@@ -12,6 +12,87 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
+/// S1: a live SSE connection that stops producing bytes must fail with
+/// `StreamIdle` after the configured budget, not hang the turn forever. The
+/// server here delivers one real event, then never writes again and never
+/// closes — exactly the hung-tunnel shape the watchdog exists for.
+#[tokio::test]
+async fn stalled_stream_fails_with_idle_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener binds");
+    let address = listener.local_addr().expect("local addr");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut buffer = Vec::new();
+        let mut header_end = None;
+        while header_end.is_none() {
+            let mut chunk = [0_u8; 1024];
+            let read = socket.read(&mut chunk).await.expect("read request");
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            header_end = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+        }
+        // Headers plus one content_block_delta sent as a single chunked body
+        // chunk, then stall: the body stays open forever with no terminating
+        // zero-size chunk and no further bytes.
+        let sse = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
+        );
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+        socket.write_all(head.as_bytes()).await.expect("write head");
+        let chunk_frame = format!("{:x}\r\n{}\r\n", sse.len(), sse);
+        socket
+            .write_all(chunk_frame.as_bytes())
+            .await
+            .expect("write sse");
+        socket.flush().await.expect("flush");
+        // Hold the connection open without sending anything else. Aborted when
+        // the test task ends.
+        std::future::pending::<()>().await;
+    });
+
+    let client = AnthropicClient::new("test-key")
+        .with_base_url(format!("http://{address}"))
+        .with_stream_idle_timeout(Some(Duration::from_millis(150)));
+    let mut stream = client
+        .stream_message(&sample_request(false))
+        .await
+        .expect("stream should start");
+
+    // First event parses fine: the watchdog only governs the gap between
+    // chunks, not the first-byte latency.
+    let first = stream.next_event().await.expect("first event");
+    assert!(first.is_some(), "the delivered event must arrive");
+
+    let started = std::time::Instant::now();
+    let error = stream
+        .next_event()
+        .await
+        .expect_err("a stalled stream must fail, not hang");
+    let elapsed = started.elapsed();
+
+    match &error {
+        ApiError::StreamIdle { idle } => {
+            assert_eq!(*idle, Duration::from_millis(150));
+        }
+        other => panic!("expected StreamIdle, got {other:?}"),
+    }
+    assert!(
+        error.is_retryable(),
+        "a mid-stream stall is a transport fault"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the watchdog must fire near the budget, took {elapsed:?}"
+    );
+
+    server.abort();
+}
+
 #[tokio::test]
 async fn send_message_posts_json_and_parses_response() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));

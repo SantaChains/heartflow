@@ -866,6 +866,17 @@ where
                     )));
                     continue;
                 }
+                // S7: the turn is about to fail, but the user already watched
+                // these deltas stream in — dropping them would make the saved
+                // transcript lie about what happened and leave tool_use blocks
+                // unrecoverable. Land the partial content (skipped on the
+                // hard-trigger retry above: the retry regenerates this content
+                // and must not carry it into a larger, already-overflowing
+                // request).
+                if !blocks.is_empty() {
+                    let partial = ConversationMessage::assistant_with_usage(blocks, usage);
+                    self.session.messages.push(partial);
+                }
                 return Err(RuntimeError::with_kind(
                     classify_stream_error(&message),
                     message,
