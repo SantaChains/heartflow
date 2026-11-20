@@ -151,8 +151,12 @@ impl ToolExecutor for NativeToolExecutor {
                 WebAccess::from_u8(self.web_access.load(Ordering::Relaxed)).label()
             )));
         }
-        let value = serde_json::from_str(input)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        let value = serde_json::from_str(input).map_err(|error| {
+            ToolError::with_hint(
+                format!("invalid tool input JSON: {error}"),
+                "arguments must be one JSON object matching the tool's input_schema; check quote escaping and trailing commas",
+            )
+        })?;
         tools::execute_tool(tool_name, &value).map_err(ToolError::new)
     }
 

@@ -1389,7 +1389,7 @@ async fn dispatch_slash_command(
             LoopControl::Continue
         }
         _ if trimmed == "/mission" || trimmed.starts_with("/mission ") => {
-            handle_mission_command(trimmed, missions);
+            handle_mission_command(trimmed, missions, state, runtime, prompter, mode).await;
             LoopControl::Continue
         }
         _ if trimmed == "/schedule" || trimmed.starts_with("/schedule ") => {
@@ -1807,7 +1807,14 @@ fn handle_jobs_command(
 /// supervisor's long-lived task units. The disciplines (anti-early-complete,
 /// anti-early-give-up, budget-not-kill) are enforced in `runtime::mission`,
 /// not by prompt — this surface only translates them into messages.
-fn handle_mission_command(input: &str, missions: &runtime::MissionLedger) {
+async fn handle_mission_command(
+    input: &str,
+    missions: &runtime::MissionLedger,
+    state: &SessionShared,
+    runtime: &mut AgentRuntime,
+    prompter: &mut CliPermissionPrompter,
+    mode: &str,
+) {
     let arg = input.trim().strip_prefix("/mission").unwrap_or("").trim();
     let mut tokens = arg.split_whitespace();
     let sub = tokens.next().unwrap_or("");
@@ -1969,7 +1976,21 @@ fn handle_mission_command(input: &str, missions: &runtime::MissionLedger) {
                 missions.resume(id)
             };
             match result {
-                Ok(m) => println!("m{} is now {}", m.id, m.status.label()),
+                Ok(m) => {
+                    println!("m{} is now {}", m.id, m.status.label());
+                    // ST-3: a resume only flips the ledger; the autopilot
+                    // loop exited when the mission blocked, so a loop-mode
+                    // session restarts the drive here instead of stranding
+                    // the mission Active with nobody pushing it. A paused
+                    // mission stays parked — the operator resumes work, not
+                    // necessarily the automation.
+                    if sub == "resume" && mode == "loop" {
+                        println!("loop: restarting the auto-continue drive for m{}...", m.id);
+                        let _ = maybe_autopilot(state, runtime, prompter, mode).await;
+                    } else if sub == "resume" {
+                        println!("hint: /mode loop restarts the auto-continue drive for this mission.");
+                    }
+                }
                 Err(error) => println!("{error}"),
             }
         }

@@ -206,10 +206,21 @@ pub trait ToolExecutor: Send + Sync + 'static {
     }
 }
 
+/// A tool execution failure with an optional `hint` for the model. W5
+/// (nushell `LabeledError` 参照): the hint rides the transcript's tool_result
+/// text as a separate `hint:` line, so a repeated failure carries a *fix
+/// suggestion*, not just the error — the model's most common failure mode is
+/// retrying the identical call after a policy denial or a malformed argument.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{message}")]
+#[error(
+    "{message}{}",
+    self.hint
+        .as_ref()
+        .map_or(String::new(), |h| format!("\nhint: {h}"))
+)]
 pub struct ToolError {
     message: String,
+    hint: Option<String>,
 }
 
 impl ToolError {
@@ -217,6 +228,16 @@ impl ToolError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            hint: None,
+        }
+    }
+
+    /// An error that tells the model what to try next, not only what broke.
+    #[must_use]
+    pub fn with_hint(message: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            hint: Some(hint.into()),
         }
     }
 }
@@ -1234,14 +1255,20 @@ where
                     allowed.push((tool_use_id.clone(), tool_name.clone(), input.clone()));
                 }
                 PermissionOutcome::Deny { reason } => {
+                    // W5: a denial is a policy refusal, not a tool fault —
+                    // the model's reflex (retry unchanged) is exactly wrong.
+                    // The hint rides the tool_result text the model reads.
+                    let output = format!(
+                        "{reason}\nhint: this is a policy denial, not a tool failure; do not retry the call unchanged - reshape it to stay inside the workspace and non-destructive, or ask the operator to approve it"
+                    );
                     notify(&AgentEvent::ToolResult {
                         id: tool_use_id.clone(),
                         name: tool_name.clone(),
-                        output: reason.clone(),
+                        output: output.clone(),
                         is_error: true,
                     });
                     let message =
-                        ConversationMessage::tool_result(tool_use_id, tool_name, reason, true);
+                        ConversationMessage::tool_result(tool_use_id, tool_name, output, true);
                     self.session.messages.push(message.clone());
                     tool_results.push(message);
                 }
@@ -1697,7 +1724,12 @@ impl ToolExecutor for StaticToolExecutor {
     fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
         self.handlers
             .get(tool_name)
-            .ok_or_else(|| ToolError::new(format!("unknown tool: {tool_name}")))?(input)
+            .ok_or_else(|| {
+                ToolError::with_hint(
+                    format!("unknown tool: {tool_name}"),
+                    "call with a name from the advertised tool specs; check spelling and namespace prefixes before retrying",
+                )
+            })?(input)
     }
 }
 
@@ -2750,7 +2782,13 @@ mod tests {
         assert_eq!(summary.tool_results.len(), 1);
         assert!(matches!(
             &summary.tool_results[0].blocks[0],
-            ContentBlock::ToolResult { is_error: true, output, .. } if output == "not now"
+            ContentBlock::ToolResult { is_error: true, output, .. } if output.starts_with("not now")
+        ));
+        // W5: the denial rides a policy hint so the model does not retry
+        // the identical call.
+        assert!(matches!(
+            &summary.tool_results[0].blocks[0],
+            ContentBlock::ToolResult { output, .. } if output.contains("hint: this is a policy denial")
         ));
     }
 
@@ -3620,6 +3658,16 @@ mod tests {
                 ]))
             }
         }
+    }
+
+    #[test]
+    fn tool_error_hint_rides_the_display_text() {
+        // W5: the hint reaches the transcript as a separate line, so a model
+        // reading the tool_result sees a fix suggestion, not only the error.
+        let plain = ToolError::new("boom");
+        assert_eq!(plain.to_string(), "boom");
+        let hinted = ToolError::with_hint("denied", "reshape the call");
+        assert_eq!(hinted.to_string(), "denied\nhint: reshape the call");
     }
 
     #[tokio::test]

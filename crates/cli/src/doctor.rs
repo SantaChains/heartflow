@@ -8,7 +8,7 @@
 use std::env;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use provider::config_file_paths;
 use runtime::Session;
@@ -251,6 +251,14 @@ pub(crate) fn run_doctor(fix: bool) -> Result<Vec<String>, Box<dyn std::error::E
     // The derived history database, if present, must be structurally sound.
     check_history_store(&mut problems);
 
+    // §D4/D8 (security.dev.md): credential-exposure surface. Files that look
+    // like they hold secrets but are not gitignored can leak through the
+    // model's own reads (bash/glob see everything readable), checkpoint
+    // snapshots, and git-status system-prompt lines. An inline config key is
+    // plaintext on disk by design, but the operator should know it is there.
+    check_secret_exposure(&mut problems);
+    check_inline_api_key(&mut problems);
+
     let count = problems.len();
     if count == 0 {
         println!("no problems found");
@@ -321,6 +329,121 @@ fn check_history_store(problems: &mut Vec<String>) {
             println!("  fail {message}");
             problems.push(message);
         }
+    }
+}
+
+/// File-name shapes that commonly hold credentials. Name-based, on purpose:
+/// content scanning would read every file (slow, and itself a privacy move).
+const SECRET_FILE_PATTERNS: &[&str] = &[
+    ".env",
+    ".env.",
+    ".pem",
+    ".key",
+    "id_rsa",
+    "id_ed25519",
+    "credentials",
+    "secret",
+    ".netrc",
+    ".npmrc",
+    "token",
+];
+
+/// Directories never descended into: VCS internals, dependency trees and
+/// build outputs are noise, never operator secrets.
+const SECRET_SCAN_SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".venv"];
+
+/// Files in `dir` (depth ≤ 2) whose names suggest credentials.
+fn candidate_secret_files(dir: &Path, depth: usize) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let skip = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| SECRET_SCAN_SKIP_DIRS.contains(&n));
+            if !skip && depth < 2 {
+                found.extend(candidate_secret_files(&path, depth + 1));
+            }
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        if SECRET_FILE_PATTERNS
+            .iter()
+            .any(|pattern| lower.starts_with(pattern) || lower.contains(pattern))
+        {
+            found.push(path);
+        }
+    }
+    found
+}
+
+/// D4: a secret-shaped file that git does not ignore is one `git add .` (or a
+/// checkpoint snapshot) away from leaving the machine, and the model's tools
+/// can read it either way — the operator should at least know it is exposed.
+/// Git decides "ignored" (`git check-ignore`), so the check degrades to
+/// reporting everything when git is unavailable or the directory is not a
+/// repository.
+fn check_secret_exposure(problems: &mut Vec<String>) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let candidates = candidate_secret_files(&cwd, 0);
+    if candidates.is_empty() {
+        println!("  ok   secrets: no credential-shaped files in the workspace");
+        return;
+    }
+    let mut exposed = Vec::new();
+    for path in &candidates {
+        let ignored = std::process::Command::new("git")
+            .args(["check-ignore", "-q"])
+            .arg(path.as_os_str())
+            .current_dir(&cwd)
+            .status()
+            .is_ok_and(|status| status.success());
+        if !ignored {
+            exposed.push(path.display().to_string());
+        }
+    }
+    if exposed.is_empty() {
+        println!(
+            "  ok   secrets: {} credential-shaped file(s), all gitignored",
+            candidates.len()
+        );
+        return;
+    }
+    println!("  warn secrets: not gitignored (tools can read them; snapshots may copy them):");
+    for path in &exposed {
+        println!("       {path}");
+    }
+    println!("       add them to .gitignore, or move secrets into env vars / the keychain");
+    problems.push(format!(
+        "{} secret-shaped file(s) are not gitignored: {}",
+        exposed.len(),
+        exposed.join(", ")
+    ));
+}
+
+/// D8: an inline `[provider] api_key` is plaintext in config.toml. Legitimate
+/// (materialize falls back to it), but worth a line so the operator knows the
+/// key is on disk in a file that travels with dotfile syncs.
+fn check_inline_api_key(problems: &mut Vec<String>) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let settings = provider::load_merged_settings(&cwd, &crate::storage::home_dir());
+    if settings
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty())
+    {
+        let message = "config.toml holds an inline [provider] api_key (plaintext on disk)";
+        println!("  warn config: {message}; prefer api_key_env (an env var name) so the secret stays out of synced files");
+        problems.push(message.to_string());
+    } else {
+        println!("  ok   config: no inline api_key (env-var sourcing or none)");
     }
 }
 

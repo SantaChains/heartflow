@@ -65,9 +65,9 @@ L3 旁路落盘   jobs / cassette / checkpoint / 后台日志 ← 本批前无�
 
 1. ✅ D1/D3/D5/D10 本批已修（各带测试或共享实现）
 2. ✅ D2 jobs 写点接 redact 已修：`set_job_redaction_secrets` 全局集 + spawn 源头脱敏 + worker 写点过滤，测试钉死
-3. 【D4】`hf doctor` 增加检查：工作区含 `.env`/`*key*` 等未 gitignore 文件时警告会进 checkpoint 影子库
+3. ✅ D4 已修（2026-11-21）：`hf doctor` 新增 `check_secret_exposure`——工作区深度 ≤2 扫描含密文件名形态（.env/.pem/.key/id_rsa/credentials/secret/token/.netrc/.npmrc），跳过 .git/node_modules/target/.venv，`git check-ignore` 判定是否被忽略（git 不可用则保守全部报告）
 4. 【D9】save 路径 0600：Windows 侧用现有 ACL（用户目录默认私有，可降级处理），Unix `PermissionsExt::set_mode(0o600)`
-5. 【D8】`hf doctor` 警告 inline api_key 明文，提示改 `api_key_env`
+5. ✅ D8 已修（2026-11-21）：`hf doctor` 新增 `check_inline_api_key`——inline `[provider] api_key` 明文落盘时警告并建议 `api_key_env`
 6. 稳定面已由 ST-1/ST-2 覆盖：idle timeout、blocks 落 transcript、步级重试、压缩降级（见 stability.md）
 
 ## 九、检测面（防泄漏的观测点）

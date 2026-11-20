@@ -175,7 +175,7 @@ REPL 主循环（`cli/main.rs:1047-1108`）→ `run_turn_interactive`（`cli/tur
 
 ### 未动（按纪律）
 - **S1/S7/R1 流式路径**（idle timeout、步级重试、blocks 落 transcript）：ST-0 夹具未录，铁律不动。
-- **ST-3 后半**（Blocked 恢复路径 `/jobs unblock`）：需要 mission 工具面扩展，下批。
+- **ST-3 后半已落地**（2026-11-21）：`/mission resume <id>` 成功翻回 Active 且当前 mode 为 loop 时自动重启 autopilot 驱动（`maybe_autopilot`），不再停留在"Active 但无人推动"的死态；非 loop 模式提示 `/mode loop`。刻意区分：resume Blocked → 重启自动化，resume Paused → 仅翻状态（操作者恢复工作不等于恢复自动化）。
 - **StopPolicy 的 token 预算臂**：需要 `usage_tracker` 跨迭代口径，随 ST-2。
 
 ## 7. 落地记录（2026-11-20 第三批：ST-1，夹具先行纪律兑现）
