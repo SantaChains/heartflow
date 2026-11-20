@@ -14,6 +14,7 @@ use crate::compact::{
 use crate::permissions::{PermissionOutcome, PermissionPolicy, PermissionPrompter};
 use crate::schema::validate_tool_input;
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+use crate::stop::StopPolicy;
 use crate::usage::{TokenUsage, UsageTracker};
 
 /// Provider-agnostic tool advertisement sent alongside each request.
@@ -219,11 +220,102 @@ impl ToolError {
     }
 }
 
+/// Machine-readable class of a runtime failure (roadmap §16 R2: 失败有类，
+/// 类定动作). Callers branch on this instead of string-matching error text:
+/// the loop autopilot excludes [`ErrorKind::Transport`] from its blocked
+/// streak, the CLI renders cancellation differently, and retry policy hangs
+/// off the transport class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// Connection/setup failure, mid-stream hang, timeout, or a premature
+    /// stream end — transient, worth retrying.
+    Transport,
+    /// Authentication/authorization failure (401/403, bad key).
+    Auth,
+    /// The provider rejected the request as over the context window.
+    Overflow,
+    /// The model misbehaved: empty reply, loop-detected tool spinning, fuse
+    /// tripped — not worth retrying the same way.
+    Model,
+    /// The operator cancelled the turn (Ctrl+C).
+    Cancelled,
+    /// Anything not covered above.
+    Other,
+}
+
+impl ErrorKind {
+    /// Short label for logs and the loop autopilot's messages.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Transport => "transport",
+            Self::Auth => "auth",
+            Self::Overflow => "overflow",
+            Self::Model => "model",
+            Self::Cancelled => "cancelled",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Classify a mid-stream `AgentEvent::Error` message. All provider transports
+/// surface failures as text at this boundary (the structured `ApiError` lives
+/// in the `api` crate and does not cross it), so this is the one deliberate
+/// string-matching point — kept next to the overflow matcher in `compact.rs`
+/// and covered by tests. Unknown patterns classify as [`ErrorKind::Other`].
+#[must_use]
+pub fn classify_stream_error(message: &str) -> ErrorKind {
+    let lower = message.to_ascii_lowercase();
+    if is_context_overflow_error(message) {
+        return ErrorKind::Overflow;
+    }
+    const AUTH_MARKERS: [&str; 6] = [
+        "401",
+        "403",
+        "unauthorized",
+        "authentication",
+        "invalid api key",
+        "api key",
+    ];
+    const TRANSPORT_MARKERS: [&str; 12] = [
+        "connection",
+        "timed out",
+        "timeout",
+        "reset",
+        "eof",
+        "broken pipe",
+        "network",
+        "502",
+        "503",
+        "504",
+        "overloaded",
+        "stream ended",
+    ];
+    if AUTH_MARKERS.iter().any(|m| lower.contains(m)) {
+        return ErrorKind::Auth;
+    }
+    if TRANSPORT_MARKERS.iter().any(|m| lower.contains(m)) {
+        return ErrorKind::Transport;
+    }
+    if lower.contains("429") || lower.contains("rate limit") {
+        // Rate limiting is transient but quota-shaped, not transport-shaped:
+        // the autopilot retries it with its backoff, yet it is not a
+        // connection fault. Classed as Transport so transient bursts do not
+        // kill long missions.
+        return ErrorKind::Transport;
+    }
+    if lower.contains("400") || lower.contains("invalid request") {
+        return ErrorKind::Model;
+    }
+    ErrorKind::Other
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{message}")]
 pub struct RuntimeError {
     message: String,
     hint: Option<String>,
+    kind: ErrorKind,
 }
 
 impl RuntimeError {
@@ -232,6 +324,7 @@ impl RuntimeError {
         Self {
             message: message.into(),
             hint: None,
+            kind: ErrorKind::Other,
         }
     }
 
@@ -240,13 +333,36 @@ impl RuntimeError {
         Self {
             message: message.into(),
             hint,
+            kind: ErrorKind::Other,
         }
+    }
+
+    /// A classified error: explicit kind, optional user-facing hint.
+    #[must_use]
+    pub fn with_kind(kind: ErrorKind, message: impl Into<String>, hint: Option<String>) -> Self {
+        Self {
+            message: message.into(),
+            hint,
+            kind,
+        }
+    }
+
+    /// The operator cancelled: the canonical cancellation error.
+    #[must_use]
+    pub fn cancelled(message: impl Into<String>) -> Self {
+        Self::with_kind(ErrorKind::Cancelled, message, None)
     }
 
     /// A human-readable hint for what to try next, when the error carries one.
     #[must_use]
     pub fn hint(&self) -> Option<&str> {
         self.hint.as_deref()
+    }
+
+    /// The machine-readable failure class.
+    #[must_use]
+    pub fn kind(&self) -> ErrorKind {
+        self.kind
     }
 }
 
@@ -271,6 +387,13 @@ const SUMMARIZER_PROMPT: &str = "You summarize an earlier portion of a coding co
 /// Tool-result ceiling in characters: larger outputs are head+tail truncated
 /// so a runaway command or MCP tool can never blow the model context.
 const MAX_TOOL_OUTPUT_CHARS: usize = 32_000;
+
+/// S6 tool-error fuse: this many consecutive tool batches where every executed
+/// tool errored trips the turn (success anywhere resets the count). Chosen
+/// above the common "model recovers on the second try" band but far below the
+/// 64-iteration soft cap, so a hostile environment fails fast instead of
+/// burning requests.
+const MAX_CONSECUTIVE_TOOL_ERROR_BATCHES: usize = 8;
 const TOOL_OUTPUT_HEAD: usize = 24_000;
 const TOOL_OUTPUT_TAIL: usize = 6_000;
 
@@ -637,11 +760,20 @@ where
         let mut tool_results = Vec::new();
         let mut iterations = 0usize;
         let mut continuations = 0usize;
+        // S6 (roadmap §16 R2): behavior-level fuses for the turn loop.
+        let mut stop_policy = StopPolicy::new();
+        let mut consecutive_tool_error_batches = 0usize;
         // D4.2: the hard-trigger retry happens at most once per turn; a
         // second context-overflow rejection surfaces as a real error.
         let mut hard_retried = false;
 
         loop {
+            // Honor a Ctrl+C FIRST (C2, semantic review): cancellation must
+            // outrank the iteration-limit soft landing — a cancelled turn is
+            // an interrupt, never a "success carrying completed work".
+            if cancel.is_cancelled() {
+                return Err(RuntimeError::cancelled("turn cancelled"));
+            }
             iterations += 1;
             if iterations > self.max_iterations {
                 // Soft landing: the previous iteration finished (its tool
@@ -656,11 +788,6 @@ where
                     self.max_iterations
                 )));
                 break;
-            }
-            // Honor a Ctrl+C that landed between iterations (e.g. right after a
-            // tool batch) instead of spending another request before noticing it.
-            if cancel.is_cancelled() {
-                return Err(RuntimeError::new("turn cancelled"));
             }
 
             // Steer consumption point (§11.2): absorb steered user text at the
@@ -739,7 +866,11 @@ where
                     )));
                     continue;
                 }
-                return Err(RuntimeError::with_hint(message, error_hint));
+                return Err(RuntimeError::with_kind(
+                    classify_stream_error(&message),
+                    message,
+                    error_hint,
+                ));
             }
             if !finished {
                 // Preserve streamed text so the transcript stays API-consistent,
@@ -749,15 +880,25 @@ where
                     self.session.messages.push(message.clone());
                     assistant_messages.push(message);
                 }
-                let reason = if cancelled {
-                    "turn cancelled"
+                let (reason, kind) = if cancelled {
+                    ("turn cancelled", ErrorKind::Cancelled)
                 } else {
-                    "assistant stream ended without a message stop event"
+                    // The stream died before the message stop event: treat it
+                    // as a transport fault (retryable upstream) rather than a
+                    // model failure.
+                    (
+                        "assistant stream ended without a message stop event",
+                        ErrorKind::Transport,
+                    )
                 };
-                return Err(RuntimeError::new(reason));
+                return Err(RuntimeError::with_kind(kind, reason, None));
             }
             if blocks.is_empty() {
-                return Err(RuntimeError::new("assistant stream produced no content"));
+                return Err(RuntimeError::with_kind(
+                    ErrorKind::Model,
+                    "assistant stream produced no content",
+                    None,
+                ));
             }
 
             if let Some(value) = usage {
@@ -787,7 +928,43 @@ where
             self.session.messages.push(assistant_message.clone());
             assistant_messages.push(assistant_message);
 
+            // S6 loop detection (roadmap §16 R2): the same tool batch hashing
+            // identically iteration after iteration means the model is
+            // spinning. Fail the turn with a Model-class error so the loop
+            // autopilot treats it as a real block, not a transient fault; the
+            // transcript is already consistent (assistant + prior tool results
+            // are in the session).
+            if !pending_tool_uses.is_empty() {
+                let batch: Vec<(String, String)> = pending_tool_uses
+                    .iter()
+                    .map(|(_, name, input)| (name.clone(), input.to_string()))
+                    .collect();
+                if let Some(reason) = stop_policy.register(&batch) {
+                    notify(&AgentEvent::Truncated(format!(
+                        "stop policy: {reason} - ending the turn"
+                    )));
+                    return Err(RuntimeError::with_kind(
+                        ErrorKind::Model,
+                        format!("loop detected: {reason}"),
+                        Some(
+                            "the model kept repeating identical tool calls; restate the goal with the concrete next step, or investigate the failing step manually".to_string(),
+                        ),
+                    ));
+                }
+            }
+
             if pending_tool_uses.is_empty() {
+                // S5 (roadmap §16 R3): steers that arrived during the final
+                // (tool-less) reply used to evaporate with the mailbox. Drain
+                // them into the transcript as user messages so the next
+                // request — autopilot continuation or the operator's next
+                // turn — carries them; nothing the user typed is lost.
+                for text in self.steer_mailbox.drain() {
+                    self.session
+                        .messages
+                        .push(ConversationMessage::user_text(text.clone()));
+                    notify(&AgentEvent::Steered(text));
+                }
                 // Self-iteration: with unfinished plan tasks, nudge the model
                 // to keep working instead of ending the turn early.
                 if self.tool_executor.pending_tasks() > 0 && continuations < self.max_continuations
@@ -809,11 +986,45 @@ where
                 continue;
             }
 
+            // S6 tool-error fuse: a batch where every executed tool errored
+            // advances the streak; any success resets it. Too many consecutive
+            // all-error batches means the environment is fighting the model —
+            // stop burning requests and surface it (zaly's error-circuit
+            // breaker; success clears the count).
+            let batch_start = tool_results.len();
             let interrupted = self
                 .execute_tools(allowed, &mut tool_results, notify, cancel)
                 .await;
             if interrupted {
-                return Err(RuntimeError::new("turn cancelled"));
+                return Err(RuntimeError::cancelled("turn cancelled"));
+            }
+            let batch_results: Vec<&ContentBlock> = tool_results[batch_start..]
+                .iter()
+                .flat_map(|message| &message.blocks)
+                .collect();
+            let has_result = batch_results
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolResult { .. }));
+            let all_errored = has_result
+                && batch_results.iter().all(|block| match block {
+                    ContentBlock::ToolResult { is_error, .. } => *is_error,
+                    _ => true,
+                });
+            if all_errored {
+                consecutive_tool_error_batches += 1;
+            } else if has_result {
+                consecutive_tool_error_batches = 0;
+            }
+            if consecutive_tool_error_batches >= MAX_CONSECUTIVE_TOOL_ERROR_BATCHES {
+                return Err(RuntimeError::with_kind(
+                    ErrorKind::Model,
+                    format!(
+                        "tool-error fuse: {consecutive_tool_error_batches} consecutive tool batches all failed"
+                    ),
+                    Some(
+                        "every recent tool call failed; fix the underlying problem (missing file, bad command, permission) before retrying".to_string(),
+                    ),
+                ));
             }
         }
 
@@ -3322,7 +3533,9 @@ mod iteration_limit_tests {
     use std::sync::Arc;
 
     /// A client that always answers with one tool call: the loop never ends on
-    /// its own, so the iteration limit is the only exit.
+    /// its own, so the iteration limit is the only exit. The input varies per
+    /// call — an identical batch every iteration would trip the S6 loop
+    /// detector (that contract is pinned in `loop_detector_tests` below).
     struct EverCallingClient {
         calls: Arc<AtomicUsize>,
     }
@@ -3335,7 +3548,7 @@ mod iteration_limit_tests {
                 AgentEvent::ToolUse {
                     id: format!("t-{call}"),
                     name: "tick".to_string(),
-                    input: "{}".to_string(),
+                    input: format!(r#"{{"n":{call}}}"#),
                 },
                 AgentEvent::MessageStop,
             ]))
@@ -3375,5 +3588,153 @@ mod iteration_limit_tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, AgentEvent::Truncated(reason) if reason.contains("iteration limit (3)"))));
+    }
+}
+
+/// S6 loop detection end-to-end (roadmap §16 R2): an identical tool batch
+/// three iterations in a row fails the turn with a Model-class error.
+#[cfg(test)]
+mod loop_detector_tests {
+    use super::{
+        AgentEvent, ApiClient, ApiRequest, ConversationRuntime, RuntimeError, Session,
+        StaticToolExecutor, TurnStream,
+    };
+    use crate::PermissionMode;
+    use crate::PermissionPolicy;
+
+    struct SameCallClient {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ApiClient for SameCallClient {
+        fn stream(&mut self, _request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            Ok(TurnStream::from_events(vec![
+                AgentEvent::ToolUse {
+                    id: format!("t-{call}"),
+                    name: "tick".to_string(),
+                    input: "{}".to_string(),
+                },
+                AgentEvent::MessageStop,
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn identical_tool_batches_trip_the_loop_fuse() {
+        let executor = StaticToolExecutor::new().register("tick", |_| Ok("ok".to_string()));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SameCallClient {
+                calls: std::sync::Arc::clone(&calls),
+            },
+            executor,
+            PermissionPolicy::new(PermissionMode::Allow),
+            Vec::new(),
+        )
+        .with_max_iterations(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut notify = |_: &AgentEvent| {};
+        let error = runtime
+            .run_turn("spin", None, &mut notify, &cancel)
+            .await
+            .expect_err("identical batches must trip the loop fuse");
+        assert_eq!(error.kind(), super::ErrorKind::Model);
+        assert!(error.to_string().contains("loop detected"), "{error}");
+        // D7 (ai-rust-hygiene): pin the trigger ORDER. If MAX_REPEAT_STREAK
+        // were ever raised above the iteration cap, this test would otherwise
+        // drift into testing the cap's soft landing instead of the fuse. The
+        // fuse must fire strictly before the cap would.
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) < 64,
+            "the loop fuse must trip before the iteration limit soft-landing"
+        );
+    }
+}
+
+/// ErrorKind + classifier tests (roadmap §16 R2): the one deliberate
+/// string-matching boundary, so its arms are pinned here.
+#[cfg(test)]
+mod error_kind_tests {
+    use super::{classify_stream_error, ErrorKind, RuntimeError};
+
+    #[test]
+    fn overflow_wins_over_everything() {
+        assert_eq!(
+            classify_stream_error("api returned 400 (invalid_request_error): prompt is too long: 210000 tokens > 200000 maximum"),
+            ErrorKind::Overflow
+        );
+    }
+
+    #[test]
+    fn auth_markers_classify_auth() {
+        assert_eq!(
+            classify_stream_error("api returned 401 (authentication_error): invalid x-api-key"),
+            ErrorKind::Auth
+        );
+        assert_eq!(
+            classify_stream_error("api returned 403: permission denied"),
+            ErrorKind::Auth
+        );
+    }
+
+    #[test]
+    fn transport_markers_classify_transport() {
+        for message in [
+            "error sending request: connection closed before message completed",
+            "stream idle timeout exceeded",
+            "api returned 502: bad gateway",
+            "provider overloaded_error",
+        ] {
+            assert_eq!(
+                classify_stream_error(message),
+                ErrorKind::Transport,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn rate_limits_are_transport_class() {
+        // S2: a 429 burst must not poison the autopilot's blocked streak.
+        assert_eq!(
+            classify_stream_error("api returned 429 (rate_limit_error): too many requests"),
+            ErrorKind::Transport
+        );
+    }
+
+    #[test]
+    fn bad_requests_are_model_class() {
+        assert_eq!(
+            classify_stream_error("api returned 400 (invalid_request_error): unknown tool name"),
+            ErrorKind::Model
+        );
+    }
+
+    #[test]
+    fn unknown_patterns_fall_to_other() {
+        assert_eq!(
+            classify_stream_error("something completely novel"),
+            ErrorKind::Other
+        );
+    }
+
+    #[test]
+    fn runtime_error_kinds_round_trip() {
+        let error = RuntimeError::new("plain");
+        assert_eq!(error.kind(), ErrorKind::Other);
+        assert_eq!(
+            RuntimeError::cancelled("turn cancelled").kind(),
+            ErrorKind::Cancelled
+        );
+        let classified = RuntimeError::with_kind(
+            ErrorKind::Transport,
+            "connection reset",
+            Some("check the network".to_string()),
+        );
+        assert_eq!(classified.kind(), ErrorKind::Transport);
+        assert_eq!(classified.hint(), Some("check the network"));
+        assert_eq!(ErrorKind::Transport.label(), "transport");
     }
 }

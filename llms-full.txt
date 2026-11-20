@@ -658,7 +658,7 @@ cd wiki-checkout && git add -A && git commit -m "docs: seed wiki" && git push
 
 # 路线图
 
-以下方向已明确规划但**尚未实现**，仅作路线记录。2026-10-19 批次新增 §1–§6 六条主线，2026-10-21 批次新增 §7（推理引擎生态深研）、§8（bash job 监控 / job 超时 / 挂起检测）并续批扩写 §1（多子代理 spawn 面 / pi 的 job 系统 / 队列三件套设计规格——源自 `archive/pi-research/pi-subagents` 源码实证与 `openmemory.md.bak` 的队列需求回溯），全部来自外部项目调研，本地研究副本均**不入库**：pi-subagents/MergeSearch 在 `archive/pi-research/`；ds4（antirez DwarfStar 推理引擎）、easy-llm-cli（Gemini-CLI 派生 agentic CLI）、kimi-code（`MoonshotAI/kimi-code`，MIT © 2026 Moonshot AI，agent-core-v2 已源码核实）、DeepInfer（deepseek-ai，Apache 2.0）与 deepseek-recipe（deepseek-ai，MIT，纯 Rust）在 `.workbuddy/`。当前**不执行**，只锁定设计判据与借鉴对象。2026-10-22 批次新增 §10（PandaCode / pi / codex / claude 设计借鉴与取舍——源自 `archive/pandacode` 浅克隆源码实证，聚焦 mcp 与 code-mode 升级取舍），聚焦「采纳 / 改造 / 不做」三档结论。
+以下方向已明确规划但**尚未实现**，仅作路线记录。2026-10-19 批次新增 §1–§6 六条主线，2026-10-21 批次新增 §7（推理引擎生态深研）、§8（bash job 监控 / job 超时 / 挂起检测）并续批扩写 §1（多子代理 spawn 面 / pi 的 job 系统 / 队列三件套设计规格——源自 `archive/pi-research/pi-subagents` 源码实证与 `openmemory.md.bak` 的队列需求回溯），全部来自外部项目调研，本地研究副本均**不入库**：pi-subagents/MergeSearch 在 `archive/pi-research/`；ds4（antirez DwarfStar 推理引擎）、easy-llm-cli（Gemini-CLI 派生 agentic CLI）、kimi-code（`MoonshotAI/kimi-code`，MIT © 2026 Moonshot AI，agent-core-v2 已源码核实）、DeepInfer（deepseek-ai，Apache 2.0）与 deepseek-recipe（deepseek-ai，MIT，纯 Rust）在 `.workbuddy/`。当前**不执行**，只锁定设计判据与借鉴对象。2026-10-22 批次新增 §10（PandaCode / pi / codex / claude 设计借鉴与取舍——源自 `archive/pandacode` 浅克隆源码实证，聚焦 mcp 与 code-mode 升级取舍），聚焦「采纳 / 改造 / 不做」三档结论。2026-11-20 批次新增 §15（zaly / maki / codex 三仓 agent 循环本体借鉴——凭据自动发现、停机保险丝、后台任务+heartbeat、压缩护栏、取消传播、子代理治理；源自 `gitmine/{zaly,maki,codex}` 浅克隆源码实证，全文证据见根目录 `agents.dev.md`）与 §16（自身稳定性重构止血四相 ST-0~ST-4——流中挂断零防护、autopilot 错误不分级、压缩护栏默认关等七项根因，全文见根目录 `stability.md`）。
 
 > **kimi-code 自研度结论（源码核实）**：agent 核心 `packages/agent-core-v2` 是**一方自研包**，**非 gemini-cli / claude-code / codex 二改**（grep 三家零命中）；仅 TUI 层源自外部 `pi-tui`（入库为 `@moonshot-ai/pi-tui`，README 致谢），并采纳行业开放协议 MCP/ACP 与 Agent Skills 约定。另有一方包可对标 heartflow：`@moonshot-ai/kosong`（"LLM abstraction layer"，直接包 `@anthropic-ai/sdk` + `openai` SDK ≈ heartflow `api`+`provider`）、`@moonshot-ai/kimi-telemetry`（一方遥测）、`acp-server`。**下面标注「源码实证」的条目均已对照 `.workbuddy/kimi-code` 当前 HEAD 核实行号。**
 
@@ -1211,6 +1211,49 @@ enum CredentialSource {
 - **搜索/爬虫/正文提取**：§2 已有判决（MergeSearch provider 链 + crawl 工具），本轮补：readability 正文提取并入 web_fetch 清洗双轨。
 - **测试异常自动分析**：§6 写后诊断已是雏形（cargo check 失败自动回注）；扩展 = loop 模式相（测试失败 → 自动分析回合）。
 - **管道能力**：已具（`hf prompt`/pipe/`--json`/cassette 录放），增强随 §2。
+
+### 15. Agent 循环本体借鉴：凭据自动发现 + 停机保险丝 + 后台任务 + 压缩护栏（2026-11-20 批次，设计规格，未落地）
+
+**来源**：`folke/zaly`（folke，TS 终端 agent）+ `tontinton/maki`（Rust）+ `openai/codex`（Rust），本地克隆 `gitmine/{zaly,maki,codex}`（浅拷贝，不入库）。**全文（含 文件:行号 证据、B/C 档判决、长任务四层保险丝汇总）见根目录 [agents.dev.md](../../agents.dev.md)**，此处只锁方向与落点。
+
+**A1 · 环境变量自动发现凭据（零配置启动，用户点名）**：builtin 表 `api_key_env: &'static str` 升格为复数名单 `api_key_envs: &[&str]`（对齐 zaly `provider.env: string[]` 语义，`auth/manager.ts:242-249`）；`resolve_spec` 的无显式配置分支改为按固定文档化优先级扫描名单、首个非空命中构造 Resolved spec；`CredentialSource::Env{var}` 进 Profile（与 §12 P-A 合流）；doctor 报「检测到 X 凭据但 provider 配置为 Y」（§12 混线 401 的预防面）；抄 codex `env_key_instructions`（`model-provider-info/src/lib.rs:171-175`）给 builtin 加凭据缺失指引文案。落点 `crates/provider/src/config.rs`。**不做**：keychain/其他工具 dotfiles 扫描（沿 `config.rs:598-604` 二来源制）、`!command` bash 凭据求值（第三来源破坏可审计性）、跨供应商择优。
+
+**A2 · StopPolicy 停机保险丝（zaly `stop.ts` 全表）**：token 预算、连续工具错误熔断（成功清零）、同参重复调用检测（`name\0params` 哈希：连续 3 次 + 窗口 10 内重复 4 次双臂）——补进 §4 停机矩阵；现有 loop 64 回合上限只是第一根。
+
+**A3 · 后台任务 + heartbeat（zaly `tasks.ts`）**：工具超 grace（10s）转后台注册表、占位符结果、`task_poll/stop/list` 工具面、task-done 注入 system 消息、心跳注入 running 清单。是 §1 监工-工人的前置件；`bash` 工具率先 Streamable 化。
+
+**A4 · Wakeup hint 不蒸发（zaly `agent.ts:396-430`）**：被提前唤醒取消的 wakeup，hint 折叠为 `status="cancelled"` system 消息随下一注入落地；取消时机精确到 idle/paused→streaming 外部迁移。适用于 loop autopilot 续跑与 `/queue` 泳道。
+
+**A5 · 压缩护栏补强（三仓合流）**：保护尾按字节预算 64KiB 而非条数（maki `compaction.rs:29-32`，条数制被单个巨型 MCP dump 打爆的教训）；背景压缩先行 0.9/同步 0.95 双阈（zaly `agent.ts:479-503`）；同会话同尾消息压缩尝试去重 + ≤N 上限；摘要附确定性文件/bash 使用表直拷（`compactions.ts:98-108`）。全部在 §4 七相内做，不动存储层。
+
+**A6 · 取消传播（maki `cancel.rs`）**：Drop 触发 + TOCTOU 双检 + Weak 子链传播（无后台任务、子 drop 自然出链），对接 P2 并发模型的 token 取消传播。
+
+**A7 · 子代理治理**：深度达上限**滤掉 spawn 工具**而非报错（zaly `agent.ts:176`，模型看不见工具就没有错误路径）；总量与深度分开计（codex `registry.rs`）；子→父转发只带纯文本不带 reasoning/工具轨迹（`swarm.ts:234-245`）。
+
+**A8 · 会话事件上下文化**：统一 notify 队列，模型切换/凭据来源/压力档位折成一条 system 消息注入（zaly `agent.ts:372-378`），是 §12 身份可见在对话内的投影。
+
+**落地顺序建议**：A1（函数级，最高性价比）→ A2 → A5①（一行常量级）→ A6（对接 P2）→ A3（§1 前置件）→ 其余按需。**明确不做**（C 档全文见 agents.dev.md）：双运行时测试矩阵、Lua 插件层、强制单一 wire 协议、daemon/cloud 产品面。
+
+**批次二补录（2026-11-20 晚，goose / gemini-cli / aider，证据见根目录 agents.dev.md 批次二节）**：
+- **随既定相顺手带**：retry 指数退避加 ±30% 抖动（gemini `utils/retry.ts`，ST-2 落地时一行）；`hf prompt` 管道模式按 `ErrorKind` 派生退出码（goose `ExitOnError` 思路，R2 已有分级）。
+- **新增候选方向（只记录不执行）**：StopPolicy 第三臂——纯文本诵经检测（gemini `ContentChantingDetector`，hf 现在只盯工具调用）；scheduler 启动时清理崩溃遗留的 stale running job（goose `crates/goose/src/scheduler/`，长任务崩溃恢复，ST-5 候选）；keyring 双后端 + env 覆盖通道（goose `config/base.rs`，随 A1）；写类工具前 checkpoint 覆盖审计（gemini；hf checkpoint.rs 已有基建）；用户仓库自动提交纪律（aider，需显式开关，侵入性高）；fallback 模型链（gemini 429 切备用，随 A1/§12 有 provider 池后评估）；压缩自校验轮（gemini，D4.5 后评估）。
+- **大件只记录**：repo map（aider `repomap.py`，tree-sitter 符号图 + PageRank + token 预算，长任务跨文件全局视野，需独立批次）。
+- **不投入**：LLM 循环裁判（多模型基建成本不符）、多级编辑格式梯子（hf 工具协议单一）、压缩双阈值（HalfWindow 已等价，goose `context_mgmt/mod.rs:29,136-141` 佐证）。
+- **§1 子代理素材补充**：goose lead-worker 的 `AbortOnDropHandle`（tokio-util 现成件）+ spawn 信号量并发闸 + 独立 Session 模型，落地时采纳。
+
+### 16. 自身稳定性重构：回合循环止血四相（2026-11-20 批次；R2/R4/S4/S5/S6 非流式部分**已落地**，ST-0/1/2 流式部分仍待夹具）
+
+**背景**：用户实测「任务进行中不能长期稳定运行，会意外重置」。**全文（含代码实证、已排除嫌疑清单、重构方案、验收标准、落地记录）见根目录 [stability.md](../../stability.md)**，此处只锁根因与分相。
+
+**根因清单（源码实证）**：S1 流中挂断零防护（`api/client.rs:263` `chunk().await` 无 idle timeout、无 mid-stream 重连，`drive_stream` 任一错误 → 整回合死）；S2 autopilot 停机判据无错误分级（`autopilot.rs:106-127` 任意失败计 blocked claim，3 连 → mission 持久 Blocked——瞬时网络抖动即可杀死长任务）；S3 压缩护栏默认全关（`hard_trigger: false` / `tail_budget_tokens: 0`，`compact.rs:481-484`，二次 overflow 无降级路径）；S4 config 热重载清 planning/speccing 标志（`main.rs:1036-1040`）；S5 steer 静默蒸发（每回合新 mailbox drop 未消费 steer，`conversation.rs:560-565`）；S6 无 StopPolicy 三保险丝（token 预算/连续工具错误/loop 检测）；S7 流错误丢弃已收 blocks（error 分支不进 transcript，`conversation.rs:717-743`）。
+
+**重构方案**：R1 传输层韧性（idle timeout + 步级重试 ≤2 + blocks 落 transcript）→ R2 错误分级贯通（`RuntimeError.kind` 替换字符串嗅探，autopilot 按类分级 + 退避续跑 + Blocked 恢复路径）→ R3 输入零丢失（steer 回收 + 模式标志单一事实源）→ R4 压缩默认值翻转（窗口模式默认启用 tail budget + 硬触发两级降级）。
+
+**分相路线（依赖排序）**：ST-0 先录三个流故障 cassette（断流/idle 超时/overflow 二连——**先录夹具再动流式路径**是既有铁律）→ ST-1 错误分级 + idle timeout + blocks 落 transcript → ST-2 步级重试 + 压缩两级降级 → ST-3 autopilot 分级 + 退避续跑 → ST-4 steer 回收 + StopPolicy。验收 = 夹具全绿 + 真机长任务 soak。
+
+**落地进度（2026-11-20 第二批，非流式路径，clippy 零 error + workspace 测试全绿）**：R2 已落地（`ErrorKind` + `classify_stream_error` 唯一字符串匹配点 + `TurnOutcome.error_class`，turn.rs 嗅探已删）；S2 已落地（transport 类退避 30s→2m→8m 不计 blocked streak，3 次耗尽记 1 claim）；R4 已落地（窗口模式 tail budget `min(32k, window/8)` + hard trigger 默认开，env 双向覆盖）；S6 已落地（新模块 `runtime/src/stop.rs` 双臂 loop 检测 + 连续 8 批全错工具熔断，端到端测试钉死）；S4 已落地（热重载重放 policy 交换，不清标志）；S5 已落地（终回合 drain steer 入 transcript）。**未动**：S1/S7/R1（流式，夹具铁律）、Blocked 恢复路径、token 预算臂。
+
+**明确不做**（本批）：后台任务注册表/wakeup/子代理（属扩容，等止血四相验收）；不重写 run_turn 为状态机（P2 一并做）；不动分层边界、不新增依赖。
 
 
 ## B. 研究存档与先不做清单

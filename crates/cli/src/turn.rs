@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use crossterm::style::Stylize;
 use runtime::{
     auto_record_turn, truncate_chars, turn_reminder, AgentEvent, ContentBlock, ConversationMessage,
-    MessageRole, MissionLedger, PermissionPrompter, TokenUsage,
+    ErrorKind, MessageRole, MissionLedger, PermissionPrompter, TokenUsage,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -279,6 +279,10 @@ pub(crate) struct TurnOutcome {
     /// (a real error) so the loop autopilot can stop on interrupt instead of
     /// counting the cancel as a blocked claim.
     pub(crate) interrupted: bool,
+    /// Machine-readable failure class when `ok == false` (roadmap §16 R2).
+    /// `None` on success. The loop autopilot excludes transport-class errors
+    /// from its blocked streak and retries with backoff instead.
+    pub(crate) error_class: Option<ErrorKind>,
 }
 
 /// Count tool results flagged as errors across a turn's transcript entries.
@@ -413,10 +417,13 @@ pub(crate) async fn run_turn_interactive(
                 tool_errors: count_tool_errors(&summary.tool_results),
                 conclusion: last_assistant_conclusion(&summary.assistant_messages),
                 interrupted: false,
+                error_class: None,
             }
         }
         Err(error) => {
-            let interrupted = error.to_string().contains("cancelled");
+            // R2: classification comes from the structured kind — no more
+            // string-matching the rendered message for "cancelled".
+            let interrupted = error.kind() == ErrorKind::Cancelled;
             turn.render_incomplete();
             if turn.spinner_active {
                 if interrupted {
@@ -458,6 +465,7 @@ pub(crate) async fn run_turn_interactive(
                 tool_errors: 0,
                 conclusion: None,
                 interrupted,
+                error_class: Some(error.kind()),
             });
         }
     };

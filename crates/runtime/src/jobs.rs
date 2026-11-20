@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc, Mutex, PoisonError, RwLock};
 use std::time::SystemTime;
 
 /// Concurrent worker cap (semaphore semantics; pi enforces the same via its
@@ -294,6 +294,23 @@ struct RegistryInner {
     jobs: Mutex<BTreeMap<u64, Arc<JobHandle>>>,
 }
 
+/// Releases one active-slot claim on scope exit (J1, semantic review): a
+/// panicking runner unwinds past any manual decrement, and a leaked slot
+/// would permanently shrink the pool until restart.
+struct SlotGuard {
+    active: Arc<Mutex<usize>>,
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *active = active.saturating_sub(1);
+    }
+}
+
 impl JobRegistry {
     /// Registry with the given concurrency and no wall-clock timeout; call
     /// once per REPL and pass clones where needed.
@@ -353,11 +370,13 @@ impl JobRegistry {
         let queued_plus_running = jobs
             .values()
             .filter(|handle| {
+                // A poisoned record means "state unknown": count it toward the
+                // saturation limit (conservative) rather than letting a
+                // poisoned job bypass capacity.
                 handle
                     .record
                     .lock()
-                    .map(|record| !record.status.is_terminal())
-                    .unwrap_or(false)
+                    .map_or(true, |record| !record.status.is_terminal())
             })
             .count();
         if queued_plus_running >= self.inner.max_pending {
@@ -464,10 +483,24 @@ impl JobRegistry {
                     });
                 };
 
-                let outcome = runner.run(&prompt_owned, &registry.stop_flag(id), &mut emit);
-                if let Ok(mut active) = registry.inner.active.lock() {
-                    *active = active.saturating_sub(1);
-                }
+                // J1 (semantic review): a panicking runner must neither leak
+                // the slot nor leave the job Running forever. The guard
+                // releases the slot on unwind; catch_unwind converts the
+                // panic into an honest Failed verdict.
+                let _slot_guard = SlotGuard {
+                    active: Arc::clone(&registry.inner.active),
+                };
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    runner.run(&prompt_owned, &registry.stop_flag(id), &mut emit)
+                }))
+                .unwrap_or_else(|payload| {
+                    let message = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    Err(format!("worker panicked: {message}"))
+                });
                 match outcome {
                     Ok(result) if registry.stopped(id) => {
                         // The runner finished its in-flight work after the
@@ -526,25 +559,35 @@ impl JobRegistry {
     }
 
     fn set_status(&self, id: u64, status: JobStatus) {
-        if let Ok(jobs) = self.inner.jobs.lock() {
-            if let Some(handle) = jobs.get(&id) {
-                if let Ok(mut record) = handle.record.lock() {
-                    record.status = status;
-                    let json =
-                        serde_json::to_string_pretty(&*record).unwrap_or_else(|_| "{}".to_string());
-                    persist(&jobs_root(), id, &json);
-                }
-            }
+        // Lock order: outer `jobs` (task table) -> inner `record` (per-job).
+        // Poisoning recovers via into_inner: a lost status write would corrupt
+        // the job lifecycle (results become wrong, not merely degraded).
+        let jobs = self
+            .inner
+            .jobs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(handle) = jobs.get(&id) {
+            let mut record = handle.record.lock().unwrap_or_else(PoisonError::into_inner);
+            record.status = status;
+            let json = serde_json::to_string_pretty(&*record).unwrap_or_else(|_| "{}".to_string());
+            persist(&jobs_root(), id, &json);
         }
     }
 
     fn status_of(&self, id: u64) -> Option<JobStatus> {
-        self.inner
+        let jobs = self
+            .inner
             .jobs
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&id)
-            .and_then(|handle| handle.record.lock().ok().map(|record| record.status))
+            .unwrap_or_else(PoisonError::into_inner);
+        jobs.get(&id).map(|handle| {
+            handle
+                .record
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .status
+        })
     }
 
     fn terminalize(&self, id: u64, status: JobStatus, result_head: Option<String>) {
@@ -572,20 +615,28 @@ impl JobRegistry {
         result_head: Option<String>,
         note: Option<String>,
     ) {
-        if let Ok(jobs) = self.inner.jobs.lock() {
-            if let Some(handle) = jobs.get(&id) {
-                if let Ok(mut record) = handle.record.lock() {
-                    if record.status.is_terminal() {
-                        return;
-                    }
-                    record.status = status;
-                    record.note = note;
-                    record.result_head = result_head;
-                    let json =
-                        serde_json::to_string_pretty(&*record).unwrap_or_else(|_| "{}".to_string());
-                    persist(&jobs_root(), id, &json);
-                }
+        // Lock order: outer `jobs` -> inner `record`. Poisoning recovers via
+        // into_inner: this is the watchdog verdict path — a lost verdict would
+        // leave a timed-out job Running forever.
+        let jobs = self
+            .inner
+            .jobs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(handle) = jobs.get(&id) {
+            let mut record = handle.record.lock().unwrap_or_else(PoisonError::into_inner);
+            if record.status.is_terminal() {
+                // Still record the event below: idempotence applies to the
+                // record write, not to the operator-visible event trail.
+                drop(record);
+                append_event(&jobs_root(), id, status.label(), "");
+                return;
             }
+            record.status = status;
+            record.note = note;
+            record.result_head = result_head;
+            let json = serde_json::to_string_pretty(&*record).unwrap_or_else(|_| "{}".to_string());
+            persist(&jobs_root(), id, &json);
         }
         append_event(&jobs_root(), id, status.label(), "");
     }
@@ -599,20 +650,26 @@ impl JobRegistry {
     /// the shutdown verdict. Returns how many jobs were finalized.
     #[must_use]
     pub fn finalize_on_shutdown(&self, note: &str) -> usize {
-        let ids: Vec<u64> = match self.inner.jobs.lock() {
-            Ok(jobs) => jobs
-                .iter()
-                .filter_map(|(id, handle)| {
-                    let non_terminal = handle
-                        .record
-                        .lock()
-                        .map(|record| !record.status.is_terminal())
-                        .unwrap_or(false);
-                    non_terminal.then_some(*id)
-                })
-                .collect(),
-            Err(_) => return 0,
-        };
+        // Poisoning recovers via into_inner: returning 0 here would skip
+        // shutdown finalization silently; the process is exiting anyway, so
+        // there is no deadlock risk to fear from a poisoned guard.
+        let jobs = self
+            .inner
+            .jobs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let ids: Vec<u64> = jobs
+            .iter()
+            .filter_map(|(id, handle)| {
+                let non_terminal = handle
+                    .record
+                    .lock()
+                    .map(|record| !record.status.is_terminal())
+                    .unwrap_or(false);
+                non_terminal.then_some(*id)
+            })
+            .collect();
+        drop(jobs);
         for id in &ids {
             self.terminalize_note(*id, JobStatus::Stopped, None, Some(note.to_string()));
         }
@@ -624,9 +681,10 @@ impl JobRegistry {
     /// updates are already in events.jsonl).
     #[must_use]
     pub fn poll(&self) -> Vec<WorkerMessage> {
-        let Some(rx) = self.inner.rx.lock().ok() else {
-            return Vec::new();
-        };
+        // Poisoning recovers via into_inner: an early `Vec::new()` here would
+        // make every future poll empty too — the supervisor loop would never
+        // see a worker Result again and the turn would hang.
+        let rx = self.inner.rx.lock().unwrap_or_else(PoisonError::into_inner);
         let mut messages = Vec::new();
         while let Ok(message) = rx.try_recv() {
             messages.push(message);
@@ -637,9 +695,14 @@ impl JobRegistry {
     /// Ask a job to stop. Cooperative: the current LLM call finishes, its
     /// result is discarded, and the job terminalizes as `Stopped`.
     pub fn stop(&self, id: u64) -> bool {
-        let Ok(jobs) = self.inner.jobs.lock() else {
-            return false;
-        };
+        // Poisoning recovers via into_inner: a `false` here would tell the
+        // operator the job does not exist when it does — the stop request
+        // would be silently lost.
+        let jobs = self
+            .inner
+            .jobs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let Some(handle) = jobs.get(&id) else {
             return false;
         };
@@ -659,9 +722,9 @@ impl JobRegistry {
         let mut active = Vec::new();
         let mut terminal = Vec::new();
         for handle in jobs.values() {
-            let Ok(record) = handle.record.lock() else {
-                continue;
-            };
+            // Poisoned record: recover via into_inner (house rule) so the job
+            // still shows up in listings instead of vanishing.
+            let record = handle.record.lock().unwrap_or_else(PoisonError::into_inner);
             if record.status.is_terminal() {
                 terminal.push(record.clone());
             } else {
@@ -694,15 +757,18 @@ impl JobRegistry {
     /// Whether `id` exists and is still non-terminal.
     #[must_use]
     pub fn is_active(&self, id: u64) -> bool {
-        let Ok(jobs) = self.inner.jobs.lock() else {
-            return false;
-        };
+        // Poisoning recovers via into_inner: `false` would misreport a live
+        // job as inactive.
+        let jobs = self
+            .inner
+            .jobs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         jobs.get(&id).is_some_and(|handle| {
             handle
                 .record
                 .lock()
-                .map(|record| !record.status.is_terminal())
-                .unwrap_or(false)
+                .is_ok_and(|record| !record.status.is_terminal())
         })
     }
 }

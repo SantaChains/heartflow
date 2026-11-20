@@ -491,24 +491,17 @@ fn report_unknown_command(input: &str) {
 
 /// Reset the live session to a fresh runtime, dropping planning state. Extracted
 /// so `/clear` stays a one-token arm and `run_repl` remains under the line cap.
-#[allow(clippy::too_many_arguments)]
 fn handle_clear_command(
     state: &SessionShared,
     selection: &ProviderSelection,
     mode: &str,
     runtime: &mut AgentRuntime,
-    planning: &mut bool,
-    plan_path: &mut Option<PathBuf>,
-    speccing: &mut bool,
-    spec_path: &mut Option<PathBuf>,
+    plan: &mut ReplPlanState,
 ) {
     match build_runtime(state, Session::new(), selection.clone(), true, mode) {
         Ok(fresh) => {
             *runtime = fresh;
-            *planning = false;
-            *plan_path = None;
-            *speccing = false;
-            *spec_path = None;
+            plan.clear();
             // A cleared session is a new conversation: give it a fresh file and
             // history row instead of appending onto the one just wiped.
             rotate_session_id(state);
@@ -771,6 +764,44 @@ pub(crate) fn stdin_is_terminal() -> bool {
     io::stdin().is_terminal()
 }
 
+/// REPL planning/spec session state (D1, ai-rust-hygiene): the four flags
+/// travel together through `run_repl` → `dispatch_slash_command` → every
+/// plan/spec handler and are always mutated at mode transitions as a unit.
+/// Bundling them replaces four separate `&mut` params per signature and
+/// retired nine `too_many_arguments` allows.
+#[derive(Default)]
+struct ReplPlanState {
+    /// `/plan` mode active: research/design turns run under `BlockPrompter`.
+    planning: bool,
+    /// Path of the markdown contract reserved for the planning session.
+    plan_path: Option<PathBuf>,
+    /// `/spec` mode active: turns run under `SpecPrompter`.
+    speccing: bool,
+    /// Path of the markdown contract reserved for the spec session.
+    spec_path: Option<PathBuf>,
+}
+
+impl ReplPlanState {
+    /// Leave every contract mode (used by commands that rebuild the runtime).
+    fn clear(&mut self) {
+        self.planning = false;
+        self.plan_path = None;
+        self.speccing = false;
+        self.spec_path = None;
+    }
+
+    /// Which mode policy should be re-applied after a runtime rebuild.
+    fn active_policy(&self) -> Option<&'static str> {
+        if self.planning {
+            Some("plan")
+        } else if self.speccing {
+            Some("spec")
+        } else {
+            None
+        }
+    }
+}
+
 async fn run_repl(
     state: &SessionShared,
     selection: ProviderSelection,
@@ -845,15 +876,11 @@ async fn run_repl(
     let mut catalog = load_catalog(&home_dir());
     let mut runtime = build_runtime(state, session, selection.clone(), true, &mode)?;
     let mut prompter = CliPermissionPrompter::new();
-    // Planning runs on the *same* runtime (policy swapped in place) so the todo
-    // ledger and conversation survive the plan -> execute handoff. `plan_path`
-    // is the exact document the CLI reserved for the current planning session.
-    let mut planning = false;
-    let mut plan_path: Option<PathBuf> = None;
-    // Spec writing mirrors planning: same-runtime policy swap, with `spec_path`
-    // the exact document the CLI reserved for the current spec-writing session.
-    let mut speccing = false;
-    let mut spec_path: Option<PathBuf> = None;
+    // Planning and spec writing run on the *same* runtime (policy swapped in
+    // place) so the todo ledger and conversation survive the plan -> execute
+    // handoff; `plan_path`/`spec_path` are the exact documents the CLI
+    // reserved for the current contract session.
+    let mut plan = ReplPlanState::default();
     let history_path = home_dir().join(".heartflow").join("history.txt");
     let mut editor = editor::ReplEditor::new(&history_path);
     editor.set_reduced_motion(settings::Settings::load(&cwd, &home_dir()).reduced_motion);
@@ -1005,8 +1032,7 @@ async fn run_repl(
             state,
             &mut runtime,
             &mut model,
-            planning,
-            speccing,
+            &plan,
             &mut prompter,
             &mut editor,
             &mode,
@@ -1035,8 +1061,16 @@ async fn run_repl(
         let changed = watcher.changed();
         if changed.config {
             reload_config(state, &cwd, &mut selection, &mut runtime, &mode);
-            planning = false;
-            speccing = false;
+            // S4 (roadmap §16 R3): a config edit must not silently kick the
+            // session out of plan/spec mode — the flags used to be cleared
+            // here, so an agent editing config.toml mid-task dropped the
+            // plan contract on the floor. The runtime rebuild resets the
+            // permission policy to the mode default, so re-apply the
+            // in-place swap the active mode was using (same mechanism
+            // `/plan` and `/spec` use on entry).
+            if let Some(policy) = plan.active_policy() {
+                set_runtime_mode_policy(&mut runtime, policy);
+            }
         }
         if changed.theme {
             theme::Theme::reload(&cwd, &home_dir());
@@ -1052,10 +1086,7 @@ async fn run_repl(
                 &mut runtime,
                 &mut selection,
                 &mut mode,
-                &mut planning,
-                &mut plan_path,
-                &mut speccing,
-                &mut spec_path,
+                &mut plan,
                 &mut model,
                 &mut prompter,
                 &cwd,
@@ -1080,10 +1111,10 @@ async fn run_repl(
                     println!("follow-up queue is full; /queue to inspect");
                 }
             } else {
-                let outcome = if planning {
+                let outcome = if plan.planning {
                     run_turn_interactive(state, &mut runtime, trimmed, Some(&mut BlockPrompter))
                         .await?
-                } else if speccing {
+                } else if plan.speccing {
                     run_turn_interactive(state, &mut runtime, trimmed, Some(&mut SpecPrompter))
                         .await?
                 } else {
@@ -1164,13 +1195,11 @@ async fn save_and_report(state: &SessionShared, runtime: &AgentRuntime) {
 /// injection message here (locked semantics: never interrupt, always deliver
 /// after the turn). A refused/failed injection is re-queued by the caller, so
 /// nothing is lost.
-#[allow(clippy::too_many_arguments)]
 async fn deliver_queued_injection(
     state: &SessionShared,
     runtime: &mut AgentRuntime,
     model: &mut HeartModel,
-    planning: bool,
-    speccing: bool,
+    plan: &ReplPlanState,
     prompter: &mut CliPermissionPrompter,
     editor: &mut editor::ReplEditor,
     mode: &str,
@@ -1182,9 +1211,9 @@ async fn deliver_queued_injection(
             return;
         };
         model.begin_turn();
-        let delivery = if planning {
+        let delivery = if plan.planning {
             run_turn_interactive(state, runtime, &injection, Some(&mut BlockPrompter)).await
-        } else if speccing {
+        } else if plan.speccing {
             run_turn_interactive(state, runtime, &injection, Some(&mut SpecPrompter)).await
         } else {
             run_turn_interactive(state, runtime, &injection, Some(prompter)).await
@@ -1196,7 +1225,7 @@ async fn deliver_queued_injection(
                 editor.note_turn(outcome.ok);
                 // A loop-mode session auto-continues from ANY delivered turn,
                 // not just direct input (semantic completeness, B项).
-                if !planning && !speccing {
+                if plan.active_policy().is_none() {
                     let _ = maybe_autopilot(state, runtime, prompter, mode).await;
                 }
             }
@@ -1215,9 +1244,9 @@ async fn deliver_queued_injection(
         return;
     };
     model.begin_turn();
-    let delivery = if planning {
+    let delivery = if plan.planning {
         run_turn_interactive(state, runtime, &entry.text, Some(&mut BlockPrompter)).await
-    } else if speccing {
+    } else if plan.speccing {
         run_turn_interactive(state, runtime, &entry.text, Some(&mut SpecPrompter)).await
     } else {
         run_turn_interactive(state, runtime, &entry.text, Some(prompter)).await
@@ -1235,7 +1264,7 @@ async fn deliver_queued_injection(
             model.queue_mut().finish_entry(entry, terminal_state);
             // A loop-mode session auto-continues from ANY delivered turn,
             // not just direct input (semantic completeness, B项).
-            if !planning && !speccing {
+            if plan.active_policy().is_none() {
                 let _ = maybe_autopilot(state, runtime, prompter, mode).await;
             }
         }
@@ -1248,8 +1277,10 @@ async fn deliver_queued_injection(
 }
 
 /// Route one `/`-prefixed line. Slash handling is inherently wide: the
-/// subcommands touch every piece of REPL state, which is why this takes the
-/// state pieces as separate `&mut`s instead of a bundled struct.
+/// subcommands touch every piece of REPL state. The plan/spec contract flags
+/// are bundled into [`ReplPlanState`]; the remaining breadth (runtime, model,
+/// registries, editor) is genuine — each piece is a distinct owner the arms
+/// mutate independently, which is why this is not a single opaque struct.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_slash_command(
     state: &SessionShared,
@@ -1257,10 +1288,7 @@ async fn dispatch_slash_command(
     runtime: &mut AgentRuntime,
     selection: &mut ProviderSelection,
     mode: &mut String,
-    planning: &mut bool,
-    plan_path: &mut Option<PathBuf>,
-    speccing: &mut bool,
-    spec_path: &mut Option<PathBuf>,
+    plan: &mut ReplPlanState,
     model: &mut HeartModel,
     prompter: &mut CliPermissionPrompter,
     cwd: &Path,
@@ -1292,9 +1320,7 @@ async fn dispatch_slash_command(
             LoopControl::Continue
         }
         "/clear" => {
-            handle_clear_command(
-                state, selection, mode, runtime, planning, plan_path, speccing, spec_path,
-            );
+            handle_clear_command(state, selection, mode, runtime, plan);
             LoopControl::Continue
         }
         "/sessions" => {
@@ -1378,10 +1404,8 @@ async fn dispatch_slash_command(
             LoopControl::Continue
         }
         _ if trimmed == "/guide" || trimmed.starts_with("/guide ") => {
-            handle_guide_command(
-                state, runtime, model, *planning, prompter, editor, mode, trimmed,
-            )
-            .await;
+            handle_guide_command(state, runtime, model, plan, prompter, editor, mode, trimmed)
+                .await;
             LoopControl::Continue
         }
         "/init" => {
@@ -1393,51 +1417,45 @@ async fn dispatch_slash_command(
         }
         _ if trimmed == "/mode" || trimmed.starts_with("/mode ") => {
             handle_mode_command(state, trimmed, mode, selection, runtime);
-            *planning = false;
-            *speccing = false;
-            *spec_path = None;
+            plan.planning = false;
+            plan.speccing = false;
+            plan.spec_path = None;
             LoopControl::Continue
         }
         _ if trimmed == "/model" || trimmed.starts_with("/model ") => {
             handle_model_command(state, trimmed, selection, runtime, mode, catalog);
-            *planning = false;
-            *speccing = false;
-            *spec_path = None;
+            plan.planning = false;
+            plan.speccing = false;
+            plan.spec_path = None;
             LoopControl::Continue
         }
         _ if trimmed == "/web" || trimmed.starts_with("/web ") => {
             handle_web_command(state, trimmed);
-            *planning = false;
-            *speccing = false;
-            *spec_path = None;
+            plan.planning = false;
+            plan.speccing = false;
+            plan.spec_path = None;
             LoopControl::Continue
         }
         _ if trimmed == "/effort" || trimmed.starts_with("/effort ") => {
             handle_effort_command(state, trimmed, selection, runtime, mode);
-            *planning = false;
-            *speccing = false;
-            *spec_path = None;
+            plan.planning = false;
+            plan.speccing = false;
+            plan.spec_path = None;
             LoopControl::Continue
         }
         _ if trimmed == "/bootstrap" || trimmed.starts_with("/bootstrap ") => {
             handle_bootstrap_command(state, trimmed, selection, runtime, mode, catalog).await;
-            *planning = false;
-            *speccing = false;
-            *spec_path = None;
+            plan.planning = false;
+            plan.speccing = false;
+            plan.spec_path = None;
             LoopControl::Continue
         }
         _ if trimmed == "/plan" || trimmed.starts_with("/plan ") => {
-            handle_plan_command(
-                state, trimmed, planning, plan_path, cwd, mode, runtime, prompter,
-            )
-            .await?;
+            handle_plan_command(state, trimmed, plan, cwd, mode, runtime, prompter).await?;
             LoopControl::Continue
         }
         _ if trimmed == "/spec" || trimmed.starts_with("/spec ") => {
-            handle_spec_command(
-                state, trimmed, speccing, spec_path, cwd, mode, runtime, prompter,
-            )
-            .await?;
+            handle_spec_command(state, trimmed, plan, cwd, mode, runtime, prompter).await?;
             LoopControl::Continue
         }
         _ => {
@@ -1679,7 +1697,6 @@ impl runtime::JobRunner for WorkerRunner {
 }
 
 /// `/jobs` — subagent job control: list, spawn, stop, log.
-#[allow(clippy::too_many_arguments)]
 fn handle_jobs_command(
     input: &str,
     jobs: &runtime::JobRegistry,
@@ -1998,7 +2015,6 @@ fn handle_mission_command(input: &str, missions: &runtime::MissionLedger) {
 /// `/schedule` — scheduled runs (roadmap §1 pi-job item 6): due schedules are
 /// handed out as normal subagent jobs by the loop-top drain or by an explicit
 /// `/schedule run-due`; there is no resident daemon by design.
-#[allow(clippy::too_many_arguments)]
 fn handle_schedule_command(
     input: &str,
     schedules: &runtime::ScheduleStore,
@@ -2178,7 +2194,6 @@ fn describe_schedule_trigger(trigger: &runtime::ScheduleTrigger) -> String {
 /// due schedule becomes a read-only worker job, exactly like `/jobs spawn`
 /// without `--write`. Scheduled work never runs with write access — a prompt
 /// that needs writes should be started deliberately, not by a timer.
-#[allow(clippy::too_many_arguments)]
 fn drain_due_schedules(
     schedules: &runtime::ScheduleStore,
     jobs: &runtime::JobRegistry,
@@ -2265,7 +2280,7 @@ async fn handle_guide_command(
     state: &SessionShared,
     runtime: &mut AgentRuntime,
     model: &mut HeartModel,
-    planning: bool,
+    plan: &ReplPlanState,
     prompter: &mut CliPermissionPrompter,
     editor: &mut editor::ReplEditor,
     mode: &str,
@@ -2306,7 +2321,7 @@ async fn handle_guide_command(
             // live transcript context so the model re-enters with anchored
             // state instead of a bare task line.
             model.begin_turn();
-            let delivery = if planning {
+            let delivery = if plan.planning {
                 run_turn_interactive(state, runtime, &draft, Some(&mut BlockPrompter)).await
             } else {
                 run_turn_interactive(state, runtime, &draft, Some(prompter)).await
@@ -2318,7 +2333,7 @@ async fn handle_guide_command(
                     editor.note_turn(outcome.ok);
                     // A loop-mode session auto-continues from a guided turn
                     // too (semantic completeness, B项).
-                    if !planning {
+                    if plan.active_policy().is_none() {
                         let _ = maybe_autopilot(state, runtime, prompter, mode).await;
                     }
                 }
@@ -3161,25 +3176,53 @@ fn env_soft_trigger() -> Option<runtime::SoftTrigger> {
 
 /// Token ceiling for the preserved tail (D4.3). Unset or 0 keeps the current
 /// count-only cut.
-fn env_tail_budget() -> usize {
+fn env_tail_budget() -> Option<usize> {
     env::var("HEARTFLOW_COMPACT_TAIL_BUDGET")
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .unwrap_or(0)
+}
+
+/// R4 (roadmap §16): default preserved-tail token budget in window mode.
+/// `min(32k, window/8)` — big enough to shield the last few turns from a
+/// giant tool dump, small enough that the preserved region can never crowd
+/// out the summary itself (maki's ≤50%-of-window self-destruction guard).
+const TAIL_BUDGET_DEFAULT: usize = 32_000;
+
+/// Effective preserved-tail budget. R4 default flip: when a context window is
+/// configured, the tail budget is on by default (was opt-in via env only);
+/// an explicit env value always wins — including `0` to force the old
+/// count-only cut.
+#[must_use]
+fn effective_tail_budget(window: usize, env: Option<usize>) -> usize {
+    match env {
+        Some(value) => value,
+        None if window > 0 => TAIL_BUDGET_DEFAULT.min(window / 8),
+        None => 0,
+    }
 }
 
 /// Hard trigger (D4.2): `1`/`true`/`on` arms the context-overflow recovery —
 /// a provider rejection for exceeding the window compacts once and retries
 /// the request exactly once. Anything else keeps the shipped behavior.
-fn env_hard_trigger() -> bool {
-    matches!(
-        env::var("HEARTFLOW_COMPACT_HARD_TRIGGER")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "on"
-    )
+fn env_hard_trigger() -> Option<bool> {
+    match env::var("HEARTFLOW_COMPACT_HARD_TRIGGER")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "1" | "true" | "on" => Some(true),
+        "0" | "false" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Effective hard-trigger state. R4 default flip: armed by default once a
+/// window is configured (the overflow-compact-retry path is the difference
+/// between a recoverable spike and a dead turn); env can force either side.
+#[must_use]
+fn effective_hard_trigger(window: usize, env: Option<bool>) -> bool {
+    env.unwrap_or(window > 0)
 }
 
 /// Continuation-summary source (D4.5): `model` asks the provider to summarize
@@ -3203,9 +3246,9 @@ fn env_summary_mode() -> runtime::SummaryMode {
 /// `context_window_tokens` (a zero window falls back to the absolute
 /// threshold). The window comes from the resolved profile (env override wins);
 /// the preserve/replay counts come from the provider's compaction profile.
-/// The soft-trigger policy and the tail token ceiling default to the shipped
-/// behavior and are opt-in via env (rollback spec: new behavior is
-/// config-gated, defaults reproduce the old behavior).
+/// R4 (roadmap §16): in window mode the tail token ceiling and the hard
+/// overflow trigger are armed by default; env overrides both (see
+/// `effective_tail_budget` / `effective_hard_trigger`).
 fn compaction_config(selection: &ProviderSelection) -> CompactionConfig {
     let context_window = resolve_context_window(selection);
     let protocol = match selection {
@@ -3225,8 +3268,11 @@ fn compaction_config(selection: &ProviderSelection) -> CompactionConfig {
         context_window_tokens: context_window,
         replay_verbatim_tail,
         soft_trigger: env_soft_trigger().unwrap_or(runtime::SoftTrigger::HalfWindow),
-        tail_budget_tokens: env_tail_budget(),
-        hard_trigger: env_hard_trigger(),
+        // R4 defaults: window mode arms the tail budget and the hard trigger
+        // (env overrides still win; see `effective_tail_budget` /
+        // `effective_hard_trigger`).
+        tail_budget_tokens: effective_tail_budget(context_window, env_tail_budget()),
+        hard_trigger: effective_hard_trigger(context_window, env_hard_trigger()),
         summary_mode: env_summary_mode(),
         ..CompactionConfig::default()
     }
@@ -3500,12 +3546,10 @@ pub(crate) fn mode_prompt_segment(mode: &str) -> Option<&'static str> {
 /// to a hard-gated policy (only the plan document is writable) instead of
 /// rebuilding it, so the todo ledger and conversation survive the transition
 /// into execution.
-#[allow(clippy::too_many_arguments)]
 async fn handle_plan_command(
     state: &SessionShared,
     input: &str,
-    planning: &mut bool,
-    plan_path: &mut Option<PathBuf>,
+    plan: &mut ReplPlanState,
     cwd: &Path,
     mode: &str,
     runtime: &mut AgentRuntime,
@@ -3517,14 +3561,14 @@ async fn handle_plan_command(
         .unwrap_or_default();
     match arg {
         "" => {
-            println!("planning is {}", if *planning { "ON" } else { "off" });
+            println!("planning is {}", if plan.planning { "ON" } else { "off" });
             println!("  /plan <goal>    research and draft a plan (writes gated to the plan file)");
             println!("  /plan approve   load the approved plan into the task list and execute it");
             println!("  /plan end       leave planning without executing");
         }
         "status" => {
-            println!("planning is {}", if *planning { "ON" } else { "off" });
-            if let Some(path) = plan_path {
+            println!("planning is {}", if plan.planning { "ON" } else { "off" });
+            if let Some(path) = &plan.plan_path {
                 println!("plan file: {}", path.display());
                 match fs::read_to_string(path) {
                     Ok(markdown) => {
@@ -3539,9 +3583,9 @@ async fn handle_plan_command(
                 }
             }
         }
-        "end" => end_planning(planning, mode, runtime),
-        "approve" => approve_plan(state, planning, plan_path, mode, runtime, prompter).await?,
-        goal => start_planning(state, goal, planning, plan_path, cwd, runtime).await?,
+        "end" => end_planning(plan, mode, runtime),
+        "approve" => approve_plan(state, plan, mode, runtime, prompter).await?,
+        goal => start_planning(state, goal, plan, cwd, runtime).await?,
     }
     Ok(())
 }
@@ -3551,8 +3595,7 @@ async fn handle_plan_command(
 async fn start_planning(
     state: &SessionShared,
     goal: &str,
-    planning: &mut bool,
-    plan_path: &mut Option<PathBuf>,
+    plan: &mut ReplPlanState,
     cwd: &Path,
     runtime: &mut AgentRuntime,
 ) -> io::Result<()> {
@@ -3563,8 +3606,8 @@ async fn start_planning(
             return Ok(());
         }
     };
-    *planning = true;
-    *plan_path = Some(path.clone());
+    plan.planning = true;
+    plan.plan_path = Some(path.clone());
     set_runtime_mode_policy(runtime, "plan");
     println!("planning mode ON - writes are blocked except the plan document.");
     println!("plan file: {}", path.display());
@@ -3581,13 +3624,13 @@ async fn start_planning(
 }
 
 /// Leave planning and restore the session's normal permission policy in place.
-fn end_planning(planning: &mut bool, mode: &str, runtime: &mut AgentRuntime) {
-    if !*planning {
+fn end_planning(plan: &mut ReplPlanState, mode: &str, runtime: &mut AgentRuntime) {
+    if !plan.planning {
         println!("not planning.");
         return;
     }
     set_runtime_mode_policy(runtime, mode);
-    *planning = false;
+    plan.planning = false;
     println!("planning mode off - back to {mode}.");
 }
 
@@ -3595,19 +3638,18 @@ fn end_planning(planning: &mut bool, mode: &str, runtime: &mut AgentRuntime) {
 /// restore the execution policy, and run the first execution turn.
 async fn approve_plan(
     state: &SessionShared,
-    planning: &mut bool,
-    plan_path: &mut Option<PathBuf>,
+    plan: &mut ReplPlanState,
     mode: &str,
     runtime: &mut AgentRuntime,
     prompter: &mut CliPermissionPrompter,
 ) -> io::Result<()> {
-    if !*planning {
+    if !plan.planning {
         println!("not planning; start with `/plan <goal>`.");
         return Ok(());
     }
-    let Some(path) = plan_path.clone() else {
+    let Some(path) = plan.plan_path.clone() else {
         println!("no plan file to approve.");
-        *planning = false;
+        plan.planning = false;
         return Ok(());
     };
     let markdown = match fs::read_to_string(&path) {
@@ -3645,7 +3687,7 @@ async fn approve_plan(
         return Ok(());
     }
     set_runtime_mode_policy(runtime, mode);
-    *planning = false;
+    plan.planning = false;
     println!(
         "plan approved - {} tasks, execution mode {mode}. Each task runs in a fresh context.",
         tasks.len()
@@ -3706,12 +3748,10 @@ async fn approve_plan(
 /// `/plan`: reserve a spec path, run the research-first turn, then present the
 /// three-way confirmation overlay (execute / cancel / revise). Execution reuses
 /// the plan task loop verbatim.
-#[allow(clippy::too_many_arguments)]
 async fn handle_spec_command(
     state: &SessionShared,
     input: &str,
-    speccing: &mut bool,
-    spec_path: &mut Option<PathBuf>,
+    plan: &mut ReplPlanState,
     cwd: &Path,
     mode: &str,
     runtime: &mut AgentRuntime,
@@ -3723,7 +3763,10 @@ async fn handle_spec_command(
         .unwrap_or_default();
     match arg {
         "" => {
-            println!("spec-writing is {}", if *speccing { "ON" } else { "off" });
+            println!(
+                "spec-writing is {}",
+                if plan.speccing { "ON" } else { "off" }
+            );
             println!(
                 "  /spec <goal>       research and draft a spec (writes gated to the spec file)"
             );
@@ -3732,8 +3775,11 @@ async fn handle_spec_command(
             println!("  /spec end          leave spec-writing without executing");
         }
         "status" => {
-            println!("spec-writing is {}", if *speccing { "ON" } else { "off" });
-            if let Some(path) = spec_path {
+            println!(
+                "spec-writing is {}",
+                if plan.speccing { "ON" } else { "off" }
+            );
+            if let Some(path) = &plan.spec_path {
                 println!("spec file: {}", path.display());
                 match fs::read_to_string(path) {
                     Ok(markdown) => {
@@ -3759,13 +3805,13 @@ async fn handle_spec_command(
             }
             Err(error) => println!("cannot list specs: {error}"),
         },
-        "end" => end_spec(speccing, spec_path, mode, runtime),
+        "end" => end_spec(plan, mode, runtime),
         "approve" => {
-            let Some(path) = spec_path.clone() else {
+            let Some(path) = plan.spec_path.clone() else {
                 println!("no spec to approve; `/spec <goal>` or `/spec approve <path>`.");
                 return Ok(());
             };
-            spec_review_loop(state, runtime, prompter, &path, speccing, spec_path, mode).await?;
+            spec_review_loop(state, runtime, prompter, &path, plan, mode).await?;
         }
         _ if arg.starts_with("approve ") => {
             let target = arg.strip_prefix("approve ").unwrap_or_default().trim();
@@ -3776,14 +3822,9 @@ async fn handle_spec_command(
                     return Ok(());
                 }
             };
-            spec_review_loop(state, runtime, prompter, &path, speccing, spec_path, mode).await?;
+            spec_review_loop(state, runtime, prompter, &path, plan, mode).await?;
         }
-        goal => {
-            start_spec(
-                state, goal, speccing, spec_path, cwd, mode, runtime, prompter,
-            )
-            .await?
-        }
+        goal => start_spec(state, goal, plan, cwd, mode, runtime, prompter).await?,
     }
     Ok(())
 }
@@ -3791,12 +3832,10 @@ async fn handle_spec_command(
 /// Begin a spec-writing session: reserve the spec document, engage the gated
 /// policy, run the first research-and-design turn under `SpecPrompter`, then
 /// present the confirmation overlay.
-#[allow(clippy::too_many_arguments)]
 async fn start_spec(
     state: &SessionShared,
     goal: &str,
-    speccing: &mut bool,
-    spec_path: &mut Option<PathBuf>,
+    plan: &mut ReplPlanState,
     cwd: &Path,
     mode: &str,
     runtime: &mut AgentRuntime,
@@ -3809,8 +3848,8 @@ async fn start_spec(
             return Ok(());
         }
     };
-    *speccing = true;
-    *spec_path = Some(path.clone());
+    plan.speccing = true;
+    plan.spec_path = Some(path.clone());
     set_runtime_mode_policy(runtime, "spec");
     println!("spec mode ON - writes are blocked except the spec document.");
     println!("spec file: {}", path.display());
@@ -3822,24 +3861,19 @@ async fn start_spec(
     )
     .await?;
     println!();
-    spec_review_loop(state, runtime, prompter, &path, speccing, spec_path, mode).await?;
+    spec_review_loop(state, runtime, prompter, &path, plan, mode).await?;
     Ok(())
 }
 
 /// Leave spec-writing and restore the session's normal permission policy.
-fn end_spec(
-    speccing: &mut bool,
-    spec_path: &mut Option<PathBuf>,
-    mode: &str,
-    runtime: &mut AgentRuntime,
-) {
-    if !*speccing {
+fn end_spec(plan: &mut ReplPlanState, mode: &str, runtime: &mut AgentRuntime) {
+    if !plan.speccing {
         println!("not spec-writing.");
         return;
     }
     set_runtime_mode_policy(runtime, mode);
-    *speccing = false;
-    *spec_path = None;
+    plan.speccing = false;
+    plan.spec_path = None;
     println!("spec mode off - back to {mode}.");
 }
 
@@ -3851,8 +3885,7 @@ async fn spec_review_loop(
     runtime: &mut AgentRuntime,
     prompter: &mut CliPermissionPrompter,
     path: &Path,
-    speccing: &mut bool,
-    spec_path: &mut Option<PathBuf>,
+    plan: &mut ReplPlanState,
     mode: &str,
 ) -> io::Result<()> {
     loop {
@@ -3872,18 +3905,15 @@ async fn spec_review_loop(
         }
         match spec_confirmation(path, &markdown) {
             SpecDecision::Execute => {
-                execute_spec(
-                    state, runtime, prompter, path, &markdown, speccing, spec_path, mode,
-                )
-                .await?;
+                execute_spec(state, runtime, prompter, path, &markdown, plan, mode).await?;
                 return Ok(());
             }
             SpecDecision::Cancel => {
                 // Restore the session policy only if this was an active
                 // spec-writing session; a later `/spec approve <path>` review
                 // never changed the policy in the first place.
-                if *speccing {
-                    end_spec(speccing, spec_path, mode, runtime);
+                if plan.speccing {
+                    end_spec(plan, mode, runtime);
                 }
                 println!("spec kept at {}; execution deferred.", path.display());
                 return Ok(());
@@ -3904,15 +3934,13 @@ async fn spec_review_loop(
 
 /// Execute a spec: parse its checkbox tasks, seed the todo ledger, restore the
 /// execution policy, and run the plan task loop. Mirrors `approve_plan`.
-#[allow(clippy::too_many_arguments)]
 async fn execute_spec(
     state: &SessionShared,
     runtime: &mut AgentRuntime,
     prompter: &mut CliPermissionPrompter,
     path: &Path,
     markdown: &str,
-    speccing: &mut bool,
-    spec_path: &mut Option<PathBuf>,
+    plan: &mut ReplPlanState,
     mode: &str,
 ) -> io::Result<()> {
     let tasks = parse_plan_tasks(markdown);
@@ -3932,8 +3960,8 @@ async fn execute_spec(
         return Ok(());
     }
     set_runtime_mode_policy(runtime, mode);
-    *speccing = false;
-    *spec_path = None;
+    plan.speccing = false;
+    plan.spec_path = None;
     println!(
         "spec approved - {} tasks ({pending} pending), execution mode {mode}. Each task runs in a fresh context.",
         tasks.len()
@@ -4996,6 +5024,7 @@ mod tests {
             tool_errors: 0,
             conclusion: Some("shipped the endpoint".to_string()),
             interrupted: false,
+            error_class: None,
         };
         assert_eq!(
             task_memory_note("t3", "add auth", &outcome),
@@ -5623,5 +5652,48 @@ mod tests {
         // A mention that does not resolve leaves the turn usable.
         assert_eq!(expand_attachments("@ghost.png").len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// R4 default-flip tests (roadmap §16): window mode arms the tail budget and
+/// the hard trigger; env overrides win in both directions.
+#[cfg(test)]
+mod stability_defaults {
+    use super::{effective_hard_trigger, effective_tail_budget, TAIL_BUDGET_DEFAULT};
+
+    #[test]
+    fn tail_budget_defaults_on_in_window_mode() {
+        // No window configured -> old behavior (count-only cut).
+        assert_eq!(effective_tail_budget(0, None), 0);
+        // Window configured -> min(32k, window/8).
+        assert_eq!(effective_tail_budget(400_000, None), TAIL_BUDGET_DEFAULT);
+        assert_eq!(
+            effective_tail_budget(200_000, None),
+            25_000,
+            "window/8 wins when it is below the 32k cap"
+        );
+        assert_eq!(
+            effective_tail_budget(32_000, None),
+            4_000,
+            "small windows scale the budget down (window/8)"
+        );
+    }
+
+    #[test]
+    fn tail_budget_env_wins_including_zero() {
+        assert_eq!(effective_tail_budget(200_000, Some(0)), 0);
+        assert_eq!(effective_tail_budget(200_000, Some(4_096)), 4_096);
+    }
+
+    #[test]
+    fn hard_trigger_defaults_armed_in_window_mode() {
+        assert!(!effective_hard_trigger(0, None));
+        assert!(effective_hard_trigger(200_000, None));
+    }
+
+    #[test]
+    fn hard_trigger_env_wins_both_ways() {
+        assert!(!effective_hard_trigger(200_000, Some(false)));
+        assert!(effective_hard_trigger(0, Some(true)));
     }
 }

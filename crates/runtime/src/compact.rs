@@ -566,11 +566,19 @@ pub fn should_compact_with_estimate(
 pub fn is_context_overflow_error(message: &str) -> bool {
     let lowered = message.to_ascii_lowercase();
     [
+        // OpenAI/Anthropic phrasings
         "maximum context length",
         "prompt is too long",
         "exceed context limit",
         "exceeds the context limit",
         "context_length_exceeded",
+        // OpenAI Responses dialect + DeepSeek/GLM phrasings (P1, semantic
+        // review): the hard-trigger recovery is a no-op if the matcher
+        // misses the wire's exact wording.
+        "context window",
+        "reduce the length",
+        "too many tokens",
+        "input tokens exceed",
     ]
     .iter()
     .any(|needle| lowered.contains(needle))
@@ -987,15 +995,20 @@ fn extract_tag_block(content: &str, tag: &str) -> Option<String> {
 fn strip_tag_block(content: &str, tag: &str) -> String {
     let start = format!("<{tag}>");
     let end = format!("</{tag}>");
-    if let (Some(start_index), Some(end_index_rel)) = (content.find(&start), content.find(&end)) {
-        let end_index = end_index_rel + end.len();
-        let mut stripped = String::new();
-        stripped.push_str(&content[..start_index]);
-        stripped.push_str(&content[end_index..]);
-        stripped
-    } else {
-        content.to_string()
-    }
+    let Some(start_index) = content.find(&start) else {
+        return content.to_string();
+    };
+    // The closing tag must sit AFTER the opening one: `find(&end)` on the
+    // whole string can hit an earlier, unrelated occurrence (P3, semantic
+    // review), which would splice the middle back in with the tags intact.
+    let Some(end_index_rel) = content[start_index..].find(&end) else {
+        return content.to_string();
+    };
+    let end_index = start_index + end_index_rel + end.len();
+    let mut stripped = String::new();
+    stripped.push_str(&content[..start_index]);
+    stripped.push_str(&content[end_index..]);
+    stripped
 }
 
 fn collapse_blank_lines(content: &str) -> String {

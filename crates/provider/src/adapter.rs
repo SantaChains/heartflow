@@ -20,6 +20,32 @@ use crate::config::{ProviderProfile, ProviderProtocol};
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
+/// Shared producer-task bridge for all three wire dialects (D3, ai-rust-hygiene):
+/// spawn a task, drive the dialect stream into a bounded channel, and wrap any
+/// transport error as a terminal `AgentEvent::Error` (the runtime's
+/// `classify_stream_error` is the single classification boundary). The bridge
+/// itself cannot fail — construction is synchronous — so callers wrap the
+/// returned stream in the trait's `Ok` themselves.
+fn spawn_stream_bridge<F, Fut>(drive: F) -> TurnStream
+where
+    F: FnOnce(mpsc::Sender<AgentEvent>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), ApiError>> + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    let handle = tokio::spawn(async move {
+        if let Err(error) = drive(tx.clone()).await {
+            let hint = error.suggestion().map(str::to_string);
+            let _ = tx
+                .send(AgentEvent::Error {
+                    message: error.to_string(),
+                    hint,
+                })
+                .await;
+        }
+    });
+    TurnStream::new(rx, handle.abort_handle())
+}
+
 /// Bridges the blocking `ApiClient` seam to the async Anthropic transport.
 ///
 /// `stream` spawns a producer task that forwards SSE deltas into a bounded
@@ -70,7 +96,6 @@ impl AnthropicStreamClient {
 
 impl ApiClient for AnthropicStreamClient {
     fn stream(&mut self, request: ApiRequest) -> Result<TurnStream, RuntimeError> {
-        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let client = self.client.clone();
         let message_request = build_message_request(
             &request,
@@ -80,20 +105,9 @@ impl ApiClient for AnthropicStreamClient {
             self.reasoning_effort.as_deref(),
             self.sampling.clone(),
         );
-
-        let handle = tokio::spawn(async move {
-            if let Err(error) = drive_stream(&client, message_request, &tx).await {
-                let hint = error.suggestion().map(str::to_string);
-                let _ = tx
-                    .send(AgentEvent::Error {
-                        message: error.to_string(),
-                        hint,
-                    })
-                    .await;
-            }
-        });
-
-        Ok(TurnStream::new(rx, handle.abort_handle()))
+        Ok(spawn_stream_bridge(move |tx| async move {
+            drive_stream(&client, message_request, &tx).await
+        }))
     }
 }
 
@@ -125,7 +139,6 @@ impl OpenAiStreamClient {
 
 impl ApiClient for OpenAiStreamClient {
     fn stream(&mut self, request: ApiRequest) -> Result<TurnStream, RuntimeError> {
-        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let client = self.client.clone();
         let chat_request = build_chat_request(
             &request,
@@ -135,20 +148,9 @@ impl ApiClient for OpenAiStreamClient {
             self.reasoning_effort.clone(),
             self.sampling.clone(),
         );
-
-        let handle = tokio::spawn(async move {
-            if let Err(error) = drive_openai_stream(&client, chat_request, &tx).await {
-                let hint = error.suggestion().map(str::to_string);
-                let _ = tx
-                    .send(AgentEvent::Error {
-                        message: error.to_string(),
-                        hint,
-                    })
-                    .await;
-            }
-        });
-
-        Ok(TurnStream::new(rx, handle.abort_handle()))
+        Ok(spawn_stream_bridge(move |tx| async move {
+            drive_openai_stream(&client, chat_request, &tx).await
+        }))
     }
 }
 
@@ -777,7 +779,6 @@ impl ResponsesStreamClient {
 
 impl ApiClient for ResponsesStreamClient {
     fn stream(&mut self, request: ApiRequest) -> Result<TurnStream, RuntimeError> {
-        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let client = self.client.clone();
         let body = build_responses_body(
             &request,
@@ -786,18 +787,9 @@ impl ApiClient for ResponsesStreamClient {
             self.enable_tools,
             self.sampling.clone(),
         );
-        let handle = tokio::spawn(async move {
-            if let Err(error) = drive_responses_stream(&client, body, &tx).await {
-                let hint = error.suggestion().map(str::to_string);
-                let _ = tx
-                    .send(AgentEvent::Error {
-                        message: error.to_string(),
-                        hint,
-                    })
-                    .await;
-            }
-        });
-        Ok(TurnStream::new(rx, handle.abort_handle()))
+        Ok(spawn_stream_bridge(move |tx| async move {
+            drive_responses_stream(&client, body, &tx).await
+        }))
     }
 }
 

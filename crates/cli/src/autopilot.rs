@@ -39,6 +39,24 @@ pub(crate) async fn maybe_autopilot(
 /// criteria-less or manual-criteria mission cannot loop forever.
 const MAX_AUTOPILOT_TURNS: usize = 64;
 
+/// S2 (roadmap §16 R2): transport-class turn failures (connection drops,
+/// timeouts, rate-limit bursts, stream deaths) are transient — they no longer
+/// count as blocked claims. Instead the autopilot retries the same nudge with
+/// exponential backoff up to this many times; only after exhausting the
+/// retries does one blocked claim get recorded. Auth/overflow/model failures
+/// still count immediately (a blocked mission is a *real* block).
+const MAX_TRANSPORT_RETRIES: usize = 3;
+
+/// Backoff schedule for transport retries: 30s -> 2m -> 8m (capped).
+#[must_use]
+pub(crate) fn transport_backoff(retry_index: usize) -> std::time::Duration {
+    match retry_index {
+        0 => std::time::Duration::from_secs(30),
+        1 => std::time::Duration::from_secs(120),
+        _ => std::time::Duration::from_secs(480),
+    }
+}
+
 /// The single active mission's id, or `None`. With several active missions the
 /// attribution of a turn's budget is a guess, so the autopilot refuses rather
 /// than pick one (mirrors `auto_record_turn`'s single-active rule).
@@ -68,6 +86,10 @@ pub(crate) async fn run_loop_autopilot(
     prompter: &mut CliPermissionPrompter,
     missions_root: &Path,
 ) -> io::Result<()> {
+    // S2: transport faults retry with backoff instead of poisoning the
+    // blocked streak; the counter resets on any non-transport outcome.
+    let mut transport_retries = 0usize;
+
     for _ in 0..MAX_AUTOPILOT_TURNS {
         let ledger = MissionLedger::load(missions_root);
         let Some(mission_id) = single_active_mission_id(&ledger) else {
@@ -103,27 +125,56 @@ pub(crate) async fn run_loop_autopilot(
             println!("loop: interrupted by the operator - auto-continue paused.");
             return Ok(());
         }
-        if !outcome.ok {
-            // A failed turn is a blocked claim; the ledger flips to Blocked on
-            // the third consecutive claim (anti-early-give-up). A successful
-            // turn already reset the streak via `auto_record_turn`.
-            match ledger.mark_blocked(mission_id, "auto-continue turn failed") {
-                Ok((mission, true)) => {
-                    println!(
-                        "loop: mission m{mission_id} blocked after {} consecutive failed turns - stopping.",
-                        mission.blocked_streak
-                    );
+        if outcome.ok {
+            transport_retries = 0;
+            continue;
+        }
+        // S2: a transport-class failure is transient. Back off and retry the
+        // same nudge without touching the blocked streak; after exhausting
+        // the retries, fall through and count one real blocked claim.
+        if outcome.error_class == Some(runtime::ErrorKind::Transport)
+            && transport_retries < MAX_TRANSPORT_RETRIES
+        {
+            let delay = transport_backoff(transport_retries);
+            transport_retries += 1;
+            println!(
+                "loop: transport failure ({}); retrying in {}s (transport retry {transport_retries}/{MAX_TRANSPORT_RETRIES}). Ctrl+C pauses auto-continue.",
+                runtime::ErrorKind::Transport.label(),
+                delay.as_secs()
+            );
+            // A1 (semantic review): the backoff must stay interruptible —
+            // racing ctrl_c means the operator can always stop the loop, no
+            // matter how long the backoff window is.
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                result = tokio::signal::ctrl_c() => {
+                    let _ = result;
+                    println!("loop: interrupted by the operator during backoff - auto-continue paused.");
                     return Ok(());
                 }
-                Ok((mission, false)) => {
-                    println!(
-                        "loop: blocked claim {}/{} recorded; continuing.",
-                        mission.blocked_streak,
-                        runtime::BLOCKED_STREAK_NEEDED
-                    );
-                }
-                Err(_) => return Ok(()),
             }
+            continue;
+        }
+        transport_retries = 0;
+        // A failed turn is a blocked claim; the ledger flips to Blocked on
+        // the third consecutive claim (anti-early-give-up). A successful
+        // turn already reset the streak via `auto_record_turn`.
+        match ledger.mark_blocked(mission_id, "auto-continue turn failed") {
+            Ok((mission, true)) => {
+                println!(
+                    "loop: mission m{mission_id} blocked after {} consecutive failed turns - stopping.",
+                    mission.blocked_streak
+                );
+                return Ok(());
+            }
+            Ok((mission, false)) => {
+                println!(
+                    "loop: blocked claim {}/{} recorded; continuing.",
+                    mission.blocked_streak,
+                    runtime::BLOCKED_STREAK_NEEDED
+                );
+            }
+            Err(_) => return Ok(()),
         }
     }
     println!("loop: auto-continue cap ({MAX_AUTOPILOT_TURNS}) reached - stopping.");
@@ -185,5 +236,17 @@ mod tests {
         let nudge = continue_nudge(7);
         assert!(nudge.contains("m7"));
         assert!(nudge.contains("AUTO-CONTINUE"));
+    }
+
+    #[test]
+    fn transport_backoff_is_exponential_and_capped() {
+        use super::transport_backoff;
+        assert_eq!(transport_backoff(0).as_secs(), 30);
+        assert_eq!(transport_backoff(1).as_secs(), 120);
+        assert_eq!(transport_backoff(2).as_secs(), 480);
+        // Out-of-range indices clamp to the cap, never panic.
+        assert_eq!(transport_backoff(9).as_secs(), 480);
+        assert!(transport_backoff(0) < transport_backoff(1));
+        assert!(transport_backoff(1) < transport_backoff(2));
     }
 }
