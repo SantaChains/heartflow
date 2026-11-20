@@ -107,17 +107,47 @@ struct BuiltinProvider {
 
 fn builtin_provider(name: &str) -> Option<BuiltinProvider> {
     match name {
+        // 2026-11 refresh: `deepseek-flash` is the official current id
+        // (V4.1-Flash); `deepseek-v4-flash` is retired-but-served and
+        // `deepseek-chat`/`deepseek-reasoner` died 2026-07-24.
         "deepseek" => Some(BuiltinProvider {
             protocol: ProviderProtocol::OpenAi,
             base_url: DEEPSEEK_BASE_URL,
             api_key_env: "DEEPSEEK_API_KEY",
-            model: Some("deepseek-v4-flash"),
+            model: Some("deepseek-flash"),
         }),
         "anthropic" => Some(BuiltinProvider {
             protocol: ProviderProtocol::Anthropic,
             base_url: ANTHROPIC_BASE_URL,
             api_key_env: "ANTHROPIC_API_KEY",
             model: None,
+        }),
+        // Domestic OpenAI-compatible flagships. Endpoints and ids verified
+        // against vendor docs 2026-11; `hf models`/`/models` discovery keeps
+        // the lists honest as vendors rename.
+        "zhipu" => Some(BuiltinProvider {
+            protocol: ProviderProtocol::OpenAi,
+            base_url: "https://open.bigmodel.cn/api/paas/v4",
+            api_key_env: "ZHIPU_API_KEY",
+            model: Some("glm-5.3"),
+        }),
+        "kimi" => Some(BuiltinProvider {
+            protocol: ProviderProtocol::OpenAi,
+            base_url: "https://api.moonshot.cn/v1",
+            api_key_env: "MOONSHOT_API_KEY",
+            model: Some("kimi-k3.1-pro"),
+        }),
+        "qwen" => Some(BuiltinProvider {
+            protocol: ProviderProtocol::OpenAi,
+            base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            api_key_env: "DASHSCOPE_API_KEY",
+            model: Some("qwen3.8-max"),
+        }),
+        "openai" => Some(BuiltinProvider {
+            protocol: ProviderProtocol::OpenAi,
+            base_url: "https://api.openai.com/v1",
+            api_key_env: "OPENAI_API_KEY",
+            model: Some("gpt-5.5"),
         }),
         _ => None,
     }
@@ -129,7 +159,7 @@ fn builtin_provider(name: &str) -> Option<BuiltinProvider> {
 /// completable without touching the CLI.
 #[must_use]
 pub fn builtin_provider_names() -> &'static [&'static str] {
-    &["deepseek", "anthropic"]
+    &["deepseek", "zhipu", "kimi", "qwen", "openai", "anthropic"]
 }
 
 /// The endpoint a builtin provider name resolves to. The `/provider` completion
@@ -541,7 +571,8 @@ pub fn resolve_spec(
             && settings.api_key.is_none()
         {
             return Err(format!(
-                "unknown provider: {name} (available: deepseek, anthropic, or set [provider] base_url in config.toml)"
+                "unknown provider: {name} (available: {}, or set [provider] base_url in config.toml)",
+                builtin_provider_names().join(", ")
             ));
         }
     }
@@ -804,7 +835,9 @@ mod tests {
                 assert_eq!(protocol, ProviderProtocol::OpenAi);
                 assert_eq!(base_url, "https://api.deepseek.com/v1");
                 assert_eq!(api_key_env, "DEEPSEEK_API_KEY");
-                assert_eq!(model, "deepseek-v4-flash");
+                // 2026-11 refresh: the official current id is deepseek-flash
+                // (V4.1-Flash); deepseek-v4-flash is retired-but-served.
+                assert_eq!(model, "deepseek-flash");
                 assert_eq!(max_tokens, DEFAULT_MAX_TOKENS);
             }
             other @ ProviderSpec::Env { .. } => panic!("expected resolved profile, got {other:?}"),

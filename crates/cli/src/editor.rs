@@ -90,6 +90,7 @@ const COMMANDS: &[(&str, &str)] = &[
         "/provider [NAME] [MODEL]",
         "Show or switch the provider (+ optional model)",
     ),
+    ("/models", "Refresh the model list from the live endpoint"),
     ("/mode [NAME]", "Show or switch the permission mode"),
     (
         "/plan <GOAL>",

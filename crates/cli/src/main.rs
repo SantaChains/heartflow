@@ -1434,6 +1434,10 @@ async fn dispatch_slash_command(
             handle_provider_command(state, trimmed, selection, runtime, mode, catalog);
             LoopControl::Continue
         }
+        _ if trimmed == "/models" => {
+            handle_models_command(selection, catalog).await;
+            LoopControl::Continue
+        }
         _ if trimmed == "/web" || trimmed.starts_with("/web ") => {
             handle_web_command(state, trimmed);
             plan.planning = false;
@@ -2905,6 +2909,71 @@ fn handle_effort_command(
             println!("reasoning effort -> {normalized}");
         }
         Err(error) => println!("failed to switch effort: {error}"),
+    }
+}
+
+/// `/models` — refresh `/model` completion from the wire: probe the active
+/// endpoint's own model list (which also proves the credential), cache it
+/// into the catalog, and print it. No argument switches anything; the
+/// current model is verified against the server list when it reports one.
+async fn handle_models_command(selection: &ProviderSelection, catalog: &ProviderCatalog) {
+    let ProviderSelection::Profile(profile) = selection else {
+        println!("model self-discovery needs an explicit provider; the env-driven Anthropic path exposes no model endpoint (use `/provider <name>` first)");
+        return;
+    };
+    println!("probing {} ...", profile.base_url);
+    match probe_models(profile).await {
+        Ok((models, supports_balance)) => {
+            println!("models ({}) from the endpoint:", models.len());
+            for info in &models {
+                let context = info
+                    .context_length
+                    .map_or_else(|| "ctx n/a".to_string(), |t| format!("ctx {t}"));
+                println!("  {:<32} {context}", info.id);
+            }
+            let current_known = models.iter().any(|info| info.id == profile.model);
+            if !current_known {
+                println!(
+                    "note: current model `{}` is not in the endpoint list; it is kept unchanged (some endpoints under-report)",
+                    profile.model
+                );
+            }
+            let discovered: Vec<(String, Option<u64>)> = models
+                .iter()
+                .map(|info| (info.id.clone(), info.context_length.map(u64::from)))
+                .collect();
+            if discovered.is_empty() {
+                println!("endpoint listed no models; catalog untouched");
+                return;
+            }
+            match persist_discovered(
+                &home_dir(),
+                &profile.base_url,
+                profile.protocol,
+                &discovered,
+            ) {
+                Ok(()) => println!(
+                    "catalog updated: `/model` completion now offers the live list ({} models filed under {})",
+                    discovered.len(),
+                    catalog
+                        .provider_key_by_host(&profile.base_url)
+                        .unwrap_or_else(|| profile.base_url.clone())
+                ),
+                Err(error) => println!("(could not cache discovered models: {error})"),
+            }
+            // DeepSeek-shaped surfaces also expose `/user/balance`; a free
+            // extra line when the endpoint supports it.
+            if supports_balance {
+                let client = OpenAiClient::new(profile.api_key.clone())
+                    .with_base_url(profile.base_url.clone());
+                if let Ok(balance) = client.get_balance().await {
+                    for info in &balance.balance_infos {
+                        println!("balance: {} {}", info.total_balance, info.currency);
+                    }
+                }
+            }
+        }
+        Err(error) => println!("probe failed (catalog untouched): {error}"),
     }
 }
 

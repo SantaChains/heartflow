@@ -616,3 +616,15 @@ enum CredentialSource {
 - **REPL 流式双写**（自 list.md #74 收编）：流式期间逐段原样打印 markdown 原文（只上 muted 色），回合结束 `MessageStop` 再把整段 assistant_text 重排一次——用户先看到 md 源码、结束时整块跳动（`.bak` T1）。候选修法：(a) 按块边界（空行、未闭合代码围栏）切分，已闭合块渲染一次不再重绘，重排限于最后一个未闭合块，需行数记账 + 光标上移重画；(b) 流式阶段不打印原始 md、改印进度指示。同类未修项：TUI 流式尾部每帧 clone、表格列宽不按终端宽度封顶（list.md #73/#75）。
 
 ---
+
+### 国内 provider 面与 DeepSeek 全家桶接线（2026-11-21 收编，来源：官方 api-docs.deepseek.com + docs.bigmodel.cn + therouter.ai 横评，均已核实）
+
+**已落地（同日 commit）**：builtin provider 表从 2 家扩到 6 家（deepseek/zhipu/kimi/qwen/openai/anthropic），`/provider` 可切换、`/provider NAME <Tab>` 两段补全吃 catalog seed（12 家国内主流端点已 seed）；deepseek 默认模型换代 `deepseek-v4-flash` → `deepseek-flash`（V4.1-Flash；旧名退役但仍服务，deepseek-chat/reasoner 已于 2026-07-24 死亡）；REPL `/models` 命令在线拉取当前 endpoint 模型列表并缓存进 catalog，`/model` 补全即刻可用。
+
+**待接线（按价值排序）**：
+
+1. **DeepSeek 全家桶应用 API**（2026-11-13 开放）：服务端完成工具调用与上下文拼接——对话内开 `deepseek_web_search`/`deepseek_read_url` 参数即得联网搜索/读链接（V4.1-Flash 在 Messages/Responses/ChatCompletions 三协议下支持）；独立接口 Search/Fetch（¥5/千次）、OCR（¥1.5/千页）、ASR/TTS 可单独调用包装成 MCP 工具或 heartflow 原生工具。与既有 web 工具面的关系：heartflow 自有 web_search/fetch 保留（跨 provider 通用），DeepSeek 服务端工具作为 deepseek transport 下的可选增强（参数开关，Token+工具费另计）——**接法**：openai-responses 协议请求体加 `tools` 服务端工具声明 + 流事件解析服务端工具输出块。
+2. **DeepSeek Harness**（developer preview，agent harness）：与 heartflow 定位重叠度待评估——先读 Harness Guide 判断其 loop/工具编排设计是否有可借鉴处，而非直接集成。
+3. **DeepSeek Anthropic 兼容端点**：`https://api.deepseek.com/anthropic`——可作为 deepseek 的第二 transport 形态（Anthropic protocol），价值有限（OpenAI 格式已全覆盖），仅记录。
+4. **模型名录维护机制**：各家改名频繁（DeepSeek 2026-07-24 大退役、DashScope 2026-10-10 sunset 30+ 旧 id）——现状 catalog seed + `/models` 在线发现已够用；若再加，考虑 `hf models --all-providers` 批量刷新而非逐家手更 seed。
+5. **peak/off-peak 计费感知**（DeepSeek 忙时 01:00-04:00/06:00-10:00 UTC 加价，已宣布未生效）：usage 记账已有时段信息，待 surcharge 实际生效后评估是否在 usage 报告标注忙时请求占比——先埋点不动。
