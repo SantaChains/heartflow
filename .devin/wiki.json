@@ -32,7 +32,7 @@
     },
     {
       "title": "Configuration",
-      "purpose": "config.toml 优先级链(CLI 参数 > -c/--config 显式文件 > 项目 > 用户 > 内置 provider > 环境变量)、[provider]/[mcp.servers] 结构、theme/keymap/settings 三面 shell 配置(各自独立 toml、用户+项目两层逐项覆盖、config export 导出生效值)、内置 deepseek/anthropic provider、密钥解析(env 优先)、热重载"
+      "purpose": "config.toml 优先级链(CLI 参数 > -c/--config 显式文件 > 项目 > 用户 > {NAME}_BASE_URL 基址重定向 > 内置 provider > 环境变量)、[provider]/[mcp.servers] 结构、theme/keymap/settings 三面 shell 配置(各自独立 toml、用户+项目两层逐项覆盖、config export 导出生效值)、内置 deepseek/zai/zhipu/kimi/qwen/openai/anthropic 七家 provider 与 {NAME}_BASE_URL 重定向、密钥解析(env 优先)、热重载"
     },
     {
       "title": "Context Engineering",

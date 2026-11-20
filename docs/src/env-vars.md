@@ -3,7 +3,9 @@
 | 变量 | 作用 |
 |------|------|
 | ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL | 环境型 provider 的密钥与基址 |
-| DEEPSEEK_API_KEY | 内置 deepseek provider 密钥（默认模型 `deepseek-v4-flash`） |
+| DEEPSEEK_API_KEY | 内置 deepseek provider 密钥（默认模型 `deepseek-flash`） |
+| ZAI_API_KEY / ZHIPU_API_KEY / MOONSHOT_API_KEY / DASHSCOPE_API_KEY / OPENAI_API_KEY | 内置 zai（智谱国际）/ zhipu / kimi / qwen / openai provider 的密钥 |
+| DEEPSEEK_BASE_URL / ZAI_BASE_URL / ZHIPU_BASE_URL / MOONSHOT_BASE_URL / DASHSCOPE_BASE_URL / OPENAI_BASE_URL / ANTHROPIC_BASE_URL | 重定向内置 provider 的基址（镜像/自建端点免改配置切换）；优先级位于显式 config `base_url` 之下、内置默认之上 |
 | HEARTFLOW_LOG | 日志级别门，默认 warn，输出至 stderr |
 | HEARTFLOW_PERMISSION_MODE | read-only / workspace-write（交互式默认）/ full（非交互默认）；另接受 plan 与 auto（=full）。REPL 内 /mode 可切换前三个，plan 由 /plan 进入 |
 | HEARTFLOW_SHELL | 覆盖 bash 工具的 shell 程序 |

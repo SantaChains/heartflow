@@ -38,8 +38,14 @@ read_only = true                       # 声明该 server 工具均只读：read
 
 ## 内置 provider
 
-- `deepseek`：OpenAI 协议，`api_key_env = "DEEPSEEK_API_KEY"`，默认模型 `deepseek-v4-flash`。
+- `deepseek`：OpenAI 协议，`api_key_env = "DEEPSEEK_API_KEY"`，默认模型 `deepseek-flash`。
+- `zai`：OpenAI 协议，`api_key_env = "ZAI_API_KEY"`，智谱国际端点（`https://api.z.ai/api/paas/v4`），默认模型 `glm-5.3`。
+- `zhipu`：OpenAI 协议，`api_key_env = "ZHIPU_API_KEY"`，默认模型 `glm-5.3`。
+- `kimi`：OpenAI 协议，`api_key_env = "MOONSHOT_API_KEY"`，默认模型 `kimi-k3.1-pro`。
+- `qwen`：OpenAI 协议，`api_key_env = "DASHSCOPE_API_KEY"`，默认模型 `qwen3.8-max`。
+- `openai`：OpenAI 协议，`api_key_env = "OPENAI_API_KEY"`，默认模型 `gpt-5.5`。
 - `anthropic`：Anthropic 协议，`api_key_env = "ANTHROPIC_API_KEY"`，基址可被 `ANTHROPIC_BASE_URL` 覆盖。
+- 任意内置 provider 的基址可用 `{NAME}_BASE_URL` 环境变量重定向（如 `ZHIPU_BASE_URL`、`DEEPSEEK_BASE_URL`），便于镜像/自建端点免改配置切换；优先级位于显式 config `base_url` 之下、内置默认之上，仅对内置名生效，空值忽略。
 - 任意 `[provider.NAME]` 表项即自定义 provider；都未命中且无内置名时回退到环境变量选路，此时默认模型为 `mimo-v2.5-pro`。
 
 ## 传输代理（`[proxy]`）
@@ -78,7 +84,7 @@ no_proxy = ["internal.corp"]        # bypass：主机、.后缀、IP、CIDR、*
 
 三层合并（后者按模型 id 覆盖前者）：
 
-1. **种子**：编译进二进制的国内常用 OpenAI 兼容供应商（DeepSeek、Moonshot/Kimi、智谱 GLM、阿里 Qwen、MiniMax、百川、千帆、硅基流动、火山方舟 Doubao、零一 Yi、阶跃 StepFun 及 OpenAI），随版本更新，**永不落盘**。
+1. **种子**：编译进二进制的国内常用 OpenAI 兼容供应商（DeepSeek、Moonshot/Kimi、智谱 GLM、智谱国际 Z.ai、阿里 Qwen、MiniMax、百川、千帆、硅基流动、火山方舟 Doubao、零一 Yi、阶跃 StepFun 及 OpenAI），随版本更新，**永不落盘**。
 2. **用户层**：你在 `~/.heartflow/provider.toml` 手写的覆盖/新增（参数不确定的模型可留空 `context_window`，宁缺毋臆造）。
 3. **自记层**：`hf models` 自举发现的模型（`source = "discovered"`）与 `/model NAME` 切换过的模型（`source = "user"`）由 heartflow 原子回写（temp+rename）到此文件。
 

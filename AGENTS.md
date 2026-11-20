@@ -79,7 +79,9 @@ CI 有三条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/**`
 | 变量                                                                | 语义                                                          | 读取处                                        |
 |---------------------------------------------------------------------|---------------------------------------------------------------|-----------------------------------------------|
 | `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | 环境型 provider 的密钥与基址                                  | `crates/api/src/client.rs:159`、provider 解析 |
-| `DEEPSEEK_API_KEY`                                                  | 内置 `deepseek` provider 密钥（默认模型 `deepseek-v4-flash`） | `crates/provider/src/config.rs:105`           |
+| `DEEPSEEK_API_KEY`                                                  | 内置 `deepseek` provider 密钥（默认模型 `deepseek-flash`）  | `crates/provider/src/config.rs:123`           |
+| `ZAI_API_KEY` / `ZHIPU_API_KEY` / `MOONSHOT_API_KEY` / `DASHSCOPE_API_KEY` / `OPENAI_API_KEY` | 内置 `zai`（智谱国际）/`zhipu`/`kimi`/`qwen`/`openai` provider 密钥 | `crates/provider/src/config.rs:129-161`       |
+| `DEEPSEEK_BASE_URL` / `ZAI_BASE_URL` / `ZHIPU_BASE_URL` / `MOONSHOT_BASE_URL` / `DASHSCOPE_BASE_URL` / `OPENAI_BASE_URL` | 重定向对应内置 provider 的基址（仅内置名生效、空值忽略）；优先级位于显式 config `base_url` 之下、内置默认之上 | `crates/provider/src/config.rs`（`env_base_url_override`） |
 | `HEARTFLOW_LOG`                                                     | tracing 过滤，默认 `warn`，仅 stderr                          | `crates/cli/src/main.rs:233`                  |
 | `HEARTFLOW_PERMISSION_MODE`                                         | 见权限策略                                                    | `crates/cli/src/permissions.rs:22`            |
 | `HEARTFLOW_SHELL`                                                   | 覆盖 bash 工具的 shell                                        | `crates/runtime/src/bash.rs:599`              |
@@ -112,7 +114,7 @@ CI 有三条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/**`
 
 `hf config export [SURFACE]`（`config` 默认 / `theme` / `keymap` / `settings` / `provider`）导出该面生效值为可编辑模板，永不落密钥；`provider` 面导出合并后的目录（种子+用户+发现）作为可编辑模板。
 
-配置优先级：CLI 参数（`--provider`/`--model`）> `-c`/`--config` 显式文件 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量；同名字段逐项覆盖。`-c`/`--config` 由 `crates/cli/src/main.rs` 在 `run()` 开头经 `provider::set_config_override`（`OnceLock`，首次写入即固定）录入绝对路径，`crates/provider/src/config.rs` 的 `config_file_paths` 将其拼在用户/项目两层之后作为最高层合并（仅影响 `config.toml` 这一面，不影响 theme/keymap/settings/provider 四面）；CLI 的 `--provider`/`--model` 仍优先于它。`ConfigWatcher`（`crates/cli/src/config.rs`）每回合边界按 mtime 逐面探测 config/theme/keymap/settings/provider 五面并热重载：`changed() -> ChangedSurfaces` 逐面上报，config 重建 runtime、theme 换入进程级调色板、keymap/settings 就地重载、provider 重载模型目录（仅供 `/model` 展示与补全，绝不重建 runtime 或改活动传输）（改 theme 绝不触发 config 重载）。
+配置优先级：CLI 参数（`--provider`/`--model`）> `-c`/`--config` 显式文件 > 项目 `.heartflow/config.toml` > 用户 `~/.heartflow/config.toml` > 内置 provider 表 > 环境变量；同名字段逐项覆盖。`{NAME}_BASE_URL` 基址重定向环境变量插在用户/项目 config 与内置 provider 表之间（显式 config `base_url` 胜出，env 胜出内置默认）。`-c`/`--config` 由 `crates/cli/src/main.rs` 在 `run()` 开头经 `provider::set_config_override`（`OnceLock`，首次写入即固定）录入绝对路径，`crates/provider/src/config.rs` 的 `config_file_paths` 将其拼在用户/项目两层之后作为最高层合并（仅影响 `config.toml` 这一面，不影响 theme/keymap/settings/provider 四面）；CLI 的 `--provider`/`--model` 仍优先于它。`ConfigWatcher`（`crates/cli/src/config.rs`）每回合边界按 mtime 逐面探测 config/theme/keymap/settings/provider 五面并热重载：`changed() -> ChangedSurfaces` 逐面上报，config 重建 runtime、theme 换入进程级调色板、keymap/settings 就地重载、provider 重载模型目录（仅供 `/model` 展示与补全，绝不重建 runtime 或改活动传输）（改 theme 绝不触发 config 重载）。
 
 ### 运行时可写路径
 

@@ -399,6 +399,20 @@ pub fn default_catalog() -> ProviderCatalog {
             ),
         ),
         (
+            "zai",
+            seed_provider(
+                "https://api.z.ai/api/paas/v4",
+                "ZAI_API_KEY",
+                &[
+                    // International Zhipu endpoint: same GLM-5.3 family as the
+                    // mainland `zhipu` entry under its own key namespace.
+                    ("glm-5.3", Some(1_048_576), Some("flagship")),
+                    ("glm-5.3-flash", Some(1_048_576), None),
+                    ("glm-5.2", Some(1_048_576), None),
+                ],
+            ),
+        ),
+        (
             "qwen",
             seed_provider(
                 "https://dashscope.aliyuncs.com/compatible-mode/v1",

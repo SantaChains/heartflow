@@ -621,6 +621,8 @@ enum CredentialSource {
 
 **已落地（同日 commit）**：builtin provider 表从 2 家扩到 6 家（deepseek/zhipu/kimi/qwen/openai/anthropic），`/provider` 可切换、`/provider NAME <Tab>` 两段补全吃 catalog seed（12 家国内主流端点已 seed）；deepseek 默认模型换代 `deepseek-v4-flash` → `deepseek-flash`（V4.1-Flash；旧名退役但仍服务，deepseek-chat/reasoner 已于 2026-07-24 死亡）；REPL `/models` 命令在线拉取当前 endpoint 模型列表并缓存进 catalog，`/model` 补全即刻可用。
 
+**续接落地（同日，接手批次）**：builtin 表扩至 7 家——新增 `zai`（智谱国际端点 `https://api.z.ai/api/paas/v4`，`ZAI_API_KEY`，默认 `glm-5.3`，catalog 同步 seed）；新增 `{NAME}_BASE_URL` 基址重定向环境变量族（`DEEPSEEK_BASE_URL`/`ZAI_BASE_URL`/`ZHIPU_BASE_URL` 等，仅内置名生效、空值忽略），优先级位于显式 config `base_url` 之下、内置默认之上——插在既定优先级链的 env 位，显式配置不被陈旧全局变量静默劫持（本机 `DEEPSEEK_BASE_URL` 误配为完整端点路径曾实证此风险）。docs/AGENTS/bucket/wiki 四面同步，llms 重生成。
+
 **待接线（按价值排序）**：
 
 1. **DeepSeek 全家桶应用 API**（2026-11-13 开放）：服务端完成工具调用与上下文拼接——对话内开 `deepseek_web_search`/`deepseek_read_url` 参数即得联网搜索/读链接（V4.1-Flash 在 Messages/Responses/ChatCompletions 三协议下支持）；独立接口 Search/Fetch（¥5/千次）、OCR（¥1.5/千页）、ASR/TTS 可单独调用包装成 MCP 工具或 heartflow 原生工具。与既有 web 工具面的关系：heartflow 自有 web_search/fetch 保留（跨 provider 通用），DeepSeek 服务端工具作为 deepseek transport 下的可选增强（参数开关，Token+工具费另计）——**接法**：openai-responses 协议请求体加 `tools` 服务端工具声明 + 流事件解析服务端工具输出块。

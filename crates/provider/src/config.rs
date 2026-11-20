@@ -16,6 +16,7 @@ pub const CONFIG_VERSION: u32 = 1;
 
 const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
 const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+const ZAI_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 
 /// Wire protocol spoken by a provider endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +132,15 @@ fn builtin_provider(name: &str) -> Option<BuiltinProvider> {
             api_key_env: "ZHIPU_API_KEY",
             model: Some("glm-5.3"),
         }),
+        // Zhipu's international endpoint. Same GLM family as the mainland
+        // `zhipu` entry under its own key namespace; model ids mirror the
+        // mainland catalog and `hf models` discovery keeps them honest.
+        "zai" => Some(BuiltinProvider {
+            protocol: ProviderProtocol::OpenAi,
+            base_url: ZAI_BASE_URL,
+            api_key_env: "ZAI_API_KEY",
+            model: Some("glm-5.3"),
+        }),
         "kimi" => Some(BuiltinProvider {
             protocol: ProviderProtocol::OpenAi,
             base_url: "https://api.moonshot.cn/v1",
@@ -159,7 +169,15 @@ fn builtin_provider(name: &str) -> Option<BuiltinProvider> {
 /// completable without touching the CLI.
 #[must_use]
 pub fn builtin_provider_names() -> &'static [&'static str] {
-    &["deepseek", "zhipu", "kimi", "qwen", "openai", "anthropic"]
+    &[
+        "deepseek",
+        "zai",
+        "zhipu",
+        "kimi",
+        "qwen",
+        "openai",
+        "anthropic",
+    ]
 }
 
 /// The endpoint a builtin provider name resolves to. The `/provider` completion
@@ -546,6 +564,20 @@ pub enum ProviderSpec {
     },
 }
 
+/// Per-builtin base-url env override (`ZHIPU_BASE_URL`, `DEEPSEEK_BASE_URL`,
+/// `ZAI_BASE_URL`, ...): lets a mirror or self-hosted endpoint be redirected
+/// without editing config.toml. Gated to builtin names so a custom provider
+/// never picks up a stray variable, and an empty value falls through to the
+/// builtin default instead of shipping a blank base_url. Precedence: an
+/// explicit config `base_url` wins, this layer wins over the builtin default.
+fn env_base_url_override(name: Option<&str>) -> Option<String> {
+    let name = name?;
+    builtin_provider(name)?;
+    let value = env::var(format!("{name}_BASE_URL")).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 /// Pure precedence resolution: CLI flags beat the merged config files, which
 /// beat built-in provider defaults. Env mode survives only when nothing
 /// configures an explicit transport.
@@ -591,9 +623,15 @@ pub fn resolve_spec(
 
     // Config layers beat built-in defaults per field so a proxy base_url or a
     // renamed key env can override a builtin provider without losing the rest.
+    // A builtin-name `{NAME}_BASE_URL` env var sits between them — above the
+    // compiled-in default but below an explicit config `base_url` — mirroring
+    // the documented precedence chain (config > env > builtin) and keeping a
+    // stale ambient var from silently hijacking an explicitly configured
+    // endpoint.
     let base_url = settings
         .base_url
         .clone()
+        .or_else(|| env_base_url_override(name))
         .or_else(|| builtin.map(|provider| provider.base_url.to_string()))
         .ok_or("provider base_url missing: set [provider] base_url in config.toml")?;
     let inline_key = settings
@@ -841,6 +879,79 @@ mod tests {
                 assert_eq!(max_tokens, DEFAULT_MAX_TOKENS);
             }
             other @ ProviderSpec::Env { .. } => panic!("expected resolved profile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zai_builtin_resolves_international_endpoint() {
+        let spec = resolve_spec(Some("zai"), None, &ProviderSettings::default()).expect("resolve");
+        match spec {
+            ProviderSpec::Resolved {
+                protocol,
+                base_url,
+                api_key_env,
+                model,
+                ..
+            } => {
+                assert_eq!(protocol, ProviderProtocol::OpenAi);
+                assert_eq!(base_url, "https://api.z.ai/api/paas/v4");
+                assert_eq!(api_key_env, "ZAI_API_KEY");
+                assert_eq!(model, "glm-5.3");
+            }
+            other @ ProviderSpec::Env { .. } => panic!("expected resolved profile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn env_base_url_override_sits_between_config_and_builtin() {
+        // Ambient-var pattern (see env_var_wins_over_inline_key): prove the
+        // `{NAME}_BASE_URL` layer only when the sandbox carries one, rather
+        // than mutating process env (unsafe in edition 2024, racy).
+        let Ok(override_url) = std::env::var("ZHIPU_BASE_URL") else {
+            return;
+        };
+        let override_url = override_url.trim();
+        if override_url.is_empty() {
+            return;
+        }
+        // Without a config base_url the env layer outranks the builtin default.
+        let spec =
+            resolve_spec(Some("zhipu"), None, &ProviderSettings::default()).expect("resolve");
+        match &spec {
+            ProviderSpec::Resolved { base_url, .. } => assert_eq!(base_url, override_url),
+            other @ ProviderSpec::Env { .. } => panic!("unexpected {other:?}"),
+        }
+        // An explicit config base_url outranks the env layer in turn.
+        let spec = resolve_spec(
+            Some("zhipu"),
+            None,
+            &settings("[provider]\nbase_url = \"https://config.local/v1\"\n"),
+        )
+        .expect("resolve");
+        match spec {
+            ProviderSpec::Resolved { base_url, .. } => {
+                assert_eq!(base_url, "https://config.local/v1")
+            }
+            other @ ProviderSpec::Env { .. } => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn env_base_url_override_ignores_custom_providers() {
+        // The override is builtin-gated: a custom provider named "proxy" must
+        // not inherit a stray PROXY_BASE_URL, and an explicit config base_url
+        // stands even if an ambient variable exists.
+        let spec = resolve_spec(
+            Some("custom"),
+            Some("m"),
+            &settings("[provider]\nbase_url = \"http://localhost:8000\"\napi_key = \"sk-abc\"\n"),
+        )
+        .expect("resolve");
+        match spec {
+            ProviderSpec::Resolved { base_url, .. } => {
+                assert_eq!(base_url, "http://localhost:8000");
+            }
+            other @ ProviderSpec::Env { .. } => panic!("unexpected {other:?}"),
         }
     }
 
