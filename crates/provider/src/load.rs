@@ -987,6 +987,25 @@ mod tests {
     }
 
     #[test]
+    fn persist_selection_is_byte_idempotent() {
+        // Repeating the same selection must not churn the file: comments and
+        // formatting stay byte-identical across writes, or every /model switch
+        // would slowly mangle the user's hand-edited config.
+        let home = std::env::temp_dir().join(format!("hf-idempotent-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join(".heartflow")).expect("mkdir");
+        let existing = "# header comment\n[provider]\nname = \"deepseek\" # inline\nmodel = \"deepseek-v4-flash\"\n\n[mcp]\nserver = \"x\"\n";
+        let config = home.join(".heartflow").join("config.toml");
+        fs::write(&config, existing).expect("seed config");
+        persist_selection(&home, None, "deepseek-v4-flash").expect("first write");
+        let once = fs::read_to_string(&config).expect("read after first write");
+        persist_selection(&home, None, "deepseek-v4-flash").expect("second write");
+        let twice = fs::read_to_string(&config).expect("read after second write");
+        assert_eq!(once, twice);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn host_and_slug_helpers() {
         assert_eq!(host_of("https://api.deepseek.com/v1"), "api.deepseek.com");
         assert_eq!(
