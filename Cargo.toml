@@ -5,9 +5,10 @@ resolver = "2"
 [workspace.package]
 version = "1.6.1"
 edition = "2021"
-# 真实下限来自依赖(image/time/simd-json/globset/ignore 均要求 1.88),声明后可让旧
-# 工具链得到明确报错而不是晦涩的依赖解析失败;开发用工具链见 rust-toolchain.toml
-rust-version = "1.88"
+# MSRV 由 2026-11 工具链升级抬升到 1.95:windows-registry 0.100 要求 rustc 1.95,
+# std 的 Atomic::try_update(取代已废弃的 fetch_update)同样 1.95 稳定。声明后可让
+# 旧工具链得到明确报错而不是晦涩的依赖解析失败;开发用工具链见 rust-toolchain.toml
+rust-version = "1.95"
 license = "Apache-2.0"
 repository = "https://github.com/SantaChains/heartflow"
 readme = "README.md"

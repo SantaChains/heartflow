@@ -4,7 +4,7 @@
 
 ## 开发环境
 
-- Rust 工具链由 `rust-toolchain.toml` 钉定（1.93.1 + rustfmt/clippy），rustup 会自动按需安装；MSRV 为 1.88（下限来自依赖，声明在根 `Cargo.toml` 的 `[workspace.package] rust-version`）
+- Rust 工具链由 `rust-toolchain.toml` 指定（`stable` 跟随最新 + rustfmt/clippy，2026-11 起不再钉版本号），rustup 会自动按需安装；MSRV 为 1.95（下限来自 windows-registry 0.100 与 std `Atomic::try_update`，声明在根 `Cargo.toml` 的 `[workspace.package] rust-version`）
 - 本仓库无每-push CI 质量门（作者自推不烧 Actions 额度，检查全部在本地完成后再提交），但外部 PR 会过 `.github/workflows/ci.yml`（只在 `pull_request` 上跑 fmt/clippy/test，不接任何 secrets）
 
 ```bash

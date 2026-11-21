@@ -101,7 +101,7 @@
 | V4 不收图片 → 转换期把每个图片替换为 `[Unsupported Image]` 文本（README:49-50） | provider 能力差异散落 `if provider == x` 补丁（§4 第 7 条） | 同族：能力降级应在协议转换层显式完成，而非请求构造处打补丁 |
 | `server-rs`：Axum，`/v1/{chat/completions,responses,messages}` 三协议 JSON+SSE，loopback:7777，mock inference，无鉴权且图片抓取不过滤内网（README 自陈） | 用户本机已有 Claude Code relay（127.0.0.1:15721） | 生态参照：本地多协议 relay 的现成骨架；heartflow 自身不做 server，记录备查 |
 
-**依赖评估（未来若评估引入，须先验证，当前不跑 cargo）**：① recipe 未声明 `rust-version`，其 edition 2024 + 依赖树是否突破 heartflow MSRV 1.88 需实跑验证；② `tokenizers` 是重量级原生依赖，Windows 构建体积与 CI 时长成本需量化；③ tokenizer.json 获取路径：HF Hub 运行时下载（http feature）vs 随仓库分发——按本仓 vendored 纪律，未修改上游资产不入库，但「clone 即可跑」检验法要求有确定获取路径，二者需折中；④ 引入属**外部依赖**而非衍生代码，按 AGENTS.md 第三方纪律在 README §致谢点名（NOTICE 仅针对衍生/移植代码）；⑤ 更轻替代：只借鉴 special-token 边界编码与流式状态机方法论，tokenizer 单引 `tokenizers` crate 自接。
+**依赖评估（未来若评估引入，须先验证，当前不跑 cargo）**：① recipe 未声明 `rust-version`，其 edition 2024 + 依赖树是否突破 heartflow MSRV 1.95 需实跑验证；② `tokenizers` 是重量级原生依赖，Windows 构建体积与 CI 时长成本需量化；③ tokenizer.json 获取路径：HF Hub 运行时下载（http feature）vs 随仓库分发——按本仓 vendored 纪律，未修改上游资产不入库，但「clone 即可跑」检验法要求有确定获取路径，二者需折中；④ 引入属**外部依赖**而非衍生代码，按 AGENTS.md 第三方纪律在 README §致谢点名（NOTICE 仅针对衍生/移植代码）；⑤ 更轻替代：只借鉴 special-token 边界编码与流式状态机方法论，tokenizer 单引 `tokenizers` crate 自接。
 
 #### 7.2 DeepInfer 引擎：方法论借鉴（代码不可用）
 

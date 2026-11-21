@@ -19,7 +19,7 @@ tracing = "0.1"
 url = "2"
 
 [target.'cfg(windows)'.dependencies]
-windows-registry = "0.5"
+windows-registry = "0.100"
 
 [lints]
 workspace = true

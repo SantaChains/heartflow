@@ -4,7 +4,7 @@
 
 ## 定位与硬约束
 
-- crate 名 `heartflow`，二进制 `hf`，edition 2021，MSRV 1.88（下限来自依赖，声明在根 `Cargo.toml` 的 `[workspace.package] rust-version`），工具链由 `rust-toolchain.toml` 钉在 1.93.1 + rustfmt/clippy。
+- crate 名 `heartflow`，二进制 `hf`，edition 2021，MSRV 1.95（2026-11 起下限来自 windows-registry 0.100 与 std `Atomic::try_update`，声明在根 `Cargo.toml` 的 `[workspace.package] rust-version`），工具链由 `rust-toolchain.toml` 指向 `stable` 跟随最新（2026-11 起不再钉版本号）+ rustfmt/clippy。
 - 身份不变量：`FRONTIER_MODEL_NAME = "heartflow"`（`crates/runtime/src/prompt.rs:39`）。系统提示词禁止模型冒充其他厂商身份，改提示词时保留该约束。
 - 版本号唯一维护点：根 `Cargo.toml` 的 `[workspace.package]`；各 crate 一律 `version.workspace = true`。
 - 分层边界不可破：`api`（传输，仅 reqwest/serde/tokio）→ `provider`（协议桥接）→ `runtime`（会话循环，不感知传输细节）；`cli` 只做装配与交互。`runtime` 不得引用具体协议类型。

@@ -1,10 +1,11 @@
 # 开发与 CI 的单一工具链事实源。workflow 不再用 dtolnay/rust-toolchain@stable,而是
-# `rustup show`,由本文件决定版本——否则 CI 跟随 stable 漂移,本地与 CI 的 fmt/clippy
-# 结果不可复现。
+# `rustup show`,由本文件决定版本。
 #
-# 下限来自依赖,不是偏好:image、time、simd-json、globset、ignore、encoding_rs 都要求
-# rustc >= 1.88。升级本文件时同步 [workspace.package] 的 rust-version 与 README 徽章,
-# 并重跑一次 cargo fmt 与 workspace 测试。
+# 本仓面向最新:channel = "stable" 跟随最新稳定版,绝不钉死版本号(2026-11 从
+# 1.93.1 钉版切到此策略,随之上限抬升的是 windows-registry 0.100 等要求 rustc
+# >= 1.95 的依赖)。代价是 fmt/clippy 结果随 stable 演进漂移,升级后需重跑全门禁。
+# 声明的 MSRV 见 [workspace.package] rust-version(2026-11 起为 1.95:windows-registry
+# 0.100 与 std Atomic::try_update 都要求 1.95)。
 [toolchain]
-channel = "1.93.1"
+channel = "stable"
 components = ["rustfmt", "clippy"]
