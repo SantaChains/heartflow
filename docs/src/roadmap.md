@@ -598,6 +598,23 @@ enum CredentialSource {
 **明确不做**（本批）：后台任务注册表/wakeup/子代理（属扩容，等止血四相验收）；不重写 run_turn 为状态机（P2 一并做）；不动分层边界、不新增依赖。
 
 
+### 17. 子 agent 竞态编辑保护（2026-11-21 批次，调研定案，未落地）
+
+**背景**：并发审计（2026-11-21）确认跨执行体编辑竞态缺口。jobs 的 `JobRunner` 各建独立 conversation（own session、own client，jobs.rs:145-159）与前台 turn 并发跑，最多 `slots` 个 worker 同时工作；单 turn 内写工具虽已串行（`execute_tools` 读写分组），但**跨执行体零防护**——前台 turn、多个 job worker、甚至两个 hf 进程可同时编辑同一工作区文件。
+
+**根因清单（源码实证）**：E1 `edit_file` 是 read→modify→write_text_atomic（file_ops.rs:347-402），读改写窗口无锁，并发时 last-writer-wins **静默丢编辑**，且 `old_string` 唯一性检查基于可能已过期的读取；E2 `write_file` 全量替换语义，并发即丢更新（语义上可接受，但需知会模型）；E3 `apply_patch` 多文件批量同理；E4 `filelock.rs` 明确只护 durable stores（schedules.json/mission/job status/queue.json），不覆盖工作区文件；E5 `checkpoint::maybe_snapshot_cwd` 在每个写工具入口触发，并发写时两线程可能同时拍快照（次级）。
+
+**方案**：工作区编辑临界区锁，复用既有 `filelock::with_exclusive` OS advisory 锁。
+
+1. 主方案：`edit_file`/`apply_patch`/`write_file` 的整个读改写临界区套 `with_exclusive`；锁文件集中放 `.heartflow/locks/`（目标路径哈希命名，避免工作区散落 `.lock` 文件）。OS advisory 锁天然覆盖双进程场景。
+2. 辅助校验（可选）：临界区内写前重读比对内容 hash，检测绕锁写入的外部修改（用户编辑器、git 操作），mismatch 报「文件已被并发修改，请重读后重试」。
+3. checkpoint 快照去抖：并发进入按 cwd+内容 hash 去重。
+
+**分相路线**：E1 锁基建（locks 目录 + 包装函数，纯函数可测）→ E2 三工具接入临界区 + 竞态测试（两线程同 edit 同文件，断言两次编辑都生效且无静默丢失）→ E3 checkpoint 去抖。验收 = 竞态测试在 `--test-threads` 下稳定全绿 + 双 hf 进程手工编辑验证。
+
+**明确不做**：不做多文件原子事务、不做 CRDT/内容合并、不锁读工具（读脏页由 checkpoint + 重读兜底）；`write_file` 保持全量替换语义不引入合并。
+
+
 ## B. 研究存档与先不做清单
 
 已整体迁出至 [roadmap-deferred.md](roadmap-deferred.md)——外部调研（§2/3/5/7/8/9/10 含 Edit 深挖与 CLI 全景）、「不做」判决（beam search/LSP/ds4 引擎/对抗绕过等）与次级待评估项。以下原 C 组活动候选保留：
