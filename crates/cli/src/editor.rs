@@ -547,6 +547,16 @@ pub(crate) struct History {
     cursor: usize,
 }
 
+/// State of the Ctrl+R incremental substring search: the live query, the draft
+/// it started from (Esc restores it verbatim), and the index of the match
+/// currently loaded into the buffer. See [`ReplEditor::fuzzy_ctrl_r`].
+#[derive(Debug)]
+struct FuzzySearch {
+    query: String,
+    draft: String,
+    idx: usize,
+}
+
 impl History {
     /// An empty, in-memory-only history (no backing file). Used where disk I/O
     /// must stay off (hermetic test construction) until a real path is set.
@@ -615,6 +625,38 @@ impl History {
             .enumerate()
             .skip(start)
             .find(|(_, entry)| entry.starts_with(prefix))
+            .map(|(i, _)| i)
+    }
+
+    /// Find the index of the next older entry whose text contains `needle`
+    /// (case-insensitive substring), searching from `from_idx` (exclusive)
+    /// going backward. Backs the Ctrl+R incremental history search: the
+    /// operator recalls by a fragment (mid-line, CJK, whatever), not a prefix.
+    pub(crate) fn search_contains_backward(&self, needle: &str, from_idx: usize) -> Option<usize> {
+        let needle = needle.to_lowercase();
+        if needle.is_empty() {
+            return None;
+        }
+        let start = from_idx.min(self.entries.len());
+        (0..start)
+            .rev()
+            .find(|&i| self.entries[i].to_lowercase().contains(&needle))
+    }
+
+    /// Find the index of the next newer entry whose text contains `needle`
+    /// (case-insensitive substring), searching from `from_idx` (exclusive)
+    /// going forward. The Ctrl+R search's step-back (↓) direction.
+    pub(crate) fn search_contains_forward(&self, needle: &str, from_idx: usize) -> Option<usize> {
+        let needle = needle.to_lowercase();
+        if needle.is_empty() {
+            return None;
+        }
+        let start = from_idx.saturating_add(1);
+        self.entries
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find(|(_, entry)| entry.to_lowercase().contains(&needle))
             .map(|(i, _)| i)
     }
 
@@ -813,6 +855,8 @@ impl ReplEditor {
         // Prefix history search: (prefix, match_index) — shows a ghost suffix
         // inline when the user cycles history entries matching the typed prefix.
         let mut prefix_search: Option<(String, usize)> = None;
+        // Ctrl+R incremental substring search over history (see `FuzzySearch`).
+        let mut fuzzy: Option<FuzzySearch> = None;
         let mut exit = Exit::Quit;
 
         let loop_result = self.edit_loop(
@@ -822,6 +866,7 @@ impl ReplEditor {
             &mut completions,
             &mut completion_idx,
             &mut prefix_search,
+            &mut fuzzy,
             &mut exit,
             ctx,
         );
@@ -857,6 +902,7 @@ impl ReplEditor {
         completions: &mut Vec<CompletionItem>,
         completion_idx: &mut Option<usize>,
         prefix_search: &mut Option<(String, usize)>,
+        fuzzy: &mut Option<FuzzySearch>,
         exit: &mut Exit,
         ctx: &CompletionContext,
     ) -> io::Result<()> {
@@ -967,6 +1013,17 @@ impl ReplEditor {
             // Any key means the user is engaging again: clear the lingering
             // Done/Error badge so the companion returns to its idle baseline.
             self.mascot.resume_idle();
+            // Ctrl+R starts or cycles the incremental substring search; while
+            // it is active the search consumes typing/Backspace/arrows/Esc and
+            // everything else exits it (buffer keeps the matched line).
+            if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                self.fuzzy_ctrl_r(textarea, fuzzy, status);
+                continue;
+            }
+            if fuzzy.is_some() && self.handle_fuzzy_key(key, textarea, fuzzy, status) {
+                continue;
+            }
+            *fuzzy = None;
             if self.handle_key(
                 key,
                 textarea,
@@ -979,6 +1036,184 @@ impl ReplEditor {
                 return Ok(());
             }
         }
+    }
+
+    /// Ctrl+R: start the incremental substring search from the current draft
+    /// (the draft is stashed so Esc restores it), or — when already searching —
+    /// step to the next older match. The matched entry is loaded into the
+    /// buffer live, bash-reverse-search style.
+    fn fuzzy_ctrl_r(
+        &self,
+        textarea: &mut TextArea<'static>,
+        fuzzy: &mut Option<FuzzySearch>,
+        status: &mut Option<String>,
+    ) {
+        let Some(state) = fuzzy.as_mut() else {
+            let query = textarea
+                .lines()
+                .first()
+                .map_or(String::new(), |line| line.trim().to_string());
+            if query.is_empty() {
+                *status = Some(String::from(
+                    "fuzzy search: type a fragment first, then Ctrl+R searches history",
+                ));
+                return;
+            }
+            let state = FuzzySearch {
+                query,
+                draft: textarea.lines().join("\n"),
+                idx: self.history.len(),
+            };
+            let found = self
+                .history
+                .search_contains_backward(&state.query, state.idx)
+                .map(|idx| FuzzySearch { idx, ..state });
+            match &found {
+                Some(state) if self.fuzzy_show(textarea, state, status) => {
+                    *fuzzy = found;
+                }
+                _ => *fuzzy = None,
+            }
+            return;
+        };
+        match self
+            .history
+            .search_contains_backward(&state.query, state.idx)
+        {
+            Some(idx) => {
+                state.idx = idx;
+                if !self.fuzzy_show(textarea, state, status) {
+                    *fuzzy = None;
+                }
+            }
+            None => {
+                *status = Some(format!("no earlier match: {}", state.query));
+            }
+        }
+    }
+
+    /// Load the entry at `state.idx` into the buffer and set the status line.
+    /// Returns `false` when the index is out of range: the caller then ends the
+    /// search (the buffer keeps whatever it held).
+    fn fuzzy_show(
+        &self,
+        textarea: &mut TextArea<'static>,
+        state: &FuzzySearch,
+        status: &mut Option<String>,
+    ) -> bool {
+        match self.history.entry_at(state.idx) {
+            Some(entry) => {
+                *textarea = textarea_from(entry);
+                *status = Some(format!(
+                    "reverse-search: {}  (Ctrl+R/Up older, Down newer, Esc restores draft, Enter sends)",
+                    state.query
+                ));
+                true
+            }
+            None => {
+                *status = Some(format!("no match: {}", state.query));
+                false
+            }
+        }
+    }
+
+    /// One key while the Ctrl+R search is armed. Returns `true` when consumed
+    /// (frame redraw); `false` means the key exits the search and must fall
+    /// through to the normal handler with the buffer keeping the match.
+    fn handle_fuzzy_key(
+        &self,
+        key: crossterm::event::KeyEvent,
+        textarea: &mut TextArea<'static>,
+        fuzzy: &mut Option<FuzzySearch>,
+        status: &mut Option<String>,
+    ) -> bool {
+        let Some(state) = fuzzy.as_mut() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                state.query.push(c);
+                // Re-search from the newest for the refined query (incremental).
+                if let Some(idx) = self
+                    .history
+                    .search_contains_backward(&state.query, self.history.len())
+                {
+                    state.idx = idx;
+                    self.fuzzy_show(textarea, state, status);
+                } else {
+                    *status = Some(format!("no match: {}", state.query));
+                }
+                true
+            }
+            KeyCode::Backspace => {
+                state.query.pop();
+                if state.query.is_empty() {
+                    self.fuzzy_restore(textarea, state, status, "fuzzy search ended (empty query)");
+                    *fuzzy = None;
+                } else if let Some(idx) = self
+                    .history
+                    .search_contains_backward(&state.query, self.history.len())
+                {
+                    state.idx = idx;
+                    self.fuzzy_show(textarea, state, status);
+                } else {
+                    *status = Some(format!("no match: {}", state.query));
+                }
+                true
+            }
+            KeyCode::Esc => {
+                self.fuzzy_restore(textarea, state, status, "fuzzy search cancelled");
+                *fuzzy = None;
+                true
+            }
+            KeyCode::Up => {
+                if let Some(idx) = self
+                    .history
+                    .search_contains_backward(&state.query, state.idx)
+                {
+                    state.idx = idx;
+                    self.fuzzy_show(textarea, state, status);
+                } else {
+                    *status = Some(format!("no earlier match: {}", state.query));
+                }
+                true
+            }
+            KeyCode::Down => {
+                if let Some(idx) = self
+                    .history
+                    .search_contains_forward(&state.query, state.idx)
+                {
+                    state.idx = idx;
+                    self.fuzzy_show(textarea, state, status);
+                } else {
+                    *status = Some(format!("no newer match: {}", state.query));
+                }
+                true
+            }
+            // Enter and every other key: leave search mode (buffer already
+            // holds the match) and let the normal handler process the key.
+            _ => false,
+        }
+    }
+
+    /// Put the stashed draft back into the buffer and say the search ended.
+    fn fuzzy_restore(
+        &self,
+        textarea: &mut TextArea<'static>,
+        state: &FuzzySearch,
+        status: &mut Option<String>,
+        reason: &str,
+    ) {
+        *textarea = if state.draft.is_empty() {
+            blank_textarea()
+        } else {
+            textarea_from(&state.draft)
+        };
+        *status = Some(format!("{reason}; draft restored"));
     }
 
     /// KI-003 paste-burst window: key events arriving within this gap of the
@@ -2326,6 +2561,32 @@ mod tests {
         assert_eq!(h.search_prefix_backward("car", 1), Some(0));
         // "cargo t" matches only "cargo test"
         assert_eq!(h.search_prefix_backward("cargo t", 3), Some(1));
+    }
+
+    #[test]
+    fn history_contains_search_walks_backward_and_forward() {
+        let h = History {
+            entries: vec![
+                "fix login bug".into(),
+                "deploy api".into(),
+                "login retry".into(),
+            ],
+            cursor: 3,
+        };
+        // Substring (not prefix) matches, newest first going backward.
+        assert_eq!(h.search_contains_backward("login", 3), Some(2));
+        assert_eq!(h.search_contains_backward("login", 2), Some(0));
+        assert_eq!(h.search_contains_backward("login", 0), None);
+        // Forward (newer) walks back toward the newest match, exclusive of it.
+        assert_eq!(h.search_contains_forward("login", 0), Some(2));
+        assert_eq!(h.search_contains_forward("login", 2), None);
+        // Case-insensitive: the uppercase query hits the same entries.
+        assert_eq!(h.search_contains_backward("LOGIN", 3), Some(2));
+        // A mid-line fragment the prefix search could never find.
+        assert_eq!(h.search_contains_backward("retry", 3), Some(2));
+        // Empty query never matches.
+        assert_eq!(h.search_contains_backward("", 3), None);
+        assert_eq!(h.search_contains_forward("", 0), None);
     }
 
     #[test]
