@@ -880,13 +880,16 @@ impl ReplEditor {
         enable_raw_mode()?;
         // Kitty keyboard protocol, flag 1 (disambiguate escape codes): with it,
         // Shift+Enter arrives as Enter+SHIFT on supporting terminals instead of
-        // a bare Enter that submits. Terminals without the protocol ignore the
-        // CSI silently, so the existing bindings stay untouched.
+        // a bare Enter that submits. crossterm 0.29 still ships this as an
+        // event Command, but the raw CSI goes through the same best-effort
+        // writer as the OSC 133 markers, and terminals without the protocol
+        // ignore it silently, so the existing bindings stay untouched.
         csi(">1u");
         // Bracketed paste makes the terminal hand over a pasted block as one
         // event, so an embedded newline stays a multi-line draft instead of
         // reading as a bare Enter that submits (the "paste auto-runs" bug).
         if let Err(error) = execute!(io::stdout(), EnableBracketedPaste) {
+            csi("<u");
             let _ = disable_raw_mode();
             return Err(error);
         }
@@ -894,6 +897,7 @@ impl ReplEditor {
         let mut terminal = match CompanionTerminal::with_inline(backend, VIEWPORT_ROWS) {
             Ok(terminal) => terminal,
             Err(error) => {
+                csi("<u");
                 let _ = disable_raw_mode();
                 return Err(error);
             }

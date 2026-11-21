@@ -29,7 +29,7 @@
 use std::fmt::Write as FmtWrite;
 
 use crossterm::style::{Color, Stylize};
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style as RtStyle};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
@@ -46,6 +46,18 @@ use crate::theme::{glyphs, Theme as AppTheme};
 pub struct TextStyle {
     pub emphasis: bool,
     pub strong: bool,
+}
+
+/// Column alignment from the table's delimiter row: `---`, `:---`, `:---:`,
+/// `---:`. `None` renders exactly like `Left` — padding goes on the right —
+/// which reproduces the pre-alignment rendering for every legacy table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Align {
+    #[default]
+    None,
+    Left,
+    Center,
+    Right,
 }
 
 /// One node of the thin markdown IR. The variant order mirrors the document,
@@ -114,9 +126,12 @@ pub enum Node {
         code: String,
     },
     /// A collected table as plain cell text (row 0 is the header). Cells are
-    /// captured without styling so column-width math stays correct.
+    /// captured without styling so column-width math stays correct. The
+    /// per-column alignment comes from the header delimiter row's colons; a
+    /// column beyond its length renders left-aligned.
     Table {
         rows: Vec<Vec<String>>,
+        alignments: Vec<Align>,
     },
 }
 
@@ -125,6 +140,7 @@ pub enum Node {
 #[derive(Debug, Default)]
 struct TableBuilder {
     rows: Vec<Vec<String>>,
+    alignments: Vec<Align>,
     current_row: Vec<String>,
     current_cell: String,
     in_cell: bool,
@@ -185,6 +201,13 @@ impl TableBuilder {
 /// else is passed through as literal text — the honest rendering, since the
 /// reader then sees the syntax instead of a silently wrong interpretation of it.
 const RENDERED_OPTIONS: Options = Options::ENABLE_TABLES.union(Options::ENABLE_TASKLISTS);
+
+/// Horizontal-rule width in terminal cells. `---`, `***` and `___` alone on a
+/// line all arrive as one `Node::Rule`; the projectors have no width context
+/// (the ANSI one renders per settled block, not per frame), so the rule is a
+/// fixed 60-cell muted line — the same pseudo-width discipline as the table
+/// grid, which also draws without knowing the pane size.
+const HR_WIDTH: usize = 60;
 
 /// Parse `markdown` into the thin IR. One walk; both projections read the result.
 #[must_use]
@@ -291,7 +314,20 @@ pub fn parse(markdown: &str) -> Vec<Node> {
                 url: dest_url.to_string(),
             }),
             // -- Tables: collect rows, emit one node once the table ends ------
-            Event::Start(Tag::Table(_)) => table = Some(TableBuilder::default()),
+            Event::Start(Tag::Table(aligns)) => {
+                table = Some(TableBuilder {
+                    alignments: aligns
+                        .iter()
+                        .map(|align| match align {
+                            Alignment::None => Align::None,
+                            Alignment::Left => Align::Left,
+                            Alignment::Center => Align::Center,
+                            Alignment::Right => Align::Right,
+                        })
+                        .collect(),
+                    ..TableBuilder::default()
+                });
+            }
             Event::Start(Tag::TableRow) => {
                 if let Some(builder) = table.as_mut() {
                     builder.start_row();
@@ -316,7 +352,10 @@ pub fn parse(markdown: &str) -> Vec<Node> {
             }
             Event::End(TagEnd::Table) => {
                 if let Some(builder) = table.take() {
-                    nodes.push(Node::Table { rows: builder.rows });
+                    nodes.push(Node::Table {
+                        rows: builder.rows,
+                        alignments: builder.alignments,
+                    });
                 }
             }
             _ => {}
@@ -394,7 +433,15 @@ pub fn project_ansi(nodes: &[Node], theme: &ColorTheme) -> String {
                 out.push_str(if *done { "[x] " } else { "[ ] " });
             }
             Node::Html { text } => out.push_str(text),
-            Node::Rule => out.push_str(glyphs::RULE),
+            Node::Rule => {
+                // One muted horizontal line across the pseudo-width; the glyph
+                // is the same `─` the table grid uses.
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    glyphs::TBL_H.repeat(HR_WIDTH).with(theme.muted())
+                );
+            }
             Node::CodeBlock { language, code } => {
                 if !language.is_empty() {
                     let _ = writeln!(
@@ -410,7 +457,7 @@ pub fn project_ansi(nodes: &[Node], theme: &ColorTheme) -> String {
                 }
                 out.push_str("\n\n");
             }
-            Node::Table { rows } => render_table(rows, theme, &mut out),
+            Node::Table { rows, alignments } => render_table(rows, alignments, theme, &mut out),
         }
     }
     out
@@ -598,11 +645,11 @@ impl RtProjector {
             }
             Node::Rule => {
                 let muted = RtStyle::default().fg(self.theme.muted().ratatui());
-                self.span(glyphs::RULE.trim_end_matches('\n'), muted);
+                self.span(glyphs::TBL_H.repeat(HR_WIDTH), muted);
                 self.newline();
             }
             Node::CodeBlock { language, code } => self.code_block(language, code),
-            Node::Table { rows } => self.table(rows),
+            Node::Table { rows, alignments } => self.table(rows, alignments),
         }
     }
 
@@ -630,11 +677,12 @@ impl RtProjector {
         self.newline();
     }
 
-    fn table(&mut self, rows: &[Vec<String>]) {
+    fn table(&mut self, rows: &[Vec<String>], alignments: &[Align]) {
         if !self.cur.is_empty() {
             self.newline();
         }
-        self.lines.extend(render_table_ratatui(rows, &self.theme));
+        self.lines
+            .extend(render_table_ratatui(rows, alignments, &self.theme));
         self.newline();
     }
 
@@ -655,10 +703,24 @@ impl RtProjector {
     }
 }
 
+/// Split a column's free padding around its cell per the alignment. `None`
+/// renders like `Left`, so legacy delimiter rows (`---`) keep the old look.
+fn align_pad(pad: usize, align: Align) -> (usize, usize) {
+    match align {
+        Align::Right => (pad, 0),
+        Align::Center => (pad / 2, pad - pad / 2),
+        Align::None | Align::Left => (0, pad),
+    }
+}
+
 /// Draw collected table rows as a light box grid of ratatui [`Line`]s — the
 /// structural twin of [`render_table`], with the same CJK-aware column widths
 /// and bolded header row.
-fn render_table_ratatui(rows: &[Vec<String>], theme: &AppTheme) -> Vec<Line<'static>> {
+fn render_table_ratatui(
+    rows: &[Vec<String>],
+    alignments: &[Align],
+    theme: &AppTheme,
+) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     if rows.is_empty() {
         return out;
@@ -688,7 +750,14 @@ fn render_table_ratatui(rows: &[Vec<String>], theme: &AppTheme) -> Vec<Line<'sta
         border,
     ));
     for (index, row) in rows.iter().enumerate() {
-        out.push(table_row_ratatui(row, &widths, index == 0, border, head));
+        out.push(table_row_ratatui(
+            row,
+            &widths,
+            alignments,
+            index == 0,
+            border,
+            head,
+        ));
         if index == 0 && last > 0 {
             out.push(table_rule_ratatui(
                 &widths,
@@ -728,11 +797,13 @@ fn table_rule_ratatui(
     Line::from(Span::styled(line, style))
 }
 
-/// One ratatui table row: each cell padded to its column width and wrapped in
-/// the vertical divider; header cells are bolded in the heading color.
+/// One ratatui table row: each cell padded to its column width (per the
+/// column's alignment) and wrapped in the vertical divider; header cells are
+/// bolded in the heading color.
 fn table_row_ratatui(
     cells: &[String],
     widths: &[usize],
+    alignments: &[Align],
     header: bool,
     border: RtStyle,
     head: RtStyle,
@@ -741,10 +812,11 @@ fn table_row_ratatui(
     for (index, width) in widths.iter().enumerate() {
         let cell = cells.get(index).map_or("", String::as_str);
         let pad = width.saturating_sub(cell.width());
+        let (left, right) = align_pad(pad, alignments.get(index).copied().unwrap_or_default());
         let body = if header { head } else { RtStyle::default() };
-        spans.push(Span::styled(" ", body));
+        spans.push(Span::styled(" ".repeat(left + 1), body));
         spans.push(Span::styled(cell.to_string(), body));
-        spans.push(Span::styled(" ".repeat(pad + 1), body));
+        spans.push(Span::styled(" ".repeat(right + 1), body));
         spans.push(Span::styled(glyphs::TBL_V, border));
     }
     Line::from(spans)
@@ -752,8 +824,9 @@ fn table_row_ratatui(
 
 /// Draw collected table rows as a light box grid. Column widths are the max
 /// display width (CJK-aware) of each cell plus one space of padding either side;
-/// the first row is treated as the header and bolded.
-fn render_table(rows: &[Vec<String>], theme: &ColorTheme, out: &mut String) {
+/// the first row is treated as the header and bolded. Cell padding follows the
+/// column's delimiter-row alignment (`None` renders like `Left`).
+fn render_table(rows: &[Vec<String>], alignments: &[Align], theme: &ColorTheme, out: &mut String) {
     if rows.is_empty() {
         return;
     }
@@ -782,7 +855,14 @@ fn render_table(rows: &[Vec<String>], theme: &ColorTheme, out: &mut String) {
         border,
     ));
     for (index, row) in rows.iter().enumerate() {
-        out.push_str(&table_row(row, &widths, index == 0, border, head));
+        out.push_str(&table_row(
+            row,
+            &widths,
+            alignments,
+            index == 0,
+            border,
+            head,
+        ));
         if index == 0 && last > 0 {
             out.push_str(&table_rule(
                 &widths,
@@ -818,12 +898,14 @@ fn table_rule(widths: &[usize], left: &str, mid: &str, right: &str, color: Color
     line
 }
 
-/// One table row: each cell padded to its column width and wrapped in the
-/// vertical divider. Header cells are bolded in the heading color; padding is
-/// computed from the plain-text width so the ANSI styling never shifts columns.
+/// One table row: each cell padded to its column width (per the column's
+/// alignment) and wrapped in the vertical divider. Header cells are bolded in
+/// the heading color; padding is computed from the plain-text width so the ANSI
+/// styling never shifts columns.
 fn table_row(
     cells: &[String],
     widths: &[usize],
+    alignments: &[Align],
     header: bool,
     border: Color,
     head: Color,
@@ -833,11 +915,12 @@ fn table_row(
     for (index, width) in widths.iter().enumerate() {
         let cell = cells.get(index).map_or("", String::as_str);
         let pad = width.saturating_sub(cell.width());
+        let (left, right) = align_pad(pad, alignments.get(index).copied().unwrap_or_default());
         let styled = format!("{}", cell.bold().with(head));
         let text = if header { &styled } else { cell };
-        line.push(' ');
+        line.push_str(&" ".repeat(left + 1));
         line.push_str(text);
-        line.push_str(&" ".repeat(pad + 1));
+        line.push_str(&" ".repeat(right + 1));
         line.push_str(&format!("{}", glyphs::TBL_V.with(border)));
     }
     line.push('\n');
@@ -846,7 +929,10 @@ fn table_row(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, project_ansi, project_ratatui, AppTheme, ColorTheme, Node, TextStyle};
+    use super::{
+        parse, project_ansi, project_ratatui, Align, AppTheme, ColorTheme, Node, TextStyle,
+        HR_WIDTH,
+    };
     use crate::theme::glyphs;
     use ratatui::style::Modifier;
     use ratatui::text::Line;
@@ -901,13 +987,131 @@ mod tests {
         let rows = nodes
             .iter()
             .find_map(|node| match node {
-                Node::Table { rows } => Some(rows.clone()),
+                Node::Table { rows, .. } => Some(rows.clone()),
                 _ => None,
             })
             .expect("a table node");
         assert_eq!(rows[0], vec!["key".to_string(), "v".to_string()]);
         // Inline code in a cell contributes bare text (no backticks).
         assert_eq!(rows[1], vec!["a".to_string(), "1".to_string()]);
+    }
+
+    /// The delimiter row's colons choose each column's alignment; a plain
+    /// `---` column stays `None` (rendered like left).
+    #[test]
+    fn delimiter_colons_set_column_alignment() {
+        let nodes = parse("| a | b | c |\n|:--|:-:|--:|\n| 1 | 2 | 3 |\n");
+        let alignments = nodes
+            .iter()
+            .find_map(|node| match node {
+                Node::Table { alignments, .. } => Some(alignments.clone()),
+                _ => None,
+            })
+            .expect("a table node");
+        assert_eq!(alignments, vec![Align::Left, Align::Center, Align::Right]);
+    }
+
+    /// Center/right cells pad per their alignment, and the CJK-width discipline
+    /// holds while doing it: every row and rule measures the same display width.
+    #[test]
+    fn aligned_cells_pad_within_the_cjk_grid() {
+        let markdown = "| 名称 | 数值 |\n|:-----|-----:|\n| ab | 1 |\n| 更长名称 | 42 |\n";
+        // Column widths: 8 ("更长名称") and 4 ("数值"); each rule segment is
+        // width + 2 (one padding cell per side).
+        let expected = [
+            "┌──────────┬──────┐",
+            "│ 名称     │ 数值 │",
+            "├──────────┼──────┤",
+            "│ ab       │    1 │",
+            "│ 更长名称 │   42 │",
+            "└──────────┴──────┘",
+        ];
+
+        let lines = project_ratatui(&parse(markdown), &AppTheme::default());
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let grid: Vec<&str> = texts
+            .iter()
+            .map(String::as_str)
+            .filter(|text| {
+                [
+                    glyphs::TBL_TL,
+                    glyphs::TBL_ML,
+                    glyphs::TBL_BL,
+                    glyphs::TBL_V,
+                ]
+                .iter()
+                .any(|lead| text.starts_with(*lead))
+            })
+            .collect();
+        assert_eq!(grid, expected, "ratatui grid: {texts:?}");
+
+        // The right-aligned column pushes its short cell to the right edge.
+        assert!(
+            texts.iter().any(|text| text.contains("│    1 │")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("│   42 │")),
+            "{texts:?}"
+        );
+
+        // The ANSI projector draws the same grid.
+        let ansi = strip_ansi(&project_ansi(&parse(markdown), &ColorTheme::default()));
+        for row in expected {
+            assert!(ansi.contains(row), "ANSI projection is missing `{row}`");
+        }
+
+        let widths: Vec<usize> = texts.iter().map(|text| text.width()).collect();
+        assert!(
+            widths.windows(2).all(|pair| pair[0] == pair[1]),
+            "every row must align with the rules: {texts:?} -> {widths:?}"
+        );
+    }
+
+    /// A `\|` escape keeps a literal pipe inside its cell instead of splitting
+    /// the row, so a cell can discuss the very syntax that draws the table.
+    #[test]
+    fn escaped_pipe_stays_inside_its_cell() {
+        let nodes = parse("| a\\|b | c |\n|------|---|\n| 1 | 2 |\n");
+        let rows = nodes
+            .iter()
+            .find_map(|node| match node {
+                Node::Table { rows, .. } => Some(rows.clone()),
+                _ => None,
+            })
+            .expect("a table node");
+        assert_eq!(
+            rows[0],
+            vec!["a|b".to_string(), "c".to_string()],
+            "the escaped pipe belongs to the first cell"
+        );
+    }
+
+    /// `---`, `***` and `___` alone on a line all arrive as one rule node and
+    /// project to a single full-width muted `─` line on both backends.
+    #[test]
+    fn thematic_breaks_render_as_a_full_width_rule() {
+        let nodes = parse("---\n\n***\n\n___");
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| matches!(node, Node::Rule))
+                .count(),
+            3,
+            "all three spellings are thematic breaks"
+        );
+        let rule: String = glyphs::TBL_H.repeat(HR_WIDTH);
+        let ansi = strip_ansi(&project_ansi(&nodes, &ColorTheme::default()));
+        assert!(
+            ansi.lines().any(|line| line == rule),
+            "ANSI projection draws a {HR_WIDTH}-cell rule"
+        );
+        let lines = project_ratatui(&nodes, &AppTheme::default());
+        assert!(
+            lines.iter().any(|line| line_text(line) == rule),
+            "ratatui projection draws a {HR_WIDTH}-cell rule: {:?}",
+            lines.iter().map(line_text).collect::<Vec<_>>()
+        );
     }
 
     /// A link becomes an open/close marker pair wrapping its label text (the

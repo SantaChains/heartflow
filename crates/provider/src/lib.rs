@@ -11,7 +11,7 @@ pub use cassette::{read_entries, CassetteClient, CassetteMode, RecordedEntry, CA
 pub use config::{
     builtin_base_url, builtin_provider_names, config_file_paths, load_merged_settings,
     set_config_override, ProviderProfile, ProviderProtocol, ProviderSelection, ProviderSettings,
-    CONFIG_VERSION,
+    StatusConfig, CONFIG_VERSION,
 };
 pub use load::{
     catalog_file_paths, catalog_write_path, default_catalog, load_catalog, persist_discovered,

@@ -188,6 +188,99 @@ pub fn builtin_base_url(name: &str) -> Option<&'static str> {
     builtin_provider(name).map(|provider| provider.base_url)
 }
 
+/// The `[status]` table from `config.toml`: which segments the per-turn status
+/// line shows. Every field is optional — absent means "on", reproducing the
+/// pre-`[status]` behavior — and a wrong-typed value is skipped with a warning,
+/// the same fault isolation every other config field gets.
+///
+/// `Option<bool>` (not plain `bool`) is what makes the layered merge correct:
+/// it distinguishes a layer that never mentions a key from one that explicitly
+/// sets `false`, so a project file toggling one segment cannot silently reset
+/// the others.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatusConfig {
+    /// `ctx` progress bar with the occupancy percentage. Off: the ctx segment
+    /// keeps its absolute token counts but drops the bar.
+    pub context_bar: Option<bool>,
+    /// Per-turn cache-hit percentage segment.
+    pub cache_hit: Option<bool>,
+    /// Estimated cost segment (unpriced models never show it either way).
+    pub cost: Option<bool>,
+    /// Session cumulative token total segment.
+    pub session_total: Option<bool>,
+}
+
+impl StatusConfig {
+    /// Field-by-field extraction with the same fault isolation as the rest of
+    /// the config layer: one bad entry never poisons the table.
+    #[must_use]
+    pub fn from_table(table: &toml::Table, source: &str) -> Self {
+        let Some(status) = table.get("status").and_then(toml::Value::as_table) else {
+            return Self::default();
+        };
+        for key in status.keys() {
+            if !matches!(
+                key.as_str(),
+                "context_bar" | "cache_hit" | "cost" | "session_total"
+            ) {
+                debug!(file = %source, field = %key, "unknown [status] field; ignored");
+            }
+        }
+        Self {
+            context_bar: bool_field(status, "context_bar", source),
+            cache_hit: bool_field(status, "cache_hit", source),
+            cost: bool_field(status, "cost", source),
+            session_total: bool_field(status, "session_total", source),
+        }
+    }
+
+    /// Later layers win per field; an absent key never flips a segment off.
+    pub fn merge(&mut self, source: Self) {
+        if source.context_bar.is_some() {
+            self.context_bar = source.context_bar;
+        }
+        if source.cache_hit.is_some() {
+            self.cache_hit = source.cache_hit;
+        }
+        if source.cost.is_some() {
+            self.cost = source.cost;
+        }
+        if source.session_total.is_some() {
+            self.session_total = source.session_total;
+        }
+    }
+
+    /// An absent key means on — the historical, all-segments default.
+    #[must_use]
+    pub fn context_bar_on(&self) -> bool {
+        self.context_bar.unwrap_or(true)
+    }
+
+    /// An absent key means on — the historical, all-segments default.
+    #[must_use]
+    pub fn cache_hit_on(&self) -> bool {
+        self.cache_hit.unwrap_or(true)
+    }
+
+    /// An absent key means on — the historical, all-segments default.
+    #[must_use]
+    pub fn cost_on(&self) -> bool {
+        self.cost.unwrap_or(true)
+    }
+
+    /// An absent key means on — the historical, all-segments default.
+    #[must_use]
+    pub fn session_total_on(&self) -> bool {
+        self.session_total.unwrap_or(true)
+    }
+
+    /// Whether any segment would render; false means the whole line is empty.
+    #[must_use]
+    pub fn any_on(&self) -> bool {
+        self.context_bar_on() || self.cache_hit_on() || self.cost_on() || self.session_total_on()
+    }
+}
+
 /// Source-level `[provider]` settings, safe to export: secret values never
 /// appear here, only the names of the environment variables holding them.
 ///
@@ -217,6 +310,9 @@ pub struct ProviderSettings {
     /// so the resolution rules stay in one place; absent means "no opinion",
     /// and the resolver falls through to env/registry.
     pub proxy: Option<ProxyConfig>,
+    /// `[status]` table: per-turn status-line segment toggles. Absent keys
+    /// mean on; see [`StatusConfig`].
+    pub status: StatusConfig,
 }
 
 impl ProviderSettings {
@@ -242,10 +338,15 @@ impl ProviderSettings {
             (!parsed.is_empty()).then_some(parsed)
         };
 
+        // `[status]` lives beside `[provider]`, so it parses even when the
+        // provider table is missing (same reason `proxy` does).
+        let status = StatusConfig::from_table(table, source);
+
         let Some(provider) = table.get("provider").and_then(toml::Value::as_table) else {
             return Self {
                 version,
                 proxy,
+                status,
                 ..Self::default()
             };
         };
@@ -305,6 +406,7 @@ impl ProviderSettings {
             },
             version,
             proxy,
+            status,
         }
     }
 
@@ -368,6 +470,7 @@ impl ProviderSettings {
                 self.proxy = Some(layer);
             }
         }
+        self.status.merge(source.status);
     }
 
     /// Render as canonical config.toml text (version header plus `[provider]`).
@@ -437,6 +540,28 @@ impl ProviderSettings {
                 let _ = writeln!(out, "no_proxy = [{}]", quote_toml_array(no_proxy));
             }
         }
+        // Only explicitly-set keys are emitted, so the export is the inverse of
+        // the loader: re-loading it reproduces this exact value.
+        let status = &self.status;
+        if status.context_bar.is_some()
+            || status.cache_hit.is_some()
+            || status.cost.is_some()
+            || status.session_total.is_some()
+        {
+            out.push_str("\n[status]\n");
+            if let Some(value) = status.context_bar {
+                let _ = writeln!(out, "context_bar = {value}");
+            }
+            if let Some(value) = status.cache_hit {
+                let _ = writeln!(out, "cache_hit = {value}");
+            }
+            if let Some(value) = status.cost {
+                let _ = writeln!(out, "cost = {value}");
+            }
+            if let Some(value) = status.session_total {
+                let _ = writeln!(out, "session_total = {value}");
+            }
+        }
         out
     }
 }
@@ -504,6 +629,17 @@ fn u64_field(table: &toml::Table, key: &str, source: &str) -> Option<u64> {
             },
             Some,
         ),
+        Some(None) => {
+            warn!(file = %source, field = key, "config field type mismatch; skipped");
+            None
+        }
+        None => None,
+    }
+}
+
+fn bool_field(table: &toml::Table, key: &str, source: &str) -> Option<bool> {
+    match table.get(key).map(toml::Value::as_bool) {
+        Some(Some(value)) => Some(value),
         Some(None) => {
             warn!(file = %source, field = key, "config field type mismatch; skipped");
             None
@@ -1475,6 +1611,10 @@ mod tests {
             },
             version: Some(CONFIG_VERSION),
             proxy: None,
+            status: super::StatusConfig {
+                cache_hit: Some(false),
+                ..super::StatusConfig::default()
+            },
         };
         let parsed = settings(&original.to_toml_string());
         assert_eq!(parsed, original);
@@ -1551,6 +1691,43 @@ mod tests {
         let parsed = super::read_provider_file(&path);
         assert_eq!(parsed, ProviderSettings::default());
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn status_table_parses_and_defaults_to_all_on() {
+        // A file with no [status] at all keeps every segment on.
+        assert_eq!(settings("").status, super::StatusConfig::default());
+        assert!(settings("").status.any_on());
+        // One explicit toggle flips only that segment.
+        let parsed = settings("[status]\ncache_hit = false\ncost = false\n");
+        assert!(parsed.status.context_bar_on());
+        assert!(!parsed.status.cache_hit_on());
+        assert!(!parsed.status.cost_on());
+        assert!(parsed.status.session_total_on());
+    }
+
+    #[test]
+    fn status_bad_values_are_skipped_not_poisonous() {
+        // Wrong-typed values warn and fall back to the default (on); the good
+        // sibling in the same table still applies.
+        let parsed = settings("[status]\ncost = \"yes\"\nsession_total = 3\ncontext_bar = false\n");
+        assert!(parsed.status.cost_on(), "string cost falls back to on");
+        assert!(
+            parsed.status.session_total_on(),
+            "int session_total falls back to on"
+        );
+        assert!(!parsed.status.context_bar_on(), "the good sibling applies");
+    }
+
+    #[test]
+    fn status_layers_merge_per_field() {
+        let mut merged = settings("[status]\ncache_hit = false\n");
+        merged.merge(settings("[status]\ncost = false\ncontext_bar = false\n"));
+        // Project-set keys win; user-only keys survive.
+        assert!(!merged.status.context_bar_on());
+        assert!(!merged.status.cache_hit_on(), "user layer's off survives");
+        assert!(!merged.status.cost_on());
+        assert!(merged.status.session_total_on(), "untouched key stays on");
     }
 
     fn temp_path(label: &str) -> PathBuf {

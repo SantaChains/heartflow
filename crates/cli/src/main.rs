@@ -2614,6 +2614,7 @@ mod tests {
     #[test]
     fn usage_line_reports_cache_hit_and_session_total() {
         use super::usage_line;
+        use provider::StatusConfig;
         use runtime::TokenUsage;
         let current = TokenUsage {
             input_tokens: 2800,
@@ -2631,8 +2632,8 @@ mod tests {
         // No window configured: ctx shows the absolute humanized count
         // (current turn's context_input = 2800 + 8400 = 11200 -> 11K).
         assert_eq!(
-            usage_line(&current, &session, 0, None),
-            "[ctx 11K · in 2800 / out 120 / cache 75% · session 171100]"
+            usage_line(&current, &session, 0, None, StatusConfig::default()),
+            "[ctx 11K · in 2800 / out 120 · cache 75% · session 171100]"
         );
         // Zero input guards the divide; no cache reads report 0%.
         let empty = TokenUsage {
@@ -2642,14 +2643,15 @@ mod tests {
             cache_read_input_tokens: 0,
         };
         assert_eq!(
-            usage_line(&empty, &empty, 0, None),
-            "[ctx 0 · in 0 / out 0 / cache 0% · session 0]"
+            usage_line(&empty, &empty, 0, None, StatusConfig::default()),
+            "[ctx 0 · in 0 / out 0 · cache 0% · session 0]"
         );
     }
 
     #[test]
     fn usage_line_draws_the_context_bar_against_the_window() {
         use super::usage_line;
+        use provider::StatusConfig;
         use runtime::TokenUsage;
         let current = TokenUsage {
             input_tokens: 2_800,
@@ -2659,16 +2661,17 @@ mod tests {
         };
         let session = TokenUsage::default();
         // ctx = 11200, window = 128000 -> floor(8.75%) = 8 -> zero filled cells.
-        let line = usage_line(&current, &session, 128_000, None);
+        let line = usage_line(&current, &session, 128_000, None, StatusConfig::default());
         assert!(line.contains("ctx ▯▯▯▯▯▯▯▯▯▯ 8% 11K/128K"), "{line}");
         // Over-occupancy clamps at 100% with a full bar.
-        let line = usage_line(&current, &session, 4_000, None);
+        let line = usage_line(&current, &session, 4_000, None, StatusConfig::default());
         assert!(line.contains("ctx ▮▮▮▮▮▮▮▮▮▮ 100%"), "{line}");
     }
 
     #[test]
     fn usage_line_shows_estimated_cost_when_priced() {
         use super::usage_line;
+        use provider::StatusConfig;
         use runtime::TokenUsage;
         let current = TokenUsage {
             input_tokens: 1_000_000,
@@ -2678,7 +2681,13 @@ mod tests {
         };
         let session = TokenUsage::default();
         // in $0.28/Mtok x 1M + out $1.10/Mtok x 0.5M = $0.28 + $0.55 = $0.83.
-        let line = usage_line(&current, &session, 0, Some((0.28, 1.10)));
+        let line = usage_line(
+            &current,
+            &session,
+            0,
+            Some((0.28, 1.10)),
+            StatusConfig::default(),
+        );
         assert!(line.contains("$0.83 turn / $0 session"), "{line}");
         // Sub-cent costs keep four decimals; unpriced models omit the segment.
         let tiny = TokenUsage {
@@ -2687,9 +2696,90 @@ mod tests {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         };
-        let line = usage_line(&tiny, &tiny, 0, Some((0.28, 1.10)));
+        let line = usage_line(&tiny, &tiny, 0, Some((0.28, 1.10)), StatusConfig::default());
         assert!(line.contains("$0.0004 turn / $0.0004 session"), "{line}");
-        assert!(!usage_line(&tiny, &tiny, 0, None).contains('$'));
+        assert!(!usage_line(&tiny, &tiny, 0, None, StatusConfig::default()).contains('$'));
+    }
+
+    #[test]
+    fn usage_line_toggles_drop_their_segments() {
+        use super::usage_line;
+        use provider::StatusConfig;
+        use runtime::TokenUsage;
+        let current = TokenUsage {
+            input_tokens: 2_800,
+            output_tokens: 120,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 8_400,
+        };
+        let session = TokenUsage {
+            input_tokens: 50_000,
+            output_tokens: 900,
+            cache_creation_input_tokens: 200,
+            cache_read_input_tokens: 120_000,
+        };
+        let toggles =
+            |context_bar: bool, cache_hit: bool, cost: bool, session_total: bool| StatusConfig {
+                context_bar: Some(context_bar),
+                cache_hit: Some(cache_hit),
+                cost: Some(cost),
+                session_total: Some(session_total),
+            };
+
+        // Bar off: the ctx segment keeps absolute counts, drops bar and pct.
+        let line = usage_line(
+            &current,
+            &session,
+            128_000,
+            None,
+            toggles(false, true, true, true),
+        );
+        assert!(line.contains("ctx 11K/128K"), "{line}");
+        // Bar off removes only the glyphs; cache toggle is independent, so the
+        // hit ratio (and its `%`) stays.
+        assert!(!line.contains('▮') && !line.contains('▯'), "{line}");
+
+        // Cache off: the hit ratio drops, siblings stay.
+        let line = usage_line(
+            &current,
+            &session,
+            0,
+            None,
+            toggles(true, false, true, true),
+        );
+        assert!(!line.contains("cache"), "{line}");
+        assert!(line.contains("session 171100"), "{line}");
+
+        // Session total off.
+        let line = usage_line(
+            &current,
+            &session,
+            0,
+            None,
+            toggles(true, true, true, false),
+        );
+        assert!(!line.contains("session"), "{line}");
+        assert!(line.contains("cache 75%"), "{line}");
+
+        // Cost off: no dollar figure even for a priced model.
+        let line = usage_line(
+            &current,
+            &session,
+            0,
+            Some((0.28, 1.10)),
+            toggles(true, true, false, true),
+        );
+        assert!(!line.contains('$'), "{line}");
+
+        // Everything off: an empty line, which the caller never prints.
+        let line = usage_line(
+            &current,
+            &session,
+            128_000,
+            Some((0.28, 1.10)),
+            toggles(false, false, false, false),
+        );
+        assert_eq!(line, "");
     }
 
     #[test]

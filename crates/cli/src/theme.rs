@@ -16,7 +16,10 @@
 //!
 //! The palette is overridable: `theme.toml` under `~/.heartflow` (user) and
 //! `.heartflow` (project, wins per token) may restate any semantic role as a
-//! `#RRGGBB` string. Overrides are layered onto the built-in palette with the
+//! `#RRGGBB` string, and a `palette` key selects the built-in base family
+//! (`kurosawa`, the default, or `dracula`) those overrides layer onto — an
+//! unknown name warns and falls back to Kurosawa. Overrides are layered onto
+//! the built-in palette with the
 //! same field-by-field fault isolation as `config.toml` — a bad or missing file
 //! never blocks startup, a bad color is skipped with a warning — and the
 //! resolved theme is cached process-wide behind a lock in [`Theme::current`],
@@ -98,6 +101,16 @@ pub struct Theme {
     muted: Rgb,
     success: Rgb,
     error: Rgb,
+    /// Fenced-code keyword token (`fn`, `def`, `const`, ...).
+    syntax_kw: Rgb,
+    /// Fenced-code string-literal token.
+    syntax_str: Rgb,
+    /// Fenced-code comment token.
+    syntax_comment: Rgb,
+    /// Fenced-code numeric-literal token.
+    syntax_num: Rgb,
+    /// Fenced-code type-name token (`String`, `Result`, capitalized ids...).
+    syntax_type: Rgb,
 }
 
 impl Default for Theme {
@@ -116,11 +129,79 @@ impl Default for Theme {
             muted: Rgb::new(232, 180, 74),  // 金箔 gold leaf, shared with `strong`
             success: Rgb::new(143, 191, 106), // 苔 jade, shared with `inline_code`
             error: Rgb::new(225, 75, 99),   // 绯 rose-crimson (High and Low)
+            // Syntax tokens reuse the family's own hues so a highlighted code
+            // block stays inside the same color world as the prose around it:
+            // keywords take the lavender, literals the gold leaf, comments the
+            // fog, numbers the celadon, and type names the ultramarine banner.
+            syntax_kw: Rgb::new(169, 139, 216), // 梦・紫 lavender (cool: structure)
+            syntax_str: Rgb::new(232, 180, 74), // 金箔 gold (warm: literal)
+            syntax_comment: Rgb::new(138, 147, 163), // 雾 fog (dim: asides)
+            syntax_num: Rgb::new(111, 191, 168), // 青磁 celadon (cool: literal)
+            syntax_type: Rgb::new(85, 136, 238), // 蓝旗 ultramarine (cool: structure)
+        }
+    }
+}
+
+/// The built-in palette families a `theme.toml` `[theme] palette` key can
+/// select. The chosen family is only the *base*: per-role `#RRGGBB` overrides
+/// still win over it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Palette {
+    /// The Kurosawa-derived default family ([`Theme::default`]).
+    #[default]
+    Kurosawa,
+    /// The Dracula official family ([`Theme::dracula`]).
+    Dracula,
+}
+
+impl Palette {
+    /// Parse a `palette` config value, warning and yielding `None` (the loader
+    /// then falls back to Kurosawa) on a wrong type or unknown name so a typo
+    /// can never block startup.
+    fn from_config(text: &str, source: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "kurosawa" => Some(Self::Kurosawa),
+            "dracula" => Some(Self::Dracula),
+            _ => {
+                warn!(
+                    file = %source,
+                    value = %text,
+                    "unknown theme palette; falling back to kurosawa"
+                );
+                None
+            }
         }
     }
 }
 
 impl Theme {
+    /// The Dracula built-in family (official hex values). The role mapping
+    /// keeps the same warm/cool discipline as the Kurosawa family: structure
+    /// roles take the cool spectrum (heading purple, link cyan, accent the one
+    /// loud pink event), prose-dimming roles share the comment blue-gray
+    /// (muted, quote), literal/inline roles take the warm spectrum (strong
+    /// yellow, emphasis orange, inline_code + success green), and error keeps
+    /// the alarm red.
+    fn dracula() -> Self {
+        Self {
+            heading: Rgb::new(0xbd, 0x93, 0xf9),        // purple
+            emphasis: Rgb::new(0xff, 0xb8, 0x6c),       // orange
+            strong: Rgb::new(0xf1, 0xfa, 0x8c),         // yellow
+            inline_code: Rgb::new(0x50, 0xfa, 0x7b),    // green
+            link: Rgb::new(0x8b, 0xe9, 0xfd),           // cyan
+            quote: Rgb::new(0x62, 0x72, 0xa4),          // comment blue-gray
+            accent: Rgb::new(0xff, 0x79, 0xc6),         // pink
+            muted: Rgb::new(0x62, 0x72, 0xa4),          // comment blue-gray, shared with `quote`
+            success: Rgb::new(0x50, 0xfa, 0x7b),        // green, shared with `inline_code`
+            error: Rgb::new(0xff, 0x55, 0x55),          // red
+            syntax_kw: Rgb::new(0xff, 0x79, 0xc6),      // pink
+            syntax_str: Rgb::new(0xf1, 0xfa, 0x8c),     // yellow
+            syntax_comment: Rgb::new(0x62, 0x72, 0xa4), // comment
+            syntax_num: Rgb::new(0xbd, 0x93, 0xf9),     // purple
+            syntax_type: Rgb::new(0x8b, 0xe9, 0xfd),    // cyan
+        }
+    }
+
     /// Markdown heading color.
     #[must_use]
     pub const fn heading(&self) -> Rgb {
@@ -170,6 +251,31 @@ impl Theme {
     #[must_use]
     pub const fn error(&self) -> Rgb {
         self.error
+    }
+    /// Fenced-code keyword token color.
+    #[must_use]
+    pub const fn syntax_kw(&self) -> Rgb {
+        self.syntax_kw
+    }
+    /// Fenced-code string-literal token color.
+    #[must_use]
+    pub const fn syntax_str(&self) -> Rgb {
+        self.syntax_str
+    }
+    /// Fenced-code comment token color.
+    #[must_use]
+    pub const fn syntax_comment(&self) -> Rgb {
+        self.syntax_comment
+    }
+    /// Fenced-code numeric-literal token color.
+    #[must_use]
+    pub const fn syntax_num(&self) -> Rgb {
+        self.syntax_num
+    }
+    /// Fenced-code type-name token color.
+    #[must_use]
+    pub const fn syntax_type(&self) -> Rgb {
+        self.syntax_type
     }
 }
 
@@ -250,14 +356,30 @@ static THEME_GEN: AtomicU64 = AtomicU64::new(0);
 
 impl Theme {
     /// Build the palette by layering user then project `theme.toml` overrides
-    /// (project wins per token) onto the built-in defaults. Fault-isolated: an
-    /// unreadable/unparseable file contributes nothing, a malformed color is
-    /// skipped, so a broken theme file can never abort startup.
+    /// (project wins per token) onto the built-in base family. The `palette`
+    /// key selects that base (Kurosawa by default; the project file wins over
+    /// the user file, mirroring the per-token merge); per-role `#RRGGBB`
+    /// overrides always win over whichever base was selected. Fault-isolated:
+    /// an unreadable/unparseable file contributes nothing, a malformed color or
+    /// an unknown palette name is skipped with a warning, so a broken theme
+    /// file can never abort startup.
     #[must_use]
     pub fn load(cwd: &Path, home: &Path) -> Self {
-        let mut theme = Self::default();
-        for path in theme_file_paths(cwd, home) {
-            read_theme_file(&path).apply_to(&mut theme);
+        let layers: Vec<ThemeSettings> = theme_file_paths(cwd, home)
+            .iter()
+            .map(|path| read_theme_file(path))
+            .collect();
+        let palette = layers
+            .iter()
+            .rev()
+            .find_map(|layer| layer.palette)
+            .unwrap_or_default();
+        let mut theme = match palette {
+            Palette::Kurosawa => Self::default(),
+            Palette::Dracula => Self::dracula(),
+        };
+        for settings in &layers {
+            settings.apply_to(&mut theme);
         }
         // Background adaptivity (roadmap C-1/P4): the built-in hues are tuned
         // for the default dark terminal; a detected light background darkens
@@ -320,7 +442,8 @@ impl Theme {
     /// Serialize the effective palette as a `theme.toml` document (every role,
     /// as `#rrggbb`), the inverse of [`Theme::load`]. Powers `hf config export
     /// theme` so a user gets a fully-specified, editable starting point rather
-    /// than an empty file.
+    /// than an empty file. Every color role is restated, which pins the export
+    /// to the exact hues it came from regardless of the base family it used.
     #[must_use]
     pub fn to_toml_string(self) -> String {
         let mut out = String::from("[theme]\n");
@@ -335,6 +458,11 @@ impl Theme {
             ("muted", self.muted),
             ("success", self.success),
             ("error", self.error),
+            ("syntax_kw", self.syntax_kw),
+            ("syntax_str", self.syntax_str),
+            ("syntax_comment", self.syntax_comment),
+            ("syntax_num", self.syntax_num),
+            ("syntax_type", self.syntax_type),
         ] {
             out.push_str(&format!("{key} = \"{}\"\n", rgb.to_hex()));
         }
@@ -342,11 +470,13 @@ impl Theme {
     }
 }
 
-/// Raw `[theme]` overrides, one optional `#RRGGBB` per semantic role. Every
-/// field is optional so a partial file (or older schema with unknown keys)
-/// loads unchanged; a field that fails to parse is dropped in isolation.
+/// Raw `[theme]` overrides: an optional palette selector plus one optional
+/// `#RRGGBB` per semantic role. Every field is optional so a partial file (or
+/// older schema with unknown keys) loads unchanged; a field that fails to parse
+/// is dropped in isolation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ThemeSettings {
+    palette: Option<Palette>,
     heading: Option<Rgb>,
     emphasis: Option<Rgb>,
     strong: Option<Rgb>,
@@ -357,6 +487,11 @@ struct ThemeSettings {
     muted: Option<Rgb>,
     success: Option<Rgb>,
     error: Option<Rgb>,
+    syntax_kw: Option<Rgb>,
+    syntax_str: Option<Rgb>,
+    syntax_comment: Option<Rgb>,
+    syntax_num: Option<Rgb>,
+    syntax_type: Option<Rgb>,
 }
 
 impl ThemeSettings {
@@ -367,7 +502,8 @@ impl ThemeSettings {
         for key in theme.keys() {
             if !matches!(
                 key.as_str(),
-                "heading"
+                "palette"
+                    | "heading"
                     | "emphasis"
                     | "strong"
                     | "inline_code"
@@ -377,11 +513,17 @@ impl ThemeSettings {
                     | "muted"
                     | "success"
                     | "error"
+                    | "syntax_kw"
+                    | "syntax_str"
+                    | "syntax_comment"
+                    | "syntax_num"
+                    | "syntax_type"
             ) {
                 tracing::debug!(file = %source, field = %key, "unknown theme token; ignored");
             }
         }
         Self {
+            palette: palette_field(theme, source),
             heading: rgb_field(theme, "heading", source),
             emphasis: rgb_field(theme, "emphasis", source),
             strong: rgb_field(theme, "strong", source),
@@ -392,6 +534,11 @@ impl ThemeSettings {
             muted: rgb_field(theme, "muted", source),
             success: rgb_field(theme, "success", source),
             error: rgb_field(theme, "error", source),
+            syntax_kw: rgb_field(theme, "syntax_kw", source),
+            syntax_str: rgb_field(theme, "syntax_str", source),
+            syntax_comment: rgb_field(theme, "syntax_comment", source),
+            syntax_num: rgb_field(theme, "syntax_num", source),
+            syntax_type: rgb_field(theme, "syntax_type", source),
         }
     }
 
@@ -408,6 +555,12 @@ impl ThemeSettings {
             muted,
             success,
             error,
+            syntax_kw,
+            syntax_str,
+            syntax_comment,
+            syntax_num,
+            syntax_type,
+            ..
         } = self;
         for (slot, value) in [
             (&mut theme.heading, heading),
@@ -420,6 +573,11 @@ impl ThemeSettings {
             (&mut theme.muted, muted),
             (&mut theme.success, success),
             (&mut theme.error, error),
+            (&mut theme.syntax_kw, syntax_kw),
+            (&mut theme.syntax_str, syntax_str),
+            (&mut theme.syntax_comment, syntax_comment),
+            (&mut theme.syntax_num, syntax_num),
+            (&mut theme.syntax_type, syntax_type),
         ] {
             if let Some(rgb) = value {
                 *slot = rgb;
@@ -470,6 +628,18 @@ fn rgb_field(table: &toml::Table, key: &str, source: &str) -> Option<Rgb> {
         warn!(file = %source, field = key, value = %text, "theme color is not #RRGGBB; skipped");
     }
     parsed
+}
+
+/// Read the `[theme] palette` selector. A wrong type or an unknown name warns
+/// and yields `None` — the loader then keeps the Kurosawa base, never blocking
+/// startup on a typo.
+fn palette_field(table: &toml::Table, source: &str) -> Option<Palette> {
+    let value = table.get("palette")?;
+    let Some(text) = value.as_str() else {
+        warn!(file = %source, field = "palette", "theme palette must be a string; ignored");
+        return None;
+    };
+    Palette::from_config(text, source)
 }
 
 /// Parse `#RRGGBB` or `RRGGBB` (case-insensitive) into [`Rgb`]; anything else is
@@ -575,6 +745,102 @@ mod tests {
         let theme = Theme::load(project.path(), home.path());
         assert_eq!(theme.muted(), Rgb::new(0xe8, 0xb4, 0x4a));
         assert_eq!(theme.quote(), Theme::default().quote());
+    }
+
+    #[test]
+    fn dracula_palette_is_selected_from_theme_toml() {
+        let project = TempDir::new("dracula");
+        project.write_theme("[theme]\npalette = \"dracula\"\n");
+        let home = TempDir::new("dracula-home");
+        let theme = Theme::load(project.path(), home.path());
+        // Accent is outside the light-adaptation set, so this holds regardless
+        // of the test environment's COLORFGBG.
+        assert_eq!(theme.accent(), Rgb::new(0xff, 0x79, 0xc6));
+        assert_eq!(theme.heading(), Rgb::new(0xbd, 0x93, 0xf9));
+        assert_eq!(theme.syntax_kw(), Rgb::new(0xff, 0x79, 0xc6));
+        assert_eq!(theme.syntax_str(), Rgb::new(0xf1, 0xfa, 0x8c));
+        assert_eq!(theme.syntax_comment(), Rgb::new(0x62, 0x72, 0xa4));
+        assert_eq!(theme.syntax_num(), Rgb::new(0xbd, 0x93, 0xf9));
+        assert_eq!(theme.syntax_type(), Rgb::new(0x8b, 0xe9, 0xfd));
+    }
+
+    #[test]
+    fn dracula_palette_name_is_case_and_space_tolerant() {
+        let project = TempDir::new("dracula-tolerant");
+        project.write_theme("[theme]\npalette = \"  Dracula  \"\n");
+        let home = TempDir::new("dracula-tolerant-home");
+        assert_eq!(
+            Theme::load(project.path(), home.path()).accent(),
+            Rgb::new(0xff, 0x79, 0xc6)
+        );
+    }
+
+    #[test]
+    fn unknown_palette_name_falls_back_to_kurosawa() {
+        let project = TempDir::new("bad-palette");
+        project.write_theme("[theme]\npalette = \"monokai\"\n");
+        let home = TempDir::new("bad-palette-home");
+        // Warned, then degraded to the built-in default rather than aborting.
+        assert_eq!(Theme::load(project.path(), home.path()), Theme::default());
+    }
+
+    #[test]
+    fn non_string_palette_value_is_ignored() {
+        let project = TempDir::new("pal-nonstring");
+        project.write_theme("[theme]\npalette = 3\n");
+        let home = TempDir::new("pal-nonstring-home");
+        assert_eq!(Theme::load(project.path(), home.path()), Theme::default());
+    }
+
+    #[test]
+    fn project_palette_wins_over_user_palette() {
+        let home = TempDir::new("pal-user");
+        home.write_theme("[theme]\npalette = \"dracula\"\n");
+        let project = TempDir::new("pal-proj");
+        project.write_theme("[theme]\npalette = \"kurosawa\"\n");
+        let theme = Theme::load(project.path(), home.path());
+        assert_eq!(theme.accent(), Theme::default().accent());
+        // The reverse: project selects dracula over the user's kurosawa.
+        let home = TempDir::new("pal-user-d");
+        home.write_theme("[theme]\npalette = \"kurosawa\"\n");
+        let project = TempDir::new("pal-proj-d");
+        project.write_theme("[theme]\npalette = \"dracula\"\n");
+        assert_eq!(
+            Theme::load(project.path(), home.path()).accent(),
+            Rgb::new(0xff, 0x79, 0xc6)
+        );
+    }
+
+    #[test]
+    fn per_role_override_beats_the_selected_palette() {
+        let project = TempDir::new("pal-override");
+        project.write_theme("[theme]\npalette = \"dracula\"\naccent = \"#123456\"\n");
+        let home = TempDir::new("pal-override-home");
+        let theme = Theme::load(project.path(), home.path());
+        // The named role wins over the dracula base…
+        assert_eq!(theme.accent(), Rgb::new(0x12, 0x34, 0x56));
+        // …while untouched roles keep the selected family.
+        assert_eq!(theme.heading(), Rgb::new(0xbd, 0x93, 0xf9));
+    }
+
+    #[test]
+    fn syntax_roles_are_distinct_within_each_palette() {
+        for theme in [Theme::default(), Theme::dracula()] {
+            let roles = [
+                theme.syntax_kw(),
+                theme.syntax_str(),
+                theme.syntax_comment(),
+                theme.syntax_num(),
+                theme.syntax_type(),
+            ];
+            let mut unique = roles.to_vec();
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                roles.len(),
+                "syntax tokens must not share a hue"
+            );
+        }
     }
 
     #[test]

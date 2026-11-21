@@ -9,6 +9,7 @@
 use std::io::{self, Write};
 
 use crossterm::style::Stylize;
+use provider::StatusConfig;
 use runtime::{
     auto_record_turn, truncate_chars, turn_reminder, AgentEvent, ContentBlock, ConversationMessage,
     ErrorKind, MessageRole, MissionLedger, PermissionPrompter, TokenUsage,
@@ -320,13 +321,21 @@ pub(crate) fn last_assistant_conclusion(messages: &[ConversationMessage]) -> Opt
 /// (with a 10-cell bar when the window is known), per-turn cache hit ratio,
 /// session total, and — when the catalog carries prices for the active model
 /// — estimated cost. Pure so tests can pin the format.
+///
+/// `status` carries the `[status]` segment toggles: a switched-off segment
+/// drops out (the ctx segment keeps its absolute counts without the bar), and
+/// every toggle off yields an empty string so the caller can skip the line.
 #[must_use]
 pub(crate) fn usage_line(
     current: &TokenUsage,
     session: &TokenUsage,
     window_tokens: usize,
     price: Option<(f64, f64)>,
+    status: StatusConfig,
 ) -> String {
+    if !status.any_on() {
+        return String::new();
+    }
     let read = u64::from(current.cache_read_input_tokens);
     let input = u64::from(current.input_tokens);
     // None when the turn had no tokens yet (`input + read == 0`) -> 0.
@@ -339,7 +348,7 @@ pub(crate) fn usage_line(
     let ctx = u64::from(current.context_input_tokens());
     let ctx_part = if window_tokens == 0 {
         format!("ctx {}", humanize_tokens(ctx))
-    } else {
+    } else if status.context_bar_on() {
         let window = window_tokens as u64;
         let pct = (ctx.saturating_mul(100) / window.max(1)).min(100);
         let cells = usize::try_from(pct / 10).unwrap_or(10);
@@ -349,32 +358,49 @@ pub(crate) fn usage_line(
             humanize_tokens(ctx),
             humanize_tokens(window)
         )
-    };
-    let price_part = price.map_or_else(String::new, |(price_in, price_out)| {
-        let turn_cost = estimate_cost(
-            current.context_input_tokens(),
-            current.output_tokens,
-            price_in,
-            price_out,
-        );
-        let session_cost = estimate_cost(
-            session.context_input_tokens(),
-            session.output_tokens,
-            price_in,
-            price_out,
-        );
+    } else {
+        // Bar off: the segment keeps the absolute counts, drops bar and pct.
         format!(
-            " · {} turn / {} session",
-            fmt_cost(turn_cost),
-            fmt_cost(session_cost)
+            "ctx {}/{}",
+            humanize_tokens(ctx),
+            humanize_tokens(window_tokens as u64)
         )
-    });
-    format!(
-        "[{ctx_part} · in {} / out {} / cache {hit}% · session {}{price_part}]",
-        current.input_tokens,
-        current.output_tokens,
-        session.total_tokens()
-    )
+    };
+    let mut segments = vec![
+        ctx_part,
+        format!(
+            "in {} / out {}",
+            current.input_tokens, current.output_tokens
+        ),
+    ];
+    if status.cache_hit_on() {
+        segments.push(format!("cache {hit}%"));
+    }
+    if status.session_total_on() {
+        segments.push(format!("session {}", session.total_tokens()));
+    }
+    if status.cost_on() {
+        if let Some((price_in, price_out)) = price {
+            let turn_cost = estimate_cost(
+                current.context_input_tokens(),
+                current.output_tokens,
+                price_in,
+                price_out,
+            );
+            let session_cost = estimate_cost(
+                session.context_input_tokens(),
+                session.output_tokens,
+                price_in,
+                price_out,
+            );
+            segments.push(format!(
+                "{} turn / {} session",
+                fmt_cost(turn_cost),
+                fmt_cost(session_cost)
+            ));
+        }
+    }
+    format!("[{}]", segments.join(" · "))
 }
 
 /// Cost estimate at USD-per-Mtok prices, charging every input token (cached or
@@ -544,10 +570,19 @@ pub(crate) async fn run_turn_interactive(
         let cumulative = runtime.usage().cumulative_usage();
         let window = runtime.compaction().context_window_tokens;
         let price = display_price(state);
-        println!(
-            "{}",
-            usage_line(&usage, &cumulative, window, price).with(turn.theme.muted())
-        );
+        // [status] toggles come from one merged config.toml read at the turn
+        // boundary: no in-process cache of ProviderSettings exists, and one
+        // stat+parse per finished turn is negligible next to the round trip.
+        let status = provider::config::load_merged_settings(
+            &crate::slash::cwd_dir(),
+            &crate::storage::home_dir(),
+        )
+        .status;
+        let line = usage_line(&usage, &cumulative, window, price, status);
+        // All segments toggled off renders nothing, not a bare bracket pair.
+        if !line.is_empty() {
+            println!("{}", line.with(turn.theme.muted()));
+        }
     }
     // Silent-save discipline: a successful turn saves without a line (the
     // path is knowable via /status, /sessions and the exit resume hint); only
