@@ -452,6 +452,14 @@ pub(crate) async fn run_turn_interactive(
                 // try next without having to parse a raw status code.
                 if let Some(hint) = error.hint() {
                     println!("{}", format!("  hint: {hint}").with(turn.theme.muted()));
+                } else {
+                    // No specific suggestion attached: fall back to the generic
+                    // triage line so a failure never dead-ends.
+                    println!(
+                        "{}",
+                        "  hint: check the API key / proxy (hf doctor), or switch endpoint: /provider NAME [MODEL]"
+                            .with(turn.theme.muted())
+                    );
                 }
             }
             if let Ok(path) = save_session_async(state, runtime.session()).await {
