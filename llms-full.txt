@@ -146,12 +146,14 @@ hf -v | -V | --version                            打印版本号
 
 ```text
 /help     帮助              /model [NAME] 显示或切换模型
-/mode     [NAME] 显示或切换权限模式（read-only/workspace-write/full）
+/provider NAME [MODEL] 显示或切换 provider（+可选模型；切换写回 config.toml 跨启动生效）  /models  从端点刷新模型目录
+/mode     [NAME] 显示或切换权限模式（read-only/workspace-write/full/plan/spec/loop）
 /status   会话状态          /compact      手动强制压缩会话历史（忽略阈值）
 /pin      切换末条消息的永不压缩标记（跨 /compact 逐字存活）
 /checkpoints 列出 shadow-git 快照（写类工具执行前自动记录）
 /restore N 恢复 tracked 文件到第 N 个快照（也可传 sha；/checkpoints 编号）
 /focus    切换聚焦模式（隐藏 mascot 伴侣、收窄为最小 chrome）
+/web on|off|local  web 工具面三态（local 保留知识库检索 doc_search）  /effort LEVEL  reasoning 深度 none|low|medium|high|max
 /save     立即持久化        /clear        开启新会话
 /sessions [F] 列出已存会话（每行以开场消息主题打头；F 大小写不敏感过滤主题）
 /open N|TOPIC 跳回第 N 个已存会话（同 /sessions 编号），或按开场消息主题匹配——唯一命中直接打开，多个命中列出编号
@@ -160,11 +162,17 @@ hf -v | -V | --version                            打印版本号
 /search Q 全文检索历史      /exit         退出（自动保存并打印 resume 命令；/quit 为别名）
 /init     生成 AGENTS.md 骨架  /expand [ID]  展开上次折叠的工具输出
 /guide T  本地零 token 组装“前情/现状/下一步”三段引导草稿，供编辑后发送
-/queue [pop|clear]  查看/撤回回合运行期间排队的后续消息（入队注入随 TUI 事件循环上线）
+/queue [SUB]  逐条队列：send [--lane]|lane|edit|remove|move|relane|merge|pop|clear（入队注入随 TUI 事件循环上线）
+/jobs [SUB]  子代理工人：spawn [--write]/stop/log（结果作为下一回合注入）
+/mission [SUB]  任务账本：create|criterion|approve|complete|pause|resume|blocked|turn
+/schedule [SUB]  定时任务：add interval|once / run-due / show / pause / resume / delete
 !CMD  不经模型直接跑一条 shell 命令取输出（Windows 走 pwsh，危险命令先确认，输出同工具一样可折叠/展开）
 /plan GOAL 规划先行（写仅门禁到 plans/）  /plan approve 逐任务新鲜上下文执行+收尾复盘  /plan end 退出规划
+/spec GOAL 设计先行（写仅门禁 specs/）——镜像 /plan：研究先行回合 → 三选确认 → /spec approve 执行
 /restart 以全新的配置与 MCP 装载重启进程（链式重启受深度上限约束）
 ```
+
+每个提示与回合都输出 OSC 133 shell 集成标记（A 提示 / B+C 提交与输出 / D 完成），ghostty、tmux 3.4+、iTerm2 等终端可原生跳转上一条提示、接收回合完成通知。
 
 ## 模型与补全
 

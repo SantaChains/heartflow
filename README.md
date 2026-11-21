@@ -112,10 +112,13 @@ hf -v | -V | --version                            打印版本号
 
 ```text
 /help     帮助              /model [NAME] 显示真实协议/base_url 或切换模型
-/mode     [NAME] 显示或切换权限模式（read-only/workspace-write/full）
+/provider NAME [MODEL] 显示或切换 provider（+可选模型；与 /model 切换都写回 config.toml，跨启动生效）  /models  从端点刷新当前 provider 的模型目录
+/mode     [NAME] 显示或切换权限模式（read-only/workspace-write/full/plan/spec/loop）
 /status   会话状态          /compact      手动强制压缩会话历史（忽略阈值）
 /pin      切换末条消息的永不压缩标记（跨 /compact 逐字存活）
+/checkpoints 列出 shadow-git 快照（写类工具执行前自动记录）  /restore N 恢复 tracked 文件到第 N 快照（可传 sha）
 /focus    切换聚焦模式（隐藏 mascot 伴侣、收窄为最小 chrome）
+/web on|off|local  web 工具面三态（local 保留 doc_search）  /effort LEVEL  reasoning 深度 none|low|medium|high|max
 /save     立即持久化        /clear        开启新会话
 /sessions [F] 列出已存会话（F 按开场消息主题过滤）   /open N|TOPIC  跳回第 N 个已存会话，或按开场消息主题匹配打开
 /remember T 追加一条长期记忆到 ~/.heartflow/MEMORY.md（自动去重）
@@ -132,6 +135,8 @@ hf -v | -V | --version                            打印版本号
 /spec GOAL 设计先行（写仅门禁到 specs/）  /spec approve 三选确认（立即执行/取消/添加修改）  /spec list 列已存 spec  /spec end 退出
 /restart 以全新的配置与 MCP 装载重启进程（链式重启受深度上限约束）
 ```
+
+每个提示与回合都输出 OSC 133 shell 集成标记（A 提示 / B+C 提交与输出 / D 完成），ghostty、tmux 3.4+、iTerm2 等终端可原生跳转上一条提示、接收回合完成通知。
 
 ## 管道与脚本
 
