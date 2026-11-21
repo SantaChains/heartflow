@@ -2266,19 +2266,6 @@ fn handle_provider_command(
             persist_active_selection(selection, Some(name));
             // Re-lookup the display price so the usage line tracks the new model.
             set_display_price(state, active_model_price(selection, catalog));
-            // Residue surfacing: the switch cleaned the user layer, but a
-            // project-layer config.toml (which outranks env/builtin) or an env
-            // override may still pin the OLD endpoint — the request would keep
-            // 401ing against the wrong host with no hint why. Name it.
-            if let Some(resolved) = selection.base_url() {
-                let overridden = provider::env_base_url_override(Some(name))
-                    .is_some_and(|value| value == resolved);
-                if !overridden && Some(resolved) != provider::builtin_base_url(name) {
-                    println!(
-                        "note: base_url is {resolved} — not the builtin for {name}; a project-layer config.toml or env override is still pinning the endpoint"
-                    );
-                }
-            }
         }
         Err(error) => println!("failed to switch provider: {error}"),
     }

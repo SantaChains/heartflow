@@ -407,7 +407,36 @@ pub(crate) fn resolve_selection(
     model: Option<&str>,
 ) -> Result<ProviderSelection, String> {
     let cwd = env::current_dir().map_err(|error| error.to_string())?;
-    load_provider_selection(&cwd, &home_dir(), provider, model)
+    let selection = load_provider_selection(&cwd, &home_dir(), provider, model)?;
+    // Name anchor: the CLI flag, else the persisted `[provider] name`.
+    let name = provider
+        .map(str::to_string)
+        .or_else(|| provider::load_merged_settings(&cwd, &home_dir()).name);
+    warn_endpoint_residue(&selection, name.as_deref());
+    Ok(selection)
+}
+
+/// Surface endpoint residue whenever a selection resolves (startup, `/provider`,
+/// `/bootstrap`, doctor): if the resolved base_url is neither the named
+/// provider's builtin nor a legitimate `{NAME}_BASE_URL` override, something —
+/// usually a stale project/user-layer config.toml from a previous provider —
+/// is pinning the endpoint. Say so now instead of letting the turn 401 against
+/// the wrong host with no hint. Custom providers (no builtin default) are
+/// exempt: their base_url is the point.
+pub(crate) fn warn_endpoint_residue(selection: &ProviderSelection, name: Option<&str>) {
+    let (Some(name), Some(resolved)) = (name, selection.base_url()) else {
+        return;
+    };
+    let Some(builtin) = provider::builtin_base_url(name) else {
+        return;
+    };
+    let overridden =
+        provider::env_base_url_override(Some(name)).is_some_and(|value| value == resolved);
+    if !overridden && resolved != builtin {
+        println!(
+            "note: base_url is {resolved} — not the builtin for {name}; a project-layer config.toml or env override is still pinning the endpoint"
+        );
+    }
 }
 
 /// Export one merged config surface (no CLI flags, no secret values). `config`
@@ -1576,6 +1605,14 @@ fn reload_config(
             Ok(rebuilt) => {
                 *runtime = rebuilt;
                 *selection = next;
+                // Hand-edited configs can pin a stale endpoint (see
+                // `warn_endpoint_residue`); hot-reload must surface it too.
+                warn_endpoint_residue(
+                    selection,
+                    provider::load_merged_settings(cwd, &home_dir())
+                        .name
+                        .as_deref(),
+                );
                 // The usage line's price mirror follows the swap: a config-edited
                 // model change must not keep showing the old cost segment.
                 set_display_price(

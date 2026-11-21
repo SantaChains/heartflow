@@ -680,25 +680,23 @@ pub fn persist_selection(home: &Path, provider: Option<&str>, model: &str) -> st
         }
     };
     if let Some(name) = provider {
-        // Cross-provider switch: the old provider's explicit endpoint binding
-        // is stale by definition — drop it so env/builtin resolution takes
-        // over (see the doc comment for the observed failure mode). The full
-        // binding set is `base_url`/`api_key`/`api_key_env`/`protocol`/
-        // `context_window`: a leftover protocol points the new provider at the
-        // wrong dialect, a leftover api_key_env would read the OLD provider's
-        // env var as the new credential, and a leftover context_window feeds
-        // the wrong budget to the ctx bar and auto-compact. `reasoning_effort`
-        // and unknown user keys stay: they are preferences, not bindings.
-        let switching = match table.get("name").and_then(toml_edit::Item::as_str) {
-            Some(old) => old != name,
-            None => true,
-        };
-        if switching {
-            table.remove("base_url");
-            table.remove("api_key");
-            table.remove("api_key_env");
-            table.remove("protocol");
-            table.remove("context_window");
+        // `/provider NAME` is an explicit "make NAME the active transport":
+        // ALWAYS drop the binding set, not just when the stored name differs.
+        // The name alone cannot prove the binding is current — a broken older
+        // build could have written the new name while leaving the old
+        // provider's keys in place (observed: `name = "deepseek"` with zhipu's
+        // base_url/api_key/protocol/context_window), and a re-switch to the
+        // same name then skipped cleanup forever. Idempotent removal; env/
+        // builtin resolution takes over. `reasoning_effort` and unknown user
+        // keys stay: they are preferences, not bindings.
+        for key in [
+            "base_url",
+            "api_key",
+            "api_key_env",
+            "protocol",
+            "context_window",
+        ] {
+            table.remove(key);
         }
         table.insert("name", toml_edit::value(name));
     }
@@ -1128,13 +1126,15 @@ mod tests {
             "preferences survive a provider switch"
         );
 
-        // A same-provider model switch keeps a hand-tuned endpoint intact.
+        // A model-only switch (`/model`, provider=None) keeps a hand-tuned
+        // endpoint intact — but `/provider NAME` cleans bindings even when
+        // NAME equals the stored name (the residue-proofing rule above).
         fs::write(
             &config,
             "[provider]\nname = \"deepseek\"\nbase_url = \"https://my-proxy.example/v1\"\napi_key = \"mine\"\nmodel = \"a\"\n",
         )
         .expect("seed tuned config");
-        persist_selection(&home, Some("deepseek"), "deepseek-flash").expect("model switch");
+        persist_selection(&home, None, "deepseek-flash").expect("model switch");
         let text = fs::read_to_string(&config).expect("re-read");
         let table: toml::Table = toml::from_str(&text).expect("parses");
         assert_eq!(
@@ -1143,6 +1143,25 @@ mod tests {
         );
         assert_eq!(table["provider"]["api_key"].as_str(), Some("mine"));
         assert_eq!(table["provider"]["model"].as_str(), Some("deepseek-flash"));
+
+        // The observed escape hatch: the name already matches the target (a
+        // broken older build wrote the new name but left the old bindings), so
+        // a re-switch to the SAME provider must still clean.
+        fs::write(
+            &config,
+            "[provider]\nname = \"deepseek\"\nprotocol = \"openai\"\nbase_url = \"https://open.bigmodel.cn/api/coding/paas/v4\"\napi_key = \"stale-key\"\nmodel = \"deepseek-flash\"\ncontext_window = 1048576\n",
+        )
+        .expect("seed same-name residue");
+        persist_selection(&home, Some("deepseek"), "deepseek-flash")
+            .expect("re-switch same provider");
+        let text = fs::read_to_string(&config).expect("re-read");
+        let table: toml::Table = toml::from_str(&text).expect("parses");
+        for key in ["base_url", "api_key", "protocol", "context_window"] {
+            assert!(
+                table["provider"].get(key).is_none(),
+                "same-name re-switch must still clean stale {key}"
+            );
+        }
         let _ = fs::remove_dir_all(&home);
     }
 
