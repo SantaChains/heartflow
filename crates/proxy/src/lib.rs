@@ -472,6 +472,21 @@ impl ProxyResolution {
     fn mark_probed(&mut self) {
         self.probed = true;
     }
+
+    /// Identity of the effective proxy decision, for reload reuse: when the
+    /// resolution did not change, re-probing would only flap and re-print the
+    /// dead warning. Includes the rules Debug so a rule edit counts as a
+    /// change even when the address is the same.
+    fn fingerprint(&self) -> String {
+        format!(
+            "{:?}|{:?}|{:?}|{:?}|{:?}",
+            self.source,
+            self.mode,
+            self.address.as_ref().map(Url::as_str),
+            self.no_proxy,
+            self.rules
+        )
+    }
 }
 
 /// Hosts that are never proxied, regardless of configuration: loopback,
@@ -541,6 +556,20 @@ fn probe(address: &Url) -> bool {
         .any(|addr| TcpStream::connect_timeout(addr, PROBE_TIMEOUT).is_ok())
 }
 
+/// Probe with one retry: a proxy that is starting up, or briefly saturated,
+/// fails a single connect and answers immediately afterwards. A genuinely
+/// dead port costs one extra second per dead *episode* — once, not per
+/// request — while a transient blip no longer permanently downgrades the
+/// session to direct.
+fn probe_with_retry(address: &Url) -> bool {
+    probe(address) || probe(address)
+}
+
+/// Address of the last dead-proxy warning, so one dead episode warns once
+/// instead of once per reload. Cleared whenever a probe succeeds, so a
+/// recover-then-die cycle warns again.
+static DEAD_WARNED: RwLock<Option<String>> = RwLock::new(None);
+
 // ---------------------------------------------------------------------------
 // Process-global resolution
 // ---------------------------------------------------------------------------
@@ -550,18 +579,57 @@ static GLOBAL: RwLock<Option<Arc<ProxyResolution>>> = RwLock::new(None);
 /// Resolve, probe, and install the process-global resolution. Called once at
 /// CLI startup and again on config reload. Probing is skipped when no proxy
 /// address is in force.
+///
+/// Reload discipline (the parts that keep the system quiet and stable):
+/// - an **unchanged** healthy decision is reused verbatim — no re-probe, no
+///   repeat warning (a config touch elsewhere must not flap the proxy);
+/// - a **dead** decision is re-probed on the next init, so a proxy that comes
+///   back (or starts up late) recovers at the next turn boundary without a
+///   restart;
+/// - one dead *episode* prints exactly one warning, however many reloads
+///   happen while it stays dead.
 pub fn init_global(config: Option<&ProxyConfig>) {
     let mut resolution = ProxyResolution::resolve(config);
     if let Some(address) = resolution.address.clone() {
-        if probe(&address) {
+        let healthy_reuse = {
+            let guard = GLOBAL.read().ok();
+            guard
+                .as_ref()
+                .and_then(|slot| slot.as_ref())
+                .is_some_and(|current| {
+                    !current.is_dead()
+                        && current.was_probed()
+                        && current.fingerprint() == resolution.fingerprint()
+                })
+        };
+        if healthy_reuse {
+            return;
+        }
+        if probe_with_retry(&address) {
             resolution.mark_probed();
+            if let Ok(mut guard) = DEAD_WARNED.write() {
+                *guard = None;
+            }
         } else {
             resolution.mark_dead();
-            tracing::warn!(
-                proxy = %display_redacted(&address),
-                "proxy did not answer a {PROBE_TIMEOUT:?} TCP probe; requests will go direct",
-            );
+            let redacted = display_redacted(&address);
+            let warned = match DEAD_WARNED.write() {
+                Ok(mut guard) => {
+                    let repeat = guard.as_deref() == Some(redacted.as_str());
+                    *guard = Some(redacted.clone());
+                    repeat
+                }
+                Err(_) => false,
+            };
+            if !warned {
+                tracing::warn!(
+                    proxy = %redacted,
+                    "proxy did not answer a {PROBE_TIMEOUT:?} TCP probe (retried once); requests will go direct until the proxy answers a probe — check that the proxy app is running on that port, or set HEARTFLOW_PROXY_MODE=direct to silence this"
+                );
+            }
         }
+    } else if let Ok(mut guard) = DEAD_WARNED.write() {
+        *guard = None;
     }
     // A poisoned lock only loses the cache: every later `resolution()` call
     // recomputes, so the failure mode is repeated work, never a wrong route.
@@ -870,5 +938,37 @@ mod tests {
         assert!(!text.contains("secret"), "{text}");
         assert!(!text.contains("user:secret"), "{text}");
         assert!(text.contains("127.0.0.1:7890"), "{text}");
+    }
+
+    #[test]
+    fn fingerprint_changes_when_the_decision_changes() {
+        // Reload reuse keys on this fingerprint: a rule edit or mode change on
+        // the same address must count as a change (fresh probe), while an
+        // unrelated config reload (same decision) must reuse the probe.
+        let a = ProxyResolution::resolve(Some(&address_config("http://127.0.0.1:7890")));
+        let b = ProxyResolution::resolve(Some(&address_config("http://127.0.0.1:7890")));
+        assert_eq!(a.fingerprint(), b.fingerprint());
+        let rules = config(&[
+            (
+                "address",
+                toml::Value::String("http://127.0.0.1:7890".into()),
+            ),
+            (
+                "rules",
+                toml::Value::Array(vec![toml::Value::String("MATCH,PROXY".into())]),
+            ),
+        ]);
+        let with_rules = ProxyResolution::resolve(Some(&rules));
+        assert_ne!(a.fingerprint(), with_rules.fingerprint());
+        let other_port = ProxyResolution::resolve(Some(&address_config("http://127.0.0.1:7891")));
+        assert_ne!(a.fingerprint(), other_port.fingerprint());
+    }
+
+    #[test]
+    fn probe_retry_fails_closed_on_a_closed_port() {
+        // Port 0 is never connectable; both attempts must fail so a dead
+        // episode is still reported (the retry must not mask real death).
+        let dead = Url::parse("http://127.0.0.1:0").expect("url");
+        assert!(!probe_with_retry(&dead));
     }
 }
