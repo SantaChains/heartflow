@@ -939,7 +939,7 @@ impl ReplEditor {
         if let Exit::Submit(ref text) = exit {
             // Command-start/output-start boundaries: everything printed after
             // this point (slash-command output or the streamed turn) belongs to
-            // this submission until the matching D marker (turn.rs / main.rs).
+            // this submission until the matching D marker in the REPL loop.
             osc133("B");
             osc133("C");
             if !text.trim().is_empty() {

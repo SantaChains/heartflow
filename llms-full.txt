@@ -403,7 +403,7 @@ source = "user"                     # seed | user | discovered（seed 不会出�
 last_seen = 1730000000              # 可选；最近记录/发现的 Unix 秒
 ```
 
-模型配置了成对的 `price_in`/`price_out` 时，回合末 usage 行追加成本估算：`ctx ▮▮▯▯ 38% 52K/138K · in/out/cache · $0.013 turn / $0.21 session`。上下文占用取最后一次请求的实际计费输入（含缓存三项）对窗口的比例；成本按全价口径估算（缓存折扣因厂商而异，不做臆测）。缺 `context_window` 无进度条只显绝对值，缺价格则整段省略。
+模型配置了成对的 `price_in`/`price_out` 时，回合末 usage 行追加成本估算：`ctx ▮▮▯▯ 38% 52K/138K · in/out/cache · $0.013 req / $0.21 session`。上下文占用取最后一次请求的实际计费输入（含缓存三项）对窗口的比例；`req` 是最近一次 API 请求的成本（工具循环一回合发多个请求，所以标签不是 turn），`session` 是累计口径；成本按全价口径估算（缓存折扣因厂商而异，不做臆测）。缺 `context_window` 无进度条只显绝对值，缺价格则整段省略。
 
 ## 终端配色（theme.toml）
 
