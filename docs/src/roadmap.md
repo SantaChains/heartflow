@@ -604,15 +604,16 @@ enum CredentialSource {
 
 **根因清单（源码实证）**：E1 `edit_file` 是 read→modify→write_text_atomic（file_ops.rs:347-402），读改写窗口无锁，并发时 last-writer-wins **静默丢编辑**，且 `old_string` 唯一性检查基于可能已过期的读取；E2 `write_file` 全量替换语义，并发即丢更新（语义上可接受，但需知会模型）；E3 `apply_patch` 多文件批量同理；E4 `filelock.rs` 明确只护 durable stores（schedules.json/mission/job status/queue.json），不覆盖工作区文件；E5 `checkpoint::maybe_snapshot_cwd` 在每个写工具入口触发，并发写时两线程可能同时拍快照（次级）。
 
-**方案**：工作区编辑临界区锁，复用既有 `filelock::with_exclusive` OS advisory 锁。
+**方案（2026-11-21 网络调研后修订为三层设计，业界对齐：Claude Code subagent `isolation: worktree` 官方机制、CAID 论文 arxiv 2603.21489 的 per-engineer worktree+merge、社区 blockedBy 任务依赖排序、agenthold/agent-coherence 的 write_cas 乐观并发）**：
 
-1. 主方案：`edit_file`/`apply_patch`/`write_file` 的整个读改写临界区套 `with_exclusive`；锁文件集中放 `.heartflow/locks/`（目标路径哈希命名，避免工作区散落 `.lock` 文件）。OS advisory 锁天然覆盖双进程场景。
-2. 辅助校验（可选）：临界区内写前重读比对内容 hash，检测绕锁写入的外部修改（用户编辑器、git 操作），mismatch 报「文件已被并发修改，请重读后重试」。
-3. checkpoint 快照去抖：并发进入按 cwd+内容 hash 去重。
+1. 第一层（始终开启，E1-E2 落地）：悲观逐文件 advisory 锁。`edit_file`/`apply_patch`/`write_file` 的整个读改写临界区套 `filelock::with_exclusive`，锁文件集中放 `.heartflow/locks/`（目标路径哈希命名，避免工作区散落 `.lock`）。OS advisory 锁天然覆盖双 hf 进程与非 git 目录（worktree 隔离做不到这两点，故此层不可省）。`apply_patch` 批量按排序顺序逐文件加锁避免死锁，绝不嵌套批锁。
+2. 第二层（可选增强，随 E2 落地）：锁内写前重验内容 hash（CAS），捕获绕过协调面的写入（用户编辑器、git 操作、其他工具）——锁与 worktree 都探测不到的盲区。mismatch 返回类型化冲突「文件已被并发修改，请重读后重试」，由模型侧重读重试，不自动合并。
+3. 第三层（独立演进项，E3 后评估）：git worktree per-job 隔离。git 仓库下 jobs 可选 per-job worktree（对齐 Claude Code `isolation: worktree` 语义），编辑冲突从静默丢失变成 git merge 冲突，由集成点收编。代价：分支生命周期管理、checkpoint 语义按 worktree 变化、untracked 文件不共享（node_modules 级目录需重建）、非 git 目录自动降级回第一层。重度并行（slots 多、任务粗粒度）时收益才显著，属扩容项。
+4. 明确不入工具层：blockedBy 式文件所有权分区属提示词纪律（模型自守），非强制机制；`write_file` 保持全量替换语义不引入合并。
 
-**分相路线**：E1 锁基建（locks 目录 + 包装函数，纯函数可测）→ E2 三工具接入临界区 + 竞态测试（两线程同 edit 同文件，断言两次编辑都生效且无静默丢失）→ E3 checkpoint 去抖。验收 = 竞态测试在 `--test-threads` 下稳定全绿 + 双 hf 进程手工编辑验证。
+**分相路线**：E1 锁基建（locks 目录 + 包装函数，纯函数可测）→ E2 三工具接入临界区 + hash 重验 + 竞态测试（两线程同 edit 同文件，断言两次编辑都生效且无静默丢失；外加绕锁写入的 CAS 冲突测试）→ E3 checkpoint 去抖 → E4（评估后决定）per-job worktree。验收 = 竞态测试在 `--test-threads` 下稳定全绿 + 双 hf 进程手工编辑验证。
 
-**明确不做**：不做多文件原子事务、不做 CRDT/内容合并、不锁读工具（读脏页由 checkpoint + 重读兜底）；`write_file` 保持全量替换语义不引入合并。
+**明确不做**：不做多文件原子事务、不做 CRDT/内容合并、不锁读工具（读脏页由 checkpoint + 重读兜底）。
 
 
 ## B. 研究存档与先不做清单
