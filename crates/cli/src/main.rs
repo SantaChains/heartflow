@@ -5038,7 +5038,10 @@ mod tests {
             .await,
             PermissionOutcome::Allow
         );
-        // Windows separators still resolve to a plan document.
+        // Windows separators still resolve to a plan document (on Unix a
+        // backslash is a legal filename character, so the gate correctly
+        // denies there).
+        #[cfg(windows)]
         assert_eq!(
             plan.authorize(
                 "edit_file",

@@ -1601,24 +1601,12 @@ mod tests {
         let _guard = root_guard();
         set_jobs_root_for_test("foreign-dead");
         let root = super::jobs_root().expect("root set");
-        // A child that exits immediately: after wait() its pid is dead.
-        let mut short_lived = {
-            #[cfg(windows)]
-            {
-                let mut command = std::process::Command::new("cmd");
-                command.args(["/C", "exit", "0"]);
-                command
-            }
-            #[cfg(not(windows))]
-            {
-                // `true` takes no arguments and is never mutated here: build
-                // the child directly to stay clean under `-D warnings`.
-                std::process::Command::new("true")
-            }
-        };
-        let dead_pid = short_lived.spawn().expect("child ran").id();
-        // Give the child a moment to exit so its pid is genuinely dead.
-        std::thread::sleep(Duration::from_millis(300));
+        // A foreign pid that can never be alive: above every realistic
+        // pid_max (Linux default 32768, raised max 4194304) and absent from
+        // the Windows tasklist CSV. Spawning a real short-lived child was
+        // flaky — under the parallel suite its pid is routinely reused by a
+        // concurrent sleeper before the liveness probe runs.
+        let dead_pid: u32 = 4_000_000;
         let path = write_record(
             &root,
             &format!("job-{dead_pid}-9"),

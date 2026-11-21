@@ -323,11 +323,11 @@ pub(crate) fn last_assistant_conclusion(messages: &[ConversationMessage]) -> Opt
 pub(crate) fn usage_line(current: &TokenUsage, session: &TokenUsage) -> String {
     let read = u64::from(current.cache_read_input_tokens);
     let input = u64::from(current.input_tokens);
-    let hit = if input + read > 0 {
-        read * 100 / (input + read)
-    } else {
-        0
-    };
+    // None when the turn had no tokens yet (`input + read == 0`) -> 0.
+    let hit = read
+        .checked_mul(100)
+        .and_then(|num| num.checked_div(input + read))
+        .unwrap_or(0);
     format!(
         "[in {} / out {} / cache {}% · session {}]",
         current.input_tokens,
