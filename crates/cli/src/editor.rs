@@ -186,8 +186,9 @@ pub(crate) fn osc133(sequence: &str) {
 }
 
 /// Emit one raw CSI control sequence (best-effort, same contract as
-/// [`osc133`]). Used for the kitty keyboard protocol push/pop that crossterm
-/// 0.29 no longer wraps as helpers.
+/// [`osc133`]). Used for the kitty keyboard protocol push/pop — which is
+/// unix-only (see `read_line_tui`), so the helper is too.
+#[cfg(unix)]
 fn csi(sequence: &str) {
     let mut stdout = io::stdout();
     let _ = stdout.write_all(format!("\x1b[{sequence}").as_bytes());
@@ -878,17 +879,21 @@ impl ReplEditor {
         // jump target at every REPL prompt.
         osc133("A");
         enable_raw_mode()?;
-        // Kitty keyboard protocol, flag 1 (disambiguate escape codes): with it,
-        // Shift+Enter arrives as Enter+SHIFT on supporting terminals instead of
-        // a bare Enter that submits. crossterm 0.29 still ships this as an
-        // event Command, but the raw CSI goes through the same best-effort
-        // writer as the OSC 133 markers, and terminals without the protocol
-        // ignore it silently, so the existing bindings stay untouched.
+        // Kitty keyboard protocol, flag 1 (disambiguate escape codes), **unix
+        // only**: on Windows crossterm's event source reads Win32 console
+        // records and cannot decode CSI u input, so Windows Terminal hands the
+        // encoded sequences through as literal characters — every Ctrl key,
+        // Esc and arrow became garbage text (observed in the wild). Windows
+        // already carries SHIFT in its console key records, so Shift+Enter
+        // works there without the protocol; unix terminals without kitty
+        // support ignore the CSI silently, leaving existing bindings intact.
+        #[cfg(unix)]
         csi(">1u");
         // Bracketed paste makes the terminal hand over a pasted block as one
         // event, so an embedded newline stays a multi-line draft instead of
         // reading as a bare Enter that submits (the "paste auto-runs" bug).
         if let Err(error) = execute!(io::stdout(), EnableBracketedPaste) {
+            #[cfg(unix)]
             csi("<u");
             let _ = disable_raw_mode();
             return Err(error);
@@ -897,6 +902,7 @@ impl ReplEditor {
         let mut terminal = match CompanionTerminal::with_inline(backend, VIEWPORT_ROWS) {
             Ok(terminal) => terminal,
             Err(error) => {
+                #[cfg(unix)]
                 csi("<u");
                 let _ = disable_raw_mode();
                 return Err(error);
@@ -931,7 +937,8 @@ impl ReplEditor {
         // scrollback record of the submitted line back to the normal buffer.
         let _ = terminal.hide_cursor();
         let _ = terminal.clear();
-        csi("<u"); // pop the kitty keyboard flags pushed at entry
+        #[cfg(unix)]
+        csi("<u"); // pop the kitty keyboard flags pushed at entry (unix only)
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), DisableBracketedPaste, Show);
         loop_result?;
