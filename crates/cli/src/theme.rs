@@ -665,10 +665,6 @@ pub mod glyphs {
     pub const BULLET: &str = "• ";
     /// Block-quote left bar.
     pub const QUOTE_BAR: &str = "│ ";
-    /// Horizontal rule: a short box-drawing run, self-terminating, kept narrow
-    /// so it never wraps on ordinary terminal widths (a full-width fixed rule
-    /// would break layout on narrow terminals).
-    pub const RULE: &str = "──────\n";
     /// Open corner for a fenced code block; the language follows after a space.
     pub const CODE_OPEN: &str = "╭─ ";
     /// Close corner for a fenced code block.

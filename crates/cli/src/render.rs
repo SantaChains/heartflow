@@ -25,6 +25,11 @@ pub struct ColorTheme {
     spinner_active: Color,
     success: Color,
     error: Color,
+    syntax_kw: Color,
+    syntax_str: Color,
+    syntax_comment: Color,
+    syntax_num: Color,
+    syntax_type: Color,
 }
 
 impl ColorTheme {
@@ -42,6 +47,11 @@ impl ColorTheme {
             spinner_active: theme.accent().crossterm(),
             success: theme.success().crossterm(),
             error: theme.error().crossterm(),
+            syntax_kw: theme.syntax_kw().crossterm(),
+            syntax_str: theme.syntax_str().crossterm(),
+            syntax_comment: theme.syntax_comment().crossterm(),
+            syntax_num: theme.syntax_num().crossterm(),
+            syntax_type: theme.syntax_type().crossterm(),
         }
     }
 
@@ -84,6 +94,31 @@ impl ColorTheme {
     #[must_use]
     pub fn error(&self) -> Color {
         self.error
+    }
+    /// Fenced-code keyword color.
+    #[must_use]
+    pub fn syntax_kw(&self) -> Color {
+        self.syntax_kw
+    }
+    /// Fenced-code string-literal color.
+    #[must_use]
+    pub fn syntax_str(&self) -> Color {
+        self.syntax_str
+    }
+    /// Fenced-code comment color.
+    #[must_use]
+    pub fn syntax_comment(&self) -> Color {
+        self.syntax_comment
+    }
+    /// Fenced-code numeric-literal color.
+    #[must_use]
+    pub fn syntax_num(&self) -> Color {
+        self.syntax_num
+    }
+    /// Fenced-code type-name color.
+    #[must_use]
+    pub fn syntax_type(&self) -> Color {
+        self.syntax_type
     }
 }
 
@@ -256,11 +291,12 @@ mod tests {
         assert!(markdown_output.contains('\u{1b}'));
     }
 
-    /// A fenced block keeps its frame and language label, but the body is
-    /// verbatim: no token colors from a palette the app cannot control, so the
-    /// terminal's own foreground (and a light color scheme) reads correctly.
+    /// A fenced block keeps its frame and language label, and the body is
+    /// highlighted through the theme's syntax roles (keyword runs carry the
+    /// `syntax_kw` hue; plain gaps stay on the terminal's own foreground, so a
+    /// light color scheme still reads correctly).
     #[test]
-    fn code_block_bodies_carry_no_color() {
+    fn code_block_bodies_highlight_via_theme_roles() {
         let terminal_renderer = TerminalRenderer::new();
         let markdown_output =
             terminal_renderer.render_markdown("```rust\nfn hi() { println!(\"hi\"); }\n```");
@@ -270,12 +306,14 @@ mod tests {
         assert!(plain_text.contains("╭─ rust"), "{plain_text}");
         assert!(plain_text.contains("╰─"), "{plain_text}");
 
-        // The body row is reproduced exactly, with no escape on it at all.
+        // The body row is token-split (`fn` carries an escape), but its visible
+        // text is reproduced verbatim.
         let body = markdown_output
             .lines()
-            .find(|line| line.contains("fn hi"))
+            .find(|line| line.contains("hi() {"))
             .expect("the code body is rendered");
-        assert_eq!(body, "fn hi() { println!(\"hi\"); }");
+        assert_ne!(body, "fn hi() { println!(\"hi\"); }");
+        assert_eq!(strip_ansi(body), "fn hi() { println!(\"hi\"); }");
 
         // The rest of the document is still theme-colored.
         assert!(markdown_output.contains('\u{1b}'));

@@ -17,11 +17,14 @@
 //! share one document model and one [`crate::theme::Theme`] palette, so they can
 //! no longer drift the way two independent walkers did.
 //!
-//! A fenced code block is emitted **without** syntax highlighting, so every
-//! colored glyph in a transcript is derived from the app theme (see the
-//! [`Node::CodeBlock`] note for why the token colors were removed). Tables are
-//! drawn as a light box grid whose column widths are measured in terminal cells,
-//! so CJK cell text stays aligned with ASCII.
+//! A fenced code block gets **cheap, theme-aware** highlighting: one regex-free
+//! line scanner (keywords / strings / comments / numbers / type names) whose
+//! colors come from the app's own `syntax_*` roles, so every colored glyph in a
+//! transcript follows [`crate::theme`] (the fixed third-party palette that got
+//! token coloring removed once is gone). Marks are closed within each line, so
+//! no color can bleed across rows. Tables are drawn as a light box grid whose
+//! column widths are measured in terminal cells, so CJK cell text stays aligned
+//! with ASCII.
 //!
 //! The parser is built on a deliberate subset rather than `Options::all()`;
 //! see [`RENDERED_OPTIONS`] for which grammars are in and why the rest are out.
@@ -113,14 +116,13 @@ pub enum Node {
     /// A fenced or indented code block. `language` is empty for a bare fence and
     /// `"text"` for an indented block; `code` is the raw body.
     ///
-    /// The body is deliberately **not** syntax-highlighted. Token coloring came
-    /// from a fixed third-party palette (`base16-ocean.dark`) that no theme in
-    /// this app can override, so a code block was the one region of the
-    /// transcript whose colors did not follow [`crate::theme`] — wrong on a
-    /// light terminal and unreachable from a custom palette. The block is drawn
-    /// in the terminal's own foreground instead, which is correct under every
-    /// theme by construction. The fence marks and language label stay, because
-    /// those are structure, not color.
+    /// The body is highlighted by the line scanner below — deliberately cheap:
+    /// keyword/string/comment/number/type runs against a per-language keyword
+    /// list, no dependency, no language probe beyond the fence label, and every
+    /// mark closes within its line (colors cannot bleed across rows, the
+    /// failure mode that got the old span-level coloring rolled back). Unknown
+    /// languages still get strings/comments/numbers via the shared profile.
+    /// The fence marks and language label stay, because those are structure.
     CodeBlock {
         language: String,
         code: String,
@@ -450,8 +452,11 @@ pub fn project_ansi(nodes: &[Node], theme: &ColorTheme) -> String {
                         format!("{}{language}", glyphs::CODE_OPEN).with(theme.heading())
                     );
                 }
-                // Verbatim: no token colors, no escape at all. See `Node::CodeBlock`.
-                out.push_str(code);
+                // Per-line highlighting through the theme's syntax roles; gaps
+                // render in the terminal's own foreground.
+                for line in code.lines() {
+                    write_code_line_ansi(&mut out, line, language, theme);
+                }
                 if !language.is_empty() {
                     let _ = write!(out, "{}", glyphs::CODE_CLOSE.with(theme.heading()));
                 }
@@ -461,6 +466,239 @@ pub fn project_ansi(nodes: &[Node], theme: &ColorTheme) -> String {
         }
     }
     out
+}
+
+// --- fenced-code highlighter -------------------------------------------------
+
+/// Token kinds for the cheap highlighter, mapped one-to-one onto the theme's
+/// `syntax_*` roles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenKind {
+    Kw,
+    Str,
+    Comment,
+    Num,
+    Type,
+}
+
+/// One styled run inside a single code line: byte range `[start, end)`.
+/// Non-overlapping and ordered; the gaps between marks render in the
+/// terminal's own foreground.
+#[derive(Debug, PartialEq, Eq)]
+struct Mark {
+    start: usize,
+    end: usize,
+    kind: TokenKind,
+}
+
+const RUST_KW: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "false",
+    "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
+    "return", "self", "static", "struct", "trait", "true", "type", "unsafe", "use", "where",
+    "while", "Self",
+];
+const PYTHON_KW: &[&str] = &[
+    "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif",
+    "else", "except", "False", "finally", "for", "from", "global", "if", "import", "in", "is",
+    "lambda", "None", "nonlocal", "not", "or", "pass", "raise", "return", "True", "try", "while",
+    "with", "yield", "self",
+];
+const JS_KW: &[&str] = &[
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "do",
+    "else",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "from",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "let",
+    "new",
+    "null",
+    "return",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "undefined",
+    "var",
+    "void",
+    "while",
+    "yield",
+];
+const SHELL_KW: &[&str] = &[
+    "case", "do", "done", "elif", "else", "esac", "export", "fi", "for", "function", "if", "in",
+    "local", "return", "set", "then", "until", "while",
+];
+const JSON_KW: &[&str] = &["false", "null", "true"];
+
+/// Keyword list and comment opener per fence label; an unknown language keeps
+/// string/number highlighting (and types) but no comment opener.
+fn language_profile(language: &str) -> (&'static [&'static str], Option<&'static str>) {
+    match language.to_ascii_lowercase().as_str() {
+        "rust" | "rs" => (RUST_KW, Some("//")),
+        "python" | "py" => (PYTHON_KW, Some("#")),
+        "javascript" | "js" | "typescript" | "ts" | "jsx" | "tsx" => (JS_KW, Some("//")),
+        "bash" | "sh" | "shell" | "zsh" => (SHELL_KW, Some("#")),
+        "toml" => (JSON_KW, Some("#")),
+        "json" => (JSON_KW, None),
+        _ => (&[], None),
+    }
+}
+
+fn is_word(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// The scanner itself: one line in, styled marks out. ASCII-only token
+/// triggers keep slicing char-boundary safe (UTF-8 passes through as plain
+/// runs); comments claim the rest of their line; strings honor `\\` escapes;
+/// `Upper`-cased identifier heads go to the type role. Every mark ends within
+/// the line, so a color can never bleed into the next row.
+fn highlight_line(
+    line: &str,
+    kws: &'static [&'static str],
+    comment: Option<&'static str>,
+) -> Vec<Mark> {
+    let bytes = line.as_bytes();
+    let mut marks = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(opener) = comment {
+            if line[i..].starts_with(opener) {
+                marks.push(Mark {
+                    start: i,
+                    end: bytes.len(),
+                    kind: TokenKind::Comment,
+                });
+                return marks;
+            }
+        }
+        let quote = bytes[i];
+        if quote == b'"' || quote == b'\'' {
+            let mut j = i + 1;
+            while j < bytes.len() {
+                if bytes[j] == b'\\' {
+                    j += 2;
+                } else if bytes[j] == quote {
+                    j += 1;
+                    break;
+                } else {
+                    j += 1;
+                }
+            }
+            let end = j.min(bytes.len());
+            marks.push(Mark {
+                start: i,
+                end,
+                kind: TokenKind::Str,
+            });
+            i = end;
+        } else if bytes[i].is_ascii_digit() && (i == 0 || !is_word(bytes[i - 1])) {
+            let mut j = i;
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b'.') {
+                j += 1;
+            }
+            marks.push(Mark {
+                start: i,
+                end: j,
+                kind: TokenKind::Num,
+            });
+            i = j;
+        } else if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let mut j = i;
+            while j < bytes.len() && is_word(bytes[j]) {
+                j += 1;
+            }
+            let word = &line[i..j];
+            let kind = if kws.contains(&word) {
+                Some(TokenKind::Kw)
+            } else if word.chars().next().is_some_and(char::is_uppercase) {
+                Some(TokenKind::Type)
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                marks.push(Mark {
+                    start: i,
+                    end: j,
+                    kind,
+                });
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    marks
+}
+
+/// ANSI rendering of one code line: plain gaps verbatim, marks wrapped in the
+/// matching `syntax_*` color. Colors reset per styled run, so nothing leaks
+/// past the line.
+fn write_code_line_ansi(out: &mut String, line: &str, language: &str, theme: &ColorTheme) {
+    let (kws, comment) = language_profile(language);
+    let mut cursor = 0usize;
+    for mark in highlight_line(line, kws, comment) {
+        if mark.start > cursor {
+            out.push_str(&line[cursor..mark.start]);
+        }
+        let color = match mark.kind {
+            TokenKind::Kw => theme.syntax_kw(),
+            TokenKind::Str => theme.syntax_str(),
+            TokenKind::Comment => theme.syntax_comment(),
+            TokenKind::Num => theme.syntax_num(),
+            TokenKind::Type => theme.syntax_type(),
+        };
+        out.push_str(&line[mark.start..mark.end].with(color).to_string());
+        cursor = mark.end;
+    }
+    out.push_str(&line[cursor..]);
+    out.push('\n');
+}
+
+/// ratatui rendering of one code line as spans with the same roles.
+fn code_line_spans(line: &str, language: &str, theme: &AppTheme) -> Vec<Span<'static>> {
+    let (kws, comment) = language_profile(language);
+    let mut spans = Vec::new();
+    let mut cursor = 0usize;
+    for mark in highlight_line(line, kws, comment) {
+        if mark.start > cursor {
+            spans.push(Span::raw(line[cursor..mark.start].to_string()));
+        }
+        let color = match mark.kind {
+            TokenKind::Kw => theme.syntax_kw(),
+            TokenKind::Str => theme.syntax_str(),
+            TokenKind::Comment => theme.syntax_comment(),
+            TokenKind::Num => theme.syntax_num(),
+            TokenKind::Type => theme.syntax_type(),
+        };
+        spans.push(Span::styled(
+            line[mark.start..mark.end].to_string(),
+            RtStyle::default().fg(color.ratatui()),
+        ));
+        cursor = mark.end;
+    }
+    if cursor < line.len() {
+        spans.push(Span::raw(line[cursor..].to_string()));
+    }
+    spans
 }
 
 /// Append one text run to the ANSI buffer with its resolved styling. Priority
@@ -661,13 +899,12 @@ impl RtProjector {
         if !self.cur.is_empty() {
             self.newline();
         }
-        // Unstyled rows: the terminal's own foreground, same as `project_ansi`.
-        // `lines()` (not `LinesWithEndings`) so no trailing `\r` survives on a
-        // CRLF-encoded block; a trailing newline in `code` would otherwise add a
-        // phantom blank row.
+        // Highlighted rows via the syntax roles; `lines()` (not
+        // `LinesWithEndings`) so no trailing `\r` survives on a CRLF-encoded
+        // block, and a trailing newline in `code` adds no phantom row.
         self.lines.extend(
             code.lines()
-                .map(|line| Line::from(Span::raw(line.to_string()))),
+                .map(|line| Line::from(code_line_spans(line, language, &self.theme))),
         );
         if !language.is_empty() {
             let head = self.heading_style();
@@ -930,8 +1167,8 @@ fn table_row(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse, project_ansi, project_ratatui, Align, AppTheme, ColorTheme, Node, TextStyle,
-        HR_WIDTH,
+        highlight_line, language_profile, parse, project_ansi, project_ratatui, Align, AppTheme,
+        ColorTheme, Node, TextStyle, TokenKind, HR_WIDTH,
     };
     use crate::theme::glyphs;
     use ratatui::style::Modifier;
@@ -1136,34 +1373,37 @@ mod tests {
         );
     }
 
-    /// A code block body carries **no** color: the only escape the ANSI
-    /// projection may emit for it is none at all, so the terminal's own
-    /// foreground applies. The fence marks still bracket it, so the block stays
-    /// visually distinct from prose.
+    /// Code rows highlight through the theme's syntax roles: `fn` gets the
+    /// keyword color, plain text stays verbatim, and every styled run resets so
+    /// nothing leaks past the line (the old rollback failure mode).
     #[test]
-    fn code_blocks_are_not_highlighted() {
+    fn code_blocks_highlight_via_theme_roles() {
         let ansi = project_ansi(&parse("```rust\nfn main() {}\n```"), &ColorTheme::default());
         let body = ansi
             .lines()
-            .find(|line| line.contains("fn main"))
+            .find(|line| line.contains("main() {}"))
             .expect("the code body is rendered");
-        assert_eq!(
-            body, "fn main() {}",
-            "the body row must be verbatim, with no ANSI escape around it"
+        // `fn` carries an escape sequence; plain text survives after it.
+        assert!(
+            body != "fn main() {}",
+            "the keyword row is highlighted: {body}"
         );
+        assert!(body.contains("main"), "plain text must survive: {body}");
 
-        // The ratatui side: an unstyled span, not a colored one.
+        // The ratatui side: token spans with fg color, gap spans unstyled.
         let lines = project_ratatui(&parse("```rust\nfn main() {}\n```"), &AppTheme::default());
         let body = lines
             .iter()
             .find(|line| line_text(line).contains("fn main"))
             .expect("the code body is rendered");
-        assert_eq!(body.spans.len(), 1, "one span, so no token splits");
-        assert_eq!(
-            body.spans[0].style,
-            ratatui::style::Style::default(),
-            "the body span must be unstyled"
+        assert!(body.spans.len() > 1, "the row is split into token spans");
+        assert!(
+            body.spans
+                .iter()
+                .any(|span| span.style.fg.is_some() && span.content.contains("fn")),
+            "the keyword span carries the syntax_kw color"
         );
+        assert_eq!(line_text(body), "fn main() {}", "text content is verbatim");
     }
 
     /// A code block whose body is empty must not emit a phantom row: the
@@ -1175,6 +1415,44 @@ mod tests {
         assert!(
             texts.is_empty(),
             "an empty block renders nothing: {texts:?}"
+        );
+    }
+
+    /// The scanner marks exactly the intended runs, and every mark ends within
+    /// the line (the no-bleed invariant the old span coloring lacked).
+    #[test]
+    fn highlight_line_marks_the_intended_runs() {
+        let (kws, comment) = language_profile("rust");
+        let marks = highlight_line("let usage = TokenUsage::new(); // 定语", kws, comment);
+        assert_eq!(marks[0].kind, TokenKind::Kw);
+        assert_eq!(
+            &"let usage = TokenUsage::new(); // 定语"[marks[0].start..marks[0].end],
+            "let"
+        );
+        // The comment claims the rest of the line, CJK included, and ends at EOL.
+        let last = marks.last().expect("comment mark present");
+        assert_eq!(last.kind, TokenKind::Comment);
+        assert_eq!(last.end, "let usage = TokenUsage::new(); // 定语".len());
+        // Type head + string + number on one line, all ordered non-overlapping.
+        let marks = highlight_line(r#"let s = "a\"b"; 42 + Width"#, kws, comment);
+        let kinds: Vec<_> = marks.iter().map(|m| m.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Kw,
+                TokenKind::Str,
+                TokenKind::Num,
+                TokenKind::Type
+            ]
+        );
+        for pair in marks.windows(2) {
+            assert!(pair[0].end <= pair[1].start, "marks must not overlap");
+        }
+        // Numbers only where they are not part of an identifier.
+        let marks = highlight_line("v2", kws, comment);
+        assert!(
+            marks.is_empty(),
+            "v2 is an identifier, not a number: {marks:?}"
         );
     }
 
