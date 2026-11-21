@@ -631,8 +631,16 @@ pub fn persist_discovered(
 /// layout-preserving via `toml_edit`: only `name` (when a provider switch is
 /// given) and `model` inside `[provider]` are set; every other table, comment,
 /// and key order stays untouched. A missing file is created holding just the
-/// table. Never touches base_url/api_key: builtins resolve those from their
-/// compiled-in table, and hand-tuned endpoints must not be overwritten.
+/// table.
+///
+/// A **cross-provider** switch also removes the table's explicit `base_url`/
+/// `api_key`: those describe the previous transport and would silently keep
+/// routing requests to the old endpoint after the name flipped (observed in
+/// the wild — a zhipu `base_url`/`api_key` left behind by a switch to
+/// `deepseek` sent deepseek model ids to bigmodel.cn and 401'd). Env vars and
+/// the built-in table then resolve the new provider's endpoint and key. A
+/// same-provider model switch (or `provider: None`) leaves them untouched, so
+/// hand-tuned endpoints survive `/model NAME`.
 ///
 /// # Errors
 /// Fails when the file exists but is not valid TOML, or the atomic write
@@ -667,6 +675,17 @@ pub fn persist_selection(home: &Path, provider: Option<&str>, model: &str) -> st
         }
     };
     if let Some(name) = provider {
+        // Cross-provider switch: the old provider's explicit endpoint binding
+        // is stale by definition — drop it so env/builtin resolution takes
+        // over (see the doc comment for the observed failure mode).
+        let switching = match table.get("name").and_then(toml_edit::Item::as_str) {
+            Some(old) => old != name,
+            None => true,
+        };
+        if switching {
+            table.remove("base_url");
+            table.remove("api_key");
+        }
         table.insert("name", toml_edit::value(name));
     }
     table.insert("model", toml_edit::value(model));
@@ -1017,6 +1036,53 @@ mod tests {
         )
         .expect("seed broken config");
         assert!(persist_selection(&home, Some("deepseek"), "m").is_err());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn persist_selection_clears_stale_endpoint_on_provider_switch() {
+        let home = std::env::temp_dir().join(format!("hf-switch-clean-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join(".heartflow")).expect("mkdir");
+        // The observed failure: a zhipu endpoint/key left in the table, then a
+        // switch to deepseek flipped only the name — deepseek model ids went to
+        // bigmodel.cn with the zhipu key and 401'd.
+        let config = home.join(".heartflow").join("config.toml");
+        fs::write(
+            &config,
+            "[provider]\nname = \"zhipu\"\nbase_url = \"https://open.bigmodel.cn/api/coding/paas/v4\"\napi_key = \"stale-key\"\nmodel = \"glm-4.7\"\n",
+        )
+        .expect("seed stale config");
+        persist_selection(&home, Some("deepseek"), "deepseek-flash").expect("provider switch");
+        let text = fs::read_to_string(&config).expect("re-read");
+        let table: toml::Table = toml::from_str(&text).expect("parses");
+        assert_eq!(table["provider"]["name"].as_str(), Some("deepseek"));
+        assert_eq!(table["provider"]["model"].as_str(), Some("deepseek-flash"));
+        // The stale endpoint binding must be gone, not just shadowed.
+        assert!(
+            table["provider"].get("base_url").is_none(),
+            "stale base_url must be removed on provider switch"
+        );
+        assert!(
+            table["provider"].get("api_key").is_none(),
+            "stale api_key must be removed on provider switch"
+        );
+
+        // A same-provider model switch keeps a hand-tuned endpoint intact.
+        fs::write(
+            &config,
+            "[provider]\nname = \"deepseek\"\nbase_url = \"https://my-proxy.example/v1\"\napi_key = \"mine\"\nmodel = \"a\"\n",
+        )
+        .expect("seed tuned config");
+        persist_selection(&home, Some("deepseek"), "deepseek-flash").expect("model switch");
+        let text = fs::read_to_string(&config).expect("re-read");
+        let table: toml::Table = toml::from_str(&text).expect("parses");
+        assert_eq!(
+            table["provider"]["base_url"].as_str(),
+            Some("https://my-proxy.example/v1")
+        );
+        assert_eq!(table["provider"]["api_key"].as_str(), Some("mine"));
+        assert_eq!(table["provider"]["model"].as_str(), Some("deepseek-flash"));
         let _ = fs::remove_dir_all(&home);
     }
 
