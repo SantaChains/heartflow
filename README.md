@@ -206,8 +206,12 @@ api_key_env = "DEEPSEEK_API_KEY"    # 只写变量名，供发现与提示
 [[providers.deepseek.models]]
 id = "deepseek-v4-flash"
 context_window = 1000000            # 可选；不确定就删掉这行
+price_in = 0.28                     # 可选；USD 每 1M tokens（输入）
+price_out = 1.10                    # 可选；USD 每 1M tokens（输出）
 source = "user"                     # seed | user | discovered（seed 不落盘）
 ```
+
+模型配置了成对的 `price_in`/`price_out` 时，回合末的 usage 行会追加成本估算（`ctx ▮▮▯▯ 38% 52K/138K · in/out/cache · $0.013 turn / $0.21 session`）：上下文占用按最后一次请求的实际计费输入（含缓存三项）对窗口取比例，成本按全价口径（缓存折扣因厂商而异，不做臆测）。缺 `context_window` 则无进度条只显绝对值，缺价格则整段省略——配置缺失永远降级而不是显示陈旧数字。
 
 ### 终端配色（theme.toml）
 

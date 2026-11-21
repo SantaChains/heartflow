@@ -102,6 +102,10 @@ pub(crate) struct SessionState {
     /// `run_turn_interactive` can inject the mode's prompt segment without
     /// threading the string through every call site.
     pub(crate) mode: String,
+    /// Display price for the active model (USD per 1M tokens, in/out) from the
+    /// catalog, mirrored here so the per-turn usage line can show cost without
+    /// threading the catalog through every call site (same pattern as `mode`).
+    pub(crate) price: Option<(f64, f64)>,
 }
 
 /// Shared handle to one conversation's mutable state.
@@ -131,6 +135,18 @@ pub(crate) fn lock_state(state: &SessionShared) -> std::sync::MutexGuard<'_, Ses
 /// A fresh, empty state handle for one conversation/section.
 pub(crate) fn new_session_state() -> SessionShared {
     Arc::new(Mutex::new(SessionState::default()))
+}
+
+/// Mirror the active model's display price (USD per 1M tokens, in/out) into the
+/// shared state so the per-turn usage line can render cost. Called at REPL
+/// startup and on every `/model`//`/provider` switch.
+pub(crate) fn set_display_price(state: &SessionShared, price: Option<(f64, f64)>) {
+    lock_state(state).price = price;
+}
+
+/// The mirrored display price, if the active model has one in the catalog.
+pub(crate) fn display_price(state: &SessionShared) -> Option<(f64, f64)> {
+    lock_state(state).price
 }
 
 pub(crate) fn save_session(state: &SessionShared, session: &Session) -> io::Result<PathBuf> {

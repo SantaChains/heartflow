@@ -185,6 +185,15 @@ pub(crate) fn osc133(sequence: &str) {
     let _ = stdout.flush();
 }
 
+/// Emit one raw CSI control sequence (best-effort, same contract as
+/// [`osc133`]). Used for the kitty keyboard protocol push/pop that crossterm
+/// 0.29 no longer wraps as helpers.
+fn csi(sequence: &str) {
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(format!("\x1b[{sequence}").as_bytes());
+    let _ = stdout.flush();
+}
+
 /// `/plan` sub-actions offered at the argument position. The plan goal itself is
 /// free text, so only these fixed verbs are enumerable.
 const PLAN_ACTIONS: &[(&str, &str)] = &[
@@ -869,6 +878,11 @@ impl ReplEditor {
         // jump target at every REPL prompt.
         osc133("A");
         enable_raw_mode()?;
+        // Kitty keyboard protocol, flag 1 (disambiguate escape codes): with it,
+        // Shift+Enter arrives as Enter+SHIFT on supporting terminals instead of
+        // a bare Enter that submits. Terminals without the protocol ignore the
+        // CSI silently, so the existing bindings stay untouched.
+        csi(">1u");
         // Bracketed paste makes the terminal hand over a pasted block as one
         // event, so an embedded newline stays a multi-line draft instead of
         // reading as a bare Enter that submits (the "paste auto-runs" bug).
@@ -913,6 +927,7 @@ impl ReplEditor {
         // scrollback record of the submitted line back to the normal buffer.
         let _ = terminal.hide_cursor();
         let _ = terminal.clear();
+        csi("<u"); // pop the kitty keyboard flags pushed at entry
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), DisableBracketedPaste, Show);
         loop_result?;

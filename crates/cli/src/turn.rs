@@ -18,8 +18,8 @@ use tokio_util::sync::CancellationToken;
 use crate::render::{ColorTheme, Spinner, TerminalRenderer};
 use crate::theme::glyphs;
 use crate::{
-    expand_attachments, fold_tool_output, mode_prompt_segment, save_session_async, AgentRuntime,
-    SessionShared, FOLD_TOOL_OUTPUT_LINES,
+    display_price, expand_attachments, fold_tool_output, humanize_tokens, mode_prompt_segment,
+    save_session_async, AgentRuntime, SessionShared, FOLD_TOOL_OUTPUT_LINES,
 };
 
 /// Aborts the wrapped task when the guard drops. tokio detaches a spawned task
@@ -316,11 +316,17 @@ pub(crate) fn last_assistant_conclusion(messages: &[ConversationMessage]) -> Opt
     Some(truncate_chars(&text, 240))
 }
 
-/// The per-turn usage line: current turn tokens with the cache hit rate and
-/// the session cumulative total, so cost trajectories are visible at a glance
-/// (`cache 72%` = cache_read share of this turn's input).
+/// One-line per-turn telemetry: context occupancy against the model window
+/// (with a 10-cell bar when the window is known), per-turn cache hit ratio,
+/// session total, and — when the catalog carries prices for the active model
+/// — estimated cost. Pure so tests can pin the format.
 #[must_use]
-pub(crate) fn usage_line(current: &TokenUsage, session: &TokenUsage) -> String {
+pub(crate) fn usage_line(
+    current: &TokenUsage,
+    session: &TokenUsage,
+    window_tokens: usize,
+    price: Option<(f64, f64)>,
+) -> String {
     let read = u64::from(current.cache_read_input_tokens);
     let input = u64::from(current.input_tokens);
     // None when the turn had no tokens yet (`input + read == 0`) -> 0.
@@ -328,13 +334,66 @@ pub(crate) fn usage_line(current: &TokenUsage, session: &TokenUsage) -> String {
         .checked_mul(100)
         .and_then(|num| num.checked_div(input + read))
         .unwrap_or(0);
+    // `context_input_tokens` is the prompt size actually charged for last
+    // request — the honest proxy for "how full is the window right now".
+    let ctx = u64::from(current.context_input_tokens());
+    let ctx_part = if window_tokens == 0 {
+        format!("ctx {}", humanize_tokens(ctx))
+    } else {
+        let window = window_tokens as u64;
+        let pct = (ctx.saturating_mul(100) / window.max(1)).min(100);
+        let cells = usize::try_from(pct / 10).unwrap_or(10);
+        let bar = "▮".repeat(cells) + &"▯".repeat(10 - cells);
+        format!(
+            "ctx {bar} {pct}% {}/{}",
+            humanize_tokens(ctx),
+            humanize_tokens(window)
+        )
+    };
+    let price_part = price.map_or_else(String::new, |(price_in, price_out)| {
+        let turn_cost = estimate_cost(
+            current.context_input_tokens(),
+            current.output_tokens,
+            price_in,
+            price_out,
+        );
+        let session_cost = estimate_cost(
+            session.context_input_tokens(),
+            session.output_tokens,
+            price_in,
+            price_out,
+        );
+        format!(
+            " · {} turn / {} session",
+            fmt_cost(turn_cost),
+            fmt_cost(session_cost)
+        )
+    });
     format!(
-        "[in {} / out {} / cache {}% · session {}]",
+        "[{ctx_part} · in {} / out {} / cache {hit}% · session {}{price_part}]",
         current.input_tokens,
         current.output_tokens,
-        hit,
         session.total_tokens()
     )
+}
+
+/// Cost estimate at USD-per-Mtok prices, charging every input token (cached or
+/// not) at the input price: cache discounts differ per provider, and ignoring
+/// the discount is the honest baseline rather than a guessed ratio.
+fn estimate_cost(context_input: u32, output: u32, price_in: f64, price_out: f64) -> f64 {
+    (u64::from(context_input) as f64 * price_in + u64::from(output) as f64 * price_out)
+        / 1_000_000.0
+}
+
+/// Render a USD cost with the precision its magnitude deserves.
+fn fmt_cost(cost: f64) -> String {
+    if cost >= 0.01 {
+        format!("${cost:.2}")
+    } else if cost > 0.0 {
+        format!("${cost:.4}")
+    } else {
+        "$0".to_string()
+    }
 }
 
 /// Run one interactive turn: stream events to the terminal, abort on Ctrl+C,
@@ -483,9 +542,11 @@ pub(crate) async fn run_turn_interactive(
 
     if let Some(usage) = turn.last_usage {
         let cumulative = runtime.usage().cumulative_usage();
+        let window = runtime.compaction().context_window_tokens;
+        let price = display_price(state);
         println!(
             "{}",
-            usage_line(&usage, &cumulative).with(turn.theme.muted())
+            usage_line(&usage, &cumulative, window, price).with(turn.theme.muted())
         );
     }
     // Silent-save discipline: a successful turn saves without a line (the

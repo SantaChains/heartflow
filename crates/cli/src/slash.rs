@@ -2247,6 +2247,8 @@ fn handle_provider_command(
                 }
             }
             persist_active_selection(selection, Some(name));
+            // Re-lookup the display price so the usage line tracks the new model.
+            set_display_price(state, active_model_price(selection, catalog));
         }
         Err(error) => println!("failed to switch provider: {error}"),
     }
@@ -2328,6 +2330,8 @@ fn handle_model_command(
             // Also write the model into the user config.toml so the switch
             // survives restart, same as `/provider` does for provider+model.
             persist_active_selection(selection, None);
+            // Re-lookup the display price so the usage line tracks the new model.
+            set_display_price(state, active_model_price(selection, catalog));
         }
         Err(error) => println!("failed to switch model: {error}"),
     }

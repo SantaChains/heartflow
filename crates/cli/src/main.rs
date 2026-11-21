@@ -851,6 +851,7 @@ async fn run_repl(
     // The provider/model catalog backs `/model` display + completion. Loaded
     // once at startup and hot-reloaded on a `provider.toml` edit below.
     let mut catalog = load_catalog(&home_dir());
+    set_display_price(state, active_model_price(&selection, &catalog));
     let mut runtime = build_runtime(state, session, selection.clone(), true, &mode)?;
     let mut prompter = CliPermissionPrompter::new();
     // Planning and spec writing run on the *same* runtime (policy swapped in
@@ -1515,7 +1516,7 @@ fn model_detail(model: &CatalogModel) -> String {
 
 /// Render a token count compactly: exact millions as `NM`, thousands as `NK`,
 /// otherwise the raw number. Only for the completion detail column.
-fn humanize_tokens(tokens: u64) -> String {
+pub(crate) fn humanize_tokens(tokens: u64) -> String {
     const M: u64 = 1_000_000;
     const K: u64 = 1_000;
     if tokens >= M && tokens.is_multiple_of(M) {
@@ -1525,6 +1526,25 @@ fn humanize_tokens(tokens: u64) -> String {
     } else {
         tokens.to_string()
     }
+}
+
+/// USD-per-Mtok (in, out) for the active model, looked up in the catalog by
+/// host match for profile selections. Both prices must be set for a cost
+/// segment to display (half a price would imply the other side is free); the
+/// env-Anthropic path has no catalog key, so it never shows cost.
+pub(crate) fn active_model_price(
+    selection: &ProviderSelection,
+    catalog: &ProviderCatalog,
+) -> Option<(f64, f64)> {
+    let provider = match selection {
+        ProviderSelection::Profile(profile) => catalog.provider_by_host(&profile.base_url)?,
+        ProviderSelection::Env { .. } => return None,
+    };
+    let model = provider
+        .models
+        .iter()
+        .find(|model| model.id == selection.model())?;
+    Some((model.price_in?, model.price_out?))
 }
 
 /// Permission modes exposed to `/mode`, ordered from most to least restrictive.
@@ -2608,9 +2628,11 @@ mod tests {
             cache_read_input_tokens: 120_000,
         };
         // hit = 8400 / (2800 + 8400) = 75%; session total sums all four axes.
+        // No window configured: ctx shows the absolute humanized count
+        // (current turn's context_input = 2800 + 8400 = 11200 -> 11K).
         assert_eq!(
-            usage_line(&current, &session),
-            "[in 2800 / out 120 / cache 75% · session 171100]"
+            usage_line(&current, &session, 0, None),
+            "[ctx 11K · in 2800 / out 120 / cache 75% · session 171100]"
         );
         // Zero input guards the divide; no cache reads report 0%.
         let empty = TokenUsage {
@@ -2620,9 +2642,94 @@ mod tests {
             cache_read_input_tokens: 0,
         };
         assert_eq!(
-            usage_line(&empty, &empty),
-            "[in 0 / out 0 / cache 0% · session 0]"
+            usage_line(&empty, &empty, 0, None),
+            "[ctx 0 · in 0 / out 0 / cache 0% · session 0]"
         );
+    }
+
+    #[test]
+    fn usage_line_draws_the_context_bar_against_the_window() {
+        use super::usage_line;
+        use runtime::TokenUsage;
+        let current = TokenUsage {
+            input_tokens: 2_800,
+            output_tokens: 120,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 8_400,
+        };
+        let session = TokenUsage::default();
+        // ctx = 11200, window = 128000 -> floor(8.75%) = 8 -> zero filled cells.
+        let line = usage_line(&current, &session, 128_000, None);
+        assert!(line.contains("ctx ▯▯▯▯▯▯▯▯▯▯ 8% 11K/128K"), "{line}");
+        // Over-occupancy clamps at 100% with a full bar.
+        let line = usage_line(&current, &session, 4_000, None);
+        assert!(line.contains("ctx ▮▮▮▮▮▮▮▮▮▮ 100%"), "{line}");
+    }
+
+    #[test]
+    fn usage_line_shows_estimated_cost_when_priced() {
+        use super::usage_line;
+        use runtime::TokenUsage;
+        let current = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 500_000,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        let session = TokenUsage::default();
+        // in $0.28/Mtok x 1M + out $1.10/Mtok x 0.5M = $0.28 + $0.55 = $0.83.
+        let line = usage_line(&current, &session, 0, Some((0.28, 1.10)));
+        assert!(line.contains("$0.83 turn / $0 session"), "{line}");
+        // Sub-cent costs keep four decimals; unpriced models omit the segment.
+        let tiny = TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 100,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        let line = usage_line(&tiny, &tiny, 0, Some((0.28, 1.10)));
+        assert!(line.contains("$0.0004 turn / $0.0004 session"), "{line}");
+        assert!(!usage_line(&tiny, &tiny, 0, None).contains('$'));
+    }
+
+    #[test]
+    fn active_model_price_requires_both_sides_and_a_catalog_hit() {
+        use super::active_model_price;
+        use provider::{
+            CatalogModel, CatalogProvider, ModelSource, ProviderCatalog, ProviderProfile,
+            ProviderProtocol, ProviderSelection,
+        };
+        let mut catalog = ProviderCatalog::default();
+        let mut provider = CatalogProvider {
+            protocol: None,
+            base_url: Some("https://api.deepseek.com/v1".to_string()),
+            api_key_env: None,
+            models: Vec::new(),
+        };
+        provider.models.push(CatalogModel {
+            id: "deepseek-v4-flash".to_string(),
+            context_window: Some(131_072),
+            price_in: Some(0.28),
+            price_out: None, // half-priced: no cost segment
+            note: None,
+            source: ModelSource::User,
+            last_seen: None,
+        });
+        catalog.providers.insert("deepseek".to_string(), provider);
+
+        let profile = ProviderSelection::Profile(ProviderProfile {
+            protocol: ProviderProtocol::OpenAi,
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            api_key: "sk-test".to_string(),
+            auth_token: None,
+            model: "deepseek-v4-flash".to_string(),
+            max_tokens: 4096,
+            reasoning_effort: None,
+            context_window: None,
+            sampling: api::SamplingParams::default(),
+        });
+        // price_out is None -> no cost segment, even though the model matched.
+        assert_eq!(active_model_price(&profile, &catalog), None);
     }
 
     #[test]

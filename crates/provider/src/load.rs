@@ -61,13 +61,19 @@ impl ModelSource {
 }
 
 /// One model in the catalog.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CatalogModel {
     /// The provider's model id, exactly as sent in a request.
     pub id: String,
     /// Context window in tokens when confidently known; `None` rather than a
     /// guess (the plan's "不确定的留空而非臆造").
     pub context_window: Option<u64>,
+    /// Display price, USD per 1M input tokens. Optional because endpoints
+    /// reprice constantly: unset means the usage line omits the cost segment
+    /// rather than showing a stale number.
+    pub price_in: Option<f64>,
+    /// Display price, USD per 1M output tokens.
+    pub price_out: Option<f64>,
     /// Free-form tag (e.g. "reasoning", "vision", "free tier").
     pub note: Option<String>,
     pub source: ModelSource,
@@ -78,7 +84,7 @@ pub struct CatalogModel {
 /// One provider entry: connection scaffolding plus its known models. The
 /// scaffolding is reference-only (a hint for `api_key_env`, a match target for
 /// host lookup); the active transport still comes from `config.toml`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CatalogProvider {
     pub protocol: Option<ProviderProtocol>,
     pub base_url: Option<String>,
@@ -99,7 +105,7 @@ impl CatalogProvider {
 
 /// The whole catalog: providers keyed by a stable slug (`deepseek`, `moonshot`).
 /// A `BTreeMap` keeps render and completion order deterministic.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProviderCatalog {
     pub providers: BTreeMap<String, CatalogProvider>,
 }
@@ -200,6 +206,8 @@ impl ProviderCatalog {
             None => entry.models.push(CatalogModel {
                 id: model_id.to_string(),
                 context_window,
+                price_in: None,
+                price_out: None,
                 note: None,
                 source,
                 last_seen: now,
@@ -242,6 +250,8 @@ impl ProviderCatalog {
                     models.push(CatalogModel {
                         id,
                         context_window: u64_field(model_table, "context_window", source),
+                        price_in: f64_field(model_table, "price_in", source),
+                        price_out: f64_field(model_table, "price_out", source),
                         note: string_field(model_table, "note", source),
                         source: string_field(model_table, "source", source)
                             .and_then(|text| ModelSource::parse(&text))
@@ -293,6 +303,12 @@ impl ProviderCatalog {
                 if let Some(context_window) = model.context_window {
                     let _ = writeln!(out, "context_window = {context_window}");
                 }
+                if let Some(price) = model.price_in {
+                    let _ = writeln!(out, "price_in = {price}");
+                }
+                if let Some(price) = model.price_out {
+                    let _ = writeln!(out, "price_out = {price}");
+                }
                 if let Some(note) = &model.note {
                     let _ = writeln!(out, "note = {}", quote_toml_string(note));
                 }
@@ -322,6 +338,10 @@ fn seed_provider(
             .map(|(id, context_window, note)| CatalogModel {
                 id: (*id).to_string(),
                 context_window: *context_window,
+                // Seed carries no prices: endpoints reprice constantly and a
+                // stale compiled-in number would mislead the usage line.
+                price_in: None,
+                price_out: None,
                 note: (*note).map(str::to_string),
                 source: ModelSource::Seed,
                 last_seen: None,
@@ -751,6 +771,20 @@ fn u64_field(table: &toml::Table, key: &str, source: &str) -> Option<u64> {
     }
 }
 
+/// TOML float (or integer, e.g. `price_in = 1`) for display-price fields.
+fn f64_field(table: &toml::Table, key: &str, source: &str) -> Option<f64> {
+    let value = table.get(key)?;
+    let parsed = match value {
+        toml::Value::Float(number) => Some(*number),
+        toml::Value::Integer(number) => Some(*number as f64),
+        _ => None,
+    };
+    if parsed.is_none() {
+        warn!(file = %source, field = key, "catalog field must be a number; skipped");
+    }
+    parsed
+}
+
 /// A bare TOML key when safe, a quoted string otherwise.
 fn bare_or_quoted(key: &str) -> String {
     let bare = !key.is_empty()
@@ -1014,5 +1048,28 @@ mod tests {
         );
         assert_eq!(slug_from_host("api.deepseek.com"), "deepseek");
         assert_eq!(slug_from_host("dashscope.aliyuncs.com"), "dashscope");
+    }
+
+    #[test]
+    fn price_fields_round_trip_through_toml() {
+        let text = concat!(
+            "[providers.deepseek]\n",
+            "base_url = \"https://api.deepseek.com/v1\"\n",
+            "\n[[providers.deepseek.models]]\n",
+            "id = \"deepseek-v4-flash\"\n",
+            "context_window = 131072\n",
+            "price_in = 0.28\n",
+            "price_out = 1.1\n",
+        );
+        let table: toml::Table = toml::from_str(text).expect("fixture parses");
+        let catalog = ProviderCatalog::from_table(&table, "test");
+        let model = &catalog.providers["deepseek"].models[0];
+        assert_eq!(model.price_in, Some(0.28));
+        assert_eq!(model.price_out, Some(1.1));
+        // Written back verbatim on the persisted layer; absent prices stay off
+        // the wire so hand-edited files are not churned.
+        let rendered = catalog.to_toml_string();
+        assert!(rendered.contains("price_in = 0.28"), "{rendered}");
+        assert!(rendered.contains("price_out = 1.1"), "{rendered}");
     }
 }
