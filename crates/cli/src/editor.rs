@@ -1475,7 +1475,8 @@ fn complete_menu(
 
 /// Rewrite the buffer for a chosen candidate: a command head becomes
 /// `"<label> "` (the trailing space opens its argument menu); an argument
-/// replaces only the partial arg, keeping the command (`/model de` → the id).
+/// replaces only the partial arg, keeping the command and any prior argument
+/// (`/model de` → the id; `/provider zhipu gl` → `/provider zhipu glm-...`).
 fn apply_completion(
     textarea: &mut TextArea<'static>,
     item: &CompletionItem,
@@ -1483,7 +1484,10 @@ fn apply_completion(
 ) {
     let text = match site {
         CompletionSite::Command { .. } => format!("{} ", item.label),
-        CompletionSite::Argument { command, .. } => format!("{command} {}", item.label),
+        CompletionSite::Argument { command, prior, .. } => match prior {
+            Some(first) => format!("{command} {first} {}", item.label),
+            None => format!("{command} {}", item.label),
+        },
     };
     *textarea = blank_textarea();
     textarea.insert_str(text);
@@ -2015,6 +2019,22 @@ mod tests {
         assert!(complete("/model zzz", &ctx()).is_empty());
         // A command with no matching head.
         assert!(complete("/zzz", &ctx()).is_empty());
+    }
+
+    #[test]
+    fn completing_second_provider_arg_keeps_the_first() {
+        use super::{apply_completion, completion_site, textarea_from};
+        // Regression: apply_completion used to rebuild the buffer as
+        // `"/provider glm-5"`, silently dropping the first argument and
+        // shifting the model into its slot (so the next Tab completed from the
+        // provider pool again).
+        let mut textarea = textarea_from("/provider zhipu gl");
+        let text = textarea.lines().join("\n");
+        let site = completion_site(&text).expect("two-arg command should parse");
+        let candidates = complete(&text, &ctx());
+        assert_eq!(labels(&candidates), vec!["glm-5"]);
+        apply_completion(&mut textarea, &candidates[0], site);
+        assert_eq!(textarea.lines().join("\n"), "/provider zhipu glm-5");
     }
 
     #[test]
