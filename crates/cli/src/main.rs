@@ -1081,7 +1081,7 @@ async fn run_repl(
         }
         let trimmed = line.trim();
         let control = if trimmed.starts_with('/') {
-            dispatch_slash_command(
+            let control = dispatch_slash_command(
                 state,
                 trimmed,
                 &mut runtime,
@@ -1099,9 +1099,14 @@ async fn run_repl(
                 &mut schedule_links,
                 &runtime_handle,
             )
-            .await?
+            .await?;
+            // Command-finish boundary for slash commands: the turn path emits
+            // its own D in `run_turn_interactive`.
+            editor::osc133("D;0");
+            control
         } else if trimmed.starts_with('!') {
             handle_bang_command(state, &mode, trimmed).await;
+            editor::osc133("D;0");
             LoopControl::Continue
         } else {
             // Running turns cannot be submitted through the blocking line
@@ -4378,47 +4383,204 @@ fn resolve_spec_path(cwd: &Path, target: &str) -> Result<PathBuf, String> {
     ))
 }
 
+/// REPL command help table: (left column, description, optional continuation
+/// line). Printed by `print_repl_help` and kept in sync with
+/// `editor::COMMANDS` by the `repl_help_and_completion_commands_stay_in_sync`
+/// test below; a command only enters one table when it enters both. The
+/// `!<CMD>` row is deliberately outside the sync (it is not a slash command).
+pub(crate) const REPL_HELP: &[(&str, &str, Option<&str>)] = &[
+    ("/help", "Show help", None),
+    ("/status", "Show session status", None),
+    ("/model [NAME]", "Show or switch the model", None),
+    (
+        "/provider [NAME]",
+        "Show or switch the provider (+ optional model), persisted",
+        None,
+    ),
+    (
+        "/models",
+        "Refresh the model list from the live endpoint",
+        None,
+    ),
+    (
+        "/bootstrap <P>",
+        "Validated provider swap: pre-flight, switch, memory carries",
+        Some("over (--reorganize lets the new model rewrite MEMORY.md)"),
+    ),
+    ("/mode [NAME]", "Show or switch the permission mode", None),
+    (
+        "/web <MODE>",
+        "Web tool access: on / off / local (knowledge-base retrieval only)",
+        None,
+    ),
+    (
+        "/effort <LEVEL>",
+        "Reasoning depth: none / low / medium / high / max",
+        None,
+    ),
+    (
+        "/plan <GOAL>",
+        "Plan first (writes gated to .heartflow/plans), then /plan approve to execute",
+        None,
+    ),
+    (
+        "/spec <GOAL>",
+        "Design first (writes gated to .heartflow/specs), then review execute/cancel/revise",
+        None,
+    ),
+    ("/compact", "Compact session history", None),
+    (
+        "/pin",
+        "Toggle never-compacted on the last message (survives /compact)",
+        None,
+    ),
+    (
+        "/checkpoints",
+        "List shadow-git snapshots taken before write-class tools",
+        None,
+    ),
+    (
+        "/restore <N>",
+        "Restore tracked files to checkpoint N (see /checkpoints)",
+        None,
+    ),
+    (
+        "/focus",
+        "Toggle focus mode (hide mascot, minimal chrome)",
+        None,
+    ),
+    ("/save", "Persist the session now", None),
+    ("/clear", "Start a fresh session", None),
+    (
+        "/sessions [F]",
+        "List saved sessions (F filters by opening message)",
+        None,
+    ),
+    (
+        "/open <N|TOP>",
+        "Jump to saved session N, or the one whose opening message matches TOP",
+        None,
+    ),
+    (
+        "/remember <T>",
+        "Persist a durable pitfall/preference to MEMORY.md",
+        None,
+    ),
+    (
+        "/search <Q>",
+        "Full-text search saved conversation history",
+        None,
+    ),
+    ("/mcp", "List connected MCP servers and tools", None),
+    (
+        "/expand [ID]",
+        "Re-show a folded tool output (default: latest)",
+        None,
+    ),
+    (
+        "/queue [SUB]",
+        "Queue control: send/lane/edit/remove/move/relane/merge/pop/clear",
+        None,
+    ),
+    (
+        "/guide <TASK>",
+        "Assemble a prior-work/current-state/task draft and run it now",
+        Some("(/guide draft / /guide queue keep it editable or queued)"),
+    ),
+    (
+        "/jobs [SUB]",
+        "Subagent workers: spawn [--write]/stop/log - results arrive as",
+        Some("the next supervisor turn (workers run read-only without --write)"),
+    ),
+    (
+        "/schedule [SUB]",
+        "Timed prompts: add/run-due/show/pause/resume/delete by id",
+        None,
+    ),
+    (
+        "/mission [SUB]",
+        "Mission ledger: create/criterion/approve/complete/pause/resume/blocked/turn",
+        None,
+    ),
+    (
+        "!<CMD>",
+        "Run a shell command directly (no model); output folds like a tool result",
+        None,
+    ),
+    (
+        "/init",
+        "Scaffold a starting AGENTS.md in the current directory",
+        None,
+    ),
+    (
+        "/restart",
+        "Re-launch the program with a fresh config/MCP load",
+        None,
+    ),
+    ("/exit", "Quit the REPL", None),
+];
+
 fn print_repl_help() {
     println!("Available commands:");
-    println!("  /help          Show help");
-    println!("  /status        Show session status");
-    println!("  /model [NAME]  Show or switch the model");
-    println!("  /bootstrap <P> Validated provider swap: pre-flight, switch, memory carries");
-    println!("                 over (--reorganize lets the new model rewrite MEMORY.md)");
-    println!("  /mode [NAME]   Show or switch the permission mode");
-    println!("  /plan <GOAL>   Plan first (writes gated to .heartflow/plans), then /plan approve to execute");
-    println!("  /spec <GOAL>   Design first (writes gated to .heartflow/specs), then review execute/cancel/revise");
-    println!("  /compact       Compact session history");
-    println!("  /pin           Toggle never-compacted on the last message (survives /compact)");
-    println!("  /checkpoints   List shadow-git snapshots taken before write-class tools");
-    println!("  /restore <N>   Restore tracked files to checkpoint N (see /checkpoints)");
-    println!("  /focus         Toggle focus mode (hide mascot, minimal chrome)");
-    println!("  /save          Persist the session now");
-    println!("  /clear         Start a fresh session");
-    println!("  /sessions [F]  List saved sessions (F filters by opening message)");
-    println!(
-        "  /open <N|TOP>  Jump to saved session N, or the one whose opening message matches TOP"
-    );
-    println!("  /remember <T>  Persist a durable pitfall/preference to MEMORY.md");
-    println!("  /search <Q>    Full-text search saved conversation history");
-    println!("  /mcp           List connected MCP servers and tools");
-    println!("  /expand [ID]   Re-show a folded tool output (default: latest)");
-    println!("  /queue [sub]   Queue control: send/edit/remove/move/merge/pop/clear");
-    println!("  /guide <TASK>  Assemble a prior-work/current-state/task draft and run it now");
-    println!("                 (/guide draft / /guide queue keep it editable or queued)");
-    println!("  /jobs [sub]    Subagent workers: spawn [--write]/stop/log - results arrive as");
-    println!("                 the next supervisor turn (workers run read-only without --write)");
-    println!(
-        "  !<CMD>         Run a shell command directly (no model); output folds like a tool result"
-    );
-    println!("  /init          Scaffold a starting AGENTS.md in the current directory");
-    println!("  /restart       Re-launch the program with a fresh config/MCP load");
-    println!("  /exit          Quit the REPL");
+    for (left, desc, continuation) in REPL_HELP {
+        println!("  {left:<15}{desc}");
+        if let Some(extra) = continuation {
+            println!("  {:<15}{extra}", "");
+        }
+    }
     println!();
     println!("Input: Enter sends, Alt/Shift+Enter inserts a newline, Up/Down walks history,");
     println!("  Tab completes a slash command, Ctrl+C clears the idle line, Ctrl+D quits.");
     println!("Ctrl+C while a turn is running interrupts that turn; on an empty prompt");
     println!("it just clears the line. Quit with /exit or Ctrl+D.");
+}
+
+#[cfg(test)]
+mod repl_help_sync_tests {
+    use std::collections::BTreeSet;
+
+    use super::REPL_HELP;
+    use crate::editor::COMMANDS;
+
+    /// The command head of a help left-column entry: its first whitespace
+    /// token (`/model [NAME]` -> `/model`). `!<CMD>` is shell passthrough, not
+    /// a slash command, and stays out of the comparison.
+    fn help_head(left: &str) -> Option<&str> {
+        let head = left.split_whitespace().next()?;
+        (head != "!<CMD>").then_some(head)
+    }
+
+    /// The command head of a completion entry, mirroring `suggest_command`
+    /// (`/provider [NAME] [MODEL]` -> `/provider`).
+    fn completion_head(entry: &str) -> &str {
+        entry.split([' ', '<']).next().unwrap_or(entry)
+    }
+
+    #[test]
+    fn repl_help_and_completion_commands_stay_in_sync() {
+        let help: BTreeSet<&str> = REPL_HELP
+            .iter()
+            .filter_map(|(left, _, _)| help_head(left))
+            .collect();
+        let completions: BTreeSet<&str> = COMMANDS
+            .iter()
+            .map(|(name, _)| completion_head(name))
+            .collect();
+        assert_eq!(
+            help.symmetric_difference(&completions).collect::<Vec<_>>(),
+            Vec::<&&str>::new(),
+            "REPL_HELP and editor::COMMANDS disagree; a command must enter both or neither"
+        );
+        // Duplicates would render twice in the dropdown: guard the heads too.
+        let mut heads: Vec<&str> = COMMANDS
+            .iter()
+            .map(|(name, _)| completion_head(name))
+            .collect();
+        heads.sort_unstable();
+        let unique = heads.len();
+        heads.dedup();
+        assert_eq!(heads.len(), unique, "editor::COMMANDS has duplicate heads");
+    }
 }
 
 /// Render a tool result, folding outputs longer than `fold_lines` to a head

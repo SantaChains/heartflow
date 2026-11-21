@@ -468,6 +468,9 @@ pub(crate) async fn run_turn_interactive(
                     format!("· session saved to {}", path.display()).with(turn.theme.muted())
                 );
             }
+            // Command-finish boundary (failure): closes the B/C opened at submit.
+            let _ = write!(stdout, "\x1b]133;D;1\x07");
+            let _ = stdout.flush();
             return Ok(TurnOutcome {
                 ok: false,
                 tool_errors: 0,
@@ -494,6 +497,10 @@ pub(crate) async fn run_turn_interactive(
             format!("· session save failed: {error}").with(turn.theme.error())
         );
     }
+    // Command-finish boundary (success): closes the B/C opened at submit so
+    // terminal shell integration sees the turn as a completed command.
+    let _ = write!(stdout, "\x1b]133;D;0\x07");
+    let _ = stdout.flush();
     Ok(outcome)
 }
 

@@ -83,8 +83,10 @@ pub(crate) fn tui_input(key: KeyEvent) -> Input {
 }
 
 /// REPL slash commands surfaced by completion and the "did you mean" hint.
-/// Kept in sync with `print_repl_help` in main.rs; add new commands to both.
-const COMMANDS: &[(&str, &str)] = &[
+/// Kept in sync with `REPL_HELP` in main.rs by the
+/// `repl_help_and_completion_commands_stay_in_sync` test there; a command only
+/// enters one table when it enters both.
+pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show help"),
     ("/status", "Show session status"),
     ("/model [NAME]", "Show or switch the model"),
@@ -93,13 +95,28 @@ const COMMANDS: &[(&str, &str)] = &[
         "Show or switch the provider (+ optional model)",
     ),
     ("/models", "Refresh the model list from the live endpoint"),
-    ("/mode [NAME]", "Show or switch the permission mode"),
+    (
+        "/mode [NAME]",
+        "Show or switch the mode: read-only/workspace-write/full/plan/spec/loop",
+    ),
     (
         "/plan <GOAL>",
         "Plan first (writes gated to .heartflow/plans), then /plan approve",
     ),
+    (
+        "/spec <GOAL>",
+        "Design first (writes gated to .heartflow/specs), then /spec approve",
+    ),
     ("/compact", "Compact session history"),
     ("/pin", "Toggle never-compacted on the last message"),
+    (
+        "/checkpoints",
+        "List shadow-git snapshots taken before write-class tools",
+    ),
+    (
+        "/restore <N>",
+        "Restore tracked files to checkpoint N (see /checkpoints)",
+    ),
     ("/focus", "Toggle focus mode (hide mascot, minimal chrome)"),
     ("/save", "Persist the session now"),
     ("/clear", "Start a fresh session"),
@@ -119,20 +136,28 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/mcp", "List MCP servers and tools"),
     ("/expand [ID]", "Re-show a folded tool output"),
     (
-        "/queue [pop|clear]",
-        "Inspect/withdraw follow-ups queued during a turn",
+        "/queue [SUB]",
+        "Queue control: send/lane/edit/remove/move/relane/merge/pop/clear",
     ),
     (
         "/guide <TASK>",
         "Assemble a prior-work/state/task draft to send",
     ),
     (
-        "/bootstrap <provider> [MODEL]",
-        "Validated provider swap: pre-flight, switch, memory carries over",
+        "/jobs [SUB]",
+        "Subagent workers: spawn [--write]/stop/log; results arrive as the next turn",
     ),
     (
-        "/mode <NAME>",
-        "Switch mode: read-only/workspace-write/full/plan/spec/loop",
+        "/schedule [SUB]",
+        "Timed prompts: add/run-due/show/pause/resume/delete by id",
+    ),
+    (
+        "/mission [SUB]",
+        "Mission ledger: create/criterion/approve/complete/pause/resume/blocked/turn",
+    ),
+    (
+        "/bootstrap <provider> [MODEL]",
+        "Validated provider swap: pre-flight, switch, memory carries over",
     ),
     (
         "/web <on|off|local>",
@@ -149,6 +174,16 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/restart", "Re-launch with a fresh config/MCP load"),
     ("/exit", "Quit the REPL"),
 ];
+
+/// Emit one OSC 133 shell-integration marker (BEL-terminated) so the
+/// surrounding terminal gets native prompt-jump and command-finish boundaries
+/// (ghostty, tmux 3.4+, iTerm2). Writes are best-effort: the marker only
+/// enables terminal-side conveniences, so an ignored write is harmless.
+pub(crate) fn osc133(sequence: &str) {
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(format!("\x1b]133;{sequence}\x07").as_bytes());
+    let _ = stdout.flush();
+}
 
 /// `/plan` sub-actions offered at the argument position. The plan goal itself is
 /// free text, so only these fixed verbs are enumerable.
@@ -830,6 +865,9 @@ impl ReplEditor {
     }
 
     fn read_line_tui(&mut self, ctx: &CompletionContext) -> io::Result<Exit> {
+        // Prompt-start boundary: lets the terminal's shell integration place a
+        // jump target at every REPL prompt.
+        osc133("A");
         enable_raw_mode()?;
         // Bracketed paste makes the terminal hand over a pasted block as one
         // event, so an embedded newline stays a multi-line draft instead of
@@ -880,6 +918,11 @@ impl ReplEditor {
         loop_result?;
 
         if let Exit::Submit(ref text) = exit {
+            // Command-start/output-start boundaries: everything printed after
+            // this point (slash-command output or the streamed turn) belongs to
+            // this submission until the matching D marker (turn.rs / main.rs).
+            osc133("B");
+            osc133("C");
             if !text.trim().is_empty() {
                 self.history.push(&self.history_path, text);
             }
