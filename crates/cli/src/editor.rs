@@ -25,7 +25,9 @@ use crossterm::event::{
     KeyModifiers,
 };
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
@@ -877,7 +879,13 @@ impl ReplEditor {
                 0
             };
             let height = VIEWPORT_ROWS.saturating_add(u16::try_from(menu_rows).unwrap_or(0));
-            terminal.draw(height, |buf, area| {
+            // Synchronized-update frame (maki's `present()` discipline,
+            // maki-ui/src/present.rs:42): Windows Terminal defers painting
+            // until End arrives, so the intermediate cursor positions of the
+            // diff writes (Mascot/hint/menu spans) never render as a stray
+            // second caret. Terminals without DEC 2026 ignore both sequences.
+            execute!(io::stdout(), BeginSynchronizedUpdate)?;
+            let frame = terminal.draw(height, |buf, area| {
                 draw_frame(
                     buf,
                     area,
@@ -893,7 +901,9 @@ impl ReplEditor {
                     }),
                     self.focus_mode,
                 )
-            })?;
+            });
+            let _ = execute!(io::stdout(), EndSynchronizedUpdate);
+            frame?;
 
             // Poll instead of a blocking read so the mascot can tick while the
             // user is idle. A tick that produces no visible change skips the
@@ -1266,16 +1276,12 @@ fn draw_frame(
     if let Some(suffix) = prefix_suffix {
         let (cursor_row, cursor_col) = textarea.cursor();
         if cursor_row == 0 {
-            // Ghost text starts at the display width (cells) before the
-            // cursor, not the char count: tui-textarea renders CJK glyphs
-            // two cells wide via unicode-width, so char counts drift.
             let line = textarea
                 .lines()
                 .first()
                 .map(String::as_str)
                 .unwrap_or_default();
-            let before = &line[..col_char_to_byte(line, cursor_col)];
-            let width: usize = before.chars().map(|ch| ch.width().unwrap_or(0)).sum();
+            let width = display_col(line, cursor_col);
             let start_x = editor
                 .x
                 .saturating_add(u16::try_from(width).unwrap_or(u16::MAX));
@@ -1327,13 +1333,17 @@ fn draw_frame(
 
     render_menu(buf, size, completions, completion_idx, &theme);
 
-    // Park the real terminal cursor on the input cell (the IME anchor).
+    // Park the real terminal cursor on the input cell (the IME anchor). The
+    // column is display cells, not char count — see `display_col`. With the
+    // 1-row editor rect, tui-textarea scrolls the cursor's line into view, so
+    // the caret row is always the viewport's first row.
     let (cursor_row, cursor_col) = textarea.cursor();
-    let column = if cursor_row == 0 {
-        u16::try_from(cursor_col).unwrap_or(u16::MAX)
-    } else {
-        0
-    };
+    let line = textarea
+        .lines()
+        .get(cursor_row)
+        .map(String::as_str)
+        .unwrap_or("");
+    let column = u16::try_from(display_col(line, cursor_col)).unwrap_or(u16::MAX);
     let x = (size.x + PROMPT_WIDTH + column).min(size.x + size.width.saturating_sub(1));
     Some(Position::new(x, size.y))
 }
@@ -1838,6 +1848,21 @@ fn col_char_to_byte(line: &str, col: usize) -> usize {
         .map_or(line.len(), |(byte, _)| byte)
 }
 
+/// Display-cell offset of character column `col` on `line`. tui-textarea's
+/// `cursor()` is character-wise, but it *renders* wide glyphs (CJK, emoji)
+/// two cells wide via unicode-width — parking the hardware caret on the raw
+/// count lands it mid-text (over the first half of a wide glyph, reading as a
+/// second inverted caret) and drags the IME anchor with it. maki does the same
+/// mapping in its input layout (`maki-ui/src/components/input/layout.rs:327`).
+#[must_use]
+pub(crate) fn display_col(line: &str, col: usize) -> usize {
+    let bytes = col_char_to_byte(line, col);
+    line[..bytes]
+        .chars()
+        .map(|ch| ch.width().unwrap_or(0))
+        .sum()
+}
+
 /// Move the textarea cursor by one word in `direction`. Operates on the
 /// current line only (no cross-line jumps).
 fn move_word(textarea: &mut TextArea<'static>, backward: bool) {
@@ -1902,10 +1927,25 @@ fn read_line_fallback() -> io::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        col_char_to_byte, complete, decode_history, echo_lines, encode_history_line,
+        col_char_to_byte, complete, decode_history, display_col, echo_lines, encode_history_line,
         menu_accept_on_enter, menu_window, move_word, suggest_command, textarea_from,
         CompletionContext, CompletionItem, History,
     };
+
+    #[test]
+    fn display_col_counts_wide_glyphs_as_two_cells() {
+        // Regression for the "caret drifts into the text with CJK input" bug:
+        // the parked hardware caret used the raw char count, landing over the
+        // first half of a wide glyph (read as a second inverted caret) and
+        // dragging the IME anchor off the true insertion point.
+        assert_eq!(display_col("abc", 3), 3);
+        assert_eq!(display_col("你好", 0), 0);
+        assert_eq!(display_col("你好", 1), 2);
+        assert_eq!(display_col("你好", 2), 4);
+        // Mixed ASCII/CJK and past-the-end clamping.
+        assert_eq!(display_col("hf你好", 3), 4);
+        assert_eq!(display_col("你好", 9), 4);
+    }
 
     /// A context with a few models, the three modes, and two sessions, so the
     /// argument-position tests exercise every pool.

@@ -89,7 +89,7 @@ use crate::config::ConfigWatcher;
 use crate::core::{
     guide_context, guide_draft, DeliveryMode, GuideContext, HeartModel, QueueSource,
 };
-use crate::editor::{tui_input, History};
+use crate::editor::{display_col, tui_input, History};
 use crate::keymap::{Action, Keymap};
 use crate::markdown;
 use crate::settings::Settings;
@@ -1814,8 +1814,15 @@ fn view(app: &App, area: Rect, frame: &mut Frame, context_window: Option<usize>)
     frame.render_widget(&app.input, areas[1]);
     // Park the real cursor at the editor's caret so the terminal draws IME
     // candidates in the right place (native composition, never self-drawn).
+    // The column is display cells, not char count — tui-textarea renders wide
+    // glyphs two cells wide, so the raw char column drifts (see
+    // `editor::display_col`).
     let (row, col) = app.input.cursor();
-    let caret_x = areas[1].x.saturating_add(1).saturating_add(col as u16);
+    let line = app.input.lines().get(row).map(String::as_str).unwrap_or("");
+    let caret_x = areas[1]
+        .x
+        .saturating_add(1)
+        .saturating_add(u16::try_from(display_col(line, col)).unwrap_or(u16::MAX));
     let caret_y = areas[1].y.saturating_add(1).saturating_add(row as u16);
     frame.set_cursor_position((caret_x, caret_y));
 
