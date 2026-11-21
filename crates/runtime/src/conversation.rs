@@ -1549,6 +1549,11 @@ where
                         summary.push_str(&delta);
                     }
                 }
+                // The summarize call is billed like any other request: dropping
+                // its usage here would under-report the session total against
+                // the provider's own account (the cumulative tracker is the
+                // only budget the usage line shows).
+                AgentEvent::Usage(value) => self.usage_tracker.record(value),
                 AgentEvent::MessageStop => {
                     finished = true;
                     break;

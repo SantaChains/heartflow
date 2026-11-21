@@ -96,6 +96,36 @@ impl ProviderSelection {
             Self::Profile(profile) => profile.model = model,
         }
     }
+
+    /// The resolved endpoint for surface checks (`/provider` switch residue
+    /// warnings). Env-driven selections resolve their endpoint at client-build
+    /// time from env/builtin, not from a stored field — hence no value here.
+    #[must_use]
+    pub fn base_url(&self) -> Option<&str> {
+        match self {
+            Self::Env { .. } => None,
+            Self::Profile(profile) => Some(&profile.base_url),
+        }
+    }
+
+    /// The active reasoning-effort knob, if the selection carries one.
+    #[must_use]
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        match self {
+            Self::Env { .. } => None,
+            Self::Profile(profile) => profile.reasoning_effort.as_deref(),
+        }
+    }
+
+    /// Adopt an endpoint-reported context window (e.g. a `/bootstrap` probe):
+    /// keeps the ctx bar and auto-compact budget honest for the model actually
+    /// in use, instead of whatever window the previous provider configured.
+    /// Env-driven selections have no window knob; nothing to set there.
+    pub fn set_context_window(&mut self, window: Option<u64>) {
+        if let Self::Profile(profile) = self {
+            profile.context_window = window.and_then(|value| u32::try_from(value).ok());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -706,7 +736,10 @@ pub enum ProviderSpec {
 /// never picks up a stray variable, and an empty value falls through to the
 /// builtin default instead of shipping a blank base_url. Precedence: an
 /// explicit config `base_url` wins, this layer wins over the builtin default.
-fn env_base_url_override(name: Option<&str>) -> Option<String> {
+/// Public so `/provider` can distinguish a legitimate env override from
+/// project-layer residue when surfacing endpoint mismatches.
+#[must_use]
+pub fn env_base_url_override(name: Option<&str>) -> Option<String> {
     let name = name?;
     builtin_provider(name)?;
     let value = env::var(format!("{name}_BASE_URL")).ok()?;
@@ -840,20 +873,29 @@ pub fn materialize(spec: ProviderSpec) -> Result<ProviderSelection, String> {
         } => {
             // Industry-standard split: `api_key_env` (indirect, secret stays out
             // of the file) takes precedence over inline `[provider] api_key`,
-            // which is only the on-disk fallback.
+            // which is only the on-disk fallback. A blank env value counts as
+            // unset: `DEEPSEEK_API_KEY=` with no value must fall through to the
+            // inline key rather than ship whitespace as the credential — the
+            // same blank-is-unset rule `env_base_url_override` applies.
             let from_env = env::var(&api_key_env).unwrap_or_default();
+            let from_env = from_env.trim().to_string();
             let api_key = if from_env.is_empty() {
                 api_key.unwrap_or_default()
             } else {
                 from_env
             };
             if api_key.is_empty() {
+                let env_state = if env::var(&api_key_env).is_ok() {
+                    " is set but blank"
+                } else {
+                    " is not set"
+                };
                 return Err(if api_key_env.is_empty() {
                     "api key missing: set [provider] api_key in config.toml or export an api-key env var"
                         .to_string()
                 } else {
                     format!(
-                        "environment variable {api_key_env} is not set and no [provider] api_key is configured"
+                        "environment variable {api_key_env}{env_state} and no [provider] api_key is configured"
                     )
                 });
             }

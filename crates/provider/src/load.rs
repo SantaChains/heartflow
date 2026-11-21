@@ -200,7 +200,12 @@ impl ProviderCatalog {
                 if context_window.is_some() {
                     model.context_window = context_window;
                 }
-                model.source = source;
+                // A hand-tagged `user` entry keeps its provenance: a discovery
+                // probe must not demote an explicitly recorded model (the tag
+                // is the user's statement, the probe is our best guess).
+                if model.source != ModelSource::User {
+                    model.source = source;
+                }
                 model.last_seen = now.or(model.last_seen);
             }
             None => entry.models.push(CatalogModel {
@@ -677,7 +682,13 @@ pub fn persist_selection(home: &Path, provider: Option<&str>, model: &str) -> st
     if let Some(name) = provider {
         // Cross-provider switch: the old provider's explicit endpoint binding
         // is stale by definition — drop it so env/builtin resolution takes
-        // over (see the doc comment for the observed failure mode).
+        // over (see the doc comment for the observed failure mode). The full
+        // binding set is `base_url`/`api_key`/`api_key_env`/`protocol`/
+        // `context_window`: a leftover protocol points the new provider at the
+        // wrong dialect, a leftover api_key_env would read the OLD provider's
+        // env var as the new credential, and a leftover context_window feeds
+        // the wrong budget to the ctx bar and auto-compact. `reasoning_effort`
+        // and unknown user keys stay: they are preferences, not bindings.
         let switching = match table.get("name").and_then(toml_edit::Item::as_str) {
             Some(old) => old != name,
             None => true,
@@ -685,10 +696,49 @@ pub fn persist_selection(home: &Path, provider: Option<&str>, model: &str) -> st
         if switching {
             table.remove("base_url");
             table.remove("api_key");
+            table.remove("api_key_env");
+            table.remove("protocol");
+            table.remove("context_window");
         }
         table.insert("name", toml_edit::value(name));
     }
     table.insert("model", toml_edit::value(model));
+    atomic_write(&path, &doc.to_string())
+}
+
+/// Write the `/effort` choice back into the user-layer `config.toml`
+/// (`[provider] reasoning_effort`) so it survives restart — and so a later
+/// config hot-reload cannot silently roll it back to the on-disk value
+/// (session-only effort was clobbered by any unrelated config edit).
+/// Comment-preserving via `toml_edit`; never creates the file or a missing
+/// `[provider]` table: with no selection persisted yet there is nothing to
+/// attach the preference to, and a bare `[provider]` table would break
+/// `resolve_spec` (it reads name/credential scaffolding from it).
+///
+/// # Errors
+/// Fails when the file exists but is not valid TOML, or the atomic write fails.
+pub fn persist_reasoning_effort(home: &Path, effort: Option<&str>) -> std::io::Result<()> {
+    let path = home.join(".heartflow").join("config.toml");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        // No persisted selection: the effort choice stays session-only.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|error| {
+        std::io::Error::other(format!("{} is not valid TOML: {error}", path.display()))
+    })?;
+    match doc.as_table_mut().get_mut("provider") {
+        Some(toml_edit::Item::Table(table)) => {
+            if let Some(value) = effort {
+                table.insert("reasoning_effort", toml_edit::value(value));
+            } else {
+                table.remove("reasoning_effort");
+            }
+        }
+        // No [provider] table: nothing to attach to; stay session-only.
+        _ => return Ok(()),
+    }
     atomic_write(&path, &doc.to_string())
 }
 
@@ -1050,7 +1100,7 @@ mod tests {
         let config = home.join(".heartflow").join("config.toml");
         fs::write(
             &config,
-            "[provider]\nname = \"zhipu\"\nbase_url = \"https://open.bigmodel.cn/api/coding/paas/v4\"\napi_key = \"stale-key\"\nmodel = \"glm-4.7\"\n",
+            "[provider]\nname = \"zhipu\"\nprotocol = \"openai\"\nbase_url = \"https://open.bigmodel.cn/api/coding/paas/v4\"\napi_key = \"stale-key\"\napi_key_env = \"ZHIPU_API_KEY\"\nmodel = \"glm-4.7\"\ncontext_window = 1048576\nreasoning_effort = \"high\"\n",
         )
         .expect("seed stale config");
         persist_selection(&home, Some("deepseek"), "deepseek-flash").expect("provider switch");
@@ -1058,14 +1108,24 @@ mod tests {
         let table: toml::Table = toml::from_str(&text).expect("parses");
         assert_eq!(table["provider"]["name"].as_str(), Some("deepseek"));
         assert_eq!(table["provider"]["model"].as_str(), Some("deepseek-flash"));
-        // The stale endpoint binding must be gone, not just shadowed.
-        assert!(
-            table["provider"].get("base_url").is_none(),
-            "stale base_url must be removed on provider switch"
-        );
-        assert!(
-            table["provider"].get("api_key").is_none(),
-            "stale api_key must be removed on provider switch"
+        // The whole stale binding set must be gone, not just shadowed; the
+        // preference key stays.
+        for key in [
+            "base_url",
+            "api_key",
+            "api_key_env",
+            "protocol",
+            "context_window",
+        ] {
+            assert!(
+                table["provider"].get(key).is_none(),
+                "stale {key} must be removed on provider switch"
+            );
+        }
+        assert_eq!(
+            table["provider"]["reasoning_effort"].as_str(),
+            Some("high"),
+            "preferences survive a provider switch"
         );
 
         // A same-provider model switch keeps a hand-tuned endpoint intact.

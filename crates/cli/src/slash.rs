@@ -1901,6 +1901,11 @@ async fn handle_bootstrap_command(
                         .find(|info| info.id == picked)
                         .and_then(|info| info.context_length.map(u64::from));
                     next.set_model(picked);
+                    // Adopt the endpoint-reported window on the ACTIVE profile
+                    // too, not just the catalog: the ctx bar and auto-compact
+                    // budget read the selection, and the previous provider's
+                    // window must not linger after a bootstrap.
+                    next.set_context_window(server_context);
                 }
                 // Balance is a DeepSeek-only extra (`/user/balance`); other
                 // providers without that endpoint just skip the line.
@@ -2121,6 +2126,16 @@ fn handle_effort_command(
             *runtime = rebuilt;
             *selection = next;
             println!("reasoning effort -> {normalized}");
+            // Persist when the (profile) selection actually carries the knob:
+            // session-only effort used to be silently rolled back by the next
+            // config hot-reload (the disk value wins there). Env-driven
+            // selections have no knob — persisting `None` would erase a
+            // hand-written `reasoning_effort`, so they stay untouched.
+            if let Some(effort) = selection.reasoning_effort() {
+                if let Err(error) = provider::persist_reasoning_effort(&home_dir(), Some(effort)) {
+                    println!("(could not persist effort: {error})");
+                }
+            }
         }
         Err(error) => println!("failed to switch effort: {error}"),
     }
@@ -2251,6 +2266,19 @@ fn handle_provider_command(
             persist_active_selection(selection, Some(name));
             // Re-lookup the display price so the usage line tracks the new model.
             set_display_price(state, active_model_price(selection, catalog));
+            // Residue surfacing: the switch cleaned the user layer, but a
+            // project-layer config.toml (which outranks env/builtin) or an env
+            // override may still pin the OLD endpoint — the request would keep
+            // 401ing against the wrong host with no hint why. Name it.
+            if let Some(resolved) = selection.base_url() {
+                let overridden = provider::env_base_url_override(Some(name))
+                    .is_some_and(|value| value == resolved);
+                if !overridden && Some(resolved) != provider::builtin_base_url(name) {
+                    println!(
+                        "note: base_url is {resolved} — not the builtin for {name}; a project-layer config.toml or env override is still pinning the endpoint"
+                    );
+                }
+            }
         }
         Err(error) => println!("failed to switch provider: {error}"),
     }
