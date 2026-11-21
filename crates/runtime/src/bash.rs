@@ -120,6 +120,7 @@ fn arm_idle_watchdog(
 ) -> (
     Arc<std::sync::atomic::AtomicU64>,
     Arc<std::sync::atomic::AtomicBool>,
+    tokio::task::JoinHandle<()>,
 ) {
     let beat = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
     let hung = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -129,7 +130,7 @@ fn arm_idle_watchdog(
     let beat_task = Arc::clone(&beat);
     let hung_task = Arc::clone(&hung);
     let threshold_ms = u64::try_from(idle.as_millis()).unwrap_or(u64::MAX);
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         loop {
             tokio::time::sleep(poll).await;
             if hung_task.load(std::sync::atomic::Ordering::Relaxed) {
@@ -144,7 +145,7 @@ fn arm_idle_watchdog(
             }
         }
     });
-    (beat, hung)
+    (beat, hung, handle)
 }
 
 /// Read one child stream up to [`MAX_STREAM_BYTES`], then keep draining and
@@ -646,11 +647,15 @@ async fn execute_bash_async(
     let child_pid = child.id();
     // Idle-watchdog state: `beat` is stamped by every arriving chunk on both
     // streams; `hung` flips when the watchdog decides the command is stuck.
-    let (beat, hung) = match (idle, child_pid) {
-        (Some(idle), Some(pid)) => arm_idle_watchdog(idle, pid),
+    let (beat, hung, watchdog) = match (idle, child_pid) {
+        (Some(idle), Some(pid)) => {
+            let (beat, hung, handle) = arm_idle_watchdog(idle, pid);
+            (beat, hung, Some(handle))
+        }
         _ => (
             Arc::new(std::sync::atomic::AtomicU64::new(now_ms())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
         ),
     };
     // Boxed once: the join! state machine plus Child exceed clippy's
@@ -682,6 +687,15 @@ async fn execute_bash_async(
         }),
     )
     .await;
+    // Retire the watchdog before reading `hung`: once the child is gone the
+    // task must not keep polling, or a late trip would (a) misreport a
+    // finished command as idle_timeout and (b) `terminate_by_pid` a pid the
+    // OS may already have recycled to an unrelated process. If the watchdog
+    // fired while the child was alive, `hung` is already set and the kill
+    // that broke the streams is this fix's race-free window.
+    if let Some(handle) = watchdog {
+        handle.abort();
+    }
     let (output, interrupted) = if let Ok(triple) = collected {
         (triple, false)
     } else {
