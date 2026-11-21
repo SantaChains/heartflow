@@ -147,7 +147,7 @@ impl ApiError {
                 let code = status.as_u16();
                 match code {
                     401 | 403 => Some("check your API key and ensure it has the required permissions — and that base_url matches the key's provider (a config.toml base_url from another provider will 401 here)"),
-                    404 => Some("model or endpoint not found — check the model name and base_url"),
+                    404 => Some("model or endpoint not found — check the model name and that base_url is the API root (without /chat/completions or other resource paths)"),
                     429 => Some("rate limited — wait a moment and try again, or reduce request frequency"),
                     500 | 502 | 503 => Some("provider-side error — this is usually temporary, try again shortly"),
                     504 => Some("gateway timeout — the provider is slow, try again in a moment"),

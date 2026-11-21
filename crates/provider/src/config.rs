@@ -747,6 +747,22 @@ pub fn env_base_url_override(name: Option<&str>) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+/// Normalize a user-supplied base_url into what the transport actually expects:
+/// the API root, without the resource path. The OpenAI dialect appends
+/// `/chat/completions` itself (openai.rs), so a pasted full endpoint like
+/// `https://api.deepseek.com/chat/completions` would otherwise request the
+/// doubled path and 404 with no visible cause (observed in the wild via
+/// `DEEPSEEK_BASE_URL`). Stripping the suffix is safe: no real API root ends
+/// with it. Trailing slashes are trimmed the same way the client does.
+#[must_use]
+pub fn normalize_base_url(url: String) -> String {
+    let trimmed = url.trim_end_matches('/').to_string();
+    match trimmed.strip_suffix("/chat/completions") {
+        Some(root) => root.trim_end_matches('/').to_string(),
+        None => trimmed,
+    }
+}
+
 /// Pure precedence resolution: CLI flags beat the merged config files, which
 /// beat built-in provider defaults. Env mode survives only when nothing
 /// configures an explicit transport.
@@ -802,6 +818,7 @@ pub fn resolve_spec(
         .clone()
         .or_else(|| env_base_url_override(name))
         .or_else(|| builtin.map(|provider| provider.base_url.to_string()))
+        .map(normalize_base_url)
         .ok_or("provider base_url missing: set [provider] base_url in config.toml")?;
     let inline_key = settings
         .api_key
@@ -1039,12 +1056,16 @@ mod tests {
     fn deepseek_builtin_sets_native_endpoint_and_model() {
         // Ambient-var aware (see env_var_wins_over_inline_key): a sandbox
         // carrying DEEPSEEK_BASE_URL proves the env layer outranking the
-        // builtin default; otherwise the compiled-in endpoint stands.
-        let expected_base_url = std::env::var("DEEPSEEK_BASE_URL")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "https://api.deepseek.com/v1".to_string());
+        // builtin default; otherwise the compiled-in endpoint stands. The
+        // expected value goes through the same normalization as resolution:
+        // a pasted full endpoint reduces to the API root either way.
+        let expected_base_url = super::normalize_base_url(
+            std::env::var("DEEPSEEK_BASE_URL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "https://api.deepseek.com/v1".to_string()),
+        );
         let spec =
             resolve_spec(Some("deepseek"), None, &ProviderSettings::default()).expect("resolve");
         match spec {
@@ -1143,12 +1164,26 @@ mod tests {
 
     #[test]
     fn config_layers_override_builtin_base_url_and_key_env() {
+        // A pasted full endpoint (the observed `DEEPSEEK_BASE_URL` mistake) is
+        // normalized down to the API root at resolution, on every layer.
+        assert_eq!(
+            super::normalize_base_url("https://api.deepseek.com/chat/completions".to_string()),
+            "https://api.deepseek.com"
+        );
+        assert_eq!(
+            super::normalize_base_url("https://api.deepseek.com/v1/".to_string()),
+            "https://api.deepseek.com/v1"
+        );
+        assert_eq!(
+            super::normalize_base_url("https://api.deepseek.com".to_string()),
+            "https://api.deepseek.com"
+        );
         let spec = resolve_spec(
             Some("deepseek"),
             None,
             &settings(concat!(
                 "[provider]\n",
-                "base_url = \"https://proxy.local/v1\"\n",
+                "base_url = \"https://proxy.local/v1/chat/completions\"\n",
                 "api_key_env = \"PROXY_KEY\"\n"
             )),
         )
