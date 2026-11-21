@@ -83,7 +83,7 @@ pub(crate) fn tui_input(key: KeyEvent) -> Input {
 }
 
 /// REPL slash commands surfaced by completion and the "did you mean" hint.
-/// Kept in sync with `REPL_HELP` in main.rs by the
+/// Kept in sync with `REPL_HELP` in slash.rs by the
 /// `repl_help_and_completion_commands_stay_in_sync` test there; a command only
 /// enters one table when it enters both.
 pub(crate) const COMMANDS: &[(&str, &str)] = &[
