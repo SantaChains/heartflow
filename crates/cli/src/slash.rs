@@ -2321,8 +2321,76 @@ fn handle_model_command(
         return;
     }
 
+    let mut requested = requested.to_string();
+    // Catalog-aware disambiguation, ordered exact → unique prefix → unique
+    // substring → ambiguous (abort with candidates) → unknown (trust + note).
+    // Typing `/model flash` lands on deepseek-flash instead of 404ing later.
+    if let ProviderSelection::Profile(profile) = selection {
+        let known: Vec<String> = catalog
+            .provider_by_host(&profile.base_url)
+            .map(|provider| provider.models.iter().map(|m| m.id.clone()).collect())
+            .unwrap_or_default();
+        let ci_exact = known
+            .iter()
+            .find(|id| id.eq_ignore_ascii_case(&requested))
+            .cloned();
+        if let Some(exact) = ci_exact {
+            // Same id, different casing: adopt the catalog's spelling so the
+            // recorded/persisted id is canonical.
+            if exact != requested {
+                requested = exact;
+            }
+        } else if !known.is_empty() {
+            let needle = requested.to_ascii_lowercase();
+            let prefix: Vec<&String> = known
+                .iter()
+                .filter(|id| id.to_ascii_lowercase().starts_with(&needle))
+                .collect();
+            let contains: Vec<&String> = known
+                .iter()
+                .filter(|id| id.to_ascii_lowercase().contains(&needle))
+                .collect();
+            let unique: Option<&String> = match (prefix.as_slice(), contains.as_slice()) {
+                ([one], _) => Some(one),
+                ([], [one]) => Some(one),
+                ([], []) => None,
+                (prefix, _) if prefix.len() > 1 => {
+                    println!(
+                        "ambiguous model {requested:?}; prefix candidates: {} — type more characters",
+                        prefix
+                            .iter()
+                            .map(|id| id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    return;
+                }
+                (_, contains) => {
+                    println!(
+                        "ambiguous model {requested:?}; candidates: {} — type more characters",
+                        contains
+                            .iter()
+                            .map(|id| id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    return;
+                }
+            };
+            match unique {
+                Some(matched) => {
+                    println!("matched catalog model {matched} for {requested:?}");
+                    requested = matched.clone();
+                }
+                None => println!(
+                    "note: {requested:?} is not in the catalog for this provider; sending as-is"
+                ),
+            }
+        }
+    }
+
     let mut next = selection.clone();
-    next.set_model(requested);
+    next.set_model(requested.clone());
     match build_runtime(state, runtime.session().clone(), next.clone(), true, mode) {
         Ok(rebuilt) => {
             *runtime = rebuilt;
@@ -2337,7 +2405,7 @@ fn handle_model_command(
                     &home_dir(),
                     &profile.base_url,
                     profile.protocol,
-                    requested,
+                    &requested,
                     profile.context_window.map(u64::from),
                     ModelSource::User,
                 ) {

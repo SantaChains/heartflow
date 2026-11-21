@@ -834,7 +834,22 @@ pub fn resolve_spec(
         .ok_or("provider api_key_env missing: set [provider] api_key_env or [provider] api_key in config.toml")?;
     let model = model_flag
         .map(str::to_string)
-        .or(settings.model.clone())
+        .or_else(|| {
+            // A persisted model belongs to the provider it was switched on: a
+            // cross-provider switch without an explicit model must fall back
+            // to the new provider's default instead of carrying the old model
+            // id to the new endpoint (observed: deepseek-flash resolved
+            // against bigmodel.cn → 404 model-not-found). At startup there is
+            // no incoming name flag and the name/model pair was persisted
+            // together, so the carried model stands; a same-provider re-switch
+            // keeps it too.
+            let carried = settings.model.clone()?;
+            let same_provider = match name {
+                Some(incoming) => settings.name.as_deref().is_none_or(|old| old == incoming),
+                None => true,
+            };
+            same_provider.then_some(carried)
+        })
         .or_else(|| builtin.and_then(|provider| provider.model.map(str::to_string)))
         .ok_or("model required: pass --model or set [provider] model in config.toml")?;
     // Custom providers default to the Anthropic dialect so legacy config
@@ -1050,6 +1065,32 @@ mod tests {
                 model: "m2".to_string()
             }
         );
+    }
+
+    #[test]
+    fn cross_provider_switch_does_not_carry_the_old_model() {
+        // The persisted model belongs to the provider it was switched on: a
+        // `/provider NAME` without a model must resolve NAME's default, not
+        // ship the old model id to the new endpoint (observed 404). A
+        // same-provider re-switch keeps the persisted model.
+        let persisted = settings("[provider]\nname = \"zhipu\"\nmodel = \"glm-4.7\"\n");
+        let spec = resolve_spec(Some("deepseek"), None, &persisted).expect("resolve");
+        match spec {
+            ProviderSpec::Resolved { model, .. } => {
+                assert_eq!(
+                    model, "deepseek-flash",
+                    "cross-provider switch must adopt the new default"
+                );
+            }
+            other @ _ => panic!("expected resolved profile, got {other:?}"),
+        }
+        let spec = resolve_spec(Some("zhipu"), None, &persisted).expect("resolve");
+        match spec {
+            ProviderSpec::Resolved { model, .. } => {
+                assert_eq!(model, "glm-4.7", "same-provider re-switch keeps the model");
+            }
+            other @ _ => panic!("expected resolved profile, got {other:?}"),
+        }
     }
 
     #[test]
