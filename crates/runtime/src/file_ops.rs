@@ -1591,16 +1591,44 @@ fn resolve_existing_prefix(path: &Path) -> PathBuf {
             for part in tail.iter().rev() {
                 resolved.push(part);
             }
-            return resolved;
+            return normalize_lexical(resolved);
         }
-        let Some(name) = probe.file_name().map(std::ffi::OsStr::to_os_string) else {
+        let Some(name) = probe.components().next_back() else {
             return path.to_path_buf();
         };
-        tail.push(name);
+        // `file_name()` returns None for paths terminating in `..`, which
+        // would bail out and leak the unresolved `..` into the containment
+        // test; the raw last component (even a ParentDir) must be captured.
+        tail.push(name.as_os_str().to_os_string());
         if !probe.pop() {
             return path.to_path_buf();
         }
     }
+}
+
+/// Collapse `ParentDir`/`CurDir` components lexically. The tail appended to the
+/// canonicalized existing prefix is raw, so `root/sub/../../x` must normalize
+/// to `root/../x` before the containment prefix test — a naive component match
+/// treats the raw `..` as literal and lets `../../src/lib.rs` pass as "inside"
+/// on Unix (Windows `canonicalize` collapses `..` before the probe ever runs,
+/// which is why this only bit non-Windows). Leading `..` on a relative path is
+/// clamped, mirroring how the filesystem resolves them.
+fn normalize_lexical(path: PathBuf) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                if out.file_name().is_some() {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Component-wise prefix test. Windows paths are case-insensitive, so compare

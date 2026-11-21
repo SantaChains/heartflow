@@ -1184,6 +1184,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // the pipeline command is PowerShell syntax; on Unix the
+                    // bash fallback would reject it before any output is produced.
     fn oversized_output_is_truncated_with_note() {
         let output = execute_bash(BashCommandInput {
             // ~2 MB of stdout: beyond the 512 KB capture cap.
