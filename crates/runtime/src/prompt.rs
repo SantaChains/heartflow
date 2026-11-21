@@ -141,10 +141,10 @@ impl SystemPromptBuilder {
         }
         sections.push(get_simple_system_section());
         sections.push(get_simple_doing_tasks_section());
-        sections.push(get_design_section());
-        sections.push(get_response_style_section());
         sections.push(get_task_loop_section());
         sections.push(get_actions_section());
+        sections.push(get_design_section());
+        sections.push(get_response_style_section());
         sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
         sections.push(self.environment_section());
         if let Some(tools) = external_tools_section() {
@@ -510,7 +510,20 @@ fn render_config_section(config: &RuntimeConfig) -> String {
     }
     lines.push(String::new());
     let redacted = redact_secrets(config.as_json());
-    lines.push(serde_json::to_string(&redacted).unwrap_or_else(|_| "{}".to_string()));
+    // One line per top-level key instead of a single JSON blob: discrete
+    // anchors are easier for attention to locate than one opaque string.
+    let serde_json::Value::Object(entries) = redacted else {
+        return lines.join("\n");
+    };
+    if entries.is_empty() {
+        lines.push("No settings overrides.".to_string());
+    }
+    for (key, value) in entries {
+        lines.push(format!(
+            "{key} = {}",
+            serde_json::to_string(&value).unwrap_or_else(|_| "[unserializable]".to_string())
+        ));
+    }
     lines.join("\n")
 }
 
@@ -587,14 +600,12 @@ fn get_simple_doing_tasks_section() -> String {
         "1. Match effort to the task: for a large or underdetermined change, state the approach and get agreement before writing; for a small, clear change, just do it.",
         "2. Ground every claim in the code. Locate cheaply: search for the line, then read just that region rather than whole files. Search and read before you answer or edit; never assume file contents or behavior.",
         "3. When a request is still ambiguous, ask one focused clarifying question before acting.",
-        "4. Before editing, be sure the current state can be rolled back, so a failed change can be reverted.",
-        "5. Change only what the task needs. Do not cause regressions, add speculative abstractions or compatibility shims, do unrelated cleanup, or create files the task does not require.",
-        "6. Prefer established solutions over reinvention: reach for the official, mature approach first, then proven open source; when an installed tool already does the job, drive it instead of hand-writing a script; add a mechanism only when a concrete gap calls for one.",
-        "7. If an approach fails, diagnose the failure before switching tactics.",
-        "8. Do not introduce security vulnerabilities such as command injection, XSS, or SQL injection.",
-        "9. You cannot see images. After writing any graphic file (png/jpg/gif/webp/svg/html), run the verify_graphics tool and fix it if the check fails.",
-        "10. After you change code, report which file and which lines changed and what changed; do not paste full files or diffs.",
-        "11. Report outcomes faithfully: state what you verified, what failed, and what you could not check; never claim a result you did not observe.",
+        "4. Change only what the task needs; delete parts that stop earning their place. Do not cause regressions, add speculative abstractions or compatibility shims, do unrelated cleanup, or create files the task does not require.",
+        "5. Prefer established solutions over reinvention: reach for the official, mature approach first, then proven open source; when an installed tool already does the job, drive it instead of hand-writing a script; add a mechanism only when a concrete gap calls for one.",
+        "6. If an approach fails, diagnose the failure before switching tactics.",
+        "7. Do not introduce security vulnerabilities such as command injection, XSS, or SQL injection.",
+        "8. You cannot see images. After writing any graphic file (png/jpg/gif/webp/svg/html), run the verify_graphics tool and fix it if the check fails.",
+        "9. Report outcomes faithfully and precisely: which file and lines changed and what changed, what you verified, what failed, and what you could not check; never claim a result you did not observe, and never paste full files or diffs.",
     ]
     .join("\n")
 }
@@ -602,10 +613,7 @@ fn get_simple_doing_tasks_section() -> String {
 fn get_design_section() -> String {
     [
         "Design.",
-        "Follow the conventions of the domain you are working in: learn how it is already done well and match its proven practice instead of inventing a private style.",
-        "Reason from first principles and deep domain knowledge, then let concrete structure follow: turn intangible intent into observable, testable behavior.",
-        "Look for shared structure across domains and transfer proven methods along it; be original only where that clearly wins, and stay conventional everywhere else.",
-        "Decide by explicit trade-offs, fuse the best of competing options, and delete every part that does not earn its place; redundancy is the first thing to cut.",
+        "Follow the proven conventions of the domain you are working in, and be original only where that clearly wins.",
         "Rank results by performance first, then smoothness (no stalls, flakiness, or rough edges a user would notice), then aesthetics.",
     ]
     .join("\n")
@@ -616,7 +624,7 @@ fn get_response_style_section() -> String {
         "Response style.",
         "Lead with the answer and the most load-bearing detail; keep supporting context brief and later.",
         "Write in plain prose with minimal formatting; short paragraphs are enough, and fenced code blocks are for code only.",
-        "Speak like a senior engineer: precise terminology, exact file paths, real interface and architecture names. No hedging, no filler, no echoing what the user just said.",
+        "Speak like a senior engineer: precise terminology, exact file paths, real interface and architecture names.",
         "Never emit emoji, decorative symbols, or ASCII flourishes such as banners and divider lines.",
         "Comment code only where the logic is non-obvious; never narrate self-evident code.",
     ]
@@ -634,7 +642,7 @@ fn get_task_loop_section() -> String {
 fn get_actions_section() -> String {
     [
         "Acting with care.",
-        "Weigh reversibility and blast radius before you act. Local, reversible steps such as editing a file or running a test are fine. Actions that affect shared systems, publish state, or delete data need explicit authorization from the user or durable workspace instructions.",
+        "Weigh reversibility and blast radius before you act, and be sure the current state can be rolled back before editing. Local, reversible steps such as editing a file or running a test are fine. Actions that affect shared systems, publish state, or delete data need explicit authorization from the user or durable workspace instructions.",
     ]
     .join("\n")
 }
@@ -927,6 +935,33 @@ mod tests {
     }
 
     #[test]
+    fn config_section_renders_per_key_lines_not_one_json_blob() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join(".heartflow")).expect("heartflow dir");
+        fs::write(
+            root.join(".heartflow").join("settings.json"),
+            r#"{"permissionMode":"workspace-write","model":"smart"}"#,
+        )
+        .expect("write settings");
+
+        let config = ConfigLoader::new(&root, root.join("missing-home"))
+            .load()
+            .expect("config should load");
+        let section = super::render_config_section(&config);
+
+        assert!(
+            section.contains("permissionMode = \"workspace-write\""),
+            "{section}"
+        );
+        assert!(section.contains("model = \"smart\""), "{section}");
+        assert!(
+            !section.contains("{\"permissionMode\""),
+            "config must not render as a single JSON blob: {section}"
+        );
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn config_redaction_drops_secret_values_but_keeps_normal_keys() {
         let raw = serde_json::json!({
             "model": "heartflow",
@@ -980,12 +1015,27 @@ mod tests {
         let style = joined
             .find("Response style.")
             .expect("response style section");
+        let boundary = joined
+            .find(super::SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+            .expect("dynamic boundary");
         assert!(
             doing < design && design < style,
             "design discipline sits between doing tasks and response style"
         );
-        assert!(joined.contains("redundancy is the first thing to cut"));
-        assert!(joined.contains("match its proven practice"));
+        // U-shape attention bias: output-format rules earn the last static slot,
+        // immediately before the dynamic boundary.
+        assert!(
+            style < boundary,
+            "response style is the last static section"
+        );
+        assert!(joined.contains("be original only where that clearly wins"));
+        assert!(joined.contains("Rank results by performance first"));
+        // The terse directive lives exactly once: no duplicate filler clause.
+        let terse_count = joined
+            .lines()
+            .filter(|line| line.contains("filler") || line.contains("filler,"))
+            .count();
+        assert_eq!(terse_count, 1, "filler rule must appear exactly once");
     }
 
     #[test]
