@@ -1611,8 +1611,9 @@ mod tests {
             }
             #[cfg(not(windows))]
             {
-                let mut command = std::process::Command::new("true");
-                command
+                // `true` takes no arguments and is never mutated here: build
+                // the child directly to stay clean under `-D warnings`.
+                std::process::Command::new("true")
             }
         };
         let dead_pid = short_lived.spawn().expect("child ran").id();
