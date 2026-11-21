@@ -13,6 +13,7 @@ use crate::compact::{
     ThresholdKind, TokenCalibration,
 };
 use crate::permissions::{PermissionOutcome, PermissionPolicy, PermissionPrompter};
+use crate::prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY;
 use crate::schema::validate_tool_input;
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 use crate::stop::StopPolicy;
@@ -39,6 +40,23 @@ pub struct ApiRequest {
     pub system_prompt: Vec<String>,
     pub messages: Vec<ConversationMessage>,
     pub tools: Vec<ToolSpec>,
+}
+
+impl ApiRequest {
+    /// Provider-facing rendering: sections joined with a blank line, minus the
+    /// internal [`SYSTEM_PROMPT_DYNAMIC_BOUNDARY`] marker. The marker is
+    /// cassette-replay machinery (the live/recorded comparison splits on it),
+    /// never model-facing text — leaking it into the system string would burn
+    /// tokens every turn and show the model plumbing it cannot act on.
+    #[must_use]
+    pub fn rendered_system_prompt(&self) -> String {
+        self.system_prompt
+            .iter()
+            .filter(|section| section.as_str() != SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
 }
 
 /// Events that flow from a provider stream and the agent loop to the UI layer.
@@ -1753,7 +1771,7 @@ mod tests {
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest,
     };
-    use crate::prompt::{ProjectContext, SystemPromptBuilder};
+    use crate::prompt::{ProjectContext, SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY};
     use crate::redact::redact_session;
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::usage::TokenUsage;
@@ -1762,6 +1780,22 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn rendered_system_prompt_strips_internal_boundary_marker() {
+        let request = ApiRequest {
+            system_prompt: vec![
+                "Identity and ground rules.".to_string(),
+                SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
+                "Environment.".to_string(),
+            ],
+            messages: Vec::new(),
+            tools: Vec::new(),
+        };
+        let rendered = request.rendered_system_prompt();
+        assert_eq!(rendered, "Identity and ground rules.\n\nEnvironment.");
+        assert!(!rendered.contains("DYNAMIC_BOUNDARY"));
+    }
 
     #[test]
     fn compaction_pipeline_preserves_tool_pairing_for_random_well_formed_sessions() {

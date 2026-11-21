@@ -381,7 +381,7 @@ fn build_message_request(
         model: model.to_string(),
         max_tokens,
         messages: convert_messages(&request.messages),
-        system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
+        system: (!request.system_prompt.is_empty()).then(|| request.rendered_system_prompt()),
         tools,
         tool_choice: match tool_policy {
             Some("required") if tools_enabled => Some(ToolChoice::Any),
@@ -594,7 +594,7 @@ fn build_chat_request(
     if !request.system_prompt.is_empty() {
         messages.push(ChatMessage {
             role: ChatRole::System,
-            content: Some(ChatContent::Text(request.system_prompt.join("\n\n"))),
+            content: Some(ChatContent::Text(request.rendered_system_prompt())),
             tool_calls: None,
             tool_call_id: None,
         });
@@ -811,7 +811,7 @@ fn build_responses_body(
         "stream": true,
     });
     if !request.system_prompt.is_empty() {
-        body["instructions"] = serde_json::Value::String(request.system_prompt.join("\n\n"));
+        body["instructions"] = serde_json::Value::String(request.rendered_system_prompt());
     }
     // The Responses dialect only carries these two sampling knobs.
     if let Some(temperature) = sampling.temperature {
