@@ -554,9 +554,9 @@ impl JobRegistry {
                     Err(format!("worker panicked: {message}"))
                 });
                 match outcome {
-                    Ok(result) if registry.stopped(id) => {
-                        // The runner finished its in-flight work after the
-                        // stop: discard the result, terminalize honestly.
+                    // The runner finished its in-flight work after the stop:
+                    // discard the result, terminalize honestly.
+                    Ok(_) if registry.stopped(id) => {
                         registry.terminalize(id, JobStatus::Stopped, None);
                     }
                     Err(_) if registry.stopped(id) => {
