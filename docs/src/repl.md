@@ -9,7 +9,8 @@
 /restore N 恢复 tracked 文件到第 N 个快照（也可传 sha；/checkpoints 编号）
 /focus    切换聚焦模式（隐藏 mascot 伴侣、收窄为最小 chrome）
 /save     立即持久化        /clear        开启新会话
-/sessions 列出已存会话      /open N       跳回第 N 个已存会话（同 /sessions 编号）
+/sessions [F] 列出已存会话（每行以开场消息主题打头；F 大小写不敏感过滤主题）
+/open N|TOPIC 跳回第 N 个已存会话（同 /sessions 编号），或按开场消息主题匹配——唯一命中直接打开，多个命中列出编号
 /remember T 追加一条长期记忆到 ~/.heartflow/MEMORY.md（自动去重）
 /mcp      列出 MCP 服务器与工具
 /search Q 全文检索历史      /exit         退出（自动保存并打印 resume 命令；/quit 为别名）
@@ -34,7 +35,7 @@ known models: deepseek-v4-flash, deepseek-v4-pro, deepseek-flash
 switch with: /model NAME
 ```
 
-`provider` 是目录键（未命中目录则 `custom`，env-anthropic 路径为 `anthropic (env)`），`protocol` 是真实协议（`anthropic` | `openai` | `openai-responses`）。`known models` 来自 provider/模型目录（`~/.heartflow/provider.toml` + 内置种子）；`hf models` 自举发现与 `/model NAME` 切换都会把模型回写进目录，下一回合即可补全。传输失败时看这里的 `protocol`/`base_url` 就能确认真正在用哪个协议，不会被 "anthropic" 之类字样误导。
+`provider` 是目录键（未命中目录则 `custom`，env-anthropic 路径为 `anthropic (env)`），`protocol` 是真实协议（`anthropic` | `openai` | `openai-responses`）。`known models` 来自 provider/模型目录（`~/.heartflow/provider.toml` + 内置种子）；`hf models` 自举发现与 `/model NAME` 切换都会把模型回写进目录，下一回合即可补全。切换同时持久化：`/model NAME` 与 `/provider NAME [MODEL]` 成功后把 `name`/`model` 写回用户层 `~/.heartflow/config.toml` 的 `[provider]`（toml_edit 注释保留式，只动这两键，其余表与注释字节不变；项目层 config.toml 带 `[provider]` 覆盖时打印提示），下次启动仍在切换后的 provider/模型上。传输失败时看这里的 `protocol`/`base_url` 就能确认真正在用哪个协议，不会被 "anthropic" 之类字样误导。
 
 补全不止命令名：在 `/model `、`/mode `、`/open ` 后敲空格，会按命令弹出参数候选表格——分别是当前 provider 的目录模型（附上下文窗口与来源）、权限三档、近期会话序号。↑/↓ 选择，Tab 或 Enter 只补全当前参数位（不整行重置），Esc 取消高亮；候选多时表格随高亮滚动。
 

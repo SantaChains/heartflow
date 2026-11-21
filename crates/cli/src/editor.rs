@@ -103,8 +103,14 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/focus", "Toggle focus mode (hide mascot, minimal chrome)"),
     ("/save", "Persist the session now"),
     ("/clear", "Start a fresh session"),
-    ("/sessions", "List saved sessions"),
-    ("/open <N>", "Jump the live REPL back to saved session N"),
+    (
+        "/sessions [FILTER]",
+        "List saved sessions (FILTER matches the opening message)",
+    ),
+    (
+        "/open <N|TOPIC>",
+        "Jump to saved session N, or the one whose opening message matches TOPIC",
+    ),
     (
         "/remember <T>",
         "Persist a durable pitfall/preference to MEMORY.md",

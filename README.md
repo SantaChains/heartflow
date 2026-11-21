@@ -22,13 +22,13 @@ Rust 实现的终端 AI agent。二进制命令 `hf`，在 REPL 中通过流式�
 - 任务循环：todo_write 登记计划，未完成任务自动续推，受最大续推次数约束。工具调度按读/写分类：连续的只读工具（read_file/grep/glob/search_files/search_documents/verify_graphics/web_fetch/web_search）并行批跑，写类与交互式工具（bash/write/edit/apply_patch/generate_image/todo_write/ask_user 及非只读 MCP）严格串行，保证写不会与并发读竞态、两个 ask_user 不抢终端
 - Hermes 任务环：`/plan approve` 后逐任务执行，每个任务在新鲜上下文里跑（复用同一 runtime，仅重置会话消息、绝不重连 MCP），确定性 verify（无 judge，看工具错误与完成标记），失败按 重试→换策略→询问 升级，收尾落盘复盘
 - 上下文工程：`>50%` 窗口预压缩——设 `config.toml` 的 `[provider] context_window` 或环境变量 `HEARTFLOW_AUTO_COMPACT_TOKENS`（= 模型上下文窗口 tokens，env 优先）后，回合内每次请求前若会话估算越过半窗即 summarize-then-compact（旧消息折成可续摘要、近若干条原样保留）；`/compact` 为手动强制压缩（忽略阈值立即压缩）。摘要按近期加权：越靠近存活窗口的轮次保留越多细节（每块 80→240 字预算）；`/pin` 把关键消息标记为永不压缩，逐字存活于每次压缩之后
-- 会话持久化：每个对话一份权威 JSON 快照，原子（temp+rename）写入 `~/.heartflow/sessions/<id>.json`，每回合覆盖同一文件而非另存新档；resume/`/open` 沿用同一 `<id>` 原地续写，`/clear` 轮换到新 `<id>`。支持 compact；`/exit` 打印本段 resume 命令，`/open N` 在 REPL 内直接跳回历史会话
+- 会话持久化：每个对话一份权威 JSON 快照，原子（temp+rename）写入 `~/.heartflow/sessions/<id>.json`，每回合覆盖同一文件而非另存新档；resume/`/open` 沿用同一 `<id>` 原地续写，`/clear` 轮换到新 `<id>`。支持 compact；`/exit` 打印本段 resume 命令，`/open N|TOPIC` 在 REPL 内直接跳回历史会话（N 按编号，TOPIC 按开场消息主题匹配）；`/sessions [F]` 每行以开场消息主题打头、可按主题过滤
 - 全文历史检索：每回合自动镜像进系统级 SQLite 库 `~/.heartflow/heartflow.db`（FTS5 trigram，中英文通吃，JSON 仍为权威存储），`hf search` 与 REPL `/search` 跨会话检索
 - 自迭代记忆：`~/.heartflow/MEMORY.md`（或项目 `.heartflow/MEMORY.md`）作为跨会话的坑/决策/偏好记录，以极小 token（截断 4KB）注入系统提示词的 Memory 段；`/remember` 手动追加（去重），任务环遇硬坑（多次尝试失败被跳过）自动记录（非向量嵌入）
 - Unix 管道组合：stdin 被管道时读入为上下文，`git diff | hf prompt "评审这次改动"`；`--quiet` 只输出答案、`--json` 输出结构化结果，方便脚本串联
 - 外部 CLI 工具按需感知：系统提示词只广播主机上确已安装的非交互文本过滤器（jq/yq/gron/jc/rg/fd/tree/tokei/hyperfine/difft/xsv/gh），并约定首次使用前先 `<tool> --help` 学当前 flag 而非臆测；交互式/装饰性 TTY 工具（fzf、git-delta、less）归人类终端，不进 agent 提示（其能力已由原生 search_files 模糊检索与 apply_patch/真实 diff 覆盖）
 - 配置热重载：REPL 每回合边界按 mtime 探测 config/theme/keymap/settings/provider 五面变更——config 自动重建 provider 并保留会话，theme/keymap/settings 就地生效，provider 重载模型目录供 /model 与补全（绝不动活动传输）（零依赖轮询，逐面上报，改 theme 不触发 config 重载）
-- 模型目录与参数补全：`~/.heartflow/provider.toml` 是 provider/模型**目录**（已知宇宙的注册表，非活动配置——选路仍由 `config.toml` 决定），内置国内常用 OpenAI 兼容供应商种子（DeepSeek/Kimi/GLM/Qwen/…，2026-10 已刷新至 GLM-5.3/Kimi-K3.1/Qwen3.8/deepseek-flash 一代），`hf models` 自举发现与 `/model` 切换即时回写并热更；`/bootstrap` 的端点探测同样把发现清单回写目录（种子过时失效时的自动兜底），三协议（openai/openai-responses/anthropic）都有真实凭据+可达性预检——验证不过绝不切换；点名模型永不自动更改，智能选择（flash 档自动选）仅作用于未点名时；REPL 补全从命令名升级到参数值，`/model `/`/mode `/`/open ` 后敲空格弹出对齐表格下拉（模型附上下文窗口与来源）
+- 模型目录与参数补全：`~/.heartflow/provider.toml` 是 provider/模型**目录**（已知宇宙的注册表，非活动配置——选路仍由 `config.toml` 决定），内置国内常用 OpenAI 兼容供应商种子（DeepSeek/Kimi/GLM/Qwen/…，2026-10 已刷新至 GLM-5.3/Kimi-K3.1/Qwen3.8/deepseek-flash 一代），`hf models` 自举发现与 `/model` 切换即时回写并热更；`/model NAME` 与 `/provider NAME [MODEL]` 切换成功还会把 `name`/`model` 注释保留式写回用户层 `config.toml` 的 `[provider]`（只动两键），跨启动生效；`/bootstrap` 的端点探测同样把发现清单回写目录（种子过时失效时的自动兜底），三协议（openai/openai-responses/anthropic）都有真实凭据+可达性预检——验证不过绝不切换；点名模型永不自动更改，智能选择（flash 档自动选）仅作用于未点名时；REPL 补全从命令名升级到参数值，`/model `/`/mode `/`/open ` 后敲空格弹出对齐表格下拉（模型附上下文窗口与来源）
 - 自检自愈：`hf doctor [--fix]` 校验配置解析、目录可写、provider 与密钥，并对历史库跑 `PRAGMA integrity_check`（库体过大时自动降级 `quick_check`）；`--fix` 建缺失目录、坏配置备份移开
 - 权限模型：read-only / workspace-write / full 三档，REPL 内 `/mode` 热切换（`auto` 归一为 full；`HEARTFLOW_PERMISSION_MODE` 另接受 `plan`，其硬门禁只允许写 `.heartflow/plans/*.md`），工具级覆盖；/plan 规划模式（硬门禁：仅可写 `.heartflow/plans/*.md`，其余写/bash 一律拒绝），审批后进入 Hermes 任务环逐任务新鲜上下文执行，收尾把复盘写入 `.heartflow/reflections/`（可选沉淀为 `.agent/skills`）；六档模式再含 `spec`（硬门禁只写 `.heartflow/specs/*.md`，先搜后设计，写毕三选确认）与 `loop`（full + mission 自动续跑：判据未满足即自动下一回合，blocked 三连停机，Ctrl+C 可中断）；read-only 与 plan/spec 两档自动放行标注为只读的 MCP 工具（`readOnlyHint`/`read_only`），让远程只读 MCP 在受限模式下亦可用
 - 健壮性：connect/read 双超时、子进程 kill_on_drop、UTF-8 全链路（BOM 剥除、PowerShell 编码前缀，非 UTF-8 字节经 `chardetng` 嗅探 + `encoding_rs` 解码 GBK 等遗留码页、不再 lossy 碎字、CJK 宽度对齐）、工具输出 32K 截断、缓存目录剪枝；工具入参执行前用 `jsonschema` crate 做完整 JSON-Schema 校验（draft 全能力；空/布尔/无法编译的 schema 一律放行，绝不误拦合法调用），转发给 provider 前对（MCP）schema 做规整（object 补 `properties`、array 补 `items`、单元素 `type` 联合折叠），MCP 握手（initialize+tools/list）失败按 200/400ms 退避重试 3 次（幂等），工具调用本身不自动重试（非幂等危险）交由模型层决策
@@ -117,7 +117,7 @@ hf -v | -V | --version                            打印版本号
 /pin      切换末条消息的永不压缩标记（跨 /compact 逐字存活）
 /focus    切换聚焦模式（隐藏 mascot 伴侣、收窄为最小 chrome）
 /save     立即持久化        /clear        开启新会话
-/sessions 列出已存会话      /open N       跳回第 N 个已存会话（同 /sessions 编号）
+/sessions [F] 列出已存会话（F 按开场消息主题过滤）   /open N|TOPIC  跳回第 N 个已存会话，或按开场消息主题匹配打开
 /remember T 追加一条长期记忆到 ~/.heartflow/MEMORY.md（自动去重）
 /mcp      列出 MCP 服务器与工具
 /search Q 全文检索历史      /exit         退出（自动保存并打印 resume 命令，/quit 为别名）

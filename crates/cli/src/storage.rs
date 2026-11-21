@@ -52,6 +52,27 @@ pub(crate) fn load_saved_session(path: &Path) -> Result<Session, String> {
     Ok(session)
 }
 
+/// Single-line topic snippet of a saved session: the first user text message,
+/// whitespace-collapsed and capped. Backs `/sessions` rows (a bare `<id>.json`
+/// path is unreadable as a list entry) and `/sessions FILTER` + `/open TOPIC`
+/// matching. Read/parse failures degrade to `None` — a listing row just shows
+/// the path; a broken segment never fails the whole listing.
+pub(crate) fn session_topic(path: &Path) -> Option<String> {
+    let (session, _) = Session::load_with_segment(path).ok()?;
+    let text = session
+        .messages
+        .iter()
+        .find(|message| message.role == runtime::MessageRole::User)
+        .and_then(|message| {
+            message.blocks.iter().find_map(|block| match block {
+                runtime::ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+        })?;
+    let one_line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!one_line.is_empty()).then(|| runtime::truncate_chars(&one_line, 96))
+}
+
 /// Instance-scoped session state, replacing the former process-global statics.
 /// One `hf` run owns exactly one of these; a future parallel section (Phase 6)
 /// owns its own, so nothing here may assume a process singleton. Held behind

@@ -1324,8 +1324,10 @@ async fn dispatch_slash_command(
             handle_clear_command(state, selection, mode, runtime, plan);
             LoopControl::Continue
         }
-        "/sessions" => {
-            print_sessions_listing();
+        _ if trimmed == "/sessions" || trimmed.starts_with("/sessions ") => {
+            let filter = trimmed.strip_prefix("/sessions").map(|rest| rest.trim());
+            // An empty rest means the bare command: no filter, full listing.
+            print_sessions_listing(filter.filter(|rest| !rest.is_empty()));
             LoopControl::Continue
         }
         _ if trimmed == "/open" || trimmed.starts_with("/open ") => {
@@ -2470,18 +2472,44 @@ async fn handle_bang_command(state: &SessionShared, mode: &str, input: &str) {
     }
 }
 
-/// Print the saved-session list for the `/sessions` command.
-fn print_sessions_listing() {
+/// Print the saved-session list for the `/sessions` command. Each row leads
+/// with the session's topic (its first user message — a bare `<id>.json` path
+/// is unreadable as a list entry) with the path after it. With a filter, only
+/// sessions whose topic contains it (case-insensitive) are shown, up to a
+/// larger cap since the point is narrowing a long list down.
+fn print_sessions_listing(filter: Option<&str>) {
     let sessions = list_sessions();
     if sessions.is_empty() {
         println!("no saved sessions found");
         return;
     }
+    let needle = filter.map(str::to_lowercase);
     println!("saved sessions (newest first):");
-    for (index, path) in sessions.iter().enumerate().take(9) {
-        println!("  {}. {}", index + 1, path.display());
+    let cap = if needle.is_some() { 20 } else { 9 };
+    let mut shown = 0;
+    for (index, path) in sessions.iter().enumerate() {
+        let topic = session_topic(path);
+        if let Some(needle) = &needle {
+            let haystack = topic.as_deref().unwrap_or("");
+            if !haystack.to_lowercase().contains(needle) {
+                continue;
+            }
+        }
+        shown += 1;
+        if shown > cap {
+            break;
+        }
+        let topic = topic.as_deref().unwrap_or("(untitled)");
+        println!("  {}. {}  ({})", index + 1, topic, path.display());
     }
-    println!("resume with: heartflow --resume");
+    if shown == 0 {
+        println!(
+            "no session matches `{}` (searched each session's opening message)",
+            filter.unwrap_or_default()
+        );
+        return;
+    }
+    println!("resume with: heartflow --resume; open in-place: /open <N> (or /open <TOPIC>)");
 }
 
 /// Save the live session on the way out and print the exact command to resume
@@ -2498,8 +2526,11 @@ async fn exit_with_resume_hint(state: &SessionShared, runtime: &AgentRuntime) {
 
 /// Jump the live REPL to a previously saved section: reload session N (using the
 /// same newest-first numbering as `/sessions`) into a freshly built runtime,
-/// swapping the in-place conversation without restarting the process. The
-/// connected MCP servers and provider are reconstructed by `build_runtime`.
+/// swapping the in-place conversation without restarting the process. A
+/// non-numeric argument is a topic: the newest session whose opening message
+/// contains it opens when unique, otherwise the matches list with their
+/// numbers. The connected MCP servers and provider are reconstructed by
+/// `build_runtime`.
 fn handle_open_command(
     state: &SessionShared,
     input: &str,
@@ -2509,11 +2540,11 @@ fn handle_open_command(
 ) {
     let arg = input.trim().strip_prefix("/open").unwrap_or("").trim();
     if arg.is_empty() {
-        println!("usage: /open <N>   (N is a 1-based index from /sessions)");
+        println!("usage: /open <N|TOPIC>   (N is a 1-based index from /sessions; TOPIC matches the opening message)");
         return;
     }
     let Ok(index) = arg.parse::<usize>() else {
-        println!("`{arg}` is not a valid session number");
+        open_session_by_topic(state, arg, selection, mode, runtime);
         return;
     };
     let sessions = list_sessions();
@@ -2525,7 +2556,53 @@ fn handle_open_command(
         println!("session {index} is out of range (1..{})", sessions.len());
         return;
     }
-    let path = &sessions[index - 1];
+    open_session_path(state, index, &sessions[index - 1], selection, mode, runtime);
+}
+
+/// `/open TOPIC`: newest-first scan over saved sessions, matching the argument
+/// case-insensitively against each session's opening message. A unique match
+/// opens at once; several matches print their `/sessions` numbers so the user
+/// can disambiguate with `/open N`.
+fn open_session_by_topic(
+    state: &SessionShared,
+    topic: &str,
+    selection: &ProviderSelection,
+    mode: &str,
+    runtime: &mut AgentRuntime,
+) {
+    let needle = topic.to_lowercase();
+    let matches: Vec<(usize, std::path::PathBuf)> = list_sessions()
+        .into_iter()
+        .enumerate()
+        .filter(|(_, path)| {
+            session_topic(path).is_some_and(|text| text.to_lowercase().contains(&needle))
+        })
+        .collect();
+    match matches.as_slice() {
+        [] => println!(
+            "no session matches `{topic}` (searched each session's opening message); try /sessions [FILTER]"
+        ),
+        [(index, path)] => open_session_path(state, *index, path, selection, mode, runtime),
+        many => {
+            println!("several sessions match `{topic}`; open one by number:");
+            for (index, path) in many {
+                let text = session_topic(path).unwrap_or_else(|| "(untitled)".to_string());
+                println!("  {index}. {text}  ({})", path.display());
+            }
+        }
+    }
+}
+
+/// Load the session file at `index` (1-based, `/sessions` numbering) into a
+/// fresh runtime, swapping it in as the live conversation.
+fn open_session_path(
+    state: &SessionShared,
+    index: usize,
+    path: &Path,
+    selection: &ProviderSelection,
+    mode: &str,
+    runtime: &mut AgentRuntime,
+) {
     match load_saved_session(path) {
         Ok(session) => match build_runtime(state, session, selection.clone(), true, mode) {
             Ok(fresh) => {
@@ -4318,8 +4395,10 @@ fn print_repl_help() {
     println!("  /focus         Toggle focus mode (hide mascot, minimal chrome)");
     println!("  /save          Persist the session now");
     println!("  /clear         Start a fresh session");
-    println!("  /sessions      List saved sessions");
-    println!("  /open <N>      Jump the live REPL back to saved session N");
+    println!("  /sessions [F]  List saved sessions (F filters by opening message)");
+    println!(
+        "  /open <N|TOP>  Jump to saved session N, or the one whose opening message matches TOP"
+    );
     println!("  /remember <T>  Persist a durable pitfall/preference to MEMORY.md");
     println!("  /search <Q>    Full-text search saved conversation history");
     println!("  /mcp           List connected MCP servers and tools");
@@ -4842,6 +4921,29 @@ mod tests {
         let after = current_session_id(&state);
         assert!(!after.is_empty(), "a fresh id is never empty");
         assert_ne!(before, after, "rotate must start a new conversation id");
+    }
+
+    #[test]
+    fn session_topic_extracts_first_user_message_as_one_line() {
+        use super::session_topic;
+        use runtime::{ContentBlock, ConversationMessage, Session};
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("hf-topic-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mkdir");
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "assistant preamble first".to_string(),
+            }]),
+            ConversationMessage::user_text("  fix the\n\tlogin  bug  "),
+        ];
+        let path = dir.join("s.json");
+        session.save_to_path(&path).expect("save fixture");
+        // The assistant preamble is skipped; the user opener collapses to one
+        // line and loses its padding.
+        assert_eq!(session_topic(&path).as_deref(), Some("fix the login bug"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
