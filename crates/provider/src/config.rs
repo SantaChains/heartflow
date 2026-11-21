@@ -1082,14 +1082,14 @@ mod tests {
                     "cross-provider switch must adopt the new default"
                 );
             }
-            other @ _ => panic!("expected resolved profile, got {other:?}"),
+            other => panic!("expected resolved profile, got {other:?}"),
         }
         let spec = resolve_spec(Some("zhipu"), None, &persisted).expect("resolve");
         match spec {
             ProviderSpec::Resolved { model, .. } => {
                 assert_eq!(model, "glm-4.7", "same-provider re-switch keeps the model");
             }
-            other @ _ => panic!("expected resolved profile, got {other:?}"),
+            other => panic!("expected resolved profile, got {other:?}"),
         }
     }
 
