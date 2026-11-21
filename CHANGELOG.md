@@ -1,4 +1,21 @@
 
+# heartflow 1.6.1 - 2026-11-21
+
+## 缺陷修复
+
+- Linux 测试/门禁修复批——proxy system::read 桩、file_ops 越界写防线、jobs pid 复用 flake、plan 模式与 pwsh 测试平台门控 (#25) (`8813be5`)
+
+- **file_ops**: Linux 越界写防线失效——resolve_existing_prefix 用 file_name()(对 .. 结尾返回 None)泄漏未解析 ..,改 components().next_back() + 尾段词法归一; fix(jobs): 死外国 pid 改固定不可达值防并行 pid 复用 flake; fix(cli): plan 模式反斜杠断言挂 cfg(windows)+usage_line checked_div; fix(bash): pwsh 管道测试挂 cfg(windows) (`bd9941a`)
+
+- **jobs**: Stopped 分支刻意丢弃结果——Ok(result) 改 Ok(_),过 CI 的 -D warnings (`5eb105f`)
+
+- **jobs**: Not(windows) 测试分支 unused_mut + let_and_return——直接构造 true 子进程 (`9bc3f51`)
+
+- **proxy**: 改用非 Windows 测试桩——保留原 cfg(any(windows,test)) 调用点,system.rs 增 cfg(all(not(windows),test)) 的 read() None 桩,消除 Linux 测试构建 E0425 且不引入 dead_code (`2d51344`)
+
+- **proxy**: Linux 测试构建编译回归——cfg(any(windows,test)) 的 test 肢引用 windows-only 的 system::read 致 E0425,删之(Windows 测试构建已由 windows 肢覆盖) (`e12f805`)
+
+
 # heartflow 1.6.0 - 2026-11-20
 
 ## 新功能
