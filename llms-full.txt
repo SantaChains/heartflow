@@ -1568,7 +1568,27 @@ pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript �
 - **无损压缩争议（Codex，研究点）**：社区称其新压缩「lossless」优于摘要式——本仓七相（模型摘要+逐字尾+省略声明+硬触发）是摘要式阵营；「无损」的实现机制（疑似按需重取材）值得下会话研读 open-source CLI 源码对比。
 - **延迟工具加载（Claude Code，轻采纳）**：deferred tool loading——本仓条件注册（rga）是雏形，全工具面懒加载（描述后置、调用时展开）待工具面膨胀后再做。
 - **学术框架（引用）**：arXiv 2604.14228「The Design Space of AI Agent Systems」将 Claude Code 的 delegation 归类为 isolated-subagent-boundaries + deny-first-with-human-escalation——与本仓权限门+worker 只读默认同型，可作为 C-1 模式系统的理论参照。
-- **基准面共识**：Claude Code 强在多文件复杂重构、Gemini CLI 强在 monorepo 级上下文但需近两倍追问——**追问次数是比分数更真实的 UX 指标**（本仓 /effort 与 loop 模式直接作用于它）。
+- **基准面共识**：Claude Code 强在多文件复杂重构、Gemini CLI 强在 monorepo 级上下文但需近两倍追问——**追问次数是比分数更真实的 UX 指标**（本仓 /effort 与 loop 模式直接作用于它）
+
+
+### 11. windows-rs 家族对齐与增强（2026-11-21 评估，只记录不执行）
+
+**触发**：工具链切 `stable`（1.100）后 windows-registry 0.5→0.100 落地（读 WinINET，`crates/proxy/src/system.rs:30`，API 未变零适配）。借此对 windows-rs 家族做一轮全景对齐评估。
+
+**现状事实（代码实证）**：
+- 直接依赖仅 windows-registry 0.100（proxy 读侧）。windows-sys 三份均为**传递依赖**：0.59 ← fd-lock 4（`crates/runtime/src/filelock.rs:133` 文件锁）、0.61 ← anstyle/dirs-sys/clap 树、0.52 target-gated（需 `--target all` 才可见）；仓内**零直接引用**（旧记录「windows-sys 已在依赖树」指的这批）。
+- 终端层 crossterm 0.29 单一 backend（`crates/cli/src/editor.rs`），无直接 Win32 调用；Windows Terminal 光标闪烁已有专项（`viewport_term.rs:37`）。
+- bash 工具 `std/tokio::process` + 管道捕获（`crates/runtime/src/bash.rs:201-231`），`CREATE_NO_WINDOW` 已设（`bash.rs:471`），无 ConPTY。
+- 存储层：JSON 快照原子 temp+rename（`cli/core.rs:307`、`runtime/compact.rs:159`、`provider/load.rs:612`）+ fd-lock + SQLite WAL `synchronous=NORMAL`（`crates/store/src/lib.rs:138`）。
+
+**候选增强（按性价比排序，全部待验证）**：
+
+1. **windows-registry 写侧——系统代理回写（§3 读侧的镜像，中收益中风险）**：0.100 提供 `set_*` API，可补「hf 设置系统代理」方向（现只读）。风险：写注册表是用户可见副作用，须显式开关 + 原值备份回滚；Clash/V2Ray 同时运行时行为需实测。
+2. **Windows 原子写语义核验（小步、低风险，可先做）**：`std::fs::rename` 在 Windows 映射 `MoveFileExW(REPLACE_EXISTING)`，NTFS 上原子、跨卷报错——temp 与目标同目录已保证同卷。可选增强：rename 前对 temp 句柄 `sync_all()`（FlushFileBuffers 等价）缩崩溃窗口。前置：`store/tests/io_correctness.rs` 加 Windows 专项（kill 进程于 rename 前后）。
+3. **ConPTY 给 bash 工具挂伪终端（高成本，触发条件制）**：管道捕获下依赖 TTY 的子程序（分页器、颜色、进度条）行为退化。windows-sys `Win32_System_Console` 的 `CreatePseudoConsole` + `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` 可挂真伪终端。成本：会话生命周期管理、管道与 ConPTY 并存的双读死锁风险、输出含 VT 序列需下游过滤。**触发条件**：出现实际「无 TTY 行为异常」的命令案例再动；短期用 `--no-pager`/`--color=never` 注入规避（`bash.rs:591` 已有 TERM 处理）。
+4. **windows-sys 版本收敛（不做）**：fd-lock 4 锁 0.59，等 fd-lock 上游升级自然收敛到 0.61+；主动动收益为零。
+
+**对齐结论**：本仓 Windows 面现状已经过实战（代理读侧、CREATE_NO_WINDOW、fd-lock、io_correctness 测试套），与 windows-rs 家族**无需要对齐的缺口**；上述 1/2 是自然延伸，3 是触发条件制的储备项。
 
 
 ---
