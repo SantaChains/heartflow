@@ -500,8 +500,19 @@ impl JobRegistry {
                             // already-terminal job keeps its own (earlier)
                             // verdict, and terminalize is idempotent anyway.
                             if registry.status_of(id) == Some(JobStatus::Running) {
-                                registry.stop(id);
-                                append_event(&jobs_root(), id, "timeout", "");
+                                // Verdict BEFORE flag: `stop` only raises the
+                                // runner's cancellation flag, and under heavy
+                                // load the runner can observe it and land its
+                                // generic "stopped before completion" verdict
+                                // before this thread gets scheduled again —
+                                // first-terminal-wins would then keep the
+                                // generic note and lose the timeout. Writing
+                                // the verdict first makes the timeout the
+                                // first terminal word, deterministically; the
+                                // flag afterwards still unwinds the runner
+                                // (whose own terminalize then idempotently
+                                // no-ops), and the slot guard releases as
+                                // usual.
                                 registry.terminalize_note(
                                     id,
                                     JobStatus::Stopped,
@@ -512,6 +523,8 @@ impl JobRegistry {
                                         wall.as_secs()
                                     )),
                                 );
+                                registry.stop(id);
+                                append_event(&jobs_root(), id, "timeout", "");
                             }
                         });
                 }
