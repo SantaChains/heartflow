@@ -280,11 +280,17 @@ fn decode_text(bytes: &[u8]) -> String {
     if let Ok(text) = std::str::from_utf8(bytes) {
         return text.to_string();
     }
-    let mut detector = chardetng::EncodingDetector::new();
+    // 1.0 renames the boolean flags into enums; `Deny` mirrors the old
+    // `allow_utf8: false` (the bytes are known non-UTF-8 here, so forcing a
+    // legacy candidate avoids re-emitting the same bytes lossily).
+    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
     detector.feed(bytes, true);
-    // `allow_utf8: false` is deliberate: the bytes are known non-UTF-8 here, so
-    // forcing a legacy candidate avoids re-emitting the same bytes lossily.
-    detector.guess(None, false).decode(bytes).0.into_owned()
+    // `Utf8Detection::Deny` is deliberate: see above.
+    detector
+        .guess(None, chardetng::Utf8Detection::Deny)
+        .decode(bytes)
+        .0
+        .into_owned()
 }
 
 /// Create or fully replace a text file, writing atomically via a sibling temp

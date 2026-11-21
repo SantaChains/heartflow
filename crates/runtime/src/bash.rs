@@ -816,12 +816,15 @@ fn decode_output(bytes: &[u8]) -> String {
 }
 
 /// Sniff the most probable legacy encoding for bytes already known to be
-/// non-UTF-8. `allow_utf8: false` is deliberate: a UTF-8 verdict is impossible
+/// non-UTF-8. `Utf8Detection::Deny` is deliberate: a UTF-8 verdict is impossible
 /// here, so forcing a legacy candidate avoids re-emitting the same bytes lossy.
 fn guess_encoding(bytes: &[u8]) -> &'static encoding_rs::Encoding {
-    let mut detector = chardetng::EncodingDetector::new();
+    // 1.0 renames the boolean flags into enums; `Allow` keeps the 0.1
+    // behavior (ISO-2022-JP stayed a candidate unconditionally), `Deny`
+    // mirrors the old `allow_utf8: false`.
+    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
     detector.feed(bytes, true);
-    detector.guess(None, false)
+    detector.guess(None, chardetng::Utf8Detection::Deny)
 }
 
 fn decode_with(bytes: &[u8], encoding: &'static encoding_rs::Encoding) -> String {
