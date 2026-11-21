@@ -143,7 +143,7 @@ impl RetryPolicy {
                 },
                 Err(error) => error,
             };
-            if !error.is_retryable() || attempts > self.max_retries + 1 {
+            if !error.is_retryable() {
                 return Err(error);
             }
             if attempts > self.max_retries {

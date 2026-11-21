@@ -124,9 +124,13 @@ pub fn anthropic_event(frame: &SseFrame) -> Result<Option<StreamEvent>, ApiError
         return Ok(None);
     }
 
-    serde_json::from_str::<StreamEvent>(&frame.data)
-        .map(Some)
-        .map_err(ApiError::from)
+    let event = serde_json::from_str::<StreamEvent>(&frame.data).map_err(ApiError::from)?;
+    // Unrecognized event types decode into `StreamEvent::Unknown`; the spec
+    // asks clients to ignore them, so they surface as "no event" here.
+    if matches!(event, StreamEvent::Unknown) {
+        return Ok(None);
+    }
+    Ok(Some(event))
 }
 
 #[cfg(test)]
@@ -336,5 +340,21 @@ mod tests {
     fn data_field_without_space_still_parses() {
         let frame = parse_frame("data:{\"type\":\"ping\"}\n\n");
         assert_eq!(frame.data, "{\"type\":\"ping\"}");
+    }
+
+    #[test]
+    fn unknown_event_types_are_skipped_not_fatal() {
+        // Forward compatibility: a gateway adding an event type this client
+        // does not model must not fail the turn (the Anthropic spec asks
+        // clients to ignore unrecognized stream events).
+        let frame = parse_frame(
+            "event: telemetry_sample\ndata: {\"type\":\"telemetry_sample\",\"rate\":0.5}\n\n",
+        );
+        assert!(anthropic_event(&frame)
+            .expect("unknown event should not error")
+            .is_none());
+        // Malformed JSON still errors — only unknown *types* are skipped.
+        let bad = parse_frame("data: {\"type\":\"content_block_delta\",\"delta\":}\n\n");
+        assert!(anthropic_event(&bad).is_err());
     }
 }

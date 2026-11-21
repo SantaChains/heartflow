@@ -245,7 +245,7 @@ pub struct Usage {
 impl Usage {
     #[must_use]
     pub const fn total_tokens(&self) -> u32 {
-        self.input_tokens + self.output_tokens
+        self.input_tokens.saturating_add(self.output_tokens)
     }
 }
 
@@ -316,6 +316,13 @@ pub enum StreamEvent {
     ContentBlockDelta(ContentBlockDeltaEvent),
     ContentBlockStop(ContentBlockStopEvent),
     MessageStop(MessageStopEvent),
+    /// Any event `type` this client does not model. The Anthropic spec asks
+    /// clients to ignore unrecognized stream events, and gateways add them
+    /// (ping variants, telemetry): failing the whole turn on a new event type
+    /// would break forward compatibility, so this variant exists only to be
+    /// decoded and skipped (`anthropic_event` maps it to `None`).
+    #[serde(other)]
+    Unknown,
 }
 
 #[cfg(test)]

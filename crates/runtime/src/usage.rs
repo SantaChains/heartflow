@@ -12,9 +12,9 @@ impl TokenUsage {
     #[must_use]
     pub fn total_tokens(self) -> u32 {
         self.input_tokens
-            + self.output_tokens
-            + self.cache_creation_input_tokens
-            + self.cache_read_input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_creation_input_tokens)
+            .saturating_add(self.cache_read_input_tokens)
     }
 
     /// Size of the prompt the provider actually charged for. `input_tokens`
@@ -57,10 +57,15 @@ impl UsageTracker {
 
     pub fn record(&mut self, usage: TokenUsage) {
         self.latest_turn = usage;
-        self.cumulative.input_tokens += usage.input_tokens;
-        self.cumulative.output_tokens += usage.output_tokens;
-        self.cumulative.cache_creation_input_tokens += usage.cache_creation_input_tokens;
-        self.cumulative.cache_read_input_tokens += usage.cache_read_input_tokens;
+        let cumulative = &mut self.cumulative;
+        cumulative.input_tokens = cumulative.input_tokens.saturating_add(usage.input_tokens);
+        cumulative.output_tokens = cumulative.output_tokens.saturating_add(usage.output_tokens);
+        cumulative.cache_creation_input_tokens = cumulative
+            .cache_creation_input_tokens
+            .saturating_add(usage.cache_creation_input_tokens);
+        cumulative.cache_read_input_tokens = cumulative
+            .cache_read_input_tokens
+            .saturating_add(usage.cache_read_input_tokens);
         self.turns += 1;
     }
 

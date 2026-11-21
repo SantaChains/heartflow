@@ -263,6 +263,9 @@ async fn drive_stream(
                 let _ = tx.send(AgentEvent::MessageStop).await;
                 break;
             }
+            // Unknown event types are already filtered out by `anthropic_event`;
+            // this arm only keeps the match exhaustive.
+            StreamEvent::Unknown => {}
         }
     }
 
