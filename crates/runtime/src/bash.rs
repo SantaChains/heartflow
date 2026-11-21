@@ -582,6 +582,7 @@ fn build_shell_command(wrapped: &str, disable_sandbox: bool) -> TokioCommand {
         scrub_credential_env(command.as_std_mut());
     }
     inject_no_color(command.as_std_mut());
+    inject_headless_env(command.as_std_mut());
     hide_console_window(command.as_std_mut());
     command
 }
@@ -594,6 +595,27 @@ fn build_shell_command(wrapped: &str, disable_sandbox: bool) -> TokioCommand {
 fn inject_no_color(command: &mut std::process::Command) {
     if std::env::var_os("NO_COLOR").is_none() {
         command.env("NO_COLOR", "1");
+    }
+}
+
+/// The non-ConPTY bypass for TTY-dependent child behaviour (2026-11-21 verdict:
+/// ConPTY 正式不采——性能与生命周期成本不成比例，命令级 bypass 覆盖实际痛点）。
+/// Two failure shapes a piped child can hit that NO_COLOR does not cover:
+/// - pager spawns (`less`) blocking on terminal input that never comes;
+/// - credential/interactive prompts (git terminal prompt) hanging until the
+///   idle timeout kills the run. Deterministic fast-fail beats a silent hang.
+///
+/// Operator-set values win (same policy as NO_COLOR): only unset names get a
+/// default, so `PAGER=bat` etc. stay honored.
+fn inject_headless_env(command: &mut std::process::Command) {
+    for (name, value) in [
+        ("PAGER", "cat"),
+        ("GIT_PAGER", "cat"),
+        ("GIT_TERMINAL_PROMPT", "0"),
+    ] {
+        if std::env::var_os(name).is_none() {
+            command.env(name, value);
+        }
     }
 }
 

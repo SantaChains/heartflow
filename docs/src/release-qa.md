@@ -34,7 +34,7 @@ ds4 `QA_BEFORE_RELEASES.md` 纪律的本仓落地（roadmap §4）：每次发�
 - [ ] `bash scripts/release.sh plan`——`released=true`、版本号语义对（`feat:`→minor、`fix:`→patch、`!`/`BREAKING CHANGE:`→major）。
 - [ ] `RELEASE_TAG=<tag> RELEASE_BUMP=<bump> RELEASE_DRY_RUN=1 bash scripts/release.sh publish` 只读预演过（需本地 git-cliff；tag/bump 取 plan 输出，脚本不自动继承）。
 - [ ] push 后核对三条 CI 链：release.yml（发版）、docs.yml（文档站）、ci.yml（外部 PR 质量门）。
-- [ ] Release 资产核对：Windows amd64 zip + `.sha256` + `SHA256SUMS` + SLSA provenance；`bucket/heartflow.json` 的 version/url/hash 由 windows-zip job 确定性回写（CI 是唯一写入者）。
+- [ ] Release 资产核对：Windows amd64 zip + `.sha256` + `SHA256SUMS`；SLSA provenance 经 GitHub attestations API（`gh attestation verify <zip> -R <repo>`），非 release asset；`bucket/heartflow.json` 的 version/url/hash 由 windows-zip job 确定性回写（CI 是唯一写入者）。
 - [ ] publish 中途失败的续发口径：`RELEASE_TAG=<tag> RELEASE_BUMP=<bump> bash scripts/release.sh publish`（重跑整链会因「tag 之后无 feat/fix」短路）。
 
 ## 5. 未闭合残留的显式登记

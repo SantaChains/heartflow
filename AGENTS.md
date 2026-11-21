@@ -152,7 +152,7 @@ CI 有三条链：`release.yml`（发版）、`docs.yml`（文档站，`docs/**`
 - crates.io：裸名 `api/runtime/mcp/tools/store/commands` 已被占用，内部 crate 统一挂 `heartflow-` 前缀发布，`[lib] name` 与源码 `use` 保持不变（靠 `[workspace.dependencies]` 的 `package =` 重命名）。认证走仓库 secret `CRATES_IO_TOKEN`；单 crate 失败自动重试（429 退避），"already uploaded" 幂等跳过；版本一次性，同版本不可重发。
 - 续发：publish 中途失败时 tag 与 Release 已建，重跑整链会因 "tag 之后无 feat/fix" 判 `released=false` 而短路；改用 `RELEASE_TAG=<tag> RELEASE_BUMP=<bump> bash scripts/release.sh publish`。
 - 机器人提交 `chore(release): vX.Y.Z [skip ci]` 自动同步 Cargo.toml/Cargo.lock/CHANGELOG、打 tag、建 Release；勿手工仿写。
-- Windows amd64 便携 zip（`hf.exe` 置于包根 + `.sha256` + `SHA256SUMS` + SLSA provenance）随发布上传；`bucket/heartflow.json` 的 version/url/hash 由 windows-zip job 按 tag 确定性回写（CI 是唯一写入者，哈希取自本地构建产物）。自托管 bucket 无自动更新机器人，故不配 autoupdate 块，仅留 checkver。
+- Windows amd64 便携 zip（`hf.exe` 置于包根 + `.sha256` + `SHA256SUMS`）随发布上传；SLSA provenance **不在 release assets 里**——`attest-build-provenance@v4`（release.yml）把它存进仓库 attestations API，用 `gh attestation verify <zip> -R <repo>` 验证（2026-11-21 澄清：此前文档误写为随发布上传的资产）。`bucket/heartflow.json` 的 version/url/hash 由 windows-zip job 按 tag 确定性回写（CI 是唯一写入者，哈希取自本地构建产物）。自托管 bucket 无自动更新机器人，故不配 autoupdate 块，仅留 checkver。
 - git-cliff 版本钉在 `.github/actions/install-git-cliff/action.yml`（模板引擎行为随版本变动，升级须显式改并先过本地 dry-run）。所有 action 按 SHA 固定。
 
 ## 其他

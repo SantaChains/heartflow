@@ -281,7 +281,7 @@ pandacode 的「无递归文件 watcher、无后台轮询、bounded transcript �
 
 1. **windows-registry 写侧——系统代理回写（§3 读侧的镜像，中收益中风险）**：0.100 提供 `set_*` API，可补「hf 设置系统代理」方向（现只读）。风险：写注册表是用户可见副作用，须显式开关 + 原值备份回滚；Clash/V2Ray 同时运行时行为需实测。
 2. **Windows 原子写语义核验（小步、低风险，可先做）**：`std::fs::rename` 在 Windows 映射 `MoveFileExW(REPLACE_EXISTING)`，NTFS 上原子、跨卷报错——temp 与目标同目录已保证同卷。可选增强：rename 前对 temp 句柄 `sync_all()`（FlushFileBuffers 等价）缩崩溃窗口。前置：`store/tests/io_correctness.rs` 加 Windows 专项（kill 进程于 rename 前后）。
-3. **ConPTY 给 bash 工具挂伪终端（高成本，触发条件制）**：管道捕获下依赖 TTY 的子程序（分页器、颜色、进度条）行为退化。windows-sys `Win32_System_Console` 的 `CreatePseudoConsole` + `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` 可挂真伪终端。成本：会话生命周期管理、管道与 ConPTY 并存的双读死锁风险、输出含 VT 序列需下游过滤。**触发条件**：出现实际「无 TTY 行为异常」的命令案例再动；短期用 `--no-pager`/`--color=never` 注入规避（`bash.rs:591` 已有 TERM 处理）。
+3. **ConPTY 给 bash 工具挂伪终端——正式不采（2026-11-21 用户定夺）**：管道捕获下依赖 TTY 的子程序（分页器、颜色、进度条）行为退化。windows-sys `Win32_System_Console` 的 `CreatePseudoConsole` + `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` 可挂真伪终端，但性能与生命周期成本不成比例（性能上限明显、会话管理/双读死锁/VT 序列过滤三重复杂度），且实际痛点已被命令级 bypass 覆盖：`bash.rs` `inject_headless_env` 注入 `PAGER=cat`/`GIT_PAGER=cat`（分页器不再阻塞）与 `GIT_TERMINAL_PROMPT=0`（凭据交互确定性快败而非挂到超时），连同既有 `NO_COLOR`（`inject_no_color`）——操作员显式设置的值一律优先。**触发条件制撤销**：除非未来出现 bypass 覆盖不了的交互式程序刚需（REPL 式工具接入），不再评估。
 4. **windows-sys 版本收敛（不做）**：fd-lock 4 锁 0.59，等 fd-lock 上游升级自然收敛到 0.61+；主动动收益为零。
 
-**对齐结论**：本仓 Windows 面现状已经过实战（代理读侧、CREATE_NO_WINDOW、fd-lock、io_correctness 测试套），与 windows-rs 家族**无需要对齐的缺口**；上述 1/2 是自然延伸，3 是触发条件制的储备项。
+**对齐结论**：本仓 Windows 面现状已经过实战（代理读侧、CREATE_NO_WINDOW、fd-lock、io_correctness 测试套），与 windows-rs 家族**无需要对齐的缺口**；上述 1/2 是自然延伸，3 已定夺不采（bypass 落地），4 不做。
