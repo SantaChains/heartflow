@@ -394,7 +394,7 @@ pub(crate) fn usage_line(
                 price_out,
             );
             segments.push(format!(
-                "{} turn / {} session",
+                "{} req / {} session",
                 fmt_cost(turn_cost),
                 fmt_cost(session_cost)
             ));
@@ -405,7 +405,10 @@ pub(crate) fn usage_line(
 
 /// Cost estimate at USD-per-Mtok prices, charging every input token (cached or
 /// not) at the input price: cache discounts differ per provider, and ignoring
-/// the discount is the honest baseline rather than a guessed ratio.
+/// the discount is the honest baseline rather than a guessed ratio. The "req"
+/// label on the per-side segment is deliberate: `latest_turn` covers only the
+/// last API request of a turn (tool loops issue several), while "session" sums
+/// every request via the cumulative tracker.
 fn estimate_cost(context_input: u32, output: u32, price_in: f64, price_out: f64) -> f64 {
     (u64::from(context_input) as f64 * price_in + u64::from(output) as f64 * price_out)
         / 1_000_000.0
@@ -553,9 +556,6 @@ pub(crate) async fn run_turn_interactive(
                     format!("· session saved to {}", path.display()).with(turn.theme.muted())
                 );
             }
-            // Command-finish boundary (failure): closes the B/C opened at submit.
-            let _ = write!(stdout, "\x1b]133;D;1\x07");
-            let _ = stdout.flush();
             return Ok(TurnOutcome {
                 ok: false,
                 tool_errors: 0,
@@ -593,10 +593,6 @@ pub(crate) async fn run_turn_interactive(
             format!("· session save failed: {error}").with(turn.theme.error())
         );
     }
-    // Command-finish boundary (success): closes the B/C opened at submit so
-    // terminal shell integration sees the turn as a completed command.
-    let _ = write!(stdout, "\x1b]133;D;0\x07");
-    let _ = stdout.flush();
     Ok(outcome)
 }
 

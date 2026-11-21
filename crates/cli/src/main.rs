@@ -1104,6 +1104,10 @@ async fn run_repl(
                     run_turn_interactive(state, &mut runtime, trimmed, Some(&mut prompter)).await?
                 };
                 editor.note_turn(outcome.ok);
+                // Command-finish boundary, submission-grained: one B per
+                // submitted line (editor.rs) pairs with exactly one D here,
+                // no matter how many turns/requests that line produced.
+                editor::osc133(if outcome.ok { "D;0" } else { "D;1" });
                 // Loop mode: after a kickoff turn, drive the single active
                 // mission to a terminal state autonomously (criteria
                 // unsatisfied -> next turn; blocked 3-consecutive -> stop).
@@ -1572,6 +1576,12 @@ fn reload_config(
             Ok(rebuilt) => {
                 *runtime = rebuilt;
                 *selection = next;
+                // The usage line's price mirror follows the swap: a config-edited
+                // model change must not keep showing the old cost segment.
+                set_display_price(
+                    state,
+                    active_model_price(selection, &load_catalog(&home_dir())),
+                );
                 // The proxy resolution is process-global; re-init it so an
                 // edited `[proxy]` table takes effect without a restart.
                 proxy::init_global(load_merged_settings(cwd, &home_dir()).proxy.as_ref());
@@ -2688,7 +2698,7 @@ mod tests {
             Some((0.28, 1.10)),
             StatusConfig::default(),
         );
-        assert!(line.contains("$0.83 turn / $0 session"), "{line}");
+        assert!(line.contains("$0.83 req / $0 session"), "{line}");
         // Sub-cent costs keep four decimals; unpriced models omit the segment.
         let tiny = TokenUsage {
             input_tokens: 1_000,
@@ -2697,7 +2707,7 @@ mod tests {
             cache_read_input_tokens: 0,
         };
         let line = usage_line(&tiny, &tiny, 0, Some((0.28, 1.10)), StatusConfig::default());
-        assert!(line.contains("$0.0004 turn / $0.0004 session"), "{line}");
+        assert!(line.contains("$0.0004 req / $0.0004 session"), "{line}");
         assert!(!usage_line(&tiny, &tiny, 0, None, StatusConfig::default()).contains('$'));
     }
 

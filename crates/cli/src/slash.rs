@@ -1951,6 +1951,8 @@ async fn handle_bootstrap_command(
     };
     *runtime = rebuilt;
     *selection = next;
+    // Price mirror follows the swap (same discipline as /model and /provider).
+    set_display_price(state, active_model_price(selection, _catalog));
     println!("bootstrap complete -> model {}", selection.model());
     println!("memory carried over: MEMORY.md is model-agnostic and re-read every turn.");
     if let ProviderSelection::Profile(profile) = selection {
