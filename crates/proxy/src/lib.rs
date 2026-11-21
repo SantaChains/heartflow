@@ -261,10 +261,7 @@ impl ProxyResolution {
             }
         }
         if picked.is_none() {
-            // Windows-only: Linux test builds would otherwise hit a missing
-            // `system::read` (E0425) — the `test` limb here has no benefit,
-            // Windows test builds are already covered by the `windows` limb.
-            #[cfg(windows)]
+            #[cfg(any(windows, test))]
             if let Some(system) = system::read() {
                 warnings.extend(system.warnings);
                 picked = Some((system.url, ProxySource::System, system.no_proxy));

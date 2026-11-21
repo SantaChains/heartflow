@@ -53,6 +53,15 @@ pub(super) fn read() -> Option<SystemProxy> {
     })
 }
 
+/// Non-Windows test builds have no `WinINET` to read, but the resolution call
+/// site is compiled under `cfg(test)` too: keep it compilable with a stub that
+/// never reports a system proxy, so the platform-free parsing tests below stay
+/// runnable on every OS.
+#[cfg(all(not(windows), test))]
+pub(super) fn read() -> Option<SystemProxy> {
+    None
+}
+
 /// Pick the proxy URL out of a `ProxyServer` value.
 ///
 /// `host:port` (no `=`) is the whole value; a per-protocol list prefers
