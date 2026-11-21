@@ -606,6 +606,53 @@ pub fn persist_discovered(
     atomic_write(&path, &persisted.to_toml_string())
 }
 
+/// Write the just-applied `/provider`/`/model` switch back into the user-layer
+/// `config.toml` (`[provider]` table) so it survives restart. Comment- and
+/// layout-preserving via `toml_edit`: only `name` (when a provider switch is
+/// given) and `model` inside `[provider]` are set; every other table, comment,
+/// and key order stays untouched. A missing file is created holding just the
+/// table. Never touches base_url/api_key: builtins resolve those from their
+/// compiled-in table, and hand-tuned endpoints must not be overwritten.
+///
+/// # Errors
+/// Fails when the file exists but is not valid TOML, or the atomic write
+/// fails (same temp-then-rename semantics as [`persist_model`]).
+pub fn persist_selection(home: &Path, provider: Option<&str>, model: &str) -> std::io::Result<()> {
+    let path = home.join(".heartflow").join("config.toml");
+    let mut doc = match fs::read_to_string(&path) {
+        Ok(text) => text.parse::<toml_edit::DocumentMut>().map_err(|error| {
+            std::io::Error::other(format!("{} is not valid TOML: {error}", path.display()))
+        })?,
+        // Absent file: a fresh document that renders as only the one table.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => toml_edit::DocumentMut::new(),
+        Err(error) => return Err(error),
+    };
+    let root = doc.as_table_mut();
+    let table = match root.get_mut("provider") {
+        Some(toml_edit::Item::Table(table)) => table,
+        // Missing, or a malformed non-table `[provider]` (a bare value where a
+        // table belongs): create a fresh table — the switch writes must land,
+        // and there is no sane repair for a scalar masquerading as a table.
+        _ => {
+            root.insert("provider", toml_edit::Item::Table(toml_edit::Table::new()));
+            match root.get_mut("provider") {
+                Some(toml_edit::Item::Table(table)) => table,
+                // Unreachable: insert just replaced the entry with a Table.
+                _ => {
+                    return Err(std::io::Error::other(
+                        "cannot normalize the [provider] table in config.toml",
+                    ))
+                }
+            }
+        }
+    };
+    if let Some(name) = provider {
+        table.insert("name", toml_edit::value(name));
+    }
+    table.insert("model", toml_edit::value(model));
+    atomic_write(&path, &doc.to_string())
+}
+
 /// Write via a sibling temp file then rename over the target, so a crash never
 /// leaves a truncated catalog. Same temp-then-rename shape and retry semantics
 /// as `session.rs::save_to_path`.
@@ -890,6 +937,52 @@ mod tests {
             .find(|model| model.id == "deepseek-v4-flash")
             .expect("recorded model present");
         assert_eq!(recorded.source, ModelSource::Discovered);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn persist_selection_creates_updates_and_preserves_comments() {
+        let home = std::env::temp_dir().join(format!("hf-selection-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        // Absent file: created holding just the written table.
+        persist_selection(&home, Some("deepseek"), "deepseek-v4-flash")
+            .expect("create on first switch");
+        let text = fs::read_to_string(home.join(".heartflow").join("config.toml"))
+            .expect("config written");
+        let table: toml::Table = toml::from_str(&text).expect("rendered toml parses");
+        assert_eq!(table["provider"]["name"].as_str(), Some("deepseek"));
+        assert_eq!(
+            table["provider"]["model"].as_str(),
+            Some("deepseek-v4-flash")
+        );
+
+        // Existing file with comments, a model-only switch, and an unrelated
+        // table: only the model line moves; comments and [mcp] stay intact.
+        let existing = "# my key comment\n[provider]\nname = \"deepseek\" # inline\nmodel = \"old\"\n\n[mcp]\nserver = \"x\"\n";
+        let config = home.join(".heartflow").join("config.toml");
+        fs::write(&config, existing).expect("seed config");
+        persist_selection(&home, None, "deepseek-v4-pro").expect("model-only switch");
+        let updated = fs::read_to_string(&config).expect("config re-read");
+        assert!(updated.contains("# my key comment"));
+        assert!(updated.contains("name = \"deepseek\" # inline"));
+        assert!(updated.contains("[mcp]"));
+        assert!(updated.contains("server = \"x\""));
+        assert!(updated.contains("model = \"deepseek-v4-pro\""));
+        assert!(!updated.contains("model = \"old\""));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn persist_selection_rejects_invalid_toml() {
+        let home = std::env::temp_dir().join(format!("hf-selection-bad-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join(".heartflow")).expect("mkdir");
+        fs::write(
+            home.join(".heartflow").join("config.toml"),
+            "not [valid toml",
+        )
+        .expect("seed broken config");
+        assert!(persist_selection(&home, Some("deepseek"), "m").is_err());
         let _ = fs::remove_dir_all(&home);
     }
 

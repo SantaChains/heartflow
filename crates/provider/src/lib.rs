@@ -15,5 +15,5 @@ pub use config::{
 };
 pub use load::{
     catalog_file_paths, catalog_write_path, default_catalog, load_catalog, persist_discovered,
-    persist_model, CatalogModel, CatalogProvider, ModelSource, ProviderCatalog,
+    persist_model, persist_selection, CatalogModel, CatalogProvider, ModelSource, ProviderCatalog,
 };

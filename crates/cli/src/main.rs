@@ -51,9 +51,9 @@ use config::{load_merged_mcp, load_provider_selection, ConfigWatcher};
 use core::{guide_context, guide_draft, HeartModel};
 use provider::{
     builtin_base_url, load_catalog, load_merged_settings, persist_discovered, persist_model,
-    AnthropicStreamClient, CassetteClient, CassetteMode, CatalogModel, ModelSource,
-    ProviderCatalog, ProviderProtocol, ProviderSelection, ProviderSettings, TransportClient,
-    CONFIG_VERSION,
+    persist_selection, AnthropicStreamClient, CassetteClient, CassetteMode, CatalogModel,
+    ModelSource, ProviderCatalog, ProviderProtocol, ProviderSelection, ProviderSettings,
+    TransportClient, CONFIG_VERSION,
 };
 use render::TerminalRenderer;
 // Persistence subsystem (Phase 1 thinning): re-exported crate-wide so existing
@@ -3040,6 +3040,22 @@ fn handle_provider_command(
             *runtime = rebuilt;
             *selection = next;
             println!("provider -> {name} (model {})", selection.model());
+            // Persist so the switch survives restart (user config.toml
+            // `[provider]` name/model, comment-preserving), plus the catalog
+            // record `/model` keeps for listings and completion.
+            if let ProviderSelection::Profile(profile) = selection {
+                if let Err(error) = persist_model(
+                    &home_dir(),
+                    &profile.base_url,
+                    profile.protocol,
+                    &profile.model,
+                    profile.context_window.map(u64::from),
+                    ModelSource::User,
+                ) {
+                    println!("(could not record model in catalog: {error})");
+                }
+            }
+            persist_active_selection(selection, Some(name));
         }
         Err(error) => println!("failed to switch provider: {error}"),
     }
@@ -3118,8 +3134,35 @@ fn handle_model_command(
                     println!("(could not record model in catalog: {error})");
                 }
             }
+            // Also write the model into the user config.toml so the switch
+            // survives restart, same as `/provider` does for provider+model.
+            persist_active_selection(selection, None);
         }
         Err(error) => println!("failed to switch model: {error}"),
+    }
+}
+
+/// Write the just-applied switch back into the user-layer config.toml
+/// (`provider::persist_selection`, toml_edit comment-preserving). `/provider`
+/// passes the provider name so a builtin switch pins itself; `/model` passes
+/// `None` so only the model line moves. Best-effort: a failure prints but
+/// never aborts the already-applied switch.
+fn persist_active_selection(selection: &ProviderSelection, provider: Option<&str>) {
+    let model = selection.model().to_string();
+    if let Err(error) = persist_selection(&home_dir(), provider, &model) {
+        println!("(could not persist switch to config.toml: {error})");
+        return;
+    }
+    // A project-layer config wins per field over the user layer, so a
+    // `[provider]` table there would silently override what was just written —
+    // say so instead of letting the next launch surprise the user.
+    let project = cwd_dir().join(".heartflow").join("config.toml");
+    let overrides = fs::read_to_string(project)
+        .ok()
+        .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+        .is_some_and(|table| table.contains_key("provider"));
+    if overrides {
+        println!("(note: .heartflow/config.toml [provider] in this directory overrides the persisted switch)");
     }
 }
 

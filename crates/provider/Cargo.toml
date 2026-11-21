@@ -21,6 +21,10 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync"] }
 toml = "1.1"
+# Comment-preserving TOML surgery for `persist_selection`: /provider and
+# /model write back only the two keys they own while every other table,
+# comment, and key order in the user's config.toml stays byte-identical.
+toml_edit = "0.25"
 tracing = "0.1"
 
 [dev-dependencies]
