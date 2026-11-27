@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "1.6.1"
+version = "1.7.0"
 edition = "2021"
 # MSRV 由 2026-11 工具链升级抬升到 1.95:windows-registry 0.100 要求 rustc 1.95,
 # std 的 Atomic::try_update(取代已废弃的 fetch_update)同样 1.95 稳定。声明后可让
@@ -18,14 +18,14 @@ publish = true
 # 靠依赖重命名(package =)保住各 crate 内 use 语句不变;下方 version req 由
 # release.sh publish 时随根版本同步改写(cargo publish 要求 path 依赖带 req)
 [workspace.dependencies]
-api = { package = "heartflow-api", version = "1.6.1", path = "crates/api" }
-commands = { package = "heartflow-commands", version = "1.6.1", path = "crates/commands" }
-mcp = { package = "heartflow-mcp", version = "1.6.1", path = "crates/mcp" }
-proxy = { package = "heartflow-proxy", version = "1.6.1", path = "crates/proxy" }
-provider = { package = "heartflow-provider", version = "1.6.1", path = "crates/provider" }
-runtime = { package = "heartflow-runtime", version = "1.6.1", path = "crates/runtime" }
-store = { package = "heartflow-store", version = "1.6.1", path = "crates/store" }
-tools = { package = "heartflow-tools", version = "1.6.1", path = "crates/tools" }
+api = { package = "heartflow-api", version = "1.7.0", path = "crates/api" }
+commands = { package = "heartflow-commands", version = "1.7.0", path = "crates/commands" }
+mcp = { package = "heartflow-mcp", version = "1.7.0", path = "crates/mcp" }
+proxy = { package = "heartflow-proxy", version = "1.7.0", path = "crates/proxy" }
+provider = { package = "heartflow-provider", version = "1.7.0", path = "crates/provider" }
+runtime = { package = "heartflow-runtime", version = "1.7.0", path = "crates/runtime" }
+store = { package = "heartflow-store", version = "1.7.0", path = "crates/store" }
+tools = { package = "heartflow-tools", version = "1.7.0", path = "crates/tools" }
 
 # Shipped binaries were being built with rustc's defaults: no LTO, 16 codegen
 # units, DWARF left in. These profiles are the single largest runtime/startup

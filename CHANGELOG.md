@@ -1,4 +1,39 @@
 
+# heartflow 1.7.0 - 2026-11-27
+
+## 其他
+
+- 会话持久化取证、诊断毒锁降级与设计文档定稿 (`1112a1f`)
+
+- :rendered_system_prompt过滤内部标记，cassette回放比较仍用原始分段不受影响，新增回归测试 (`3fed8b6`)
+
+- Other @ _ → other（redundant_pattern） (`580185d`)
+
+
+## 新功能
+
+- **cli**: 会话活跃段写端与全链计时(P1)：段格式v2带毫秒时间戳与撕裂尾修复、SessionJournal/DiskJournal 回合内追加、工具/回合/会话耗时入 usage 行与 doctor (`3af1eee`)
+
+- **runtime**: 会话压缩归档(P0)：丢弃区随 CompactionResult 返回、runtime 缓冲审计、archive/<id>/ 记录+manifest、调用点先归档后存快照、doctor 统计 (`29b9eb2`)
+
+- **editor**: Ctrl+R 增量子串历史搜索——FuzzySearch{query,draft,idx} 状态机(fuzzy_ctrl_r/handle_fuzzy_key/fuzzy_show/fuzzy_restore):草稿暂存 Esc 还原,输入即时增量匹配,↑/↓ 或重复 Ctrl+R 新旧遍历,其余键退出搜索保留命中行进正常处理;History 补 search_contains_backward/forward(大小写不敏感子串,空查询不命中);不带 nucleo(500 条上限线性扫描足够,免依赖) (`49138e8`)
+
+- **cli**: /sessions 过滤与 /open 主题匹配——新增 session_topic(首条用户消息折叠截断 96 字符,坏文件降级 None);/sessions [FILTER] 大小写不敏感过滤主题,列表行改为「N. 主题 (路径)」(裸 id.json 不可读);/open N|TOPIC 非数字参数按开场消息匹配,唯一命中直接打开、多个命中列出编号;同步 AGENTS REPL 清单/README/docs repl.md/bucket notes,重新生成 llms (`6a3ae08`)
+
+- **cli**: 回合失败兜底 hint——error.hint() 缺省时补一行通用分诊提示(查 API key/代理 hf doctor,或 /provider 换端点),失败不再死路 (`1e6a2ef`)
+
+- **provider**: /provider 与 /model 切换跨启动持久化——persist_selection 用 toml_edit 注释保留式写回用户层 config.toml [provider] name/model(只动两键,其余表/注释/键序字节不变;缺文件建表;非表 [provider] 归一化为 io 错误不 panic);/provider 成功分支补 catalog record(对齐 /model)+config 写回,/model 同步 config 写回;项目层 config.toml 带 [provider] 覆盖时打印提示;带注释保留/坏 TOML 拒绝两测试 (`b70055b`)
+
+- **bash**: TTY 依赖 bypass——inject_headless_env 注入 PAGER/GIT_PAGER=cat 与 GIT_TERMINAL_PROMPT=0(操作员显式值优先),分页器不再阻塞、凭据交互确定性快败;ConPTY 正式不采(deferred §11 定夺记录);SLSA 文档偏差澄清——provenance 经 attestations API(gh attestation verify)而非 release asset (`fbd16e3`)
+
+
+## 缺陷修复
+
+- **cli**: 双光标与 CJK 错位——caret 停靠列用 tui-textarea 字符数而非显示宽,宽字符(中文/emoji)光标落在文本中间反色格(读作第二个光标)且 IME 锚点漂移;REPL/TUI 两路径统一走 display_col(显示宽换算,参照 maki input/layout.rs 的 char_width 映射);edit_loop 帧包 Begin/EndSynchronizedUpdate(maki present.rs 纪律),WT 下 diff 写入的中间光标位置不再闪现为第二光标 (`2570f37`)
+
+- **editor**: 双参数命令补全吞掉第一个参数——apply_completion 重建缓冲区丢弃 prior,补全第二个参数后 '/provider zhipu' 退化成 '/provider <model>',首个参数被删且第二个参数顶到第一位;补上 prior 段并加回归测试 (`649f6b7`)
+
+
 # heartflow 1.6.1 - 2026-11-21
 
 ## 缺陷修复
