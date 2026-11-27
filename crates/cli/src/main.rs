@@ -311,7 +311,7 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
             {
                 if let Some(command) = command {
                     // One-shot slash command run against the saved session, then exit.
-                    resume_session(&session_path, &command);
+                    resume_session(&state, &session_path, &command);
                     return Ok(false);
                 }
                 // No --run: reopen the interactive REPL with the conversation restored.
@@ -732,7 +732,7 @@ async fn run_models(
     Ok(())
 }
 
-fn resume_session(session_path: &Path, command: &str) {
+fn resume_session(state: &SessionShared, session_path: &Path, command: &str) {
     let session = match load_saved_session(session_path) {
         Ok(session) => session,
         Err(error) => {
@@ -740,6 +740,9 @@ fn resume_session(session_path: &Path, command: &str) {
             process::exit(1);
         }
     };
+    // Continue this transcript in place: the archive written below must land
+    // under the same conversation id the snapshot uses.
+    adopt_session_path(state, session_path);
     if !command.starts_with('/') {
         eprintln!("unsupported resumed command: {command}");
         process::exit(2);
@@ -759,6 +762,8 @@ fn resume_session(session_path: &Path, command: &str) {
         eprintln!("unknown slash command: {command}{hint}");
         process::exit(2);
     };
+    // Archive the compaction's dropped region before the snapshot overwrite.
+    archive_audits(state, result.audit);
     if let Err(error) = result.session.save_to_path(session_path) {
         eprintln!("failed to persist resumed session: {error}");
         process::exit(1);
@@ -1798,6 +1803,9 @@ fn maybe_auto_compact(state: &SessionShared, runtime: &mut AgentRuntime) {
     }
     if runtime.should_compact(config) {
         let result = runtime.compact(config);
+        // The dropped region now lives only in the runtime buffer; archive it
+        // before the next snapshot save replaces the transcript.
+        archive_pending(state, runtime);
         note_mirror_rewrite(state);
         println!(
             "auto-compacted {} older messages into a summary (context pressure).",

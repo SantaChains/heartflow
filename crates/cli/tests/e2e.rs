@@ -74,6 +74,35 @@ fn compact_resume_round_trip() {
     let session = load(&path);
     fs::remove_file(&path).ok();
 
+    // The dropped region is archived beside the snapshot before the overwrite:
+    // one record file plus one manifest line, tagged with the manual reason.
+    let id = path
+        .file_stem()
+        .expect("temp session has a stem")
+        .to_string_lossy()
+        .into_owned();
+    let archive = path
+        .parent()
+        .expect("temp session has a parent")
+        .join("archive")
+        .join(&id);
+    let record_path = archive.join("0001.json");
+    assert!(
+        record_path.exists(),
+        "dropped messages must be archived at {}",
+        record_path.display()
+    );
+    let record: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record_path).expect("record readable"))
+            .expect("record is JSON");
+    assert_eq!(record["removed"], 2);
+    assert_eq!(record["reason"], "manual");
+    assert_eq!(record["epoch"], 1);
+    let manifest =
+        fs::read_to_string(archive.join("manifest.jsonl")).expect("manifest should exist");
+    assert_eq!(manifest.lines().count(), 1, "one line per compaction");
+    fs::remove_dir_all(&archive).ok();
+
     // Four recent turns survive verbatim behind one system summary.
     assert_eq!(session.messages.len(), 5);
     assert_eq!(session.messages[0].role, runtime::MessageRole::System);

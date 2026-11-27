@@ -557,6 +557,9 @@ pub(crate) async fn run_turn_interactive(
                     );
                 }
             }
+            // Archive the compaction's dropped region before the snapshot
+            // overwrites the transcript (the snapshot is the only other copy).
+            crate::storage::archive_pending(state, runtime);
             if let Ok(path) = save_session_async(state, runtime.session()).await {
                 println!(
                     "{}",
@@ -591,6 +594,9 @@ pub(crate) async fn run_turn_interactive(
             println!("{}", line.with(turn.theme.muted()));
         }
     }
+    // Archive before the snapshot: compaction dropped the region in memory and
+    // the save below makes the compacted transcript the only copy.
+    crate::storage::archive_pending(state, runtime);
     // Silent-save discipline: a successful turn saves without a line (the
     // path is knowable via /status, /sessions and the exit resume hint); only
     // a failed save earns a warning, because that is the anomaly.

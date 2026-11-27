@@ -357,6 +357,9 @@ pub(crate) async fn handle_bang_command(state: &SessionShared, mode: &str, input
 /// still too short to have anything to compact.
 fn force_compact(state: &SessionShared, runtime: &mut AgentRuntime) {
     let result = runtime.compact_now(runtime.compaction());
+    // Archive before the next snapshot save (the compacted transcript is the
+    // only other copy once the snapshot is rewritten).
+    crate::storage::archive_pending(state, runtime);
     if result.removed_message_count == 0 {
         println!("nothing to compact: session is within the preserve window.");
     } else {

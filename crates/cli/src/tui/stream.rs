@@ -433,6 +433,9 @@ where
                 };
                 // With the runtime back in hand, persist the turn — success or
                 // failure, the transcript on disk stays the source of truth.
+                // Archive any compaction's dropped region first: the snapshot
+                // save below makes the compacted transcript the only copy.
+                crate::storage::archive_pending(&states[section], &mut runtime);
                 let save_note = match save.save(&states[section], runtime.session()).await {
                     Ok(path) => format!("saved {}", path.display()),
                     Err(_) => String::from("save failed"),

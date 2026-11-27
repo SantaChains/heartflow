@@ -120,6 +120,50 @@ pub(crate) fn run_doctor(fix: bool) -> Result<Vec<String>, Box<dyn std::error::E
         }
     }
 
+    // Compaction archive: every dropped region is supposed to have a record
+    // file plus one manifest line. Orphan counts expose the only inconsistency
+    // a failed append can leave (record without index entry, or vice versa).
+    let archive = crate::storage::archive_stats();
+    if archive.files == 0 {
+        println!("  ok   archive: no compaction archives yet");
+    } else {
+        let last = match archive.latest_ts {
+            Some(ts) => {
+                let secs = runtime::epoch_ms().saturating_sub(ts) / 1_000;
+                if secs < 90 {
+                    format!("{secs}s ago")
+                } else if secs < 5_400 {
+                    format!("{}m ago", secs / 60)
+                } else if secs < 172_800 {
+                    format!("{}h ago", secs / 3_600)
+                } else {
+                    format!("{}d ago", secs / 86_400)
+                }
+            }
+            None => String::from("unknown"),
+        };
+        println!(
+            "  {} archive: {} session(s), {} file(s), {} KiB, last {}{}",
+            if archive.orphans > 0 { "warn" } else { "ok" },
+            archive.sessions,
+            archive.files,
+            archive.bytes / 1_024,
+            last,
+            if archive.orphans > 0 {
+                format!(", {} orphan(s)", archive.orphans)
+            } else {
+                String::new()
+            }
+        );
+        if archive.orphans > 0 {
+            problems.push(format!(
+                "{} compaction archive orphan(s) under {} - a record file has no manifest line or vice versa",
+                archive.orphans,
+                crate::storage::archive_dir().display()
+            ));
+        }
+    }
+
     // §6 checkpoints: a snapshot failure means a write-class tool mutated the
     // project without a restore point. Degrade-but-count policy, surfaced here
     // so a persistently broken git setup is visible instead of silent.

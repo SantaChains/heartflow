@@ -141,36 +141,16 @@ impl Session {
     /// is retried three times first). The temp file is removed on failure.
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), SessionError> {
         let path = path.as_ref();
+        if path.file_name().is_none() {
+            return Err(SessionError::Format(
+                "session path has no file name".to_string(),
+            ));
+        }
         // simd-json's SIMD string classification dominates serde_json on the
         // MB-scale transcripts this writes every turn.
         let payload = simd_json::serde::to_string_pretty(self)
             .map_err(|error| SessionError::Format(error.to_string()))?;
-        let temp = match path.file_name() {
-            Some(name) => path.with_file_name(format!(
-                ".{}.tmp-{}",
-                name.to_string_lossy(),
-                std::process::id()
-            )),
-            None => {
-                return Err(SessionError::Format(
-                    "session path has no file name".to_string(),
-                ))
-            }
-        };
-        if let Err(error) = fs::write(&temp, &payload) {
-            let _ = fs::remove_file(&temp);
-            return Err(error.into());
-        }
-        // Owner-only before the rename (mode survives it): the transcript is
-        // the most sensitive surface hf writes (security.dev.md D9).
-        crate::private_fs::harden_file(&temp);
-        match rename_with_transient_retry(&temp, path) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                let _ = fs::remove_file(&temp);
-                Err(error.into())
-            }
-        }
+        write_atomic(path, payload.as_bytes()).map_err(SessionError::from)
     }
 
     /// Load a session snapshot saved by [`Self::save_to_path`], skipping a
@@ -267,6 +247,42 @@ impl Session {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { version, messages })
+    }
+}
+
+/// Atomically replace `path` with `bytes`: write a sibling temp file, tighten
+/// its permissions, then rename over the target (retrying the transient
+/// Windows `PermissionDenied` window). Shared by the session snapshot and the
+/// compaction archive — both are sensitive JSON surfaces that must never be
+/// left truncated by a crash.
+///
+/// # Errors
+/// Fails when the path has no file name, the temp write fails, or the rename
+/// fails for a non-transient reason. The temp file is removed on failure.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let temp = match path.file_name() {
+        Some(name) => path.with_file_name(format!(
+            ".{}.tmp-{}",
+            name.to_string_lossy(),
+            std::process::id()
+        )),
+        None => {
+            return Err(std::io::Error::other("path has no file name"));
+        }
+    };
+    if let Err(error) = fs::write(&temp, bytes) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    // Owner-only before the rename (mode survives it): the transcript and the
+    // archive are the most sensitive surfaces hf writes (security.dev.md D9).
+    crate::private_fs::harden_file(&temp);
+    match rename_with_transient_retry(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            Err(error)
+        }
     }
 }
 

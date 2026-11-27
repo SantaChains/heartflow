@@ -491,6 +491,12 @@ impl Default for CompactionConfig {
 pub struct CompactionResult {
     pub summary: String,
     pub removed_message_count: usize,
+    /// Messages folded into the summary and dropped from the transcript.
+    /// Moved, never cloned: the caller archives them before the snapshot is
+    /// rewritten (see the session-persistence design, archive step P0).
+    pub dropped: Vec<ConversationMessage>,
+    /// Which threshold fired; archived with `dropped` as the reason tag.
+    pub trigger: ThresholdKind,
 }
 
 #[must_use]
@@ -742,6 +748,8 @@ pub fn compact_session_in_place_with(
         return CompactionResult {
             summary: String::new(),
             removed_message_count: 0,
+            dropped: Vec::new(),
+            trigger,
         };
     }
 
@@ -816,6 +824,8 @@ pub fn compact_session_in_place_with(
     let result = CompactionResult {
         summary,
         removed_message_count: to_summarize.len(),
+        dropped: to_summarize,
+        trigger,
     };
 
     record_compact_event(&compact_event_for(
@@ -867,10 +877,27 @@ fn compact_event_for(
 const SUMMARY_MIN_CHARS: usize = 80;
 const SUMMARY_MAX_CHARS: usize = 240;
 
+/// Header prefix of the continuation message a prior compaction installed.
+/// Such a message is a replacement, not conversation content: summarizing it
+/// again nests old summaries and burns tokens on plumbing.
+const CONTINUATION_PREFIX: &str = "This session is being continued from a previous conversation";
+
+fn is_continuation_message(message: &ConversationMessage) -> bool {
+    message.role == MessageRole::System
+        && message.blocks.iter().any(|block| match block {
+            ContentBlock::Text { text } => text.starts_with(CONTINUATION_PREFIX),
+            _ => false,
+        })
+}
+
 fn summarize_messages(messages: &[ConversationMessage]) -> String {
     let mut lines = vec!["<summary>".to_string(), "Conversation summary:".to_string()];
-    let total = messages.len().max(1);
-    for (index, message) in messages.iter().enumerate() {
+    let kept: Vec<&ConversationMessage> = messages
+        .iter()
+        .filter(|message| !is_continuation_message(message))
+        .collect();
+    let total = kept.len().max(1);
+    for (index, message) in kept.iter().enumerate() {
         let role = match message.role {
             MessageRole::System => "system",
             MessageRole::User => "user",
@@ -1029,11 +1056,12 @@ fn collapse_blank_lines(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_event_for, compact_session_in_place, compaction_stats, estimate_session_tokens,
-        estimate_text_tokens, format_compact_summary, get_compact_continuation_message,
-        is_context_overflow_error, plan_compaction_cut, read_stats_file, record_compact_event,
-        record_repair_drops, set_compact_stats_path, should_compact, should_compact_with_estimate,
-        CompactEvent, CompactionConfig, SoftTrigger, ThresholdKind, TokenCalibration,
+        compact_event_for, compact_session_in_place, compact_session_in_place_with,
+        compaction_stats, estimate_session_tokens, estimate_text_tokens, format_compact_summary,
+        get_compact_continuation_message, is_context_overflow_error, plan_compaction_cut,
+        read_stats_file, record_compact_event, record_repair_drops, set_compact_stats_path,
+        should_compact, should_compact_with_estimate, CompactEvent, CompactionConfig, SoftTrigger,
+        ThresholdKind, TokenCalibration, CONTINUATION_PREFIX,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
@@ -1171,6 +1199,65 @@ mod tests {
         assert_eq!(result.removed_message_count, 0);
         assert_eq!(session, original);
         assert_eq!(result.summary, "");
+    }
+
+    #[test]
+    fn dropped_region_is_returned_for_archiving() {
+        let mut session = Session {
+            version: 1,
+            messages: vec![
+                ConversationMessage::user_text("old-one"),
+                ConversationMessage::user_text("old-two"),
+                ConversationMessage::user_text("recent"),
+            ],
+        };
+        let result = compact_session_in_place_with(
+            &mut session,
+            CompactionConfig {
+                preserve_recent_messages: 1,
+                ..CompactionConfig::default()
+            },
+            ThresholdKind::AbsoluteMax,
+            None,
+        );
+        assert_eq!(result.trigger, ThresholdKind::AbsoluteMax);
+        assert_eq!(result.dropped.len(), result.removed_message_count);
+        assert_eq!(result.dropped.len(), 2);
+        assert!(
+            session.messages.len() < 3,
+            "dropped messages leave the body"
+        );
+    }
+
+    #[test]
+    fn summary_skips_a_prior_continuation_header() {
+        let mut session = Session {
+            version: 1,
+            messages: vec![
+                ConversationMessage {
+                    role: MessageRole::System,
+                    blocks: vec![ContentBlock::Text {
+                        text: format!("{CONTINUATION_PREFIX} that ran out of context."),
+                    }],
+                    usage: None,
+                    pinned: false,
+                },
+                ConversationMessage::user_text("real content"),
+                ConversationMessage::user_text("recent"),
+            ],
+        };
+        let result = compact_session_in_place_with(
+            &mut session,
+            CompactionConfig {
+                preserve_recent_messages: 1,
+                ..CompactionConfig::default()
+            },
+            ThresholdKind::AbsoluteMax,
+            None,
+        );
+        assert!(!result.summary.contains(CONTINUATION_PREFIX));
+        assert!(!result.summary.contains("- system:"));
+        assert!(result.summary.contains("real content"));
     }
 
     #[test]

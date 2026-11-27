@@ -631,7 +631,7 @@ enum CredentialSource {
 
 **现状盘点（源码实证）**：
 - 检索后端**已存在**：`heartflow-store`（SQLite + FTS5 trigram，CJK 免分词）已覆盖全部历史会话的全文检索、token 用量分析（`store/src/lib.rs`）；`hf search` CLI 子命令已接——**但只是操作者命令，不在 `mvp_tool_specs` 工具面**，agent 自己无法调用。
-- 会话：JSONL 落盘 + `/sessions [F]`/`/open N|TOPIC`（以**开场消息主题**截断为名，无生成式标题）。
+- 会话：快照 + 活跃段 + 压缩归档（`sessions/<id>.json` / `<id>.jsonl` / `archive/<id>/`；段写入端待 P1）+ `/sessions [F]`/`/open N|TOPIC`（以**开场消息主题**截断为名，无生成式标题）。
 - 任务：jobs 已有 wall-clock watchdog（默认 30min）+ slots 并发 + timeout 事件（jobs.rs:488-527）；bash 工具有 `timeout` + `run_in_background`；mission criterion 有 `CRITERION_COMMAND_TIMEOUT`。缺：前台命令超时**转后台**语义、任务耗时在 UI 的显式呈现、TUI 的 schedule drain（KI-005）。
 - 记忆：reflections 是 plan 环专属自动注入；无 agent 自主的跨会话 memory 工具。
 
@@ -673,7 +673,7 @@ enum CredentialSource {
 **设计判决（对标）**：Manus「压缩策略必须可恢复」（URL 留、正文可丢）——heartflow 违反此底线；Claude Agent SDK 会话 JSONL 自动落盘是「产品的另一半」，压缩与分支都基于持久 transcript 而非工作上下文；Anthropic memory tool 状态外置文件化。判决：问题不在「要不要压缩」，而在**压缩不可逆 + 记录无独立持久面 + agent 无回溯接口**三者叠加——agent 对自己历史的认知残缺，只能猜。
 
 **方案（最小改动，三动作，与 §18 S1 互为前置）**：
-1. **压缩前归档（P0）**：compaction 落定丢弃范围时，先把被丢消息 append 到 sidecar `sessions/<id>-archive.jsonl`（复用 `read_entries` 语义）。工作上下文缩短，持久记录不缩。
+1. **压缩前归档（P0，已实施）**：compaction 落定丢弃范围时，先把被丢消息写入 `sessions/archive/<id>/NNNN.json`（带 ts/epoch/reason/removed 元数据头），并在 `manifest.jsonl` 追加一行索引；归档先于快照保存，只增不改。工作上下文缩短，持久记录不缩。
 2. **运行中落盘**：每回合结算把新增消息同步进 SQLite store——schema/FTS5 全现成，缺的只是运行时写入路径接线。
 3. **摘要带指针**：压缩摘要末尾固定注明「更早记录已归档，可用 session_search / session_read 取回」——回溯接口即 §18 S1（B1+B2）。
 

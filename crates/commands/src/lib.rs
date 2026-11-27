@@ -34,6 +34,9 @@ impl CommandRegistry {
 pub struct SlashCommandResult {
     pub message: String,
     pub session: Session,
+    /// Dropped regions the host must archive before saving the session
+    /// (`/compact` only; every other command leaves it empty).
+    pub audit: Vec<runtime::CompactionAudit>,
 }
 
 #[must_use]
@@ -50,16 +53,26 @@ pub fn handle_slash_command(
     match trimmed.split_whitespace().next() {
         Some("/compact") => {
             let mut session = session.clone();
+            let mut audit = Vec::new();
             let message = if runtime::should_compact(&session, compaction) {
                 let result = compact_session_in_place(&mut session, compaction);
-                format!(
+                let message = format!(
                     "Compacted {} messages into a resumable system summary.",
                     result.removed_message_count
-                )
+                );
+                audit.push(runtime::CompactionAudit {
+                    reason: "manual".to_string(),
+                    messages: result.dropped,
+                });
+                message
             } else {
                 "Compaction skipped: session is below the compaction threshold.".to_string()
             };
-            Some(SlashCommandResult { message, session })
+            Some(SlashCommandResult {
+                message,
+                session,
+                audit,
+            })
         }
         Some("/pin") => {
             let mut session = session.clone();
@@ -76,11 +89,13 @@ pub fn handle_slash_command(
                     Some(SlashCommandResult {
                         message: format!("{verb} the last message ({count} pinned total)."),
                         session,
+                        audit: Vec::new(),
                     })
                 }
                 None => Some(SlashCommandResult {
                     message: "nothing to pin - session has no pinnable messages.".to_string(),
                     session,
+                    audit: Vec::new(),
                 }),
             }
         }

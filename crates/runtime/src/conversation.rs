@@ -814,6 +814,19 @@ impl SteerMailbox {
     }
 }
 
+/// One compaction's dropped region, held in the runtime until the turn
+/// boundary so the host can archive it before the snapshot overwrites the
+/// transcript. A turn may compact more than once (D4.2 two-level hard
+/// trigger), so the buffer keeps one entry per compaction rather than one
+/// flattened list: generation boundaries must survive into the archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionAudit {
+    /// `auto` (soft gate), `hard_retry` (D4.2), `manual` (`/compact`), or
+    /// `task_reset` (per-task context reset).
+    pub reason: String,
+    pub messages: Vec<ConversationMessage>,
+}
+
 pub struct ConversationRuntime<C, T> {
     session: Session,
     api_client: C,
@@ -823,6 +836,8 @@ pub struct ConversationRuntime<C, T> {
     max_iterations: usize,
     max_continuations: usize,
     usage_tracker: UsageTracker,
+    /// Dropped regions awaiting the host's archive write, newest last.
+    pending_archive: Vec<CompactionAudit>,
     /// Window-based pre-compaction policy applied inside `run_turn`. Disabled
     /// unless `context_window_tokens` is set (via `with_compaction`).
     compaction: CompactionConfig,
@@ -897,6 +912,7 @@ where
             max_iterations: 64,
             max_continuations: 3,
             usage_tracker,
+            pending_archive: Vec::new(),
             compaction: CompactionConfig::default(),
             token_prefix: Cell::new((0, 0)),
             token_calibration: RefCell::new(TokenCalibration::default()),
@@ -1115,6 +1131,7 @@ where
                     } else {
                         ThresholdKind::AbsoluteMax
                     },
+                    "auto",
                     model_summary.as_deref(),
                 );
             }
@@ -1180,7 +1197,12 @@ where
                             target: "heartflow::compact",
                             "provider rejected the request as over the context window; {label} and retrying (hard trigger, level {hard_retries})"
                         );
-                        let result = self.compact_with(config, ThresholdKind::WindowFull, None);
+                        let result = self.compact_with(
+                            config,
+                            ThresholdKind::WindowFull,
+                            "hard_retry",
+                            None,
+                        );
                         notify(&AgentEvent::Truncated(format!(
                             "context overflow (level {hard_retries}); {} older messages compacted, retrying",
                             result.removed_message_count
@@ -1788,17 +1810,32 @@ where
     /// itself moves messages instead of cloning them.
     pub fn compact(&mut self, config: CompactionConfig) -> CompactionResult {
         if self.should_compact(config) {
-            self.compact_now(config)
+            self.compact_with(
+                config,
+                if config.context_window_tokens > 0 {
+                    ThresholdKind::ContextWindowHalf
+                } else {
+                    ThresholdKind::AbsoluteMax
+                },
+                "auto",
+                None,
+            )
         } else {
             CompactionResult {
                 summary: String::new(),
                 removed_message_count: 0,
+                dropped: Vec::new(),
+                trigger: if config.context_window_tokens > 0 {
+                    ThresholdKind::ContextWindowHalf
+                } else {
+                    ThresholdKind::AbsoluteMax
+                },
             }
         }
     }
 
-    /// Gate-free compaction for callers that already decided (`/compact`,
-    /// the D4.2 hard trigger): same in-place rebuild, deterministic summary.
+    /// Gate-free compaction for callers that already decided (manual
+    /// `/compact`): same in-place rebuild, deterministic summary.
     pub fn compact_now(&mut self, config: CompactionConfig) -> CompactionResult {
         self.compact_with(
             config,
@@ -1807,22 +1844,40 @@ where
             } else {
                 ThresholdKind::AbsoluteMax
             },
+            "manual",
             None,
         )
     }
 
     /// The loop's compaction core: an explicit trigger kind for the
-    /// observation event and an optional model-generated summary (D4.5).
+    /// observation event, the archive reason tag, and an optional
+    /// model-generated summary (D4.5).
     fn compact_with(
         &mut self,
         config: CompactionConfig,
         trigger: ThresholdKind,
+        reason: &str,
         model_summary: Option<&str>,
     ) -> CompactionResult {
-        let result =
+        let mut result =
             compact_session_in_place_with(&mut self.session, config, trigger, model_summary);
         self.token_prefix.set((0, 0));
+        if !result.dropped.is_empty() {
+            self.pending_archive.push(CompactionAudit {
+                reason: reason.to_string(),
+                messages: std::mem::take(&mut result.dropped),
+            });
+        }
         result
+    }
+
+    /// Take the dropped regions accumulated since the last call. The host
+    /// archives each entry before saving the snapshot: after the save the
+    /// in-memory transcript is the only other copy, and compaction already
+    /// dropped it there.
+    #[must_use]
+    pub fn take_compaction_audit(&mut self) -> Vec<CompactionAudit> {
+        std::mem::take(&mut self.pending_archive)
     }
 
     /// D4.5: summarize the region a compaction is about to drop with one
@@ -2018,8 +2073,14 @@ where
     /// connected and cumulative usage is preserved). This is the fresh-context
     /// per-task reset the Hermes loop relies on.
     pub fn reset_for_task(&mut self, seeds: Vec<ConversationMessage>) {
-        self.session.messages = seeds;
+        let previous = std::mem::replace(&mut self.session.messages, seeds);
         self.token_prefix.set((0, 0));
+        if !previous.is_empty() {
+            self.pending_archive.push(CompactionAudit {
+                reason: "task_reset".to_string(),
+                messages: previous,
+            });
+        }
     }
 
     /// Swap the permission policy in place. Used to move a live session between
@@ -4108,6 +4169,50 @@ mod tests {
             crate::compact::estimate_session_tokens(runtime.session())
         );
         assert!(runtime.should_compact(config), "gate sees the estimate");
+    }
+
+    #[test]
+    fn compaction_audit_holds_the_dropped_region_until_taken() {
+        struct IdleApiClient;
+        impl ApiClient for IdleApiClient {
+            fn stream(&mut self, _request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+                Err(RuntimeError::new("not used in this test"))
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            IdleApiClient,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::Allow),
+            vec!["system".to_string()],
+        );
+        runtime.reset_for_task(vec![
+            ConversationMessage::user_text("one"),
+            ConversationMessage::user_text("two"),
+            ConversationMessage::user_text("three"),
+            ConversationMessage::user_text("four"),
+        ]);
+        assert!(
+            runtime.take_compaction_audit().is_empty(),
+            "the first reset has no previous context to archive"
+        );
+
+        runtime.compact(CompactionConfig {
+            preserve_recent_messages: 1,
+            max_estimated_tokens: 1,
+            ..CompactionConfig::default()
+        });
+        let audit = runtime.take_compaction_audit();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].reason, "auto");
+        assert!(!audit[0].messages.is_empty(), "dropped region is kept");
+        assert!(runtime.take_compaction_audit().is_empty(), "take clears");
+
+        runtime.reset_for_task(vec![ConversationMessage::user_text("seed")]);
+        let audit = runtime.take_compaction_audit();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].reason, "task_reset");
     }
 
     #[tokio::test]

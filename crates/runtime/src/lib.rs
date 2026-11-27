@@ -41,9 +41,9 @@ pub use config::{
     HEARTFLOW_SETTINGS_SCHEMA_NAME,
 };
 pub use conversation::{
-    classify_stream_error, AgentEvent, ApiClient, ApiRequest, ConversationRuntime, ErrorKind,
-    RuntimeError, StaticToolExecutor, SteerMailbox, ToolError, ToolExecutor, ToolSpec, TurnStream,
-    TurnSummary,
+    classify_stream_error, AgentEvent, ApiClient, ApiRequest, CompactionAudit, ConversationRuntime,
+    ErrorKind, RuntimeError, StaticToolExecutor, SteerMailbox, ToolError, ToolExecutor, ToolSpec,
+    TurnStream, TurnSummary,
 };
 pub use diagnostics::{
     diagnostics_degradation_detail, diagnostics_ledger, run_post_edit_diagnostics, DiagnosticItem,
@@ -86,7 +86,8 @@ pub use schedule::{
 };
 pub use schema::{normalize_tool_schema, validate_tool_input};
 pub use session::{
-    ContentBlock, ConversationMessage, MessageRole, SegmentRead, Session, SessionError,
+    write_atomic, ContentBlock, ConversationMessage, MessageRole, SegmentRead, Session,
+    SessionError,
 };
 pub use stop::{StopPolicy, MAX_REPEAT_STREAK, WINDOW_MAX_REPEATS, WINDOW_SIZE};
 pub use usage::{TokenUsage, UsageTracker};

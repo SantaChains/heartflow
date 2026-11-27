@@ -4,13 +4,15 @@
 //! verbatim from `main.rs` (Phase 1 thinning) with no behavior change; all
 //! state is instance-scoped behind `SessionShared`, never a process singleton.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use runtime::{redact_messages, redact_session, Session};
+use runtime::{redact_messages, redact_session, CompactionAudit, ConversationRuntime, Session};
 use store::{SessionMeta, Store, StoreError};
 
 pub(crate) fn home_dir() -> PathBuf {
@@ -93,6 +95,10 @@ pub(crate) struct SessionState {
     pub(crate) mirror: Option<MirrorTracker>,
     /// Stable on-disk identity of the conversation this state persists.
     pub(crate) session_id: Option<String>,
+    /// Where compaction archives go; `None` = the default under
+    /// [`sessions_dir`]. Set when a snapshot outside that directory is
+    /// resumed, so its archive travels with the snapshot.
+    pub(crate) archive_root: Option<PathBuf>,
     /// Full text of tool outputs folded during rendering, indexed for `/expand`.
     pub(crate) expandable: Vec<String>,
     /// 联网三态 (roadmap C-1): shared with the tool executor so both the REPL
@@ -193,6 +199,217 @@ pub(crate) async fn save_session_async(
 /// directory. One call per finished turn, success or failure.
 pub(crate) trait TurnSaver {
     async fn save(&mut self, state: &SessionShared, session: &Session) -> io::Result<PathBuf>;
+}
+
+// ---------------------------------------------------------------------------
+// Compaction archive. The snapshot is a per-turn cache that each save
+// overwrites, so a compaction's dropped region would otherwise exist only in
+// memory. Every compaction writes its dropped messages to
+// `sessions/archive/<id>/NNNN.json` before the snapshot is saved; the archive
+// is append-only and nothing here ever deletes or rewrites a record.
+// ---------------------------------------------------------------------------
+
+/// Root of the append-only compaction archive (normal sessions live directly
+/// under the sessions directory).
+pub(crate) fn archive_dir() -> PathBuf {
+    sessions_dir().join("archive")
+}
+
+/// Archive root for the active conversation. A resumed snapshot may live
+/// outside the sessions directory (`hf --resume <path>`), and its archive
+/// belongs beside it, not under the default home tree.
+fn archive_root(state: &SessionShared) -> PathBuf {
+    lock_state(state)
+        .archive_root
+        .clone()
+        .unwrap_or_else(archive_dir)
+}
+
+/// Warn only once per process: a failing disk must not print per compaction.
+static ARCHIVE_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Drain the runtime's dropped regions into the archive. Callers invoke this
+/// *before* saving the snapshot: afterwards the compacted transcript is the
+/// only live copy. Failures warn once and never fail the turn — losing the
+/// archive is bad, losing the turn is worse.
+pub(crate) fn archive_pending<C, T>(state: &SessionShared, runtime: &mut ConversationRuntime<C, T>)
+where
+    C: runtime::ApiClient,
+    T: runtime::ToolExecutor,
+{
+    archive_audits(state, runtime.take_compaction_audit());
+}
+
+/// Same contract as [`archive_pending`] for callers that hold the audits
+/// directly (the `--run /compact` path, which never builds a runtime).
+pub(crate) fn archive_audits(state: &SessionShared, audits: Vec<CompactionAudit>) {
+    for audit in audits {
+        if let Err(error) = archive_compaction(state, &audit) {
+            if !ARCHIVE_WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!("warning: could not archive compacted messages: {error}");
+                tracing::warn!(
+                    target: "heartflow::storage",
+                    %error,
+                    "could not archive compacted messages; the snapshot is still saved"
+                );
+            }
+        }
+    }
+}
+
+/// Archive one dropped region; `None` when there was nothing to drop.
+fn archive_compaction(
+    state: &SessionShared,
+    audit: &CompactionAudit,
+) -> io::Result<Option<PathBuf>> {
+    if audit.messages.is_empty() {
+        return Ok(None);
+    }
+    // Same scrub rule as the snapshot (security.dev.md D9): the archive must
+    // never persist a live credential either.
+    let messages = redact_messages(&audit.messages, &registered_secrets(state));
+    let session_id = current_session_id(state);
+    let dir = archive_root(state).join(&session_id);
+    fs::create_dir_all(&dir)?;
+    runtime::harden_dir(&dir);
+    let epoch = next_epoch(&dir)?;
+    let ts = u64::try_from(unix_millis()).unwrap_or(u64::MAX);
+    let removed = messages.len();
+    let record = serde_json::json!({
+        "version": 1,
+        "ts": ts,
+        "session": session_id,
+        "epoch": epoch,
+        "reason": &audit.reason,
+        "removed": removed,
+        "messages": messages,
+    });
+    let path = dir.join(format!("{epoch:04}.json"));
+    let bytes = serde_json::to_vec_pretty(&record).map_err(io::Error::other)?;
+    runtime::write_atomic(&path, &bytes)?;
+    append_manifest(&dir, &path, epoch, ts, removed, &audit.reason)?;
+    Ok(Some(path))
+}
+
+/// Epoch = one past the highest epoch already on disk, counting both manifest
+/// lines and record file names. Reading file names too keeps append-only
+/// intact on the failure path: a record written before a failed manifest
+/// append is never overwritten by the next compaction.
+fn next_epoch(dir: &Path) -> io::Result<u64> {
+    let manifest = dir.join("manifest.jsonl");
+    let lines = match fs::read_to_string(&manifest) {
+        Ok(text) => text.lines().filter(|line| !line.trim().is_empty()).count(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error),
+    };
+    let highest_file = match fs::read_dir(dir) {
+        Ok(entries) => entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if path.extension().is_none_or(|extension| extension != "json") {
+                    return None;
+                }
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .and_then(|stem| stem.parse::<u64>().ok())
+            })
+            .max()
+            .unwrap_or(0),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error),
+    };
+    let seen = highest_file.max(u64::try_from(lines).unwrap_or(u64::MAX));
+    Ok(seen.saturating_add(1))
+}
+
+/// Append one single-line manifest entry (`O_APPEND` + flush). The manifest is
+/// the index a reader replays; the record files stay self-describing.
+fn append_manifest(
+    dir: &Path,
+    path: &Path,
+    epoch: u64,
+    ts: u64,
+    removed: usize,
+    reason: &str,
+) -> io::Result<()> {
+    use std::io::Write;
+    let line = serde_json::json!({
+        "version": 1,
+        "ts": ts,
+        "epoch": epoch,
+        "file": path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default(),
+        "removed": removed,
+        "bytes": fs::metadata(path).map_or(0, |meta| meta.len()),
+        "reason": reason,
+    });
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("manifest.jsonl"))?;
+    writeln!(file, "{line}")?;
+    file.flush()
+}
+
+/// Archive totals for `hf doctor`. Orphans are the two broken pairings a
+/// failed archive append can leave: a record file with no manifest line, and
+/// a manifest line whose record file is missing.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ArchiveStats {
+    pub(crate) sessions: usize,
+    pub(crate) files: usize,
+    pub(crate) bytes: u64,
+    pub(crate) latest_ts: Option<u64>,
+    pub(crate) orphans: usize,
+}
+
+pub(crate) fn archive_stats() -> ArchiveStats {
+    let mut stats = ArchiveStats::default();
+    let Ok(sessions) = fs::read_dir(archive_dir()) else {
+        return stats;
+    };
+    for session in sessions.flatten() {
+        let dir = session.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        stats.sessions += 1;
+        let mut referenced: HashSet<String> = HashSet::new();
+        if let Ok(text) = fs::read_to_string(dir.join("manifest.jsonl")) {
+            for line in text.lines().filter(|line| !line.trim().is_empty()) {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                    stats.orphans += 1;
+                    continue;
+                };
+                if let Some(file) = value.get("file").and_then(|v| v.as_str()) {
+                    referenced.insert(file.to_string());
+                }
+                if let Some(ts) = value.get("ts").and_then(serde_json::Value::as_u64) {
+                    stats.latest_ts = Some(stats.latest_ts.map_or(ts, |seen| seen.max(ts)));
+                }
+            }
+        }
+        let mut present: HashSet<String> = HashSet::new();
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_none_or(|extension| extension != "json") {
+                    continue;
+                }
+                let Some(name) = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                else {
+                    continue;
+                };
+                stats.files += 1;
+                stats.bytes += fs::metadata(&path).map_or(0, |meta| meta.len());
+                present.insert(name);
+            }
+        }
+        stats.orphans += referenced.symmetric_difference(&present).count();
+    }
+    stats
 }
 
 /// The production [`TurnSaver`]: the real on-disk snapshot save, offloaded to
@@ -450,6 +667,8 @@ pub(crate) fn rebind_conversation(state: &SessionShared, id: String) {
 /// transcript file and the history mirror.
 pub(crate) fn rotate_session_id(state: &SessionShared) {
     rebind_conversation(state, new_session_id());
+    // A fresh conversation is saved under the sessions directory again.
+    lock_state(state).archive_root = None;
 }
 
 /// Adopt the conversation persisted at `path` (resume / `/open`): continuing it
@@ -461,7 +680,10 @@ pub(crate) fn adopt_session_path(state: &SessionShared, path: &Path) {
         .map(|stem| stem.to_string_lossy().into_owned())
         .filter(|stem| !stem.is_empty())
         .unwrap_or_else(new_session_id);
+    // The archive belongs beside the snapshot it documents.
+    let archive = path.parent().map(|parent| parent.join("archive"));
     rebind_conversation(state, id);
+    lock_state(state).archive_root = archive;
 }
 
 pub(crate) fn list_sessions() -> Vec<PathBuf> {
