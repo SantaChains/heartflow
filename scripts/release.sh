@@ -7,8 +7,9 @@
 #     RELEASE_DRY_RUN=1 bash scripts/release.sh publish   # 本地预演:改完版本号即还原,不 commit/不 push/不建 Release
 #
 # 版本语义(与 cliff.toml、AGENTS.md 对齐):
-#   feat: → minor   fix: → patch   `!` 或 BREAKING CHANGE: → major
-#   chore/docs/test/ci/style/build 等不触发发版
+#   feat: → minor   fix: → patch   chore/docs/test/ci/style/build 等不触发发版
+#   `!` 或 BREAKING CHANGE: 同样只进 minor:中间位允许 0..99,只有它需要
+#   从 99 进位到 100 时才升major(即 1.42.0 → 1.43.0 → … → 1.99.0 → 2.0.0)
 #
 # 本地依赖:git-cliff(cargo install git-cliff --locked)、gh、crates.io 凭据(publish 需要:
 # CI 传 CARGO_REGISTRY_TOKEN secret,本地 cargo login 一次即可)
@@ -125,11 +126,30 @@ do_plan() {
     note "git-cliff produced no version increment, skip release"
     return 0
   fi
-  l="${base#v}"; lm="${l%%.*}"; lmi="$(cut -d. -f2 <<<"$l")"
+  l="${base#v}"; lm="$((10#${l%%.*}))"; lmi="$((10#$(cut -d. -f2 <<<"$l")))"
+  lp="$(cut -d. -f3 <<<"$l")"; lp="$((10#${lp:-0}))"
   n="${next#v}"; nm="${n%%.*}"; nmi="$(cut -d. -f2 <<<"$n")"
-  bump="patch"
-  if [ "$lm" != "$nm" ]; then bump="major"
-  elif [ "$lmi" != "$nmi" ]; then bump="minor"; fi
+  if [ -n "$last" ]; then
+    # Conventional-commit kind from git-cliff, then this project's carry rule:
+    # the middle number runs 0..99 and only its overflow enters a new major.
+    # A breaking change therefore lands as the next minor until 99 is used up.
+    local kind
+    if [ "$lm" != "$nm" ]; then kind=major
+    elif [ "$lmi" != "$nmi" ]; then kind=minor
+    else kind=patch; fi
+    case "$kind" in
+      patch) next="v${lm}.${lmi}.$((lp + 1))"; bump=patch ;;
+      *)
+        if [ "$lmi" -ge 99 ]; then
+          next="v$((lm + 1)).0.0"; bump=major
+        else
+          next="v${lm}.$((lmi + 1)).0"; bump=minor
+        fi ;;
+    esac
+  else
+    # First-ever release: 1.0.0 by design, outside the carry rule.
+    next="v${raw#v}"; bump=major
+  fi
   emit_output released true
   emit_output bump "$bump"
   emit_output tag "$next"

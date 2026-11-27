@@ -412,11 +412,17 @@ where
                 runtime.set_turn_token_budget(None);
                 prompter = Some(finished_prompter);
                 let mut mission_attention: Option<String> = None;
+                let mut timing_note = String::new();
                 let (ok, err_note, turn_error_kind) = match turn_outcome {
                     // The summary's contents (iteration count, tool results)
                     // are already folded into the session and the transcript;
                     // the TUI settle only needs success vs. failure.
                     Ok(summary) => {
+                        timing_note = format!(
+                            "turn {} · tools {}",
+                            crate::turn::fmt_duration(summary.duration_ms),
+                            crate::turn::fmt_duration(summary.tool_time_ms)
+                        );
                         // Auto-account against the single active mission
                         // (§11.3): success only — a failed turn is not
                         // productive work and must not reset a blocked
@@ -437,7 +443,13 @@ where
                 // save below makes the compacted transcript the only copy.
                 crate::storage::archive_pending(&states[section], &mut runtime);
                 let save_note = match save.save(&states[section], runtime.session()).await {
-                    Ok(path) => format!("saved {}", path.display()),
+                    Ok(path) => {
+                        if timing_note.is_empty() {
+                            format!("saved {}", path.display())
+                        } else {
+                            format!("saved {} · {timing_note}", path.display())
+                        }
+                    }
                     Err(_) => String::from("save failed"),
                 };
                 let guide = guide_snapshot(&runtime);

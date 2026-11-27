@@ -169,12 +169,16 @@ impl TurnRenderer {
                 name,
                 output,
                 is_error,
+                duration_ms,
                 ..
             } => {
+                let took = duration_ms
+                    .map(|ms| format!(" ({})", fmt_duration(ms)))
+                    .unwrap_or_default();
                 let label = if *is_error {
-                    format!("`{name}` failed")
+                    format!("`{name}` failed{took}")
                 } else {
-                    format!("`{name}` done")
+                    format!("`{name}` done{took}")
                 };
                 if self.spinner_active {
                     self.spinner.finish(&label, &self.theme, &mut out).ok();
@@ -317,10 +321,23 @@ pub(crate) fn last_assistant_conclusion(messages: &[ConversationMessage]) -> Opt
     Some(truncate_chars(&text, 240))
 }
 
+/// Wall-clock segments appended to the per-turn usage line. Measured by the
+/// runtime (`turn`, `tools`) and accumulated across the conversation (`ran`,
+/// persisted in the snapshot).
+#[allow(clippy::struct_field_names)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TurnTiming {
+    pub(crate) turn_ms: u64,
+    /// Tool execution only; excludes authorization and model time.
+    pub(crate) tool_ms: u64,
+    /// Accumulated turn wall time of the whole conversation.
+    pub(crate) session_ms: u64,
+}
+
 /// One-line per-turn telemetry: context occupancy against the model window
 /// (with a 10-cell bar when the window is known), per-turn cache hit ratio,
-/// session total, and — when the catalog carries prices for the active model
-/// — estimated cost. Pure so tests can pin the format.
+/// session total, wall-clock timings, and — when the catalog carries prices for
+/// the active model — estimated cost. Pure so tests can pin the format.
 ///
 /// `status` carries the `[status]` segment toggles: a switched-off segment
 /// drops out (the ctx segment keeps its absolute counts without the bar), and
@@ -332,6 +349,7 @@ pub(crate) fn usage_line(
     window_tokens: usize,
     price: Option<(f64, f64)>,
     status: StatusConfig,
+    timing: TurnTiming,
 ) -> String {
     if !status.any_on() {
         return String::new();
@@ -379,6 +397,17 @@ pub(crate) fn usage_line(
     if status.session_total_on() {
         segments.push(format!("session {}", session.total_tokens()));
     }
+    if timing.turn_ms > 0 {
+        let tools = if timing.tool_ms > 0 {
+            format!(" (tools {})", fmt_duration(timing.tool_ms))
+        } else {
+            String::new()
+        };
+        segments.push(format!("turn {}{tools}", fmt_duration(timing.turn_ms)));
+    }
+    if timing.session_ms > 0 {
+        segments.push(format!("ran {}", fmt_duration(timing.session_ms)));
+    }
     if status.cost_on() {
         if let Some((price_in, price_out)) = price {
             let turn_cost = estimate_cost(
@@ -423,6 +452,27 @@ fn fmt_cost(cost: f64) -> String {
     } else {
         "$0".to_string()
     }
+}
+
+/// Compact wall time: milliseconds under a second, then one decimal for
+/// seconds, then whole minutes/hours — enough precision to compare turns
+/// without a column that jumps width.
+#[must_use]
+pub(crate) fn fmt_duration(ms: u64) -> String {
+    if ms < 1_000 {
+        return format!("{ms}ms");
+    }
+    let seconds = ms / 1_000;
+    if seconds < 60 {
+        // Integer tenths keep the format exact (no float rounding surprises).
+        return format!("{seconds}.{}s", (ms % 1_000) / 100);
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m{:02}s", seconds % 60);
+    }
+    let hours = minutes / 60;
+    format!("{hours}h{:02}m", minutes % 60)
 }
 
 /// Run one interactive turn: stream events to the terminal, abort on Ctrl+C,
@@ -502,10 +552,36 @@ pub(crate) async fn run_turn_interactive(
 
     let outcome = match result {
         Ok(summary) => {
+            // `runtime_ms` already includes this turn (the runtime wrapper adds
+            // it before handing the summary back).
+            let timing = TurnTiming {
+                turn_ms: summary.duration_ms,
+                tool_ms: summary.tool_time_ms,
+                session_ms: runtime.session().runtime_ms,
+            };
             if turn.saw_text {
                 writeln!(stdout)?;
             } else {
                 turn.spinner.finish("Done", &turn.theme, &mut stdout)?;
+            }
+            if let Some(usage) = turn.last_usage {
+                let cumulative = runtime.usage().cumulative_usage();
+                let window = runtime.compaction().context_window_tokens;
+                let price = display_price(state);
+                // [status] toggles come from one merged config.toml read at the
+                // turn boundary: no in-process cache of ProviderSettings exists,
+                // and one stat+parse per finished turn is negligible next to
+                // the round trip.
+                let status = provider::config::load_merged_settings(
+                    &crate::slash::cwd_dir(),
+                    &crate::storage::home_dir(),
+                )
+                .status;
+                let line = usage_line(&usage, &cumulative, window, price, status, timing);
+                // All segments toggled off renders nothing, not a bare pair.
+                if !line.is_empty() {
+                    println!("{}", line.with(turn.theme.muted()));
+                }
             }
             TurnOutcome {
                 ok: true,
@@ -576,24 +652,6 @@ pub(crate) async fn run_turn_interactive(
         }
     };
 
-    if let Some(usage) = turn.last_usage {
-        let cumulative = runtime.usage().cumulative_usage();
-        let window = runtime.compaction().context_window_tokens;
-        let price = display_price(state);
-        // [status] toggles come from one merged config.toml read at the turn
-        // boundary: no in-process cache of ProviderSettings exists, and one
-        // stat+parse per finished turn is negligible next to the round trip.
-        let status = provider::config::load_merged_settings(
-            &crate::slash::cwd_dir(),
-            &crate::storage::home_dir(),
-        )
-        .status;
-        let line = usage_line(&usage, &cumulative, window, price, status);
-        // All segments toggled off renders nothing, not a bare bracket pair.
-        if !line.is_empty() {
-            println!("{}", line.with(turn.theme.muted()));
-        }
-    }
     // Archive before the snapshot: compaction dropped the region in memory and
     // the save below makes the compacted transcript the only copy.
     crate::storage::archive_pending(state, runtime);

@@ -8,12 +8,16 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use runtime::{redact_messages, redact_session, CompactionAudit, ConversationRuntime, Session};
+use runtime::{
+    redact_messages, redact_session, CompactionAudit, ConversationMessage, ConversationRuntime,
+    SegmentWriter, Session, SessionJournal,
+};
 use store::{SessionMeta, Store, StoreError};
+use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 pub(crate) fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
@@ -112,6 +116,10 @@ pub(crate) struct SessionState {
     /// catalog, mirrored here so the per-turn usage line can show cost without
     /// threading the catalog through every call site (same pattern as `mode`).
     pub(crate) price: Option<(f64, f64)>,
+    /// Append-only segment writer for this conversation. Created lazily by
+    /// [`ensure_journal`] when a runtime is built; shared by every runtime
+    /// rebuild so there is exactly one writer (and one open file) per session.
+    pub(crate) journal: Option<Arc<DiskJournal>>,
 }
 
 /// Shared handle to one conversation's mutable state.
@@ -165,7 +173,10 @@ pub(crate) fn save_session(state: &SessionShared, session: &Session) -> io::Resu
     // (both the authoritative JSON and the SQLite mirror) on a clone, so the
     // in-memory session that talks to the provider is left verbatim.
     let secrets = registered_secrets(state);
-    let redacted = redact_for_save(state, session, &secrets);
+    let mut redacted = redact_for_save(state, session, &secrets);
+    // The cached redaction prefix may predate this turn's runtime; the timing
+    // figure is metadata, not message content, so copy it through unchanged.
+    redacted.runtime_ms = session.runtime_ms;
     // One file per conversation, keyed by the stable id (see current_session_id):
     // each turn overwrites it via the atomic temp+rename in `save_to_path`, so a
     // crash keeps the last complete snapshot rather than a truncated tail.
@@ -182,15 +193,40 @@ pub(crate) fn save_session(state: &SessionShared, session: &Session) -> io::Resu
 /// Async wrapper around [`save_session`]: the whole chain (regex scrub,
 /// multi-MB serialize, file rename, `SQLite` mirror) is blocking work, so it
 /// runs on the blocking pool instead of stalling a reactor worker mid-turn.
+///
+/// This is the turn-boundary persistence point, so it owns the segment order:
+/// 1. flush the journal (nothing may still be queued when the snapshot moves),
+/// 2. atomically replace the snapshot,
+/// 3. reset the segment header to the saved length — only after the rename
+///    succeeded, so a crash in between leaves a stale (rejected) segment rather
+///    than a segment describing a snapshot that never landed.
 pub(crate) async fn save_session_async(
     state: &SessionShared,
     session: &Session,
 ) -> io::Result<PathBuf> {
     let session = session.clone();
     let state = state.clone();
-    tokio::task::spawn_blocking(move || save_session(&state, &session))
-        .await
-        .map_err(|error| io::Error::other(error.to_string()))?
+    tokio::task::spawn_blocking(move || {
+        // Clone the handle out before flushing: the writer thread locks the
+        // same state to redact, and holding the guard here would deadlock.
+        let journal = lock_state(&state).journal.clone();
+        if let Some(journal) = &journal {
+            // Recovery is best-effort: a segment failure must never block the
+            // authoritative snapshot save.
+            if let Err(error) = journal.flush() {
+                warn_journal(&error);
+            }
+        }
+        let path = save_session(&state, &session)?;
+        if let Some(journal) = &journal {
+            if let Err(error) = journal.rotate(session.messages.len()) {
+                warn_journal(&error);
+            }
+        }
+        Ok(path)
+    })
+    .await
+    .map_err(|error| io::Error::other(error.to_string()))?
 }
 
 /// Turn-boundary persistence, injected into the TUI loop (`tui::drive_loop`)
@@ -420,6 +456,195 @@ impl TurnSaver for DiskSaver {
     async fn save(&mut self, state: &SessionShared, session: &Session) -> io::Result<PathBuf> {
         save_session_async(state, session).await
     }
+}
+
+// ---------------------------------------------------------------------------
+// Active segment journal. Every message a turn appends is written to
+// `<id>.jsonl` beside the snapshot before it enters memory, so a crash mid-turn
+// recovers the completed work. The snapshot stays authoritative: the segment
+// only carries messages appended after the last save and is reset at every
+// turn boundary.
+// ---------------------------------------------------------------------------
+
+/// Segment path for a conversation: same directory and stem as its snapshot.
+fn segment_path(id: &str) -> PathBuf {
+    sessions_dir().join(format!("{id}.jsonl"))
+}
+
+enum JournalCmd {
+    Record {
+        ts: u64,
+        message: ConversationMessage,
+    },
+    Flush(oneshot::Sender<io::Result<()>>),
+    Rotate {
+        base: usize,
+        ack: oneshot::Sender<io::Result<()>>,
+    },
+}
+
+/// Non-blocking journal handle. [`SessionJournal::record`] only enqueues;
+/// one dedicated thread owns the open segment file, redacts new messages with
+/// the same rules as the snapshot, and services flush/rotate at turn
+/// boundaries. `record` must never block a turn, which is why no locking,
+/// redaction or I/O happens on the caller's thread.
+pub(crate) struct DiskJournal {
+    tx: tokio_mpsc::UnboundedSender<JournalCmd>,
+    /// Snapshot length the segment extends. Updated on rotate and on every
+    /// runtime rebuild; read only when (re)opening the file.
+    base: Arc<AtomicUsize>,
+}
+
+impl DiskJournal {
+    fn start(state: &SessionShared, base: usize) -> Self {
+        let (tx, rx) = tokio_mpsc::unbounded_channel();
+        let shared_base = Arc::new(AtomicUsize::new(base));
+        let _ = std::thread::Builder::new()
+            .name(String::from("hf-session-journal"))
+            .spawn({
+                let state = Arc::clone(state);
+                let shared_base = Arc::clone(&shared_base);
+                move || journal_writer_loop(state, rx, shared_base)
+            });
+        Self {
+            tx,
+            base: shared_base,
+        }
+    }
+
+    /// Point the segment at a new snapshot length. Called when a runtime is
+    /// built (the session may have grown since the last rotate) — only the
+    /// next open reads it, so a live writer is never disturbed.
+    fn rebase(&self, base: usize) {
+        self.base.store(base, Ordering::SeqCst);
+    }
+
+    /// Reset the segment for the snapshot just saved and drop the writer's open
+    /// handle. Blocking; call only from the blocking persistence path.
+    fn rotate(&self, base: usize) -> io::Result<()> {
+        let (ack, done) = oneshot::channel();
+        self.tx
+            .send(JournalCmd::Rotate { base, ack })
+            .map_err(|_| io::Error::other("session journal writer stopped"))?;
+        done.blocking_recv()
+            .map_err(|_| io::Error::other("session journal writer stopped"))?
+    }
+}
+
+impl SessionJournal for DiskJournal {
+    fn record(&self, ts_ms: u64, message: &ConversationMessage) {
+        // Unbounded: a send that fails means the writer thread is gone, and a
+        // lost recovery record must never fail the turn that produced it.
+        let _ = self.tx.send(JournalCmd::Record {
+            ts: ts_ms,
+            message: message.clone(),
+        });
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        let (ack, done) = oneshot::channel();
+        self.tx
+            .send(JournalCmd::Flush(ack))
+            .map_err(|_| io::Error::other("session journal writer stopped"))?;
+        done.blocking_recv()
+            .map_err(|_| io::Error::other("session journal writer stopped"))?
+    }
+}
+
+/// Warn once per process: a failing disk must not print per message.
+static JOURNAL_WARNED: AtomicBool = AtomicBool::new(false);
+
+fn warn_journal(error: &io::Error) {
+    if !JOURNAL_WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!("warning: could not write the session segment: {error}");
+        tracing::warn!(
+            target: "heartflow::storage",
+            %error,
+            "session segment write failed; the snapshot at the turn boundary is still authoritative"
+        );
+    }
+}
+
+// The writer thread owns its `SessionShared`/`base` handles for the process
+// lifetime: passing them by value is the point (they must be `'static`), not an
+// accidental clone.
+#[allow(clippy::needless_pass_by_value)]
+fn journal_writer_loop(
+    state: SessionShared,
+    mut rx: tokio_mpsc::UnboundedReceiver<JournalCmd>,
+    base: Arc<AtomicUsize>,
+) {
+    let mut sink: Option<(String, SegmentWriter)> = None;
+    while let Some(command) = rx.blocking_recv() {
+        match command {
+            JournalCmd::Record { ts, message } => {
+                let id = current_session_id(&state);
+                if sink.as_ref().is_none_or(|(open_id, _)| open_id != &id) {
+                    // A rotated/opened conversation points at a different file;
+                    // drop the stale handle instead of writing across ids.
+                    sink = None;
+                    match SegmentWriter::open(segment_path(&id), base.load(Ordering::SeqCst)) {
+                        Ok(writer) => sink = Some((id, writer)),
+                        Err(error) => {
+                            warn_journal(&error);
+                            continue;
+                        }
+                    }
+                }
+                let Some((_, writer)) = sink.as_mut() else {
+                    continue;
+                };
+                // Same scrub rule as the snapshot (security.dev.md D9): the
+                // segment must never persist a live credential either.
+                let secrets = registered_secrets(&state);
+                let scrubbed = redact_messages(std::slice::from_ref(&message), &secrets);
+                let message = scrubbed.into_iter().next().unwrap_or(message);
+                if let Err(error) = writer.append(ts, &message) {
+                    warn_journal(&error);
+                }
+            }
+            JournalCmd::Flush(ack) => {
+                let result = match sink.as_mut() {
+                    Some((_, writer)) => writer.sync(),
+                    None => Ok(()),
+                };
+                let _ = ack.send(result);
+            }
+            JournalCmd::Rotate {
+                base: new_base,
+                ack,
+            } => {
+                let mut result = match sink.take() {
+                    Some((_, mut writer)) => writer.sync(),
+                    None => Ok(()),
+                };
+                if result.is_ok() {
+                    let path = segment_path(&current_session_id(&state));
+                    // No segment yet (nothing journalled): do not create an
+                    // empty file just to reset its header.
+                    if path.exists() {
+                        result = runtime::reset_segment(&path, new_base);
+                    }
+                }
+                base.store(new_base, Ordering::SeqCst);
+                let _ = ack.send(result);
+            }
+        }
+    }
+}
+
+/// The journal for this conversation, created on first use and shared by every
+/// runtime rebuild. `base` is the current snapshot length: it only matters when
+/// the segment file has to be created or rebuilt.
+pub(crate) fn ensure_journal(state: &SessionShared, base: usize) -> Arc<DiskJournal> {
+    let mut guard = lock_state(state);
+    if let Some(journal) = &guard.journal {
+        journal.rebase(base);
+        return Arc::clone(journal);
+    }
+    let journal = Arc::new(DiskJournal::start(state, base));
+    guard.journal = Some(Arc::clone(&journal));
+    journal
 }
 
 /// Per-process redaction cache: the redacted prefix of the current transcript,
@@ -684,6 +909,80 @@ pub(crate) fn adopt_session_path(state: &SessionShared, path: &Path) {
     let archive = path.parent().map(|parent| parent.join("archive"));
     rebind_conversation(state, id);
     lock_state(state).archive_root = archive;
+}
+
+/// On-disk conversation footprint for `hf doctor`, which runs in its own
+/// process and cannot see live counters.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct SessionStats {
+    pub(crate) snapshots: usize,
+    pub(crate) snapshot_bytes: u64,
+    pub(crate) segments: usize,
+    pub(crate) segment_bytes: u64,
+    /// Newest snapshot: id, accumulated turn runtime, message count, and age in
+    /// seconds since its last write.
+    pub(crate) newest: Option<(String, u64, usize, u64)>,
+}
+
+/// Scan the sessions directory. Snapshot names are `<millis>-<pid>.json`, which
+/// is what separates them from sibling config files (e.g.
+/// `compaction-stats.json`).
+pub(crate) fn session_stats() -> SessionStats {
+    let mut stats = SessionStats::default();
+    let Ok(entries) = fs::read_dir(sessions_dir()) else {
+        return stats;
+    };
+    let mut newest_mtime: Option<SystemTime> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+        else {
+            continue;
+        };
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("jsonl") => {
+                stats.segments += 1;
+                stats.segment_bytes += fs::metadata(&path).map_or(0, |meta| meta.len());
+            }
+            Some("json") if is_snapshot_stem(&name) => {
+                stats.snapshots += 1;
+                stats.snapshot_bytes += fs::metadata(&path).map_or(0, |meta| meta.len());
+                let Ok(modified) = fs::metadata(&path).and_then(|meta| meta.modified()) else {
+                    continue;
+                };
+                if newest_mtime.is_none_or(|seen| modified > seen) {
+                    let id = path
+                        .file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let session = Session::load_from_path(&path).ok();
+                    stats.newest = Some((
+                        id,
+                        session.as_ref().map_or(0, |session| session.runtime_ms),
+                        session.as_ref().map_or(0, |session| session.messages.len()),
+                        SystemTime::now()
+                            .duration_since(modified)
+                            .map_or(0, |age| age.as_secs()),
+                    ));
+                    newest_mtime = Some(modified);
+                }
+            }
+            _ => {}
+        }
+    }
+    stats
+}
+
+fn is_snapshot_stem(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".json") else {
+        return false;
+    };
+    let Some((millis, pid)) = stem.split_once('-') else {
+        return false;
+    };
+    millis.parse::<u64>().is_ok() && pid.parse::<u32>().is_ok()
 }
 
 pub(crate) fn list_sessions() -> Vec<PathBuf> {

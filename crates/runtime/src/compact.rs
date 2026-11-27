@@ -1160,6 +1160,7 @@ mod tests {
             .collect::<Vec<_>>();
         let session = Session {
             version: 1,
+            runtime_ms: 0,
             messages,
         };
         let raw = estimate_session_tokens(&session);
@@ -1191,6 +1192,7 @@ mod tests {
     fn leaves_small_sessions_unchanged() {
         let mut session = Session {
             version: 1,
+            runtime_ms: 0,
             messages: vec![ConversationMessage::user_text("hello")],
         };
         let original = session.clone();
@@ -1205,6 +1207,7 @@ mod tests {
     fn dropped_region_is_returned_for_archiving() {
         let mut session = Session {
             version: 1,
+            runtime_ms: 0,
             messages: vec![
                 ConversationMessage::user_text("old-one"),
                 ConversationMessage::user_text("old-two"),
@@ -1233,6 +1236,7 @@ mod tests {
     fn summary_skips_a_prior_continuation_header() {
         let mut session = Session {
             version: 1,
+            runtime_ms: 0,
             messages: vec![
                 ConversationMessage {
                     role: MessageRole::System,
@@ -1264,6 +1268,7 @@ mod tests {
     fn compacts_older_messages_into_a_system_summary() {
         let mut session = Session {
             version: 1,
+            runtime_ms: 0,
             messages: vec![
                 ConversationMessage::user_text("one ".repeat(200)),
                 ConversationMessage::assistant(vec![ContentBlock::Text {
@@ -1320,6 +1325,7 @@ mod tests {
         // back over the trailing tool result to keep the pair together.
         let mut session = Session {
             version: 1,
+            runtime_ms: 0,
             messages: vec![
                 ConversationMessage::user_text("older context ".repeat(80)),
                 ConversationMessage::assistant(vec![ContentBlock::ToolUse {
@@ -1553,6 +1559,7 @@ mod tests {
         // wire (provider 400), so compaction must pull the results along.
         let mut session = Session {
             version: 1,
+            runtime_ms: 0,
             messages: vec![
                 ConversationMessage::user_text("old context ".repeat(80)),
                 ConversationMessage::assistant(vec![ContentBlock::ToolUse {
@@ -1615,6 +1622,7 @@ mod tests {
         // in the transcript verbatim and is excluded from the removed count.
         let mut session = Session {
             version: 1,
+            runtime_ms: 0,
             messages: vec![
                 ConversationMessage::user_text("important constraint ".repeat(40))
                     .with_pinned(true),
@@ -1681,6 +1689,7 @@ mod tests {
         // crosses its half (800) and triggers; a 3200-token window does not.
         let session = Session {
             version: 1,
+            runtime_ms: 0,
             messages: vec![
                 ConversationMessage::user_text("x".repeat(800)),
                 ConversationMessage::user_text("x".repeat(800)),
@@ -1710,6 +1719,7 @@ mod tests {
     fn window_zero_falls_back_to_absolute() {
         let session = Session {
             version: 1,
+            runtime_ms: 0,
             messages: vec![
                 ConversationMessage::user_text("x".repeat(400)),
                 ConversationMessage::user_text("x".repeat(400)),
@@ -1876,6 +1886,7 @@ mod tests {
         // threshold, compacted, moves the window-half counter.
         let mut session = Session {
             version: 1,
+            runtime_ms: 0,
             messages: vec![
                 ConversationMessage::user_text("old context ".repeat(200)),
                 ConversationMessage::assistant(vec![ContentBlock::Text {

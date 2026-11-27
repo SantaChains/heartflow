@@ -78,6 +78,7 @@ fn main() {
     let transcript = fixture_transcript();
     let session = Session {
         version: 1,
+        runtime_ms: 0,
         messages: transcript.clone(),
     };
 

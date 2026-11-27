@@ -112,6 +112,7 @@ mod tests {
     fn compacts_sessions_via_slash_command() {
         let session = Session {
             version: 1,
+            runtime_ms: 0,
             messages: vec![
                 ConversationMessage::user_text("a ".repeat(200)),
                 ConversationMessage::assistant(vec![ContentBlock::Text {
@@ -152,6 +153,7 @@ mod tests {
     fn pin_toggles_the_last_message_offline() {
         let session = Session {
             version: 1,
+            runtime_ms: 0,
             messages: vec![
                 ConversationMessage::user_text("first"),
                 ConversationMessage::assistant(vec![ContentBlock::Text {

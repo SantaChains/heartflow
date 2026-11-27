@@ -78,6 +78,12 @@ pub enum AgentEvent {
         name: String,
         output: String,
         is_error: bool,
+        /// Wall time the tool itself ran, in milliseconds. `None` for results
+        /// that were never executed (policy denial, invalid input, cancelled
+        /// before start) and for recordings made before this field existed —
+        /// kept optional so old cassettes still replay.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     Usage(TokenUsage),
     MessageStop,
@@ -511,6 +517,14 @@ pub struct TurnSummary {
     /// `auto_record_turn` (found in review, 2026-11-27: budgets used to drain
     /// quadratically).
     pub turn_usage: TokenUsage,
+    /// Wall time this turn took end to end, in milliseconds (model streaming,
+    /// permission waits, tool execution). Carried on the summary so the host can
+    /// show it without timing the call itself.
+    pub duration_ms: u64,
+    /// Summed wall time of the tool executions this turn ran, in milliseconds.
+    /// A subset of [`Self::duration_ms`]; authorization and model time are not
+    /// counted here.
+    pub tool_time_ms: u64,
 }
 
 /// Nudge injected as a user message when the model stops with unfinished
@@ -827,6 +841,41 @@ pub struct CompactionAudit {
     pub messages: Vec<ConversationMessage>,
 }
 
+/// Sink for the messages a turn appends to the transcript, so the host can
+/// persist them incrementally instead of only at the turn boundary.
+///
+/// The runtime owns no disk path: [`ConversationRuntime::with_journal`] injects
+/// an implementation, and `None` (tests, headless callers) keeps the old
+/// behavior. [record](Self::record) is called on the hot path and must never
+/// block the turn; [flush](Self::flush) runs at the turn boundary, after the
+/// last message and before the snapshot save.
+pub trait SessionJournal: Send + Sync {
+    /// Queue one message as appended at `ts_ms`. Implementations must not block
+    /// the calling turn; dropping a record is worse than queueing it.
+    fn record(&self, ts_ms: u64, message: &ConversationMessage);
+    /// Drain everything recorded so far and make it durable.
+    ///
+    /// # Errors
+    /// Fails when the underlying writer cannot flush; the caller warns and
+    /// continues — the snapshot save is the authority.
+    fn flush(&self) -> std::io::Result<()>;
+}
+
+#[derive(Debug)]
+struct ToolOutcome {
+    result: Result<String, ToolError>,
+    duration_ms: u64,
+}
+
+/// Record `message` on the journal (when present) before it enters memory: if
+/// the process dies between the two, recovery sees one extra message that
+/// `repair_tool_pairing` safely drops; the reverse order would lose the record.
+fn record_message(journal: Option<&Arc<dyn SessionJournal>>, message: &ConversationMessage) {
+    if let Some(journal) = journal {
+        journal.record(crate::epoch_ms(), message);
+    }
+}
+
 pub struct ConversationRuntime<C, T> {
     session: Session,
     api_client: C,
@@ -838,6 +887,8 @@ pub struct ConversationRuntime<C, T> {
     usage_tracker: UsageTracker,
     /// Dropped regions awaiting the host's archive write, newest last.
     pending_archive: Vec<CompactionAudit>,
+    /// Optional incremental transcript sink (crash recovery); `None` disables.
+    journal: Option<Arc<dyn SessionJournal>>,
     /// Window-based pre-compaction policy applied inside `run_turn`. Disabled
     /// unless `context_window_tokens` is set (via `with_compaction`).
     compaction: CompactionConfig,
@@ -913,6 +964,7 @@ where
             max_continuations: 3,
             usage_tracker,
             pending_archive: Vec::new(),
+            journal: None,
             compaction: CompactionConfig::default(),
             token_prefix: Cell::new((0, 0)),
             token_calibration: RefCell::new(TokenCalibration::default()),
@@ -937,6 +989,15 @@ where
     /// stale handle a finished turn left behind.
     pub fn set_steer_mailbox(&mut self, mailbox: SteerMailbox) {
         self.steer_mailbox = mailbox;
+    }
+
+    /// Inject the incremental transcript sink. Every message the turn appends
+    /// is recorded before it enters memory, so a crash mid-turn recovers the
+    /// completed work from the journal beside the last snapshot.
+    #[must_use]
+    pub fn with_journal(mut self, journal: Arc<dyn SessionJournal>) -> Self {
+        self.journal = Some(journal);
+        self
     }
 
     /// Enable in-turn window pre-compaction: before every stream, the loop
@@ -1022,16 +1083,37 @@ where
     pub async fn run_turn_with_blocks(
         &mut self,
         blocks: Vec<ContentBlock>,
+        prompter: Option<&mut dyn PermissionPrompter>,
+        notify: &mut (dyn FnMut(&AgentEvent) + Send),
+        cancel: &CancellationToken,
+    ) -> Result<TurnSummary, RuntimeError> {
+        let started = std::time::Instant::now();
+        let result = self.run_turn_timed(blocks, prompter, notify, cancel).await;
+        let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // Count everything the turn spent, including turns that ended in an
+        // error or were cancelled: the wall clock still elapsed. Added before
+        // returning so the host's usage line reads the up-to-date session total.
+        self.session.runtime_ms = self.session.runtime_ms.saturating_add(elapsed);
+        result.map(|mut summary| {
+            summary.duration_ms = elapsed;
+            summary
+        })
+    }
+
+    /// The turn loop itself; [`Self::run_turn_with_blocks`] wraps it to measure
+    /// the wall time on every exit path (including errors) in one place.
+    async fn run_turn_timed(
+        &mut self,
+        blocks: Vec<ContentBlock>,
         mut prompter: Option<&mut dyn PermissionPrompter>,
         notify: &mut (dyn FnMut(&AgentEvent) + Send),
         cancel: &CancellationToken,
     ) -> Result<TurnSummary, RuntimeError> {
-        self.session
-            .messages
-            .push(ConversationMessage::user_blocks(blocks));
+        self.push_message(ConversationMessage::user_blocks(blocks));
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
+        let mut tool_time_ms = 0u64;
         let mut iterations = 0usize;
         let mut continuations = 0usize;
         // S6 (roadmap §16 R2): behavior-level fuses for the turn loop.
@@ -1107,9 +1189,7 @@ where
             // a steer that arrives during the final (tool-less) reply simply
             // stays unconsumed for the caller to recover.
             for text in self.steer_mailbox.drain() {
-                self.session
-                    .messages
-                    .push(ConversationMessage::user_text(text.clone()));
+                self.push_message(ConversationMessage::user_text(text.clone()));
                 notify(&AgentEvent::Steered(text));
             }
 
@@ -1245,11 +1325,12 @@ where
                 if !blocks.is_empty() {
                     let unexecuted = advertised_tool_uses(&blocks);
                     let partial = ConversationMessage::assistant_with_usage(blocks, usage);
-                    self.session.messages.push(partial);
+                    self.push_message(partial);
                     Self::record_unexecuted_tools(
                         &unexecuted,
                         UNEXECUTED_STREAM_FAILED,
                         &mut self.session,
+                        self.journal.as_ref(),
                         &mut tool_results,
                         notify,
                     );
@@ -1267,7 +1348,7 @@ where
                 if !blocks.is_empty() {
                     let unexecuted = advertised_tool_uses(&blocks);
                     let message = ConversationMessage::assistant_with_usage(blocks, usage);
-                    self.session.messages.push(message.clone());
+                    self.push_message(message.clone());
                     assistant_messages.push(message);
                     let unexecuted_reason = if cancelled {
                         UNEXECUTED_CANCELLED
@@ -1278,6 +1359,7 @@ where
                         &unexecuted,
                         unexecuted_reason,
                         &mut self.session,
+                        self.journal.as_ref(),
                         &mut tool_results,
                         notify,
                     );
@@ -1319,7 +1401,7 @@ where
             let pending_tool_uses = advertised_tool_uses(&blocks);
 
             let assistant_message = ConversationMessage::assistant_with_usage(blocks, usage);
-            self.session.messages.push(assistant_message.clone());
+            self.push_message(assistant_message.clone());
             assistant_messages.push(assistant_message);
 
             // S6 loop detection (roadmap §16 R2): the same tool batch hashing
@@ -1341,6 +1423,7 @@ where
                         &pending_tool_uses,
                         UNEXECUTED_LOOP_STOP,
                         &mut self.session,
+                        self.journal.as_ref(),
                         &mut tool_results,
                         notify,
                     );
@@ -1361,9 +1444,7 @@ where
                 // request — autopilot continuation or the operator's next
                 // turn — carries them; nothing the user typed is lost.
                 for text in self.steer_mailbox.drain() {
-                    self.session
-                        .messages
-                        .push(ConversationMessage::user_text(text.clone()));
+                    self.push_message(ConversationMessage::user_text(text.clone()));
                     notify(&AgentEvent::Steered(text));
                 }
                 // Self-iteration: with unfinished plan tasks, nudge the model
@@ -1371,7 +1452,7 @@ where
                 if self.tool_executor.pending_tasks() > 0 && continuations < self.max_continuations
                 {
                     continuations += 1;
-                    self.session.messages.push(ConversationMessage::user_text(
+                    self.push_message(ConversationMessage::user_text(
                         CONTINUATION_PROMPT.to_string(),
                     ));
                     continue;
@@ -1410,9 +1491,10 @@ where
             // stop burning requests and surface it (zaly's error-circuit
             // breaker; success clears the count).
             let batch_start = tool_results.len();
-            let interrupted = self
+            let (interrupted, batch_tool_ms) = self
                 .execute_tools(allowed, &mut tool_results, notify, cancel)
                 .await;
+            tool_time_ms = tool_time_ms.saturating_add(batch_tool_ms);
             if interrupted {
                 return Err(RuntimeError::cancelled("turn cancelled"));
             }
@@ -1467,6 +1549,10 @@ where
             iterations,
             continuations,
             turn_usage,
+            // The wrapper measures the real wall time on every exit path and
+            // overwrites this before handing the summary back.
+            duration_ms: 0,
+            tool_time_ms,
         })
     }
 
@@ -1593,10 +1679,11 @@ where
                         name: tool_name.clone(),
                         output: output.clone(),
                         is_error: true,
+                        duration_ms: None,
                     });
                     let message =
                         ConversationMessage::tool_result(tool_use_id, tool_name, output, true);
-                    self.session.messages.push(message.clone());
+                    self.push_message(message.clone());
                     tool_results.push(message);
                 }
             }
@@ -1634,10 +1721,11 @@ where
                         name: tool_name.clone(),
                         output: output.clone(),
                         is_error: true,
+                        duration_ms: None,
                     });
                     let message =
                         ConversationMessage::tool_result(&tool_use_id, &tool_name, output, true);
-                    self.session.messages.push(message.clone());
+                    self.push_message(message.clone());
                     tool_results.push(message);
                     continue;
                 }
@@ -1655,17 +1743,17 @@ where
     /// write racing a concurrent read of the same file and keeps two prompts
     /// from fighting for the terminal, while leaving the fast path of several
     /// independent reads untouched. Transcript entries are appended in
-    /// submission order regardless of completion order. Returns true when
-    /// cancelled mid-flight.
+    /// submission order regardless of completion order. Returns whether the
+    /// turn was cancelled mid-flight and the summed tool wall time in
+    /// milliseconds.
     async fn execute_tools(
         &mut self,
         allowed: Vec<(String, String, String)>,
         tool_results: &mut Vec<ConversationMessage>,
         notify: &mut (dyn FnMut(&AgentEvent) + Send),
         cancel: &CancellationToken,
-    ) -> bool {
-        let mut outcomes: Vec<Option<Result<String, ToolError>>> =
-            (0..allowed.len()).map(|_| None).collect();
+    ) -> (bool, u64) {
+        let mut outcomes: Vec<Option<ToolOutcome>> = (0..allowed.len()).map(|_| None).collect();
         let mut interrupted = false;
         let mut index = 0usize;
         while index < allowed.len() {
@@ -1694,8 +1782,8 @@ where
                 break;
             }
         }
-        self.record_tool_results(&allowed, outcomes, tool_results, notify);
-        interrupted
+        let tool_time_ms = self.record_tool_results(&allowed, outcomes, tool_results, notify);
+        (interrupted, tool_time_ms)
     }
 
     /// Run one batch of tool calls (`group` indexes into `allowed`) on the
@@ -1707,7 +1795,7 @@ where
         &self,
         allowed: &[(String, String, String)],
         group: &[usize],
-        outcomes: &mut [Option<Result<String, ToolError>>],
+        outcomes: &mut [Option<ToolOutcome>],
         cancel: &CancellationToken,
     ) -> bool {
         let mut join_set = JoinSet::new();
@@ -1716,8 +1804,12 @@ where
             let tool_name = allowed[index].1.clone();
             let input = allowed[index].2.clone();
             join_set.spawn_blocking(move || {
+                // Measured around the executor only: permission prompts and the
+                // model round trip stay out of the tool's own time.
+                let started = std::time::Instant::now();
                 let result = executor.execute(&tool_name, &input);
-                (index, result)
+                let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                (index, result, duration_ms)
             });
         }
 
@@ -1729,14 +1821,17 @@ where
                     interrupted = true;
                 }
                 joined = join_set.join_next() => match joined {
-                    Some(Ok((index, result))) => outcomes[index] = Some(result),
+                    Some(Ok((index, result, duration_ms))) => {
+                        outcomes[index] = Some(ToolOutcome { result, duration_ms });
+                    }
                     Some(Err(error)) => {
                         // A panicked/cancelled task: blame an unfinished slot
                         // in this group so the model still gets a result line.
                         if let Some(&slot) = group.iter().find(|&&i| outcomes[i].is_none()) {
-                            outcomes[slot] = Some(Err(ToolError::new(format!(
-                                "tool task failed: {error}"
-                            ))));
+                            outcomes[slot] = Some(ToolOutcome {
+                                result: Err(ToolError::new(format!("tool task failed: {error}"))),
+                                duration_ms: 0,
+                            });
                         }
                     }
                     None => break,
@@ -1758,6 +1853,7 @@ where
         pending: &[(String, String, String)],
         reason: &str,
         session: &mut Session,
+        journal: Option<&Arc<dyn SessionJournal>>,
         tool_results: &mut Vec<ConversationMessage>,
         notify: &mut (dyn FnMut(&AgentEvent) + Send),
     ) {
@@ -1768,41 +1864,60 @@ where
                 name: tool_name.clone(),
                 output: output.clone(),
                 is_error: true,
+                duration_ms: None,
             });
             let message = ConversationMessage::tool_result(tool_use_id, tool_name, output, true);
+            record_message(journal, &message);
             session.messages.push(message.clone());
             tool_results.push(message);
         }
     }
 
     /// Fold execution outcomes into transcript `tool_result` messages in
-    /// submission order, emitting the `ToolResult` events and truncating
-    /// oversized output. A slot left `None` means the tool never completed
-    /// (cancelled) and is recorded as an interruption error.
+    /// submission order, emitting the `ToolResult` events (with each tool's own
+    /// wall time) and truncating oversized output. A slot left `None` means the
+    /// tool never completed (cancelled) and is recorded as an interruption
+    /// error. Returns the summed tool time in milliseconds.
     fn record_tool_results(
         &mut self,
         allowed: &[(String, String, String)],
-        outcomes: Vec<Option<Result<String, ToolError>>>,
+        outcomes: Vec<Option<ToolOutcome>>,
         tool_results: &mut Vec<ConversationMessage>,
         notify: &mut (dyn FnMut(&AgentEvent) + Send),
-    ) {
+    ) -> u64 {
+        let mut tool_time_ms = 0u64;
         for ((tool_use_id, tool_name, _), slot) in allowed.iter().zip(outcomes) {
-            let (output, is_error) = match slot {
-                Some(Ok(output)) => (truncate_tool_output(&output), false),
-                Some(Err(error)) => (truncate_tool_output(&error.to_string()), true),
-                None => (String::from("[interrupted by user]"), true),
+            let (output, is_error, duration_ms) = match slot {
+                Some(ToolOutcome {
+                    result: Ok(output),
+                    duration_ms,
+                }) => (truncate_tool_output(&output), false, Some(duration_ms)),
+                Some(ToolOutcome {
+                    result: Err(error),
+                    duration_ms,
+                }) => (
+                    truncate_tool_output(&error.to_string()),
+                    true,
+                    Some(duration_ms),
+                ),
+                None => (String::from("[interrupted by user]"), true, None),
             };
+            if let Some(duration) = duration_ms {
+                tool_time_ms = tool_time_ms.saturating_add(duration);
+            }
             notify(&AgentEvent::ToolResult {
                 id: tool_use_id.clone(),
                 name: tool_name.clone(),
                 output: output.clone(),
                 is_error,
+                duration_ms,
             });
             let message =
                 ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error);
-            self.session.messages.push(message.clone());
+            self.push_message(message.clone());
             tool_results.push(message);
         }
+        tool_time_ms
     }
 
     /// Compact the session in place, keeping a resumable system summary.
@@ -2047,6 +2162,12 @@ where
         self.tool_executor.specs()
     }
 
+    /// Append one message to the transcript, journalling it first.
+    fn push_message(&mut self, message: ConversationMessage) {
+        record_message(self.journal.as_ref(), &message);
+        self.session.messages.push(message);
+    }
+
     #[must_use]
     pub fn session(&self) -> &Session {
         &self.session
@@ -2157,8 +2278,8 @@ impl ToolExecutor for StaticToolExecutor {
 mod tests {
     use super::{
         build_replay_messages, repair_tool_pairing, AgentEvent, ApiClient, ApiRequest,
-        ConversationRuntime, RuntimeError, StaticToolExecutor, ToolError, ToolExecutor, ToolSpec,
-        TurnStream,
+        ConversationRuntime, RuntimeError, SessionJournal, StaticToolExecutor, ToolError,
+        ToolExecutor, ToolSpec, TurnStream,
     };
     use crate::compact::{
         compact_session_in_place, estimate_session_tokens, CompactionConfig, SoftTrigger,
@@ -2281,6 +2402,7 @@ mod tests {
             };
             let mut session = Session {
                 version: 1,
+                runtime_ms: 0,
                 messages,
             };
             let result = compact_session_in_place(&mut session, config);
@@ -2689,12 +2811,84 @@ mod tests {
                 ..
             }
         ));
-        assert!(events.contains(&AgentEvent::ToolResult {
-            id: "tool-1".to_string(),
-            name: "add".to_string(),
-            output: "4".to_string(),
-            is_error: false,
-        }));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult {
+                id,
+                name,
+                output,
+                is_error: false,
+                // Executed tools report a measured duration.
+                duration_ms: Some(_),
+            } if id == "tool-1" && name == "add" && output == "4"
+        )));
+    }
+
+    #[tokio::test]
+    async fn journals_every_appended_message_and_times_the_turn() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        #[derive(Clone, Default)]
+        struct RecordingJournal {
+            messages: Arc<StdMutex<Vec<ConversationMessage>>>,
+            flushes: Arc<AtomicUsize>,
+        }
+
+        impl SessionJournal for RecordingJournal {
+            fn record(&self, _ts_ms: u64, message: &ConversationMessage) {
+                self.messages
+                    .lock()
+                    .expect("journal lock")
+                    .push(message.clone());
+            }
+
+            fn flush(&self) -> std::io::Result<()> {
+                self.flushes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let journal = RecordingJournal::default();
+        let tool_executor =
+            StaticToolExecutor::new().register("add", |input| Ok(input.to_string()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ScriptedApiClient { call_count: 0 },
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::Prompt),
+            Vec::new(),
+        )
+        .with_journal(Arc::new(journal.clone()));
+
+        let mut events = Vec::new();
+        let summary = runtime
+            .run_turn(
+                "what is 2 + 2?",
+                Some(&mut PromptAllowOnce),
+                &mut |event| events.push(event.clone()),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("turn should succeed");
+
+        // Journal order mirrors memory: user, assistant+tool_use, tool_result,
+        // final assistant — recorded before each push.
+        let recorded = journal.messages.lock().expect("journal lock").clone();
+        assert_eq!(recorded, runtime.session().messages);
+        assert_eq!(recorded.len(), 4);
+        // The turn wrapper folded its wall time into the persisted accumulator.
+        assert_eq!(summary.duration_ms, runtime.session().runtime_ms);
+        // Executed tools carry a measured duration; derived results do not.
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult {
+                duration_ms: Some(_),
+                ..
+            }
+        )));
+        journal.flush().expect("flush");
+        assert_eq!(journal.flushes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -768,6 +768,14 @@ fn resume_session(state: &SessionShared, session_path: &Path, command: &str) {
         eprintln!("failed to persist resumed session: {error}");
         process::exit(1);
     }
+    // The segment was folded into the snapshot above; reset its header so the
+    // next load does not reject a stale base.
+    let segment = session_path.with_extension("jsonl");
+    if segment.exists() {
+        if let Err(error) = runtime::reset_segment(&segment, result.session.messages.len()) {
+            eprintln!("warning: could not reset the session segment: {error}");
+        }
+    }
     println!("{}", result.message);
 }
 
@@ -2138,6 +2146,9 @@ fn build_runtime_with_mcp(
     let mcp_read_only = mcp.read_only_tool_names();
     let questioner: Option<Arc<dyn UserQuestioner>> =
         interactive.then(|| Arc::new(InteractiveQuestioner) as Arc<dyn UserQuestioner>);
+    // Every runtime rebuild shares one journal (one open segment file); the
+    // base is the current transcript length the segment extends.
+    let journal = ensure_journal(state, session.messages.len());
     Ok(ConversationRuntime::new(
         session,
         client,
@@ -2149,7 +2160,8 @@ fn build_runtime_with_mcp(
         permission_policy_for_mode(mode, &mcp_read_only),
         system_prompt,
     )
-    .with_compaction(compaction))
+    .with_compaction(compaction)
+    .with_journal(journal))
 }
 
 #[cfg(test)]
@@ -2668,7 +2680,7 @@ mod tests {
 
     #[test]
     fn usage_line_reports_cache_hit_and_session_total() {
-        use super::usage_line;
+        use super::{usage_line, TurnTiming};
         use provider::StatusConfig;
         use runtime::TokenUsage;
         let current = TokenUsage {
@@ -2687,7 +2699,14 @@ mod tests {
         // No window configured: ctx shows the absolute humanized count
         // (current turn's context_input = 2800 + 8400 = 11200 -> 11K).
         assert_eq!(
-            usage_line(&current, &session, 0, None, StatusConfig::default()),
+            usage_line(
+                &current,
+                &session,
+                0,
+                None,
+                StatusConfig::default(),
+                TurnTiming::default()
+            ),
             "[ctx 11K · in 2800 / out 120 · cache 75% · session 171100]"
         );
         // Zero input guards the divide; no cache reads report 0%.
@@ -2698,14 +2717,21 @@ mod tests {
             cache_read_input_tokens: 0,
         };
         assert_eq!(
-            usage_line(&empty, &empty, 0, None, StatusConfig::default()),
+            usage_line(
+                &empty,
+                &empty,
+                0,
+                None,
+                StatusConfig::default(),
+                TurnTiming::default()
+            ),
             "[ctx 0 · in 0 / out 0 · cache 0% · session 0]"
         );
     }
 
     #[test]
     fn usage_line_draws_the_context_bar_against_the_window() {
-        use super::usage_line;
+        use super::{usage_line, TurnTiming};
         use provider::StatusConfig;
         use runtime::TokenUsage;
         let current = TokenUsage {
@@ -2716,16 +2742,30 @@ mod tests {
         };
         let session = TokenUsage::default();
         // ctx = 11200, window = 128000 -> floor(8.75%) = 8 -> zero filled cells.
-        let line = usage_line(&current, &session, 128_000, None, StatusConfig::default());
+        let line = usage_line(
+            &current,
+            &session,
+            128_000,
+            None,
+            StatusConfig::default(),
+            TurnTiming::default(),
+        );
         assert!(line.contains("ctx ▯▯▯▯▯▯▯▯▯▯ 8% 11K/128K"), "{line}");
         // Over-occupancy clamps at 100% with a full bar.
-        let line = usage_line(&current, &session, 4_000, None, StatusConfig::default());
+        let line = usage_line(
+            &current,
+            &session,
+            4_000,
+            None,
+            StatusConfig::default(),
+            TurnTiming::default(),
+        );
         assert!(line.contains("ctx ▮▮▮▮▮▮▮▮▮▮ 100%"), "{line}");
     }
 
     #[test]
     fn usage_line_shows_estimated_cost_when_priced() {
-        use super::usage_line;
+        use super::{usage_line, TurnTiming};
         use provider::StatusConfig;
         use runtime::TokenUsage;
         let current = TokenUsage {
@@ -2742,6 +2782,7 @@ mod tests {
             0,
             Some((0.28, 1.10)),
             StatusConfig::default(),
+            TurnTiming::default(),
         );
         assert!(line.contains("$0.83 req / $0 session"), "{line}");
         // Sub-cent costs keep four decimals; unpriced models omit the segment.
@@ -2751,14 +2792,29 @@ mod tests {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         };
-        let line = usage_line(&tiny, &tiny, 0, Some((0.28, 1.10)), StatusConfig::default());
+        let line = usage_line(
+            &tiny,
+            &tiny,
+            0,
+            Some((0.28, 1.10)),
+            StatusConfig::default(),
+            TurnTiming::default(),
+        );
         assert!(line.contains("$0.0004 req / $0.0004 session"), "{line}");
-        assert!(!usage_line(&tiny, &tiny, 0, None, StatusConfig::default()).contains('$'));
+        assert!(!usage_line(
+            &tiny,
+            &tiny,
+            0,
+            None,
+            StatusConfig::default(),
+            TurnTiming::default()
+        )
+        .contains('$'));
     }
 
     #[test]
     fn usage_line_toggles_drop_their_segments() {
-        use super::usage_line;
+        use super::{usage_line, TurnTiming};
         use provider::StatusConfig;
         use runtime::TokenUsage;
         let current = TokenUsage {
@@ -2788,6 +2844,7 @@ mod tests {
             128_000,
             None,
             toggles(false, true, true, true),
+            TurnTiming::default(),
         );
         assert!(line.contains("ctx 11K/128K"), "{line}");
         // Bar off removes only the glyphs; cache toggle is independent, so the
@@ -2801,6 +2858,7 @@ mod tests {
             0,
             None,
             toggles(true, false, true, true),
+            TurnTiming::default(),
         );
         assert!(!line.contains("cache"), "{line}");
         assert!(line.contains("session 171100"), "{line}");
@@ -2812,6 +2870,7 @@ mod tests {
             0,
             None,
             toggles(true, true, true, false),
+            TurnTiming::default(),
         );
         assert!(!line.contains("session"), "{line}");
         assert!(line.contains("cache 75%"), "{line}");
@@ -2823,6 +2882,7 @@ mod tests {
             0,
             Some((0.28, 1.10)),
             toggles(true, true, false, true),
+            TurnTiming::default(),
         );
         assert!(!line.contains('$'), "{line}");
 
@@ -2833,6 +2893,7 @@ mod tests {
             128_000,
             Some((0.28, 1.10)),
             toggles(false, false, false, false),
+            TurnTiming::default(),
         );
         assert_eq!(line, "");
     }

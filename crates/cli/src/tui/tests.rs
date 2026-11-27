@@ -538,12 +538,14 @@ fn reducer_fuzz_survives_random_message_streams() {
             name: "bash".into(),
             output: "ok".into(),
             is_error: false,
+            duration_ms: None,
         },
         AgentEvent::ToolResult {
             id: "9".into(),
             name: "ghost".into(),
             output: String::new(),
             is_error: true,
+            duration_ms: None,
         },
         AgentEvent::Usage(TokenUsage::default()),
         AgentEvent::MessageStop,
@@ -909,6 +911,7 @@ fn tool_use_flushes_text_then_result_clears_the_marker() {
         name: "bash".into(),
         output: "ok".into(),
         is_error: false,
+        duration_ms: None,
     }));
     assert!(
         app.running_tool.is_none(),
@@ -1001,6 +1004,7 @@ fn long_tool_output_collapses_and_tab_expands_it() {
         name: "bash".into(),
         output: body,
         is_error: false,
+        duration_ms: None,
     }));
     // Collapsed by default: only the marker row shows.
     assert_eq!(render_items(&app.transcript).len(), 1);
@@ -1020,6 +1024,7 @@ fn short_tool_output_starts_expanded() {
         name: "read_file".into(),
         output: "one\ntwo".into(),
         is_error: false,
+        duration_ms: None,
     }));
     // 2 lines <= the default inline threshold: marker + both rows, no fold.
     assert_eq!(render_items(&app.transcript).len(), 3);
@@ -1097,6 +1102,7 @@ fn zero_tool_inline_lines_folds_even_short_output() {
         name: "read_file".into(),
         output: "one\ntwo".into(),
         is_error: false,
+        duration_ms: None,
     }));
     // Threshold 0 folds even a 2-line result: marker row only.
     assert_eq!(render_items(&app.transcript).len(), 1);

@@ -171,6 +171,7 @@ pub fn redact_session(session: &Session, literals: &[String]) -> Session {
     Session {
         version: session.version,
         messages: redact_messages(&session.messages, literals),
+        runtime_ms: session.runtime_ms,
     }
 }
 
@@ -255,6 +256,7 @@ mod tests {
     fn redact_session_preserves_structure_and_ids() {
         let session = Session {
             version: 1,
+            runtime_ms: 0,
             messages: vec![
                 ConversationMessage::user_text("run curl -u bob:hunter2 https://x"),
                 ConversationMessage::assistant(vec![ContentBlock::ToolUse {
@@ -298,6 +300,7 @@ mod tests {
     fn redacts_a_slice_incrementally() {
         let session = Session {
             version: 1,
+            runtime_ms: 0,
             messages: vec![
                 ConversationMessage::user_text("plain first turn"),
                 ConversationMessage::user_text("key sk-abcdefghijklmnopqrstuv"),
@@ -318,6 +321,7 @@ mod tests {
     fn original_session_is_not_mutated() {
         let session = Session {
             version: 1,
+            runtime_ms: 0,
             messages: vec![ConversationMessage::user_text(
                 "secret sk-abcdefghijklmnopqrstuv",
             )],

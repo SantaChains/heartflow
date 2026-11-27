@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -9,7 +10,11 @@ use crate::usage::TokenUsage;
 /// Format version of the append-only segment beside a session snapshot. Bumped
 /// only when the segment layout itself changes, so a reader can refuse a body it
 /// does not understand instead of guessing.
-pub const SEGMENT_VERSION: u64 = 1;
+///
+/// v1 records a bare [`ConversationMessage`] per line; v2 wraps each one in an
+/// envelope carrying the millisecond timestamp it was appended at. The reader
+/// accepts both so hand-written v1 segments keep working.
+pub const SEGMENT_VERSION: u64 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,10 +71,22 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Session {
     pub version: u32,
     pub messages: Vec<ConversationMessage>,
+    /// Accumulated wall time of the turns this conversation ran, in
+    /// milliseconds. Persisted with the snapshot so `hf doctor` can report real
+    /// working time rather than file age; absent in older snapshots (defaults
+    /// to zero) and skipped when still zero, keeping untouched transcripts
+    /// byte-compatible with the previous format.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub runtime_ms: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -127,6 +144,7 @@ impl Session {
         Self {
             version: 1,
             messages: Vec::new(),
+            runtime_ms: 0,
         }
     }
 
@@ -246,7 +264,15 @@ impl Session {
                     .map_err(SessionError::from)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { version, messages })
+        let runtime_ms = object
+            .get("runtime_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        Ok(Self {
+            version,
+            messages,
+            runtime_ms,
+        })
     }
 }
 
@@ -323,16 +349,27 @@ impl Default for Session {
     }
 }
 
+/// One v2 segment line: the timestamp the message was appended at, plus the
+/// message itself. v1 lines carry the message alone (see [`SEGMENT_VERSION`]).
+#[derive(Debug, Deserialize)]
+struct SegmentRecord {
+    #[allow(dead_code)]
+    ts: u64,
+    message: ConversationMessage,
+}
+
 /// Decode a segment body into the messages it appends, or an explanation of why
 /// it cannot be trusted.
 ///
-/// Layout: a header line `{"base": <snapshot message count>, "version": 1}` then
-/// one JSON `ConversationMessage` per line. Position is the whole safety story —
-/// record `k` continues the snapshot at index `base + k` — so a segment is only
-/// usable while `base` still equals the snapshot length. A mismatch means the
-/// snapshot moved under it (a compaction rewrote a shorter transcript, or a newer
-/// snapshot already absorbed the tail) and the tail cannot be placed at all, so
-/// it is dropped whole rather than risk duplicating or transposing messages.
+/// Layout: a header line `{"base": <snapshot message count>, "version": 1|2}`
+/// then one record per line — a bare `ConversationMessage` for v1, an envelope
+/// `{"ts": <millis>, "message": {...}}` for v2. Position is the whole safety
+/// story — record `k` continues the snapshot at index `base + k` — so a segment
+/// is only usable while `base` still equals the snapshot length. A mismatch
+/// means the snapshot moved under it (a compaction rewrote a shorter transcript,
+/// or a newer snapshot already absorbed the tail) and the tail cannot be placed
+/// at all, so it is dropped whole rather than risk duplicating or transposing
+/// messages.
 ///
 /// The returned `Option` is the byte count of a final chunk left unterminated by
 /// an interrupted append: complete records before it are still good, and a torn
@@ -354,7 +391,7 @@ fn parse_segment(
         .get("version")
         .and_then(Value::as_u64)
         .unwrap_or(SEGMENT_VERSION);
-    if version != SEGMENT_VERSION {
+    if version != 1 && version != SEGMENT_VERSION {
         return Err(format!("unsupported segment version {version}"));
     }
     if base != snapshot_len as u64 {
@@ -370,7 +407,12 @@ fn parse_segment(
         if record.trim().is_empty() {
             return Err(format!("blank record at position {index}"));
         }
-        match serde_json::from_str::<ConversationMessage>(record) {
+        let parsed: Result<ConversationMessage, serde_json::Error> = if version == 1 {
+            serde_json::from_str::<ConversationMessage>(record)
+        } else {
+            serde_json::from_str::<SegmentRecord>(record).map(|record| record.message)
+        };
+        match parsed {
             Ok(message) => tail.push(message),
             // Only the last unterminated chunk may be a torn append; a record in
             // the middle that cannot decode means the sequence is broken.
@@ -379,6 +421,179 @@ fn parse_segment(
         }
     }
     Ok((tail, None))
+}
+
+/// Producer of the append-only segment beside a snapshot.
+///
+/// Opened once per writing session and appended to one message at a time; the
+/// header names the snapshot length the segment extends, so a reader can place
+/// every record deterministically. A segment whose header does not match the
+/// requested base is rebuilt from scratch: the snapshot moved (or the process
+/// restarted after folding the old tail into it), and appending behind a stale
+/// base would make the reader reject the whole file.
+pub struct SegmentWriter {
+    file: fs::File,
+    base: usize,
+    appended: usize,
+}
+
+impl SegmentWriter {
+    /// Open or create the segment at `path` for a snapshot of `base` messages.
+    ///
+    /// A file whose header already names `base` is resumed after repairing a
+    /// torn tail (a crash mid-append leaves a partial line that would otherwise
+    /// make the whole segment unreadable). Anything else — missing, unreadable,
+    /// older version, different base — is replaced by a fresh header.
+    ///
+    /// # Errors
+    /// Fails when the parent directory cannot be created or the file cannot be
+    /// opened for appending after the header was written.
+    pub fn open(path: impl AsRef<Path>, base: usize) -> std::io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+            crate::private_fs::harden_dir(parent);
+        }
+        let usable = match read_segment_header(&path) {
+            Ok((version, header_base)) => version == SEGMENT_VERSION && header_base == base as u64,
+            Err(_) => false,
+        };
+        if usable {
+            // A torn tail cannot be repaired by the reader (it rejects the whole
+            // segment on a bad interior record), so truncate it before appending.
+            if !repair_torn_tail(&path)? {
+                write_segment_header(&path, base)?;
+            }
+        } else {
+            // Discarding a non-empty segment is data-bearing: it means the
+            // snapshot moved past it (records already folded in) or the file is
+            // corrupt. Never silent, so a surprising loss is traceable.
+            if path.metadata().is_ok_and(|meta| meta.len() > 0) {
+                tracing::warn!(
+                    target: "heartflow::session",
+                    path = %path.display(),
+                    base,
+                    "discarding a stale session segment and starting a new one"
+                );
+            }
+            write_segment_header(&path, base)?;
+        }
+        let file = fs::OpenOptions::new().append(true).open(&path)?;
+        Ok(Self {
+            file,
+            base,
+            appended: 0,
+        })
+    }
+
+    /// Append one timestamped message as a single v2 record.
+    ///
+    /// # Errors
+    /// Fails when the record cannot be serialized or the write fails; the
+    /// segment is left with its previous complete records only.
+    pub fn append(&mut self, ts_ms: u64, message: &ConversationMessage) -> std::io::Result<()> {
+        let mut line = serde_json::to_string(&serde_json::json!({
+            "ts": ts_ms,
+            "message": message,
+        }))
+        .map_err(std::io::Error::other)?;
+        line.push('\n');
+        self.file.write_all(line.as_bytes())?;
+        self.appended += 1;
+        Ok(())
+    }
+
+    /// Durably sync the segment to disk (turn boundary).
+    ///
+    /// # Errors
+    /// Fails when the OS rejects the sync.
+    pub fn sync(&mut self) -> std::io::Result<()> {
+        self.file.sync_data()
+    }
+
+    /// Snapshot length this segment extends.
+    #[must_use]
+    pub fn base(&self) -> usize {
+        self.base
+    }
+
+    /// Records appended through this writer.
+    #[must_use]
+    pub fn appended(&self) -> usize {
+        self.appended
+    }
+}
+
+/// Reset a segment so the next turn appends against a snapshot of `base`
+/// messages. Called only after the snapshot rename succeeded: the old segment
+/// then holds nothing the snapshot does not.
+///
+/// # Errors
+/// Fails when the header cannot be written atomically.
+pub fn reset_segment(path: impl AsRef<Path>, base: usize) -> std::io::Result<()> {
+    write_segment_header(path.as_ref(), base)
+}
+
+fn write_segment_header(path: &Path, base: usize) -> std::io::Result<()> {
+    let header = format!("{{\"base\": {base}, \"version\": {SEGMENT_VERSION}}}\n");
+    write_atomic(path, header.as_bytes())
+}
+
+/// Read `(version, base)` from the header line. The first line is bounded by
+/// `read_line`, so a multi-MB body is never loaded just to inspect the header.
+fn read_segment_header(path: &Path) -> std::io::Result<(u64, u64)> {
+    let file = fs::File::open(path)?;
+    let mut line = String::new();
+    BufReader::new(file).read_line(&mut line)?;
+    let header: Value = serde_json::from_str(line.trim())
+        .map_err(|error| std::io::Error::other(format!("header is not JSON: {error}")))?;
+    let base = header
+        .get("base")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| std::io::Error::other("header has no base"))?;
+    let version = header.get("version").and_then(Value::as_u64).unwrap_or(1);
+    Ok((version, base))
+}
+
+/// Truncate a segment whose last record was cut mid-write by a crash, so the
+/// next append starts on a clean line. Scans backwards in 64 KiB blocks (the
+/// header always ends in `\n`, so the search terminates at the first line at
+/// worst). Returns false when the file has no newline at all — the header
+/// itself is torn, and the caller rewrites it.
+fn repair_torn_tail(path: &Path) -> std::io::Result<bool> {
+    const CHUNK: u64 = 64 * 1024;
+    let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(false);
+    }
+    let mut last = [0u8; 1];
+    file.seek(SeekFrom::End(-1))?;
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(true);
+    }
+    let mut end = len;
+    loop {
+        let start = end.saturating_sub(CHUNK);
+        let size = usize::try_from(end - start).unwrap_or(0);
+        if size == 0 {
+            return Ok(false);
+        }
+        let mut buffer = vec![0u8; size];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buffer)?;
+        if let Some(position) = buffer.iter().rposition(|byte| *byte == b'\n') {
+            let keep = start + u64::try_from(position + 1).unwrap_or(0);
+            file.set_len(keep)?;
+            file.sync_data()?;
+            return Ok(true);
+        }
+        if start == 0 {
+            return Ok(false);
+        }
+        end = start;
+    }
 }
 
 impl ConversationMessage {
@@ -454,8 +669,8 @@ impl ConversationMessage {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContentBlock, ConversationMessage, MessageRole, SegmentRead, Session, SessionError,
-        SEGMENT_VERSION,
+        reset_segment, ContentBlock, ConversationMessage, MessageRole, SegmentRead, SegmentWriter,
+        Session, SessionError,
     };
     use crate::usage::TokenUsage;
     use std::fs;
@@ -607,6 +822,7 @@ mod tests {
     fn round_trips_unicode_and_newlines() {
         let session = Session {
             version: 1,
+            runtime_ms: 0,
             messages: vec![ConversationMessage::user_text(
                 "\u{4e2d}\u{6587} \u{1f680} line1\r\nline2\tend",
             )],
@@ -659,6 +875,7 @@ mod tests {
     fn sample_session() -> Session {
         Session {
             version: 1,
+            runtime_ms: 0,
             messages: vec![
                 ConversationMessage::user_text("one"),
                 ConversationMessage::user_text("two"),
@@ -687,10 +904,10 @@ mod tests {
         let _ = fs::remove_file(segment_path(path));
     }
 
-    /// Build a segment the way the eventual writer will: a header naming the
-    /// snapshot length, then one serialized message per line.
+    /// Build a v1 segment (bare messages per line) so the legacy reader path
+    /// stays covered; the writer only produces v2.
     fn write_segment(path: &Path, base: usize, tail: &[ConversationMessage]) {
-        let mut body = format!("{{\"base\": {base}, \"version\": {SEGMENT_VERSION}}}\n");
+        let mut body = format!("{{\"base\": {base}, \"version\": 1}}\n");
         for message in tail {
             body.push_str(&serde_json::to_string(message).expect("message should serialize"));
             body.push('\n');
@@ -731,6 +948,7 @@ mod tests {
     fn reads_a_hand_written_segment() {
         let session = Session {
             version: 1,
+            runtime_ms: 0,
             messages: vec![ConversationMessage::user_text("one")],
         };
         let path = write_snapshot(&session, "handwritten-segment");
@@ -754,6 +972,7 @@ mod tests {
     fn drops_torn_segment_tail_with_a_warning() {
         let session = Session {
             version: 1,
+            runtime_ms: 0,
             messages: vec![ConversationMessage::user_text("one")],
         };
         let path = write_snapshot(&session, "torn-tail");
@@ -826,7 +1045,7 @@ mod tests {
     fn rejects_unknown_segment_version() {
         let session = sample_session();
         let path = write_snapshot(&session, "segment-version");
-        fs::write(segment_path(&path), "{\"base\": 4, \"version\": 2}\n")
+        fs::write(segment_path(&path), "{\"base\": 4, \"version\": 99}\n")
             .expect("segment should write");
         let (loaded, segment) = Session::load_with_segment(&path).expect("load");
         cleanup(&path);
@@ -836,6 +1055,99 @@ mod tests {
             .warning()
             .is_some_and(|text| text.contains("version")));
         assert_eq!(loaded, session);
+    }
+
+    #[test]
+    fn writer_round_trips_timestamped_records_and_reset_extends_the_base() {
+        let full = sample_session();
+        let mut snapshot = full.clone();
+        let tail = snapshot.messages.split_off(2);
+        let path = write_snapshot(&snapshot, "writer-roundtrip");
+        let mut writer = SegmentWriter::open(segment_path(&path), snapshot.messages.len())
+            .expect("writer should open");
+        assert_eq!(writer.base(), 2);
+        for (index, message) in tail.iter().enumerate() {
+            writer
+                .append(1_000 + index as u64, message)
+                .expect("append should succeed");
+        }
+        writer.sync().expect("sync should succeed");
+        assert_eq!(writer.appended(), 2);
+        let (loaded, segment) = Session::load_with_segment(&path).expect("load");
+        assert_eq!(segment, SegmentRead::Applied { appended: 2 });
+        assert_eq!(loaded, full);
+
+        // A save moves the full transcript into the snapshot and resets the
+        // header to its new length; the segment then carries nothing.
+        full.save_to_path(&path).expect("snapshot save");
+        reset_segment(segment_path(&path), full.messages.len()).expect("reset should succeed");
+        let (loaded, segment) = Session::load_with_segment(&path).expect("load");
+        assert_eq!(
+            segment,
+            SegmentRead::Applied { appended: 0 },
+            "reset segment carries no records"
+        );
+        assert_eq!(loaded.messages.len(), 4);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn writer_repairs_a_torn_tail_before_appending() {
+        let session = Session {
+            version: 1,
+            messages: vec![ConversationMessage::user_text("one")],
+            runtime_ms: 0,
+        };
+        let path = write_snapshot(&session, "writer-torn");
+        let mut first = SegmentWriter::open(segment_path(&path), 1).expect("open");
+        first
+            .append(1, &ConversationMessage::user_text("two"))
+            .expect("append");
+        first.sync().expect("sync");
+        drop(first);
+        // Simulate a crash mid-append: a partial v2 record without newline.
+        let mut torn = fs::read_to_string(segment_path(&path)).expect("read segment");
+        torn.push_str("{\"ts\":2,\"message\":{\"role\":\"user\",\"blocks\":[{\"type\":\"tex");
+        fs::write(segment_path(&path), torn).expect("write torn");
+
+        let mut writer = SegmentWriter::open(segment_path(&path), 1).expect("reopen");
+        writer
+            .append(3, &ConversationMessage::user_text("three"))
+            .expect("append after repair");
+        writer.sync().expect("sync");
+        let (loaded, segment) = Session::load_with_segment(&path).expect("load");
+        cleanup(&path);
+
+        assert_eq!(segment, SegmentRead::Applied { appended: 2 });
+        assert_eq!(loaded.messages.len(), 3);
+        assert_eq!(loaded.messages[1], ConversationMessage::user_text("two"));
+        assert_eq!(loaded.messages[2], ConversationMessage::user_text("three"));
+    }
+
+    #[test]
+    fn writer_rebuilds_a_segment_whose_base_moved() {
+        let session = Session {
+            version: 1,
+            messages: vec![
+                ConversationMessage::user_text("one"),
+                ConversationMessage::user_text("two"),
+            ],
+            runtime_ms: 0,
+        };
+        let path = write_snapshot(&session, "writer-rebase");
+        // Stale segment from before a save: base 0 with one record.
+        write_segment(&path, 0, &[ConversationMessage::user_text("stale")]);
+        let mut writer = SegmentWriter::open(segment_path(&path), 2).expect("open");
+        writer
+            .append(7, &ConversationMessage::user_text("fresh"))
+            .expect("append");
+        writer.sync().expect("sync");
+        let (loaded, segment) = Session::load_with_segment(&path).expect("load");
+        cleanup(&path);
+
+        assert_eq!(segment, SegmentRead::Applied { appended: 1 });
+        assert_eq!(loaded.messages.len(), 3);
+        assert_eq!(loaded.messages[2], ConversationMessage::user_text("fresh"));
     }
 
     #[test]

@@ -164,6 +164,34 @@ pub(crate) fn run_doctor(fix: bool) -> Result<Vec<String>, Box<dyn std::error::E
         }
     }
 
+    // Conversation footprint: snapshots plus the active segments the P1 journal
+    // writes. Doctor runs in its own process, so the only honest runtime figure
+    // is the accumulated turn time persisted inside the newest snapshot.
+    let sessions = crate::storage::session_stats();
+    if sessions.snapshots == 0 {
+        println!("  ok   sessions: none saved yet");
+    } else {
+        let newest = sessions
+            .newest
+            .as_ref()
+            .map(|(id, runtime_ms, messages, age)| {
+                format!(
+                    "; newest {id}: {} ran over {messages} message(s), last write {}",
+                    crate::turn::fmt_duration(*runtime_ms),
+                    ago(*age)
+                )
+            })
+            .unwrap_or_default();
+        println!(
+            "  ok   sessions: {} snapshot(s) ({} KiB), {} active segment(s) ({} KiB), {} KiB total{newest}",
+            sessions.snapshots,
+            sessions.snapshot_bytes / 1_024,
+            sessions.segments,
+            sessions.segment_bytes / 1_024,
+            (sessions.snapshot_bytes + sessions.segment_bytes) / 1_024
+        );
+    }
+
     // §6 checkpoints: a snapshot failure means a write-class tool mutated the
     // project without a restore point. Degrade-but-count policy, surfaced here
     // so a persistently broken git setup is visible instead of silent.
@@ -323,6 +351,19 @@ const QUICK_CHECK_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 /// Verify the derived history database is not corrupted. Read-only: it never
 /// mutates data. The JSON transcripts stay authoritative, so a corrupt database
 /// is reported with the rebuild path rather than silently patched.
+/// Coarse age for doctor lines; precision beyond the unit shown is noise.
+fn ago(secs: u64) -> String {
+    if secs < 90 {
+        format!("{secs}s ago")
+    } else if secs < 5_400 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 172_800 {
+        format!("{}h ago", secs / 3_600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
 fn check_history_store(problems: &mut Vec<String>) {
     let path = store_path();
     if !path.exists() {

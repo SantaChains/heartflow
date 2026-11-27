@@ -298,6 +298,7 @@ impl Store {
         }
         Ok(Some(Session {
             version: 1,
+            runtime_ms: 0,
             messages,
         }))
     }

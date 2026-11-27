@@ -1014,10 +1014,18 @@ impl App {
                 name,
                 output,
                 is_error,
+                duration_ms,
                 ..
             } => {
                 self.running_tool = None;
                 self.push_tool(name.clone(), *is_error, output);
+                if let Some(ms) = duration_ms {
+                    self.status_note = format!(
+                        "`{name}` {} in {}",
+                        if *is_error { "failed" } else { "done" },
+                        crate::turn::fmt_duration(*ms)
+                    );
+                }
                 true
             }
             AgentEvent::Usage(usage) => {
