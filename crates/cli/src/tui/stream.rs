@@ -213,6 +213,14 @@ where
     // C项 TUI autopilot state: per-mission auto-continue counts (cap below),
     // so an unsatisfiable mission cannot spin the queue forever.
     let mut loop_nudges: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    // S2 (roadmap §16) for the TUI autopilot: a transport-class failure in a
+    // loop-mode section schedules the same nudge again after a backoff
+    // instead of silently stopping the loop. One pending backoff at a time;
+    // per-mission attempt counts reset on any non-transport settle, exactly
+    // like the REPL's `run_loop_autopilot`.
+    let mut loop_backoff: Option<(usize, u64, tokio::time::Instant)> = None;
+    let mut loop_transport_retries: std::collections::HashMap<u64, usize> =
+        std::collections::HashMap::new();
 
     while !shell.section().quit {
         // ---- Phase R: render ----
@@ -308,9 +316,13 @@ where
                 runtime.set_steer_mailbox(steer.clone());
                 // D1.3 mission reminder: same per-turn projection the REPL
                 // injects — the on-disk ledger rendered as one system-prompt
-                // section, rebuilt fresh at every turn boundary.
+                // section, rebuilt fresh at every turn boundary. The ledger
+                // also arms the D1.2 mid-turn token guard with the single
+                // active mission's remaining budget.
                 let missions_root = crate::storage::sessions_dir().join("missions");
-                let mission_section = turn_reminder(&MissionLedger::load(&missions_root).list());
+                let missions = MissionLedger::load(&missions_root).list();
+                let mission_section = turn_reminder(&missions);
+                runtime.set_turn_token_budget(turn_token_budget(&missions));
                 let mode_section = crate::mode_prompt_segment(
                     &crate::storage::lock_state(&states[shell.active_index()]).mode,
                 );
@@ -368,6 +380,9 @@ where
         // ordering converges either way — the runtime queues every streamed
         // event before its future resolves, so a burst drained after
         // `TurnFinished` is a no-op flush or a status-bar update.
+        // S2 timer: when a loop-mode transport backoff is pending, the select
+        // wakes at its deadline to re-queue the nudge (see the settle arm).
+        let backoff_due = loop_backoff.as_ref().map(|(_, _, due)| *due);
         tokio::select! {
             biased;
             outcome = poll_live_turn(&mut turn), if turn.is_some() => {
@@ -394,9 +409,10 @@ where
                 // turn's mailbox handle so the next turn arms a fresh one.
                 runtime.set_steer_mailbox(SteerMailbox::default());
                 runtime.set_turn_context(None);
+                runtime.set_turn_token_budget(None);
                 prompter = Some(finished_prompter);
                 let mut mission_attention: Option<String> = None;
-                let (ok, err_note) = match turn_outcome {
+                let (ok, err_note, turn_error_kind) = match turn_outcome {
                     // The summary's contents (iteration count, tool results)
                     // are already folded into the session and the transcript;
                     // the TUI settle only needs success vs. failure.
@@ -404,14 +420,16 @@ where
                         // Auto-account against the single active mission
                         // (§11.3): success only — a failed turn is not
                         // productive work and must not reset a blocked
-                        // streak.
-                        let tokens = u64::from(summary.usage.input_tokens)
-                            .saturating_add(u64::from(summary.usage.output_tokens));
+                        // streak. `turn_usage` is this turn's own spend; the
+                        // ledger debits per turn, never the session
+                        // cumulative.
+                        let tokens = u64::from(summary.turn_usage.input_tokens)
+                            .saturating_add(u64::from(summary.turn_usage.output_tokens));
                         mission_attention =
                             auto_record_turn(&crate::storage::sessions_dir().join("missions"), tokens);
-                        (true, None)
+                        (true, None, None)
                     }
-                    Err(error) => (false, Some(error.to_string())),
+                    Err(error) => (false, Some(error.to_string()), Some(error.kind())),
                 };
                 // With the runtime back in hand, persist the turn — success or
                 // failure, the transcript on disk stays the source of truth.
@@ -424,13 +442,15 @@ where
                 let app = shell.section_index_mut(section);
                 if !ok {
                     // Surface the failure in the transcript, mirroring
-                    // run_turn_interactive.
+                    // run_turn_interactive. The structured class rides along
+                    // so downstream consumers classify without re-parsing.
                     let text = err_note
                         .clone()
                         .unwrap_or_else(|| String::from("turn failed"));
                     app.apply_event(&AgentEvent::Error {
                         message: text,
                         hint: None,
+                        kind: turn_error_kind,
                     });
                 }
                 // Turn boundary (locked FollowUpQueue semantics): drop the
@@ -445,41 +465,117 @@ where
                 if let Some(attention) = mission_attention.take() {
                     app.push_line(muted_line(format!("· {attention}")));
                 }
-                // C项 TUI autopilot: a loop-mode section whose turn settled OK
-                // auto-continues the single active mission — the same drive
-                // the blocking REPL's `run_loop_autopilot` provides, shaped
-                // for the event loop: instead of awaiting turns inline, the
-                // continue-nudge is queued and the Phase-T pickup runs it as
-                // the next turn. Guards mirror the REPL: a completed mission
-                // stops, a failed turn does not re-nudge, and a per-mission
-                // cap prevents an unsatisfiable mission from spinning the
-                // queue forever.
-                if ok
-                    && crate::storage::lock_state(&states[section]).mode == "loop"
-                {
+                // C项 TUI autopilot, with REPL parity on failures (§16 S2): a
+                // loop-mode section keeps driving its single active mission.
+                // A transport-class failure backs off (30s → 2m → 8m) and
+                // re-queues the same nudge via the timer arm below; a real
+                // failure records a blocked claim like the REPL's autopilot,
+                // and three consecutive claims flip the mission to Blocked
+                // and stop. The nudge goes into the *section's* queue, so
+                // the §11.4 rotation runs it where the mission lives, not
+                // wherever the operator happens to be looking.
+                if crate::storage::lock_state(&states[section]).mode == "loop" {
                     let ledger = MissionLedger::load(
                         &crate::storage::sessions_dir().join("missions"),
                     );
                     if let Some(mission_id) = single_active_mission_id(&ledger) {
-                        match ledger.complete(mission_id) {
-                            Ok(_) => {
-                                app.push_line(muted_line(format!(
-                                    "· loop: mission m{mission_id} complete"
-                                )));
-                            }
-                            Err(runtime::MissionError::Unsatisfied { .. }) => {
-                                let nudges = loop_nudges.entry(mission_id).or_insert(0);
-                                if *nudges < MAX_TUI_AUTOPILOT_NUDGES {
-                                    *nudges += 1;
-                                    queue.push_back(continue_nudge(mission_id));
-                                } else {
+                        if ok {
+                            loop_transport_retries.remove(&mission_id);
+                            loop_backoff = None;
+                            match ledger.complete(mission_id) {
+                                Ok(_) => {
                                     app.push_line(muted_line(format!(
-                                        "· loop: mission m{mission_id} hit the auto-continue cap ({MAX_TUI_AUTOPILOT_NUDGES})"
+                                        "· loop: mission m{mission_id} complete"
                                     )));
                                 }
+                                Err(runtime::MissionError::Unsatisfied { .. }) => {
+                                    // D1.2 driving half: a spent budget keeps
+                                    // the mission open but stops the driver.
+                                    if budget_stop(&ledger, mission_id) {
+                                        app.push_line(muted_line(format!(
+                                            "· loop: mission m{mission_id} budget exhausted - stopping (raise it with /mission or finish the criteria manually)"
+                                        )));
+                                    } else {
+                                        let nudges =
+                                            loop_nudges.entry(mission_id).or_insert(0);
+                                        if *nudges < MAX_TUI_AUTOPILOT_NUDGES {
+                                            *nudges += 1;
+                                            let queued = app
+                                                .model
+                                                .queue_mut()
+                                                .send(
+                                                    &continue_nudge(mission_id),
+                                                    crate::core::QueueSource::User,
+                                                )
+                                                .is_some();
+                                            if !queued {
+                                                app.push_line(muted_line(
+                                                    "· loop: queue full - auto-continue paused"
+                                                        .to_string(),
+                                                ));
+                                            }
+                                        } else {
+                                            app.push_line(muted_line(format!(
+                                                "· loop: mission m{mission_id} hit the auto-continue cap ({MAX_TUI_AUTOPILOT_NUDGES})"
+                                            )));
+                                        }
+                                    }
+                                }
+                                // WeakOnly / NotActive / NotFound: stop honestly.
+                                Err(_) => {}
                             }
-                            // WeakOnly / NotActive / NotFound: stop honestly.
-                            Err(_) => {}
+                        } else if turn_error_kind == Some(runtime::ErrorKind::Transport)
+                            && loop_transport_retries
+                                .get(&mission_id)
+                                .copied()
+                                .unwrap_or(0)
+                                < MAX_TRANSPORT_RETRIES
+                        {
+                            let attempt = loop_transport_retries.entry(mission_id).or_insert(0);
+                            let delay = transport_backoff(*attempt);
+                            *attempt += 1;
+                            loop_backoff =
+                                Some((section, mission_id, tokio::time::Instant::now() + delay));
+                            app.push_line(muted_line(format!(
+                                "· loop: transport failure ({}); retrying in {}s (transport retry {}/{})",
+                                runtime::ErrorKind::Transport.label(),
+                                delay.as_secs(),
+                                *attempt,
+                                MAX_TRANSPORT_RETRIES
+                            )));
+                        } else {
+                            // A real failure, or transport retries exhausted:
+                            // one blocked claim, REPL parity. Claims below the
+                            // streak keep driving; the third flips the mission
+                            // to Blocked and stops.
+                            loop_transport_retries.remove(&mission_id);
+                            loop_backoff = None;
+                            if let Ok((mission, flipped)) =
+                                ledger.mark_blocked(mission_id, "auto-continue turn failed")
+                            {
+                                if flipped {
+                                    app.push_line(muted_line(format!(
+                                        "· loop: mission m{mission_id} blocked after {} consecutive failed turns - stopping.",
+                                        mission.blocked_streak
+                                    )));
+                                } else {
+                                    app.push_line(muted_line(format!(
+                                        "· loop: blocked claim {}/{} recorded; the rotation keeps driving.",
+                                        mission.blocked_streak,
+                                        runtime::BLOCKED_STREAK_NEEDED
+                                    )));
+                                    // Keep driving: re-nudge once so the next
+                                    // turn happens without operator input.
+                                    let nudges = loop_nudges.entry(mission_id).or_insert(0);
+                                    if *nudges < MAX_TUI_AUTOPILOT_NUDGES {
+                                        *nudges += 1;
+                                        let _ = app.model.queue_mut().send(
+                                            &continue_nudge(mission_id),
+                                            crate::core::QueueSource::User,
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -494,13 +590,21 @@ where
                 // on success; one automatic re-queue on failure; the *same*
                 // entry failing a second consecutive time files as `Failed` —
                 // an auto-rotating queue must not retry a poisoned entry
-                // forever.
+                // forever. S2 exception: when the autopilot scheduled a
+                // transport backoff for this failure, the rotation must not
+                // also hot-requeue the entry (the timer re-nudges after the
+                // delay) — the entry files as `Failed`; the backoff's retry
+                // arrives as a fresh entry.
                 if let Some(entry) = turn_entry.take() {
+                    let s2_backoff_scheduled = loop_backoff.is_some();
                     let retried = last_failed_entry == Some(entry.id);
                     let state = if ok {
                         last_failed_entry = None;
                         crate::core::QueueEntryState::Delivered
-                    } else if retried {
+                    } else if s2_backoff_scheduled || retried {
+                        // Both file as `Failed` without a retry: an S2
+                        // backoff re-nudges as a fresh entry after the delay,
+                        // and a twice-failed entry is a poisoned one.
                         last_failed_entry = None;
                         crate::core::QueueEntryState::Failed
                     } else {
@@ -701,6 +805,77 @@ where
                     }
                 }
             },
+            _ = async {
+                match backoff_due {
+                    Some(due) => tokio::time::sleep_until(due).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                // The backoff elapsed — re-validate and re-queue the nudge
+                // into the section's own queue. Mode may have changed during
+                // the wait, and the mission may have advanced (completed,
+                // blocked, paused) from another path: stop honestly on both.
+                if let Some((bsection, mission_id, _)) = loop_backoff.take() {
+                    if bsection >= shell.sections.len()
+                        || crate::storage::lock_state(&states[bsection]).mode != "loop"
+                    {
+                        if bsection < shell.sections.len() {
+                            shell.section_index_mut(bsection).push_line(muted_line(
+                                "· loop: backoff dropped (section left loop mode)".to_string(),
+                            ));
+                        }
+                    } else {
+                        let ledger = MissionLedger::load(
+                            &crate::storage::sessions_dir().join("missions"),
+                        );
+                        match ledger.complete(mission_id) {
+                            Ok(_) => {
+                                shell.section_index_mut(bsection).push_line(muted_line(
+                                    format!("· loop: mission m{mission_id} complete"),
+                                ));
+                            }
+                            Err(runtime::MissionError::Unsatisfied { .. }) => {
+                                // D1.2 driving half: a spent budget stops the
+                                // driver here too (the settle arm checks it
+                                // as well; this covers a budget that flipped
+                                // while the backoff ticked).
+                                if budget_stop(&ledger, mission_id) {
+                                    shell.section_index_mut(bsection).push_line(muted_line(
+                                        format!(
+                                            "· loop: mission m{mission_id} budget exhausted - stopping (raise it with /mission or finish the criteria manually)"
+                                        ),
+                                    ));
+                                } else {
+                                    let queued = {
+                                        let app = shell.section_index_mut(bsection);
+                                        app.model
+                                            .queue_mut()
+                                            .send(
+                                                &continue_nudge(mission_id),
+                                                crate::core::QueueSource::User,
+                                            )
+                                            .is_some()
+                                    };
+                                    if !queued {
+                                        shell.section_index_mut(bsection).push_line(muted_line(
+                                            "· loop: queue full - auto-continue paused".to_string(),
+                                        ));
+                                    }
+                                }
+                            }
+                            // WeakOnly / NotActive / NotFound: stop honestly.
+                            Err(_) => {
+                                shell.section_index_mut(bsection).push_line(muted_line(
+                                    format!(
+                                        "· loop: mission m{mission_id} is no longer driveable - stopping."
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+                dirty = true;
+            }
         }
     }
     Ok(())

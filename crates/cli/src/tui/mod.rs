@@ -79,12 +79,14 @@ use tokio_util::sync::CancellationToken;
 use tui_textarea::{CursorMove, TextArea};
 
 use runtime::{
-    auto_record_turn, turn_reminder, AgentEvent, ApiClient, ConversationRuntime, MissionLedger,
-    PermissionPromptDecision, PermissionPrompter, PermissionRequest, RuntimeError, SteerMailbox,
-    TokenUsage, ToolExecutor, TurnSummary,
+    auto_record_turn, turn_reminder, turn_token_budget, AgentEvent, ApiClient, ConversationRuntime,
+    MissionLedger, PermissionPromptDecision, PermissionPrompter, PermissionRequest, RuntimeError,
+    SteerMailbox, TokenUsage, ToolExecutor, TurnSummary,
 };
 
-use crate::autopilot::{continue_nudge, single_active_mission_id};
+use crate::autopilot::{
+    budget_stop, continue_nudge, single_active_mission_id, transport_backoff, MAX_TRANSPORT_RETRIES,
+};
 use crate::config::ConfigWatcher;
 use crate::core::{
     guide_context, guide_draft, DeliveryMode, GuideContext, HeartModel, QueueSource,
@@ -1039,7 +1041,7 @@ impl App {
                 self.push_line(muted_line(format!("· steered: {text}")));
                 true
             }
-            AgentEvent::Error { message, hint } => {
+            AgentEvent::Error { message, hint, .. } => {
                 self.push_line(Line::from(Span::styled(
                     format!("✘ {message}"),
                     Style::default().fg(Theme::current().error().ratatui()),

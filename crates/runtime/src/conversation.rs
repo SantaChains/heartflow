@@ -99,6 +99,13 @@ pub enum AgentEvent {
         /// errors, rate limits, connection issues) so the CLI can surface
         /// actionable advice alongside the raw error message.
         hint: Option<String>,
+        /// Structured failure class straight from the provider's `ApiError`
+        /// (§12 P-B), whenever the transport can classify without guessing
+        /// from text. `None` — and every recording made before this field
+        /// existed, via the serde default — falls back to
+        /// `classify_stream_error`'s text markers.
+        #[serde(default)]
+        kind: Option<ErrorKind>,
     },
 }
 
@@ -265,7 +272,8 @@ impl ToolError {
 /// the loop autopilot excludes [`ErrorKind::Transport`] from its blocked
 /// streak, the CLI renders cancellation differently, and retry policy hangs
 /// off the transport class.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ErrorKind {
     /// Connection/setup failure, mid-stream hang, timeout, or a premature
     /// stream end — transient, worth retrying.
@@ -303,21 +311,47 @@ impl ErrorKind {
 /// in the `api` crate and does not cross it), so this is the one deliberate
 /// string-matching point — kept next to the overflow matcher in `compact.rs`
 /// and covered by tests. Unknown patterns classify as [`ErrorKind::Other`].
+///
+/// The text is self-produced (`ApiError`'s `Display`), so its stable shapes are
+/// read first: an exhausted-retry report, then an echoed status line. The
+/// marker lists only back those up, and a status code counts solely as a
+/// standalone number — as a bare substring, digits inside request ids and
+/// timestamps impersonated a status, and the autopilot acted on that as if it
+/// were real.
 #[must_use]
 pub fn classify_stream_error(message: &str) -> ErrorKind {
-    let lower = message.to_ascii_lowercase();
     if is_context_overflow_error(message) {
         return ErrorKind::Overflow;
     }
-    const AUTH_MARKERS: [&str; 6] = [
-        "401",
-        "403",
+    let lower = message.to_ascii_lowercase();
+    // `RetryPolicy` retries only faults it already classes as transient, so an
+    // exhausted-retry report is transport by construction.
+    if lower.contains("api request failed after ") {
+        return ErrorKind::Transport;
+    }
+    // A status the `api` crate echoed is authoritative (`api returned 429 Too
+    // Many Requests: ...`): read it rather than guessing from the body.
+    const AUTH_MARKERS: [&str; 4] = [
         "unauthorized",
         "authentication",
         "invalid api key",
         "api key",
     ];
-    const TRANSPORT_MARKERS: [&str; 12] = [
+    if let Some(status) = echoed_api_status(&lower) {
+        let body_claims_auth = AUTH_MARKERS.iter().any(|marker| lower.contains(marker));
+        return match status {
+            401 | 403 | 407 => ErrorKind::Auth,
+            // Some gateways report a bad key as a 400.
+            400 if body_claims_auth => ErrorKind::Auth,
+            400 => ErrorKind::Model,
+            408 | 409 | 425 | 429 => ErrorKind::Transport,
+            500..=599 => ErrorKind::Transport,
+            // 404 (model or endpoint), 413, 422, ...: permanent, and nobody's
+            // transient fault to back off from.
+            _ => ErrorKind::Other,
+        };
+    }
+    const TRANSPORT_MARKERS: [&str; 11] = [
         "connection",
         "timed out",
         "timeout",
@@ -325,29 +359,84 @@ pub fn classify_stream_error(message: &str) -> ErrorKind {
         "eof",
         "broken pipe",
         "network",
-        "502",
-        "503",
-        "504",
         "overloaded",
         "stream ended",
+        // reqwest's send-phase wrapper: connect failures, send timeouts and
+        // resets all render as this line — the underlying cause stays in the
+        // source chain and never reaches this text.
+        "error sending request",
+        // A malformed frame mid-stream is the wire misbehaving, not the model.
+        "invalid sse frame",
     ];
-    if AUTH_MARKERS.iter().any(|m| lower.contains(m)) {
+    if AUTH_MARKERS.iter().any(|marker| lower.contains(marker)) {
         return ErrorKind::Auth;
     }
-    if TRANSPORT_MARKERS.iter().any(|m| lower.contains(m)) {
+    if TRANSPORT_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
         return ErrorKind::Transport;
     }
-    if lower.contains("429") || lower.contains("rate limit") {
-        // Rate limiting is transient but quota-shaped, not transport-shaped:
-        // the autopilot retries it with its backoff, yet it is not a
-        // connection fault. Classed as Transport so transient bursts do not
-        // kill long missions.
+    let statuses: Vec<u32> = standalone_numbers(&lower).collect();
+    // Rate limiting is transient but quota-shaped, not transport-shaped: the
+    // autopilot retries it with its backoff, yet it is not a connection
+    // fault. Classed as Transport so transient bursts do not kill long
+    // missions. Server-side failures likewise: the `api` crate already
+    // retries them as transient, so they must not read as a blocked claim.
+    if statuses.contains(&429)
+        || statuses.iter().any(|status| (500..=599).contains(status))
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+    {
         return ErrorKind::Transport;
     }
-    if lower.contains("400") || lower.contains("invalid request") {
+    if statuses
+        .iter()
+        .any(|status| matches!(status, 401 | 403 | 407))
+    {
+        return ErrorKind::Auth;
+    }
+    if statuses.contains(&400) || lower.contains("invalid request") {
         return ErrorKind::Model;
     }
     ErrorKind::Other
+}
+
+/// The status code of an `ApiError::Api` report, which `Display` renders as
+/// `api returned <status> ...`. `None` for any other text.
+fn echoed_api_status(lower: &str) -> Option<u16> {
+    const PREFIX: &str = "api returned ";
+    let start = lower.find(PREFIX)? + PREFIX.len();
+    lower[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// Every decimal number in `lower` that stands on its own — not glued to
+/// other letters or digits, and not a `line`/`column` ordinal (serde_json
+/// decode errors quote them, and "at line 500 column 3" must not read as a
+/// server error) — so request ids, hex digests and timestamps cannot pass
+/// for a status code.
+fn standalone_numbers(lower: &str) -> impl Iterator<Item = u32> + '_ {
+    let mut prev_word: &str = "";
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .filter_map(move |token| {
+            let is_number = token.bytes().all(|byte| byte.is_ascii_digit());
+            let parsed = if is_number && !matches!(prev_word, "line" | "column") {
+                token.parse::<u32>().ok()
+            } else {
+                None
+            };
+            if !is_number {
+                prev_word = token;
+            }
+            parsed
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -412,7 +501,16 @@ pub struct TurnSummary {
     pub tool_results: Vec<ConversationMessage>,
     pub iterations: usize,
     pub continuations: usize,
-    pub usage: TokenUsage,
+    /// Tokens *this turn* spent, provider-reported: cumulative usage at the
+    /// turn's end minus its start. Covers every request the turn made — the
+    /// tool loop, retried transport attempts, and the compaction-summary side
+    /// call — because the provider bills all of them for this turn.
+    /// Deliberately NOT the session cumulative (that lives on
+    /// `runtime.usage()`): the mission ledger debits this figure per turn, and
+    /// a cumulative here would re-bill every earlier turn on each
+    /// `auto_record_turn` (found in review, 2026-11-27: budgets used to drain
+    /// quadratically).
+    pub turn_usage: TokenUsage,
 }
 
 /// Nudge injected as a user message when the model stops with unfinished
@@ -560,6 +658,14 @@ fn build_replay_messages(
 /// one, so this is the protocol-agnostic safety net applied to every request.
 /// Scanning in order, a result survives only once an earlier assistant message
 /// has advertised its `tool_use_id`; a `Tool` message left empty is dropped.
+///
+/// The mirror image gets the same net: a `tool_use` the transcript never
+/// answers is closed with a not-executed error result right before the next
+/// non-tool message (or at the end). Anthropic and OpenAI both reject an
+/// unanswered call, so one dangling advertisement fails every later request
+/// in the session. The turn loop records that result itself wherever it aborts
+/// (stream failure, cancellation, loop stop); this net covers sessions saved
+/// before that, and any abort path that does not.
 #[must_use]
 fn repair_tool_pairing(messages: Vec<ConversationMessage>) -> Vec<ConversationMessage> {
     let mut advertised: HashSet<String> = HashSet::new();
@@ -568,16 +674,22 @@ fn repair_tool_pairing(messages: Vec<ConversationMessage>) -> Vec<ConversationMe
     // tool result the model never saw answered is information loss on the
     // wire path, not a cosmetic cleanup.
     let mut dropped: Vec<String> = Vec::new();
-    let repaired = messages
-        .into_iter()
-        .filter_map(|message| match message.role {
+    // Advertised calls still awaiting their result, in advertisement order.
+    // Still non-empty when a non-tool message arrives (or the transcript
+    // ends) means those calls were never answered.
+    let mut unanswered: Vec<(String, String)> = Vec::new();
+    let mut repaired: Vec<ConversationMessage> = Vec::with_capacity(messages.len());
+    for message in messages {
+        match message.role {
             MessageRole::Assistant => {
+                close_unanswered(&mut unanswered, &mut repaired);
                 for block in &message.blocks {
-                    if let ContentBlock::ToolUse { id, .. } = block {
+                    if let ContentBlock::ToolUse { id, name, .. } = block {
                         advertised.insert(id.clone());
+                        unanswered.push((id.clone(), name.clone()));
                     }
                 }
-                Some(message)
+                repaired.push(message);
             }
             MessageRole::Tool => {
                 let mut kept: Vec<ContentBlock> = Vec::with_capacity(message.blocks.len());
@@ -588,27 +700,83 @@ fn repair_tool_pairing(messages: Vec<ConversationMessage>) -> Vec<ConversationMe
                         {
                             dropped.push(tool_use_id.clone());
                         }
+                        ContentBlock::ToolResult { tool_use_id, .. } => {
+                            unanswered.retain(|(id, _)| id != tool_use_id);
+                            kept.push(block);
+                        }
                         _ => kept.push(block),
                     }
                 }
-                if kept.is_empty() {
-                    None
-                } else {
-                    Some(ConversationMessage {
+                if !kept.is_empty() {
+                    repaired.push(ConversationMessage {
                         role: message.role,
                         blocks: kept,
                         usage: message.usage,
                         pinned: message.pinned,
-                    })
+                    });
                 }
             }
-            MessageRole::System | MessageRole::User => Some(message),
-        })
-        .collect();
+            MessageRole::System | MessageRole::User => {
+                close_unanswered(&mut unanswered, &mut repaired);
+                repaired.push(message);
+            }
+        }
+    }
+    close_unanswered(&mut unanswered, &mut repaired);
     if !dropped.is_empty() {
         crate::compact::record_repair_drops(&dropped);
     }
     repaired
+}
+
+/// Answer every still-unanswered advertisement with one error result each,
+/// appended to `repaired` in advertisement order.
+fn close_unanswered(
+    unanswered: &mut Vec<(String, String)>,
+    repaired: &mut Vec<ConversationMessage>,
+) {
+    for (tool_use_id, tool_name) in unanswered.drain(..) {
+        tracing::warn!(
+            target: "heartflow::compact",
+            tool_use_id = %tool_use_id,
+            tool_name = %tool_name,
+            "repair_tool_pairing closed an unanswered tool_use with a not-executed result"
+        );
+        repaired.push(ConversationMessage::tool_result(
+            tool_use_id,
+            tool_name,
+            not_executed_result(UNEXECUTED_EARLIER_TURN),
+            true,
+        ));
+    }
+}
+
+/// Tool calls the model advertised but the turn ended before running get this
+/// result. Every advertisement must be answered (both Anthropic and OpenAI
+/// reject an unanswered call), and the model must be able to tell the call
+/// never happened rather than assume it ran.
+fn not_executed_result(reason: &str) -> String {
+    format!("[not executed: {reason}; it had no effect - re-issue it if it is still needed]")
+}
+
+const UNEXECUTED_EARLIER_TURN: &str = "an earlier turn ended before this call ran";
+const UNEXECUTED_STREAM_FAILED: &str = "the stream failed before this call ran";
+const UNEXECUTED_STREAM_ENDED: &str = "the stream ended before this call ran";
+const UNEXECUTED_CANCELLED: &str = "the turn was cancelled before this call ran";
+const UNEXECUTED_LOOP_STOP: &str = "the turn was stopped by the loop detector before this call ran";
+
+/// Tool calls advertised by an assistant message, in advertisement order, as
+/// `(tool_use_id, name, input)`.
+fn advertised_tool_uses(blocks: &[ContentBlock]) -> Vec<(String, String, String)> {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, name, input } => {
+                Some((id.clone(), name.clone(), input.clone()))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Shared mailbox for steering an in-flight turn (roadmap §11.2, pi
@@ -688,6 +856,13 @@ pub struct ConversationRuntime<C, T> {
     /// entirely — hosts that already retry at their own layer (autopilot
     /// transport backoff, jobs workers) can opt out to avoid double retries.
     transport_retries_max: usize,
+    /// Per-turn token budget (D1.2 mid-turn half): the cumulative tokens this
+    /// turn may spend before it soft-lands at the next iteration boundary
+    /// (same shape as the iteration cap — completed work preserved, a
+    /// `Truncated` note explains the stop). `None` (the default) leaves the
+    /// turn uncapped; hosts set it per turn from the single active mission's
+    /// remaining budget (`mission::turn_token_budget`).
+    turn_token_budget: Option<u64>,
 }
 
 /// ST-2: transport-class stream faults are retried at the step level before
@@ -729,6 +904,7 @@ where
             turn_context: None,
             transport_retry_backoff: TRANSPORT_RETRY_BACKOFF_BASE,
             transport_retries_max: MAX_TRANSPORT_RETRIES,
+            turn_token_budget: None,
         }
     }
 
@@ -779,6 +955,16 @@ where
         self
     }
 
+    /// Set the per-turn token budget (D1.2 mid-turn half): the turn
+    /// soft-lands at the next iteration boundary once it has spent this many
+    /// cumulative tokens (input + output + cache axes, provider-reported).
+    /// `None` uncaps the turn. Hosts set it per turn from the mission
+    /// ledger — same lifecycle as [`Self::set_turn_context`] — so a mission
+    /// edited mid-turn re-arms on the next turn.
+    pub fn set_turn_token_budget(&mut self, budget: Option<u64>) {
+        self.turn_token_budget = budget;
+    }
+
     /// Run one user turn: stream assistant messages, execute requested tools
     /// concurrently (order preserved in the transcript), and repeat until the
     /// model stops calling tools.
@@ -811,11 +997,12 @@ where
     ///
     /// # Errors
     /// Fails when the provider request cannot be started or the stream
-    /// reports an error (a context-overflow rejection is compacted-and-
-    /// retried once; a second one fails the turn), when the stream ends
-    /// without a message stop or produces no content, when the loop exceeds
-    /// `max_iterations`, or when the turn is cancelled. Tool failures do not
-    /// error the turn; they are recorded as error `tool_result` messages.
+    /// reports an error (a context-overflow rejection compacts and retries,
+    /// degrading the preserved tail once harder; a third rejection fails the
+    /// turn), when the stream ends without a message stop or produces no
+    /// content, when the loop exceeds `max_iterations`, or when the turn is
+    /// cancelled. Tool failures do not error the turn; they are recorded as
+    /// error `tool_result` messages.
     pub async fn run_turn_with_blocks(
         &mut self,
         blocks: Vec<ContentBlock>,
@@ -842,6 +1029,10 @@ where
         // ST-2: transport-class stream faults are retried at the step level
         // before the turn fails (see MAX_TRANSPORT_RETRIES).
         let mut transport_retries = 0usize;
+        // D1.2 mid-turn half: the cumulative usage this turn started from.
+        // Both the per-turn token budget below and `TurnSummary::turn_usage`
+        // are deltas against this snapshot.
+        let turn_start = self.usage_tracker.cumulative_usage();
 
         loop {
             // Honor a Ctrl+C FIRST (C2, semantic review): cancellation must
@@ -865,6 +1056,34 @@ where
                 )));
                 break;
             }
+            // D1.2 mid-turn token budget: same soft-landing shape as the
+            // iteration cap. Measured from provider-reported usage only —
+            // estimates drift, and the budget is the operator's cap on real
+            // spend. Checked before spending the next request, so the last
+            // completed iteration's work is fully preserved. The unit is
+            // input+output: the same unit the mission ledger debits, so
+            // "remaining budget" and this guard's measurement agree (adding
+            // the cache axes would trip the guard early on cache-heavy
+            // providers).
+            if let Some(budget) = self.turn_token_budget {
+                let cumulative = self.usage_tracker.cumulative_usage();
+                let spent = u64::from(
+                    cumulative
+                        .input_tokens
+                        .saturating_sub(turn_start.input_tokens),
+                )
+                .saturating_add(u64::from(
+                    cumulative
+                        .output_tokens
+                        .saturating_sub(turn_start.output_tokens),
+                ));
+                if spent >= budget {
+                    notify(&AgentEvent::Truncated(format!(
+                        "turn token budget ({budget}) reached - the turn stops here with all completed work preserved; send a follow-up (or raise the mission budget) to continue"
+                    )));
+                    break;
+                }
+            }
 
             // Steer consumption point (§11.2): absorb steered user text at the
             // same safe boundary where cancellation is honored, so the request
@@ -885,7 +1104,7 @@ where
             // that side call fails — compaction itself must never fail).
             if self.should_compact(self.compaction) {
                 let model_summary = if self.compaction.summary_mode == SummaryMode::Model {
-                    self.summarize_dropped_via_llm().await
+                    self.summarize_dropped_via_llm(cancel).await?
                 } else {
                     None
                 };
@@ -914,11 +1133,21 @@ where
             };
             let mut stream = self.api_client.stream(request)?;
 
-            let (blocks, usage, finished, cancelled, stream_error, error_hint) =
+            let (blocks, usage, finished, cancelled, stream_error, error_hint, error_kind) =
                 Self::consume_stream(&mut stream, notify, cancel).await;
 
             if let Some(message) = stream_error {
-                let kind = classify_stream_error(&message);
+                // C1: the failed attempt already ran server-side, so whatever
+                // usage it reported describes a billed request — record it
+                // whether we retry below or fail the turn.
+                if let Some(value) = usage {
+                    self.usage_tracker.record(value);
+                }
+                // §12 P-B: the provider's structured class is authoritative
+                // when the transport tagged the failure; text markers stay the
+                // fallback for events without one (scripted clients, older
+                // recordings).
+                let kind = error_kind.unwrap_or_else(|| classify_stream_error(&message));
                 // D4.2 hard trigger with two-level degradation (ST-2): a
                 // context-overflow rejection is the only ground truth that the
                 // session no longer fits (estimates drift; a 400 does not).
@@ -992,22 +1221,44 @@ where
                 // and must not carry it into a larger, already-overflowing
                 // request).
                 if !blocks.is_empty() {
+                    let unexecuted = advertised_tool_uses(&blocks);
                     let partial = ConversationMessage::assistant_with_usage(blocks, usage);
                     self.session.messages.push(partial);
+                    Self::record_unexecuted_tools(
+                        &unexecuted,
+                        UNEXECUTED_STREAM_FAILED,
+                        &mut self.session,
+                        &mut tool_results,
+                        notify,
+                    );
                 }
-                return Err(RuntimeError::with_kind(
-                    classify_stream_error(&message),
-                    message,
-                    error_hint,
-                ));
+                return Err(RuntimeError::with_kind(kind, message, error_hint));
             }
             if !finished {
+                // C1: usage reported before the cut still describes a billed
+                // request.
+                if let Some(value) = usage {
+                    self.usage_tracker.record(value);
+                }
                 // Preserve streamed text so the transcript stays API-consistent,
                 // then surface the interruption.
                 if !blocks.is_empty() {
+                    let unexecuted = advertised_tool_uses(&blocks);
                     let message = ConversationMessage::assistant_with_usage(blocks, usage);
                     self.session.messages.push(message.clone());
                     assistant_messages.push(message);
+                    let unexecuted_reason = if cancelled {
+                        UNEXECUTED_CANCELLED
+                    } else {
+                        UNEXECUTED_STREAM_ENDED
+                    };
+                    Self::record_unexecuted_tools(
+                        &unexecuted,
+                        unexecuted_reason,
+                        &mut self.session,
+                        &mut tool_results,
+                        notify,
+                    );
                 }
                 let (reason, kind) = if cancelled {
                     ("turn cancelled", ErrorKind::Cancelled)
@@ -1043,15 +1294,7 @@ where
                     .observe(predicted, value.context_input_tokens());
             }
 
-            let pending_tool_uses = blocks
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::ToolUse { id, name, input } => {
-                        Some((id.clone(), name.clone(), input.clone()))
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
+            let pending_tool_uses = advertised_tool_uses(&blocks);
 
             let assistant_message = ConversationMessage::assistant_with_usage(blocks, usage);
             self.session.messages.push(assistant_message.clone());
@@ -1072,6 +1315,13 @@ where
                     notify(&AgentEvent::Truncated(format!(
                         "stop policy: {reason} - ending the turn"
                     )));
+                    Self::record_unexecuted_tools(
+                        &pending_tool_uses,
+                        UNEXECUTED_LOOP_STOP,
+                        &mut self.session,
+                        &mut tool_results,
+                        notify,
+                    );
                     return Err(RuntimeError::with_kind(
                         ErrorKind::Model,
                         format!("loop detected: {reason}"),
@@ -1112,6 +1362,23 @@ where
                 .await;
             let allowed = self.validate_tool_inputs(allowed, &mut tool_results, notify);
             if allowed.is_empty() {
+                // C3: denials and schema rejections are results too. A model
+                // that keeps re-asking for a refused call used to spin until
+                // the iteration cap; the fuse must see these batches like any
+                // all-error batch.
+                consecutive_tool_error_batches += 1;
+                if consecutive_tool_error_batches >= MAX_CONSECUTIVE_TOOL_ERROR_BATCHES {
+                    return Err(RuntimeError::with_kind(
+                        ErrorKind::Model,
+                        format!(
+                            "tool-error fuse: {consecutive_tool_error_batches} consecutive tool batches all failed"
+                        ),
+                        Some(
+                            "every recent tool call failed or was denied; adapt the approach (or ask the operator to approve it) instead of repeating the call"
+                                .to_string(),
+                        ),
+                    ));
+                }
                 continue;
             }
 
@@ -1157,12 +1424,27 @@ where
             }
         }
 
+        let cumulative = self.usage_tracker.cumulative_usage();
+        let turn_usage = TokenUsage {
+            input_tokens: cumulative
+                .input_tokens
+                .saturating_sub(turn_start.input_tokens),
+            output_tokens: cumulative
+                .output_tokens
+                .saturating_sub(turn_start.output_tokens),
+            cache_creation_input_tokens: cumulative
+                .cache_creation_input_tokens
+                .saturating_sub(turn_start.cache_creation_input_tokens),
+            cache_read_input_tokens: cumulative
+                .cache_read_input_tokens
+                .saturating_sub(turn_start.cache_read_input_tokens),
+        };
         Ok(TurnSummary {
             assistant_messages,
             tool_results,
             iterations,
             continuations,
-            usage: self.usage_tracker.cumulative_usage(),
+            turn_usage,
         })
     }
 
@@ -1177,6 +1459,7 @@ where
         bool,
         Option<String>,
         Option<String>,
+        Option<ErrorKind>,
     ) {
         let mut text = String::new();
         let mut blocks = Vec::new();
@@ -1185,6 +1468,7 @@ where
         let mut cancelled = false;
         let mut error = None;
         let mut error_hint = None;
+        let mut error_kind = None;
 
         loop {
             tokio::select! {
@@ -1222,9 +1506,10 @@ where
                     Some(AgentEvent::Truncated(reason)) => {
                         notify(&AgentEvent::Truncated(reason));
                     }
-                    Some(AgentEvent::Error { message, hint }) => {
+                    Some(AgentEvent::Error { message, hint, kind }) => {
                         error = Some(message);
                         error_hint = hint;
+                        error_kind = kind;
                         break;
                     }
                     // ToolResult events are produced by the runtime itself.
@@ -1241,7 +1526,9 @@ where
         }
 
         flush_text_block(&mut text, &mut blocks);
-        (blocks, usage, finished, cancelled, error, error_hint)
+        (
+            blocks, usage, finished, cancelled, error, error_hint, error_kind,
+        )
     }
 
     async fn authorize_tools(
@@ -1441,6 +1728,31 @@ where
         interrupted
     }
 
+    /// Close tool calls the model advertised but the turn is ending before
+    /// running: one error result each, in advertisement order. An unanswered
+    /// advertisement makes the provider reject every later request in the
+    /// session.
+    fn record_unexecuted_tools(
+        pending: &[(String, String, String)],
+        reason: &str,
+        session: &mut Session,
+        tool_results: &mut Vec<ConversationMessage>,
+        notify: &mut (dyn FnMut(&AgentEvent) + Send),
+    ) {
+        for (tool_use_id, tool_name, _) in pending {
+            let output = not_executed_result(reason);
+            notify(&AgentEvent::ToolResult {
+                id: tool_use_id.clone(),
+                name: tool_name.clone(),
+                output: output.clone(),
+                is_error: true,
+            });
+            let message = ConversationMessage::tool_result(tool_use_id, tool_name, output, true);
+            session.messages.push(message.clone());
+            tool_results.push(message);
+        }
+    }
+
     /// Fold execution outcomes into transcript `tool_result` messages in
     /// submission order, emitting the `ToolResult` events and truncating
     /// oversized output. A slot left `None` means the tool never completed
@@ -1523,7 +1835,16 @@ where
     /// never fail because its summarizer hiccuped. Events are swallowed on
     /// purpose: this is a side request, not turn output, and must not pollute
     /// the transcript.
-    async fn summarize_dropped_via_llm(&mut self) -> Option<String> {
+    ///
+    /// # Errors
+    /// [`ErrorKind::Cancelled`] when the operator cancels while the summary
+    /// streams. The caller then skips the compaction altogether: compacting
+    /// with the lossy deterministic summary is work the operator just asked
+    /// to stop, and the next turn retries the model summary instead.
+    async fn summarize_dropped_via_llm(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> Result<Option<String>, RuntimeError> {
         let config = self.compaction;
         let keep_from = self
             .session
@@ -1531,7 +1852,7 @@ where
             .len()
             .saturating_sub(config.preserve_recent_messages);
         if keep_from == 0 {
-            return None;
+            return Ok(None);
         }
         const SUMMARY_INPUT_CAP: usize = 48_000;
         const SUMMARY_OUTPUT_CAP: usize = 16_000;
@@ -1548,7 +1869,7 @@ where
             }
         }
         if transcript.trim().is_empty() {
-            return None;
+            return Ok(None);
         }
         let request = ApiRequest {
             system_prompt: vec![SUMMARIZER_PROMPT.to_string()],
@@ -1557,10 +1878,25 @@ where
             }])],
             tools: Vec::new(),
         };
-        let mut stream = self.api_client.stream(request).ok()?;
+        let Ok(mut stream) = self.api_client.stream(request) else {
+            return Ok(None);
+        };
         let mut summary = String::new();
         let mut finished = false;
-        while let Some(event) = stream.recv().await {
+        loop {
+            // Dropping `stream` on the cancel arm aborts the producer task.
+            let event = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return Err(RuntimeError::cancelled(
+                        "turn cancelled during the compaction summary",
+                    ));
+                }
+                event = stream.recv() => event,
+            };
+            let Some(event) = event else {
+                break;
+            };
             match event {
                 AgentEvent::TextDelta(delta) => {
                     if summary.len() < SUMMARY_OUTPUT_CAP {
@@ -1576,15 +1912,15 @@ where
                     finished = true;
                     break;
                 }
-                AgentEvent::Error { .. } => return None,
+                AgentEvent::Error { .. } => return Ok(None),
                 _ => {}
             }
         }
-        if finished && !summary.trim().is_empty() {
+        Ok(if finished && !summary.trim().is_empty() {
             Some(summary)
         } else {
             None
-        }
+        })
     }
 
     /// Toggle the pin flag on the most recent non-system message and return its
@@ -1779,6 +2115,7 @@ mod tests {
     use std::path::PathBuf;
     use std::pin::Pin;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
     #[test]
@@ -2000,6 +2337,148 @@ mod tests {
         );
     }
 
+    /// Every `tool_use` is answered by a later `tool_result` before any other
+    /// message intervenes, and every result answers an earlier advertisement —
+    /// the shape both Anthropic and OpenAI accept.
+    fn assert_well_paired(messages: &[ConversationMessage]) {
+        let mut pending: Vec<String> = Vec::new();
+        let mut advertised: Vec<String> = Vec::new();
+        for message in messages {
+            match message.role {
+                MessageRole::Assistant => {
+                    assert!(
+                        pending.is_empty(),
+                        "unanswered tool_use before an assistant message: {pending:?}"
+                    );
+                    for block in &message.blocks {
+                        if let ContentBlock::ToolUse { id, .. } = block {
+                            pending.push(id.clone());
+                            advertised.push(id.clone());
+                        }
+                    }
+                }
+                MessageRole::Tool => {
+                    for block in &message.blocks {
+                        let ContentBlock::ToolResult { tool_use_id, .. } = block else {
+                            continue;
+                        };
+                        assert!(
+                            advertised.contains(tool_use_id),
+                            "orphan tool_result {tool_use_id}"
+                        );
+                        let at = pending
+                            .iter()
+                            .position(|id| id == tool_use_id)
+                            .unwrap_or_else(|| {
+                                panic!("tool_result {tool_use_id} answers nothing pending")
+                            });
+                        pending.swap_remove(at);
+                    }
+                }
+                MessageRole::System | MessageRole::User => {
+                    assert!(
+                        pending.is_empty(),
+                        "unanswered tool_use before a user/system message: {pending:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            pending.is_empty(),
+            "trailing unanswered tool_use {pending:?}"
+        );
+    }
+
+    fn unanswered_ads() -> ConversationMessage {
+        ConversationMessage::assistant(vec![
+            ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "bash".to_string(),
+                input: "{}".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "call_2".to_string(),
+                name: "read_file".to_string(),
+                input: "{}".to_string(),
+            },
+        ])
+    }
+
+    #[test]
+    fn repair_closes_an_unanswered_tool_use_before_the_next_message() {
+        // The shape a turn leaves when it aborts right after advertising
+        // calls (stream failure, cancellation, loop stop). Both Anthropic and
+        // OpenAI reject the request as-is: the calls are never answered.
+        let next = ConversationMessage::user_text("continue".to_string());
+        let repaired = repair_tool_pairing(vec![unanswered_ads(), next]);
+
+        assert_well_paired(&repaired);
+        assert_eq!(
+            repaired.len(),
+            4,
+            "one not-executed result per unanswered call"
+        );
+        for message in &repaired[1..3] {
+            assert_eq!(message.role, MessageRole::Tool);
+            assert!(matches!(
+                &message.blocks[0],
+                ContentBlock::ToolResult { is_error: true, output, .. }
+                    if output.contains("not executed") && output.contains("no effect")
+            ));
+        }
+    }
+
+    #[test]
+    fn repair_closes_only_the_calls_a_partial_batch_left_unanswered() {
+        let answered = ConversationMessage::tool_result("call_1", "bash", "ok", false);
+        let next = ConversationMessage::user_text("continue".to_string());
+        let repaired = repair_tool_pairing(vec![unanswered_ads(), answered, next]);
+
+        assert_well_paired(&repaired);
+        assert_eq!(repaired.len(), 4);
+        // The real result survives untouched; only call_2 is synthesized.
+        assert!(matches!(
+            &repaired[1].blocks[0],
+            ContentBlock::ToolResult { tool_use_id, is_error: false, .. } if tool_use_id == "call_1"
+        ));
+        assert!(matches!(
+            &repaired[2].blocks[0],
+            ContentBlock::ToolResult { tool_use_id, is_error: true, .. } if tool_use_id == "call_2"
+        ));
+    }
+
+    #[test]
+    fn repair_closes_a_trailing_unanswered_tool_use() {
+        let user = ConversationMessage::user_text("go".to_string());
+        let repaired = repair_tool_pairing(vec![user, unanswered_ads()]);
+
+        assert_well_paired(&repaired);
+        assert_eq!(repaired.len(), 4);
+    }
+
+    #[test]
+    fn repair_leaves_a_well_formed_transcript_untouched() {
+        let call = ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "call_1".to_string(),
+            name: "bash".to_string(),
+            input: "{}".to_string(),
+        }]);
+        let result = ConversationMessage::tool_result("call_1", "bash", "ok", false);
+        let user = ConversationMessage::user_text("continue".to_string());
+
+        let repaired = repair_tool_pairing(vec![call, result, user]);
+
+        assert_eq!(repaired.len(), 3);
+        assert_well_paired(&repaired);
+        assert!(
+            repaired.iter().all(|message| message
+                .blocks
+                .iter()
+                .all(|block| !matches!(block, ContentBlock::ToolResult { output, .. } if output.contains("not executed")))),
+            "a paired transcript must not gain a synthesized result"
+        );
+    }
+
     /// A dropped `TurnStream` must abort its producer task. The driver ignores
     /// send errors, so without the `Drop` abort an early-dropped stream would
     /// leave the task reading the network until the read timeout fires. The
@@ -2137,7 +2616,7 @@ mod tests {
         assert_eq!(summary.assistant_messages.len(), 2);
         assert_eq!(summary.tool_results.len(), 1);
         assert_eq!(runtime.session().messages.len(), 4);
-        assert_eq!(summary.usage.output_tokens, 10);
+        assert_eq!(summary.turn_usage.output_tokens, 10);
         assert!(matches!(
             runtime.session().messages[1].blocks[1],
             ContentBlock::ToolUse { .. }
@@ -2366,6 +2845,7 @@ mod tests {
                     1 => Ok(TurnStream::from_events(vec![AgentEvent::Error {
                         message: "this model's maximum context length is 1000 tokens. However, you requested 1200 tokens".to_string(),
                         hint: None,
+                        kind: None,
                     }])),
                     _ => Ok(TurnStream::from_events(vec![
                         AgentEvent::TextDelta("recovered".to_string()),
@@ -2424,6 +2904,7 @@ mod tests {
                 Ok(TurnStream::from_events(vec![AgentEvent::Error {
                     message: "prompt is too long: 210000 tokens > 200000 maximum".to_string(),
                     hint: None,
+                    kind: None,
                 }]))
             }
         }
@@ -2505,6 +2986,7 @@ mod tests {
                     1 | 2 => Ok(TurnStream::from_events(vec![AgentEvent::Error {
                         message: "this model's maximum context length is 1000 tokens. However, you requested 1200 tokens".to_string(),
                         hint: None,
+                        kind: None,
                     }])),
                     _ => Ok(TurnStream::from_events(vec![
                         AgentEvent::TextDelta("recovered at level 2".to_string()),
@@ -2569,6 +3051,7 @@ mod tests {
                             "stream went silent for 2s mid-turn; the connection is presumed dead"
                                 .to_string(),
                         hint: None,
+                        kind: None,
                     }]));
                 }
                 Ok(TurnStream::from_events(vec![
@@ -2630,6 +3113,7 @@ mod tests {
                 Ok(TurnStream::from_events(vec![AgentEvent::Error {
                     message: "connection reset by peer".to_string(),
                     hint: None,
+                    kind: None,
                 }]))
             }
         }
@@ -2655,6 +3139,511 @@ mod tests {
             3,
             "initial request plus MAX_TRANSPORT_RETRIES retries"
         );
+    }
+
+    /// A stream that advertises one tool call, then keeps the line open for
+    /// `hold` without a message stop. A zero `hold` closes the channel on its
+    /// own (stream ended); a long one leaves only a cancel to end the turn.
+    fn advertising_stream(hold: Duration) -> TurnStream {
+        let (tx, rx) = tokio::sync::mpsc::channel::<AgentEvent>(4);
+        let handle = tokio::spawn(async move {
+            let _ = tx
+                .send(AgentEvent::ToolUse {
+                    id: "t-1".to_string(),
+                    name: "bash".to_string(),
+                    input: "{}".to_string(),
+                })
+                .await;
+            tokio::time::sleep(hold).await;
+        });
+        TurnStream::new(rx, handle.abort_handle())
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_left_by_a_failed_stream_is_closed_as_not_executed() {
+        struct AdvertiseThenFail;
+        impl ApiClient for AdvertiseThenFail {
+            fn stream(&mut self, _request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+                Ok(TurnStream::from_events(vec![
+                    AgentEvent::ToolUse {
+                        id: "t-1".to_string(),
+                        name: "bash".to_string(),
+                        input: "{}".to_string(),
+                    },
+                    // Usage reported before the fault (Anthropic's
+                    // message_delta lands ahead of message_stop): C1 says it
+                    // still describes a billed request.
+                    AgentEvent::Usage(TokenUsage {
+                        input_tokens: 50,
+                        output_tokens: 5,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AgentEvent::Error {
+                        message: "connection reset by peer".to_string(),
+                        hint: None,
+                        kind: None,
+                    },
+                ]))
+            }
+        }
+
+        let executor = StaticToolExecutor::new().register("bash", |_| Ok("ran".to_string()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            AdvertiseThenFail,
+            executor,
+            PermissionPolicy::new(PermissionMode::Allow),
+            Vec::new(),
+        )
+        // No step-level retry: the first fault lands the partial content.
+        .with_transport_retry_policy(0, Duration::ZERO);
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let mut notify = |event: &AgentEvent| events.push(event.clone());
+        let error = runtime
+            .run_turn("go", None, &mut notify, &CancellationToken::new())
+            .await
+            .expect_err("a transport fault with retries disabled fails the turn");
+        assert_eq!(error.kind(), super::ErrorKind::Transport);
+        // C1: the failed attempt's reported usage reached the cumulative
+        // account — the provider billed it regardless of the fault.
+        let usage = runtime.usage().cumulative_usage();
+        assert_eq!(usage.input_tokens, 50);
+        assert_eq!(usage.output_tokens, 5);
+
+        let messages = &runtime.session().messages;
+        assert_well_paired(messages);
+        assert_eq!(
+            messages.len(),
+            3,
+            "user, the advertisement, its closing result"
+        );
+        let ContentBlock::ToolResult {
+            tool_use_id,
+            output,
+            is_error,
+            ..
+        } = &messages[2].blocks[0]
+        else {
+            panic!("expected the closing tool_result");
+        };
+        assert_eq!(tool_use_id, "t-1");
+        assert!(*is_error);
+        assert!(output.contains("stream failed"), "{output}");
+        // The operator sees the call was skipped, and it never actually ran.
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::ToolResult { id, is_error: true, .. } if id == "t-1")
+        ));
+        assert!(events.iter().all(
+            |event| !matches!(event, AgentEvent::ToolResult { output, .. } if output == "ran")
+        ));
+    }
+
+    /// §12 P-B: a structured `kind` on the error event is authoritative —
+    /// the text markers never run when the transport tagged the failure.
+    /// Both directions: structured Auth silences the transport retry on
+    /// transport-sounding text, and structured Transport triggers the retry
+    /// on text with no recognizable markers.
+    #[tokio::test]
+    async fn a_structured_kind_outranks_the_text_markers() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        #[derive(Clone)]
+        struct StructuredKind(Arc<StdMutex<usize>>);
+        impl ApiClient for StructuredKind {
+            fn stream(&mut self, _request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+                let n = {
+                    let mut calls = self
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *calls += 1;
+                    *calls
+                };
+                Ok(TurnStream::from_events(if n == 1 {
+                    vec![AgentEvent::Error {
+                        message: "connection reset by peer".to_string(),
+                        hint: None,
+                        // Auth is not retryable at the step level — the
+                        // structured field must silence the retry despite
+                        // the transport-sounding message.
+                        kind: Some(super::ErrorKind::Auth),
+                    }]
+                } else {
+                    vec![
+                        AgentEvent::TextDelta("unreachable".to_string()),
+                        AgentEvent::MessageStop,
+                    ]
+                }))
+            }
+        }
+        let calls = Arc::new(StdMutex::new(0usize));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            StructuredKind(Arc::clone(&calls)),
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::Allow),
+            Vec::new(),
+        )
+        .with_transport_retry_policy(2, Duration::from_millis(1));
+        let error = runtime
+            .run_turn("go", None, &mut noop_notify(), &CancellationToken::new())
+            .await
+            .expect_err("structured Auth fails the turn without retrying");
+        assert_eq!(error.kind(), super::ErrorKind::Auth);
+        assert_eq!(
+            *calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            1,
+            "the transport retry must not fire for a structured Auth"
+        );
+
+        // The inverse: structured Transport on marker-free text still gets
+        // the clean regeneration.
+        #[derive(Clone)]
+        struct NovelThenReply(Arc<StdMutex<usize>>);
+        impl ApiClient for NovelThenReply {
+            fn stream(&mut self, _request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+                let n = {
+                    let mut calls = self
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *calls += 1;
+                    *calls
+                };
+                Ok(TurnStream::from_events(if n == 1 {
+                    vec![AgentEvent::Error {
+                        message: "utterly novel wording nothing matches".to_string(),
+                        hint: None,
+                        kind: Some(super::ErrorKind::Transport),
+                    }]
+                } else {
+                    vec![
+                        AgentEvent::TextDelta("recovered".to_string()),
+                        AgentEvent::MessageStop,
+                    ]
+                }))
+            }
+        }
+        let calls = Arc::new(StdMutex::new(0usize));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NovelThenReply(Arc::clone(&calls)),
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::Allow),
+            Vec::new(),
+        )
+        .with_transport_retry_policy(2, Duration::from_millis(1));
+        runtime
+            .run_turn("go", None, &mut noop_notify(), &CancellationToken::new())
+            .await
+            .expect("structured Transport gets the step-level retry");
+        assert_eq!(
+            *calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            2
+        );
+    }
+
+    /// C3: a batch where every call was denied (or schema-rejected) is an
+    /// all-error batch for the fuse — a model that keeps re-asking for a
+    /// refused call trips the fuse instead of spinning to the iteration cap.
+    /// Inputs vary per call so the S6 loop detector stays out of the way.
+    #[tokio::test]
+    async fn denied_only_batches_trip_the_tool_error_fuse() {
+        use std::sync::Mutex as StdMutex;
+
+        struct AlwaysDeniedPrompter;
+        impl PermissionPrompter for AlwaysDeniedPrompter {
+            fn decide<'a>(
+                &'a mut self,
+                _request: &'a PermissionRequest,
+            ) -> Pin<Box<dyn Future<Output = PermissionPromptDecision> + 'a>> {
+                Box::pin(async move {
+                    PermissionPromptDecision::Deny {
+                        reason: "not approved".to_string(),
+                    }
+                })
+            }
+        }
+
+        #[derive(Clone)]
+        struct VaryingToolClient(Arc<StdMutex<usize>>);
+        impl ApiClient for VaryingToolClient {
+            fn stream(&mut self, _request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+                let n = {
+                    let mut calls = self
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *calls += 1;
+                    *calls
+                };
+                Ok(TurnStream::from_events(vec![
+                    AgentEvent::ToolUse {
+                        id: format!("t-{n}"),
+                        name: "tick".to_string(),
+                        input: format!(r#"{{"n":{n}}}"#),
+                    },
+                    AgentEvent::MessageStop,
+                ]))
+            }
+        }
+
+        let calls = Arc::new(StdMutex::new(0usize));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            VaryingToolClient(Arc::clone(&calls)),
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::Prompt),
+            Vec::new(),
+        );
+        let mut prompter = AlwaysDeniedPrompter;
+        let error = runtime
+            .run_turn(
+                "go",
+                Some(&mut prompter),
+                &mut noop_notify(),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("denial-only batches must trip the tool-error fuse");
+        assert!(error.to_string().contains("tool-error fuse"), "{error}");
+        assert_eq!(error.kind(), super::ErrorKind::Model);
+        assert_eq!(
+            *calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            super::MAX_CONSECUTIVE_TOOL_ERROR_BATCHES,
+            "one request per denied batch, tripping exactly at the fuse"
+        );
+        // Well-paired despite every call being denied: each denial is an
+        // in-band error result.
+        for message in &runtime.session().messages {
+            for block in &message.blocks {
+                if let ContentBlock::ToolUse { id, .. } = block {
+                    assert!(runtime.session().messages.iter().any(|later| later
+                        .role == MessageRole::Tool
+                        && later
+                            .blocks
+                            .iter()
+                            .any(|b| matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id))));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_left_by_an_ended_or_cancelled_stream_is_closed_as_not_executed() {
+        struct AdvertiseThenHang(Duration);
+        impl ApiClient for AdvertiseThenHang {
+            fn stream(&mut self, _request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+                Ok(advertising_stream(self.0))
+            }
+        }
+
+        for (hold, cancel_after, expected_kind, expected_reason) in [
+            (
+                Duration::ZERO,
+                None,
+                super::ErrorKind::Transport,
+                "stream ended",
+            ),
+            (
+                Duration::from_secs(3),
+                Some(Duration::from_millis(30)),
+                super::ErrorKind::Cancelled,
+                "cancelled",
+            ),
+        ] {
+            let executor = StaticToolExecutor::new().register("bash", |_| Ok("ran".to_string()));
+            let mut runtime = ConversationRuntime::new(
+                Session::new(),
+                AdvertiseThenHang(hold),
+                executor,
+                PermissionPolicy::new(PermissionMode::Allow),
+                Vec::new(),
+            );
+            let cancel = CancellationToken::new();
+            if let Some(delay) = cancel_after {
+                let trigger = cancel.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    trigger.cancel();
+                });
+            }
+            let error = runtime
+                .run_turn("go", None, &mut noop_notify(), &cancel)
+                .await
+                .expect_err("the turn must not succeed");
+            assert_eq!(error.kind(), expected_kind, "{error}");
+
+            let messages = &runtime.session().messages;
+            assert_well_paired(messages);
+            assert_eq!(messages.len(), 3, "{expected_reason}");
+            let ContentBlock::ToolResult {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } = &messages[2].blocks[0]
+            else {
+                panic!("{expected_reason}: expected the closing tool_result");
+            };
+            assert_eq!(tool_use_id, "t-1");
+            assert!(*is_error);
+            assert!(output.contains(expected_reason), "{output}");
+        }
+    }
+
+    /// The S6 loop fuse stops the turn after the advertisement landed and
+    /// before the calls ran. The session must stay provider-valid — an
+    /// unanswered advertisement makes every later request fail — and the
+    /// stopped calls must never have executed.
+    #[tokio::test]
+    async fn a_loop_fuse_stop_leaves_the_session_requestable() {
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Clone)]
+        struct SameCallRecorder {
+            calls: Arc<StdMutex<usize>>,
+            requests: Arc<StdMutex<Vec<ApiRequest>>>,
+        }
+        impl ApiClient for SameCallRecorder {
+            fn stream(&mut self, request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+                self.requests
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(request);
+                let n = {
+                    let mut calls = self
+                        .calls
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *calls += 1;
+                    *calls
+                };
+                Ok(if n <= 3 {
+                    TurnStream::from_events(vec![
+                        AgentEvent::ToolUse {
+                            id: format!("t-{n}"),
+                            name: "bash".to_string(),
+                            input: "{}".to_string(),
+                        },
+                        AgentEvent::MessageStop,
+                    ])
+                } else {
+                    TurnStream::from_events(vec![
+                        AgentEvent::TextDelta("done".to_string()),
+                        AgentEvent::MessageStop,
+                    ])
+                })
+            }
+        }
+
+        let calls = Arc::new(StdMutex::new(0usize));
+        let requests: Arc<StdMutex<Vec<ApiRequest>>> = Arc::new(StdMutex::new(Vec::new()));
+        let executor = StaticToolExecutor::new().register("bash", |_| Ok("ran".to_string()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SameCallRecorder {
+                calls: Arc::clone(&calls),
+                requests: Arc::clone(&requests),
+            },
+            executor,
+            PermissionPolicy::new(PermissionMode::Allow),
+            Vec::new(),
+        );
+        let cancel = CancellationToken::new();
+        let error = runtime
+            .run_turn("spin", None, &mut noop_notify(), &cancel)
+            .await
+            .expect_err("identical batches must trip the loop fuse");
+        assert!(error.to_string().contains("loop detected"), "{error}");
+
+        let messages = &runtime.session().messages;
+        assert_well_paired(messages);
+        assert_eq!(
+            messages.len(),
+            7,
+            "two executed rounds, then the stopped advertisement closed"
+        );
+        assert!(matches!(
+            &messages[6].blocks[0],
+            ContentBlock::ToolResult { tool_use_id, is_error: true, output, .. }
+                if tool_use_id == "t-3" && output.contains("loop detector")
+        ));
+
+        // The very next request must carry a transcript the provider accepts.
+        runtime
+            .run_turn("again", None, &mut noop_notify(), &cancel)
+            .await
+            .expect("the turn after a loop stop is a normal turn");
+        let requests = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(requests.len(), 4);
+        assert_well_paired(&requests[3].messages);
+    }
+
+    #[tokio::test]
+    async fn cancelling_during_the_model_summary_skips_the_compaction() {
+        struct SummaryHangs;
+        impl ApiClient for SummaryHangs {
+            fn stream(&mut self, request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+                assert!(
+                    request
+                        .system_prompt
+                        .first()
+                        .is_some_and(|section| section.contains("durable task-state summary")),
+                    "the turn must stop at the summary"
+                );
+                let (tx, rx) = tokio::sync::mpsc::channel::<AgentEvent>(4);
+                let handle = tokio::spawn(async move {
+                    let _ = tx.send(AgentEvent::TextDelta("Goal: ".to_string())).await;
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                });
+                Ok(TurnStream::new(rx, handle.abort_handle()))
+            }
+        }
+
+        let session = fat_session(4);
+        let before = session.messages.len();
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SummaryHangs,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::Allow),
+            Vec::new(),
+        )
+        .with_compaction(CompactionConfig {
+            context_window_tokens: 1_000,
+            summary_mode: SummaryMode::Model,
+            ..CompactionConfig::default()
+        });
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            trigger.cancel();
+        });
+        let started = std::time::Instant::now();
+        let error = runtime
+            .run_turn("go", None, &mut noop_notify(), &cancel)
+            .await
+            .expect_err("cancelling mid-summary fails the turn");
+        assert_eq!(error.kind(), super::ErrorKind::Cancelled);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the cancel must interrupt the summary, not wait it out"
+        );
+        // Only the user input was appended: nothing was compacted under the
+        // operator's Ctrl+C, so the next turn retries the model summary.
+        assert_eq!(runtime.session().messages.len(), before + 1);
+        assert!(runtime.should_compact(runtime.compaction()));
     }
 
     #[tokio::test]
@@ -2684,6 +3673,7 @@ mod tests {
                         TurnStream::from_events(vec![AgentEvent::Error {
                             message: "summarizer offline".to_string(),
                             hint: None,
+                            kind: None,
                         }])
                     } else {
                         TurnStream::from_events(vec![
@@ -2758,6 +3748,154 @@ mod tests {
                 assert!(text.contains("Goal: land compaction."));
             }
         }
+    }
+
+    /// `TurnSummary::turn_usage` is the turn's own spend, never the session
+    /// cumulative: the mission ledger debits it per turn, and a cumulative
+    /// used to re-bill every earlier turn on each `auto_record_turn`
+    /// (review, 2026-11-27 — budgets drained quadratically).
+    #[tokio::test]
+    async fn turn_usage_is_the_turns_own_delta_not_the_session_cumulative() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        #[derive(Clone)]
+        struct TwoTurnUsageClient(Arc<StdMutex<usize>>);
+        impl ApiClient for TwoTurnUsageClient {
+            fn stream(&mut self, _request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+                let n = {
+                    let mut calls = self
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *calls += 1;
+                    *calls
+                };
+                let (input, output) = if n == 1 { (100, 10) } else { (30, 5) };
+                Ok(TurnStream::from_events(vec![
+                    AgentEvent::TextDelta("reply".to_string()),
+                    AgentEvent::Usage(TokenUsage {
+                        input_tokens: input,
+                        output_tokens: output,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AgentEvent::MessageStop,
+                ]))
+            }
+        }
+
+        let calls = Arc::new(StdMutex::new(0usize));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            TwoTurnUsageClient(Arc::clone(&calls)),
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::Allow),
+            Vec::new(),
+        );
+        let first = runtime
+            .run_turn("one", None, &mut noop_notify(), &CancellationToken::new())
+            .await
+            .expect("first turn");
+        let second = runtime
+            .run_turn("two", None, &mut noop_notify(), &CancellationToken::new())
+            .await
+            .expect("second turn");
+
+        assert_eq!(
+            *calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            2
+        );
+        // Each summary carries only its own turn's request.
+        assert_eq!(first.turn_usage.input_tokens, 100);
+        assert_eq!(first.turn_usage.output_tokens, 10);
+        assert_eq!(second.turn_usage.input_tokens, 30);
+        assert_eq!(second.turn_usage.output_tokens, 5);
+        // The runtime-level cumulative keeps summing across turns — the two
+        // views are distinct by design, and a regression to cumulative-in-
+        // summary would show here as 130.
+        let cumulative = runtime.usage().cumulative_usage();
+        assert_eq!(cumulative.input_tokens, 130);
+        assert_eq!(cumulative.output_tokens, 15);
+    }
+
+    /// D1.2 mid-turn half: a per-turn token budget soft-lands the turn at an
+    /// iteration boundary (same shape as the iteration cap — Ok summary,
+    /// completed work preserved, a Truncated note) instead of burning past
+    /// the operator's cap by a full turn. Inputs vary so the S6 loop detector
+    /// stays out of the way; each iteration reports 60 tokens.
+    #[tokio::test]
+    async fn a_turn_token_budget_soft_lands_with_preserved_work() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        #[derive(Clone)]
+        struct VaryingSpendClient(Arc<StdMutex<usize>>);
+        impl ApiClient for VaryingSpendClient {
+            fn stream(&mut self, _request: ApiRequest) -> Result<TurnStream, RuntimeError> {
+                let n = {
+                    let mut calls = self
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *calls += 1;
+                    *calls
+                };
+                Ok(TurnStream::from_events(vec![
+                    AgentEvent::ToolUse {
+                        id: format!("t-{n}"),
+                        name: "tick".to_string(),
+                        input: format!(r#"{{"n":{n}}}"#),
+                    },
+                    AgentEvent::Usage(TokenUsage {
+                        input_tokens: 60,
+                        output_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AgentEvent::MessageStop,
+                ]))
+            }
+        }
+
+        let calls = Arc::new(StdMutex::new(0usize));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            VaryingSpendClient(Arc::clone(&calls)),
+            StaticToolExecutor::new().register("tick", |_| Ok("ok".to_string())),
+            PermissionPolicy::new(PermissionMode::Allow),
+            Vec::new(),
+        );
+        runtime.set_turn_token_budget(Some(100));
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let mut notify = |event: &AgentEvent| events.push(event.clone());
+        let summary = runtime
+            .run_turn("go", None, &mut notify, &CancellationToken::new())
+            .await
+            .expect("a budget trip is a soft landing, not an error");
+        // 60 tokens after iteration 1 (60 < 100 → continue), 120 after
+        // iteration 2 → the iteration-3 check trips before any request.
+        assert_eq!(
+            *calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            2
+        );
+        assert_eq!(summary.tool_results.len(), 2, "completed work preserved");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Truncated(reason) if reason.contains("turn token budget (100)")
+        )));
+        // The spent tokens still reached the cumulative account — the
+        // provider billed them.
+        assert_eq!(runtime.usage().cumulative_usage().input_tokens, 120);
+
+        // A cleared budget uncaps the next turn (same runtime, budget=None).
+        runtime.set_turn_token_budget(None);
+        runtime
+            .run_turn("again", None, &mut noop_notify(), &CancellationToken::new())
+            .await
+            .expect("an uncapped turn runs normally");
     }
 
     #[tokio::test]
@@ -3946,8 +5084,8 @@ mod iteration_limit_tests {
 #[cfg(test)]
 mod loop_detector_tests {
     use super::{
-        AgentEvent, ApiClient, ApiRequest, ConversationRuntime, RuntimeError, Session,
-        StaticToolExecutor, TurnStream,
+        AgentEvent, ApiClient, ApiRequest, ContentBlock, ConversationRuntime, MessageRole,
+        RuntimeError, Session, StaticToolExecutor, TurnStream,
     };
     use crate::PermissionMode;
     use crate::PermissionPolicy;
@@ -4000,6 +5138,23 @@ mod loop_detector_tests {
             calls.load(std::sync::atomic::Ordering::SeqCst) < 64,
             "the loop fuse must trip before the iteration limit soft-landing"
         );
+        // The stopped advertisement never ran, but it must still be answered:
+        // an unanswered tool_use makes the provider reject every later request.
+        let messages = &runtime.session().messages;
+        for message in messages {
+            for block in &message.blocks {
+                if let ContentBlock::ToolUse { id, .. } = block {
+                    assert!(
+                        messages.iter().any(|later| later.role == MessageRole::Tool
+                            && later.blocks.iter().any(|block| matches!(
+                                block,
+                                ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id
+                            ))),
+                        "advertisement {id} must be answered"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -4036,6 +5191,11 @@ mod error_kind_tests {
             "stream idle timeout exceeded",
             "api returned 502: bad gateway",
             "provider overloaded_error",
+            // reqwest's send-phase wrapper: the only text a connect failure,
+            // send timeout or reset shows (the cause stays in the source
+            // chain) — it used to fall to Other and cost an immediate claim.
+            "http error: error sending request for url (http://127.0.0.1:8401/v1)",
+            "invalid sse frame: data line missing after event",
         ] {
             assert_eq!(
                 classify_stream_error(message),
@@ -4047,9 +5207,14 @@ mod error_kind_tests {
 
     #[test]
     fn rate_limits_are_transport_class() {
-        // S2: a 429 burst must not poison the autopilot's blocked streak.
+        // S2: a 429 burst must not poison the autopilot's blocked streak —
+        // with or without a numeric status in the text.
         assert_eq!(
             classify_stream_error("api returned 429 (rate_limit_error): too many requests"),
+            ErrorKind::Transport
+        );
+        assert_eq!(
+            classify_stream_error("server replied: too many requests, please slow down"),
             ErrorKind::Transport
         );
     }
@@ -4068,6 +5233,84 @@ mod error_kind_tests {
             classify_stream_error("something completely novel"),
             ErrorKind::Other
         );
+    }
+
+    #[test]
+    fn digits_inside_ids_timestamps_and_ordinals_do_not_impersonate_a_status() {
+        // A bare "401"/"403" substring used to read as Auth — which the
+        // autopilot counts as a blocked claim, with no transport backoff.
+        assert_eq!(
+            classify_stream_error(
+                "api returned 429 Too Many Requests: rate limited, request_id 8a1b2c3d4012ef45"
+            ),
+            ErrorKind::Transport
+        );
+        assert_eq!(
+            classify_stream_error("upstream timed out after 14031ms"),
+            ErrorKind::Transport
+        );
+        // serde_json decode errors quote line/column ordinals: neither is a
+        // status ("line 500" is not a server error, "line 403" not a 403).
+        assert_eq!(
+            classify_stream_error(
+                "json error: trailing characters at line 500 column 3 of the stream"
+            ),
+            ErrorKind::Other
+        );
+        assert_eq!(
+            classify_stream_error("json error: expected value at line 403 column 1"),
+            ErrorKind::Other
+        );
+        // A status that stands on its own still reads.
+        assert_eq!(
+            classify_stream_error("upstream rejected the tunnel: 403 forbidden by proxy"),
+            ErrorKind::Auth
+        );
+        assert_eq!(classify_stream_error("HTTP 429"), ErrorKind::Transport);
+        assert_eq!(classify_stream_error("HTTP 400"), ErrorKind::Model);
+    }
+
+    #[test]
+    fn exhausted_retries_and_server_errors_are_transport_class() {
+        // RetryPolicy only retries faults it already classes as transient, so
+        // an exhausted report is never a blocked claim; a bare 500 used to
+        // fall through to Other.
+        for message in [
+            "api request failed after 3 attempts (server error): api returned 500 Internal Server Error: {}",
+            "api request failed after 3 attempts (connection failed): http error: error sending request for url (https://api.example.com/v1/chat/completions)",
+            "api returned 500 Internal Server Error: {\"error\":{\"message\":\"internal server error\"}}",
+            "api returned 520 origin down: error code: 520",
+        ] {
+            assert_eq!(classify_stream_error(message), ErrorKind::Transport, "{message}");
+        }
+    }
+
+    #[test]
+    fn an_echoed_status_is_authoritative() {
+        // A 429 whose body mentions the key is still a rate limit, not an auth
+        // failure; a gateway that reports a bad key as a 400 still reports one.
+        assert_eq!(
+            classify_stream_error(
+                "api returned 429 Too Many Requests: rate limit reached for this api key"
+            ),
+            ErrorKind::Transport
+        );
+        assert_eq!(
+            classify_stream_error("api returned 400 Bad Request: invalid api key"),
+            ErrorKind::Auth
+        );
+        // Permanent client errors are nobody's transient fault to back off from.
+        for message in [
+            "api returned 404 Not Found: model not found",
+            "api returned 413 Payload Too Large",
+            "api returned 402 Payment Required: insufficient balance",
+        ] {
+            assert_eq!(
+                classify_stream_error(message),
+                ErrorKind::Other,
+                "{message}"
+            );
+        }
     }
 
     #[test]

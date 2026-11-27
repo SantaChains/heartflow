@@ -552,6 +552,7 @@ fn reducer_fuzz_survives_random_message_streams() {
         AgentEvent::Error {
             message: "boom".into(),
             hint: Some("try again".into()),
+            kind: None,
         },
     ];
     for _step in 0..2000 {

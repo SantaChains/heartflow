@@ -10,7 +10,7 @@ pub use adapter::{AnthropicStreamClient, TransportClient};
 pub use cassette::{read_entries, CassetteClient, CassetteMode, RecordedEntry, CASSETTE_ENV};
 pub use config::{
     builtin_base_url, builtin_provider_names, config_file_paths, env_base_url_override,
-    load_merged_settings, set_config_override, ProviderProfile, ProviderProtocol,
+    load_merged_settings, set_config_override, CredentialSource, ProviderProfile, ProviderProtocol,
     ProviderSelection, ProviderSettings, StatusConfig, CONFIG_VERSION,
 };
 pub use load::{

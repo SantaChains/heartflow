@@ -468,6 +468,8 @@ enum CredentialSource {
 
 **推进相**：P-A 身份可见（Profile 增 source 字段，启动/预检/`/model`/doctor 打印，纯加法零语义变更）→ P-B 诊断分流（按 `kind()` 重写 401 分支，补 `--base-url`/`--api-key-env`/`--token-stdin`）→ P-C 语义收敛（builtin 锁全量，`HEARTFLOW_PROVIDER_STRICT=1` 先行，下一主版本默认；旧配置由 doctor 报 override 行）→ P-D 回归矩阵（builtin × config × env × inline 的组合表测试 + 401 文案快照）。
 
+**P-A 落地记录（2026-11-27）**：`ProviderProfile` 增 `credential_source: CredentialSource`（`Env{var}` | `Inline` | `Missing`，`materialize` 按二来源守卫填充——env 赢则 `Env{var}`、否则 `Inline`；`Missing` 仅测试/手工构造可达），`/model` 状态行新增 `key from:` 行（`describe()` 只报来源与变量名，永不打印值）。三个 materialize 语义测试钉住（env 赢/inline 兜底/inline-only 空名不泄入 Env 变体）。启动一行与 doctor 的接入留待 P-B 一并做（同一诊断文案面）。
+
 **回退**：P-A/P-B 纯加法；P-C 挂 env 开关，关掉即回逐字段合并；`config.toml` 结构不变。
 
 **明确不做**：不扫 keychain / 浏览器 / 其他工具 dotfiles（沿 `config.rs:598-604` 纪律）；不自动改写 `config.toml`；不做跨供应商自动择优；错误里不回显 key 的任何片段。
@@ -593,7 +595,14 @@ enum CredentialSource {
 
 **分相路线（依赖排序）**：ST-0 先录三个流故障 cassette（断流/idle 超时/overflow 二连——**先录夹具再动流式路径**是既有铁律）→ ST-1 错误分级 + idle timeout + blocks 落 transcript → ST-2 步级重试 + 压缩两级降级 → ST-3 autopilot 分级 + 退避续跑 → ST-4 steer 回收 + StopPolicy。验收 = 夹具全绿 + 真机长任务 soak。
 
-**落地进度（2026-11-20 第二批，非流式路径，clippy 零 error + workspace 测试全绿）**：R2 已落地（`ErrorKind` + `classify_stream_error` 唯一字符串匹配点 + `TurnOutcome.error_class`，turn.rs 嗅探已删）；S2 已落地（transport 类退避 30s→2m→8m 不计 blocked streak，3 次耗尽记 1 claim）；R4 已落地（窗口模式 tail budget `min(32k, window/8)` + hard trigger 默认开，env 双向覆盖）；S6 已落地（新模块 `runtime/src/stop.rs` 双臂 loop 检测 + 连续 8 批全错工具熔断，端到端测试钉死）；S4 已落地（热重载重放 policy 交换，不清标志）；S5 已落地（终回合 drain steer 入 transcript）。**未动**：S1/S7/R1（流式，夹具铁律）、Blocked 恢复路径、token 预算臂。
+**落地进度（2026-11-20 第二批，非流式路径，clippy 零 error + workspace 测试全绿）**：R2 已落地（`ErrorKind` + `classify_stream_error` 唯一字符串匹配点 + `TurnOutcome.error_class`，turn.rs 嗅探已删）；S2 已落地（transport 类退避 30s→2m→8m 不计 blocked streak，3 次耗尽记 1 claim）；R4 已落地（窗口模式 tail budget `min(32k, window/8)` + hard trigger 默认开，env 双向覆盖）；S6 已落地（新模块 `runtime/src/stop.rs` 双臂 loop 检测 + 连续 8 批全错工具熔断，端到端测试钉死）；S4 已落地（热重载重放 policy 交换，不清标志）；S5 已落地（终回合 drain steer 入 transcript）。**未动**：S1/S7/R1（流式，夹具铁律——注：第三/四批已补 idle timeout 与 blocks 落盘，见 stability.md §7/§8）、Blocked 恢复路径（`/mission resume` 已有，2026-11-21）。
+
+**续批（2026-11-27，长任务韧性治理，全部离线可测、TUI 项挂冒烟清单）**：
+- **错误分类结构化（§12 P-B 提前落地）**：`AgentEvent::Error` 增 `kind` 字段（serde default 保旧夹具回放），三 adapter 从 `ApiError` 变体直接映射（`structured_error_kind`），runtime 优先结构化、`classify_stream_error` 退化为兜底；兜底层同时三层化（重试耗尽 → 权威状态码 → 文本标记 → 独立数字，排除 line/column 序数与 ID 内数字误判）。消除「新 provider 措辞不识别 → 误分类 → autopilot 误计 claim」事故面。
+- **悬空 `tool_use` 毒化会话修复（P0）**：熔断/流错误/取消收尾点补记 `[not executed]` 结果 + `repair_tool_pairing` 双向安全网——此前一次熔断后该会话每回合被 provider 400 拒绝。
+- **D1.2 双半边补齐**：① 驱动半边——`budget_stop`（REPL/TUI 三处）预算耗尽停 autopilot（mission 保持 Active 供提额）；② 回合半边——`set_turn_token_budget` 回合内软着陆保险丝，双宿主从账本武装（`mission::turn_token_budget`），自主驱动超支钳制在单次软着陆内。**StopPolicy 的 token 预算臂就此结案**（以 mission 预算为口径，非全局常量）。
+- **台账清账**：C1（流错误已收 usage 入账）、C3（被拒/无效批次计入熔断）、C4（摘要边路响应取消）全部落地；reflection 回注闭合学习环（任务环 fresh context 注入最近 2 份复盘，`plan.rs::reflection_seed_note`）。
+- **TUI autopilot S2 补齐**（挂真机冒烟）：传输退避定时臂 + 真失败 blocked claim + nudge 走 section 队列轮转；三层重试叠加维持现状并记录最坏墙钟（≈1.75h 到 Blocked，全程可停，见 stability.md §9）。KI-005 登记 TUI schedule 永不触发的缺口（待与 S2 同批陪测修复）。
 
 **明确不做**（本批）：后台任务注册表/wakeup/子代理（属扩容，等止血四相验收）；不重写 run_turn 为状态机（P2 一并做）；不动分层边界、不新增依赖。
 

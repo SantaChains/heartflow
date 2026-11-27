@@ -295,7 +295,18 @@ async fn run_one_task(
                 println!("failed to seed task into the ledger: {error}");
                 return Ok(TaskLoopStatus::Completed);
             }
-            runtime.reset_for_task(build_task_seeds(memory));
+            let mut seeds = build_task_seeds(memory);
+            // The reflection loop's read half: past runs' lessons ride every
+            // fresh task context (`reset_for_task` wipes the transcript
+            // wholesale, so without this each task would start amnesiac).
+            if let Some(note) = reflection_seed_note(
+                &reflections_dir_from_plan(task.plan_path),
+                REFLECTION_SEED_LIMIT,
+                REFLECTION_SEED_MAX_CHARS,
+            ) {
+                seeds.push(ConversationMessage::user_text(note));
+            }
+            runtime.reset_for_task(seeds);
             // A fresh task context replaces the transcript wholesale, so the
             // prior mirror rows are no longer a valid append base.
             note_mirror_rewrite(state);
@@ -348,6 +359,65 @@ async fn run_one_task(
 /// Directory holding plan reflection documents (sibling of the plans dir).
 fn reflections_dir(cwd: &Path) -> PathBuf {
     cwd.join(".heartflow").join("reflections")
+}
+
+/// The reflections directory for a plan document: `<cwd>/.heartflow/reflections`
+/// derived from the plan path (`<cwd>/.heartflow/plans/<file>`).
+fn reflections_dir_from_plan(plan_path: &Path) -> PathBuf {
+    plan_path.parent().and_then(Path::parent).map_or_else(
+        || PathBuf::from(".heartflow").join("reflections"),
+        |root| root.join("reflections"),
+    )
+}
+
+/// Reflection seeds: how many recent documents ride each fresh task context,
+/// and how much of each one (chars, char-boundary safe via
+/// `runtime::truncate_chars`).
+const REFLECTION_SEED_LIMIT: usize = 2;
+const REFLECTION_SEED_MAX_CHARS: usize = 4_096;
+
+/// The read half of the reflection loop (`write_reflection` is the write
+/// half): the newest `limit` reflection documents — files whose stem is the
+/// numeric `unix_millis` stamp `write_reflection` used — folded into one seed
+/// note so every fresh task context starts with past runs' lessons instead of
+/// rediscovering the same pitfalls. `None` when the directory is missing,
+/// unreadable, or has no reflection documents: a seed is best-effort context,
+/// never a dependency.
+#[must_use]
+pub(crate) fn reflection_seed_note(
+    dir: &Path,
+    limit: usize,
+    max_chars_per_doc: usize,
+) -> Option<String> {
+    let mut docs: Vec<String> = fs::read_dir(dir)
+        .ok()?
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "md"))
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|name| {
+            name.strip_suffix(".md").is_some_and(|stem| {
+                !stem.is_empty() && stem.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        })
+        .collect();
+    // Stamps are fixed-width epoch millis, so lexicographic order is
+    // chronological; drop the oldest first when over the limit.
+    docs.sort();
+    docs.reverse();
+    let mut joined = String::new();
+    for name in docs.iter().take(limit) {
+        let Ok(text) = fs::read_to_string(dir.join(name)) else {
+            continue;
+        };
+        joined.push_str(runtime::truncate_chars(&text, max_chars_per_doc).trim());
+        joined.push_str("\n\n");
+    }
+    if joined.trim().is_empty() {
+        return None;
+    }
+    Some(format!(
+        "LESSONS FROM PREVIOUS PLAN RUNS (most recent reflections; do not rediscover these pitfalls):\n{joined}"
+    ))
 }
 
 /// Extract the plan's `## Goal` text for the reflection header; falls back to
@@ -493,4 +563,86 @@ pub(crate) fn maybe_sink_skill(
     );
     fs::write(&path, body)?;
     Ok(Some(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{reflection_seed_note, reflections_dir_from_plan};
+
+    /// A numbered unique temp directory, removed when the guard drops.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("hf-plan-seed-{}-{}", std::process::id(), tag));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn reflection_seed_reads_the_newest_numeric_documents_only() {
+        let temp = TempDir::new("newest");
+        let dir = temp.0.clone();
+        std::fs::write(dir.join("1000.md"), "old lesson").expect("write");
+        std::fs::write(dir.join("2000.md"), "middle lesson").expect("write");
+        std::fs::write(dir.join("3000.md"), "newest lesson").expect("write");
+        std::fs::write(dir.join("notes.txt"), "not a reflection").expect("write");
+        std::fs::write(dir.join("draft.md"), "non-numeric stem").expect("write");
+
+        let note = reflection_seed_note(&dir, 2, 4_096).expect("two documents are available");
+
+        assert!(
+            note.starts_with("LESSONS FROM PREVIOUS PLAN RUNS"),
+            "{note}"
+        );
+        assert!(note.contains("newest lesson"), "{note}");
+        assert!(note.contains("middle lesson"), "{note}");
+        assert!(!note.contains("old lesson"), "over the limit: {note}");
+        assert!(!note.contains("not a reflection"), "{note}");
+        assert!(!note.contains("non-numeric stem"), "{note}");
+    }
+
+    #[test]
+    fn reflection_seed_truncates_each_document_and_survives_garbage() {
+        let temp = TempDir::new("truncate");
+        let dir = temp.0.clone();
+        std::fs::write(dir.join("100.md"), "长".repeat(500)).expect("write");
+        // Invalid UTF-8: `read_to_string` fails and the document is skipped,
+        // not fatal for the seed.
+        std::fs::write(dir.join("200.md"), [0xFF_u8, 0xFE_u8, 0xFC_u8]).expect("write");
+
+        let note = reflection_seed_note(&dir, 5, 100).expect("the valid document seeds");
+
+        assert!(note.contains("LESSONS FROM PREVIOUS PLAN RUNS"));
+        // The 500-字 document is cut to the 100-char per-doc cap.
+        assert_eq!(note.matches('长').count(), 100);
+        // The replacement char would mean the garbage document leaked in.
+        assert!(!note.contains('\u{FFFD}'), "{note}");
+    }
+
+    #[test]
+    fn reflection_seed_is_none_for_missing_or_empty_directories() {
+        let temp = TempDir::new("empty");
+        assert!(reflection_seed_note(&temp.0.clone(), 2, 100).is_none());
+        assert!(reflection_seed_note(&temp.0.join("does-not-exist"), 2, 100).is_none());
+    }
+
+    #[test]
+    fn reflections_dir_derives_from_the_plan_path() {
+        let plan = std::path::Path::new("/tmp/proj/.heartflow/plans/123-goal.md");
+        let dir = reflections_dir_from_plan(plan);
+        assert!(
+            dir.ends_with(std::path::Path::new(".heartflow").join("reflections")),
+            "{dir:?}"
+        );
+    }
 }

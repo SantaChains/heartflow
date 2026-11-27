@@ -56,6 +56,18 @@
 
 ---
 
+## KI-005 · TUI 会话内定时任务（/schedule add 的 interval/once）永不触发
+
+- **现象**：在 TUI（`hf chat` 的多 section 界面）会话中创建的 `interval`/`once` 定时任务到期后不派发；同一 schedule 在 REPL 会话中正常触发。
+- **环境·复现**：TUI 模式下（另开 REPL）`/schedule add` 一条 30s interval 任务，回到 TUI 空闲等待——到期任务不产生 job，`/schedule show`（REPL 侧）显示历史停在创建时刻。
+- **影响**：定时自动化在 TUI 会话内形同虚设；长时间挂着的 TUI 会话（长任务的常见形态）错过全部到期工作。
+- **根因（2026-11-27 代码实证）**：`drain_due_schedules`（`crates/cli/src/main.rs:1325`）只有两个调用点——REPL 输入循环顶部（`main.rs:1029`）与 `/schedule run-due`（`slash.rs:1494`）。TUI 的 `drive_loop`（`crates/cli/src/tui/stream.rs`）没有任何 drain 调用，也没有周期性 tick 唤醒——空闲 TUI 循环阻塞在 `select!` 的输入臂上，`ScheduleStore::run_due` 永远不被问。此外 `drain_due_schedules` 依赖 REPL 循环持有的 `ScheduleStore`/`JobRegistry`/links/`ProviderSelection` 四件套，TUI 路径未装配这些值，接线属事件循环签名级改动。
+- **修复方向（待做）**：① TUI 启动路径装配 ScheduleStore/JobRegistry/links/selection 并传入 `drive_loop`；② select 增加周期 tick 臂（~30s，`std::future::pending` 同型守卫），tick 内 `reconcile_schedule_links` + `drain_due_schedules`；③ 到期触发的 transcript 行路由到对应 section。**铁律**：TUI 派发改动须真机冒烟——本条与 §16 的 TUI autopilot S2 改动同批陪测。
+- **登记日期**：2026-11-27
+- **状态**：登记未修复（workaround：定时任务在 REPL 会话中创建/等待，或周期性切回 REPL 跑 `/schedule run-due`）
+
+---
+
 ## 登记纪律
 
 - 登记时只登记、不修复（除非用户当次明确指令）。

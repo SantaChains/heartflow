@@ -39,11 +39,12 @@ provider: deepseek
 protocol: openai
 base_url: https://api.deepseek.com/v1
 model: deepseek-v4-flash
+key from: env var DEEPSEEK_API_KEY
 known models: deepseek-v4-flash, deepseek-v4-pro, deepseek-flash
 switch with: /model NAME
 ```
 
-`provider` 是目录键（未命中目录则 `custom`，env-anthropic 路径为 `anthropic (env)`），`protocol` 是真实协议（`anthropic` | `openai` | `openai-responses`）。`known models` 来自 provider/模型目录（`~/.heartflow/provider.toml` + 内置种子）；`hf models` 自举发现与 `/model NAME` 切换都会把模型回写进目录，下一回合即可补全。切换同时持久化：`/model NAME` 与 `/provider NAME [MODEL]` 成功后把 `name`/`model` 写回用户层 `~/.heartflow/config.toml` 的 `[provider]`（toml_edit 注释保留式，只动这两键，其余表与注释字节不变；项目层 config.toml 带 `[provider]` 覆盖时打印提示），下次启动仍在切换后的 provider/模型上。传输失败时看这里的 `protocol`/`base_url` 就能确认真正在用哪个协议，不会被 "anthropic" 之类字样误导。
+`provider` 是目录键（未命中目录则 `custom`，env-anthropic 路径为 `anthropic (env)`），`protocol` 是真实协议（`anthropic` | `openai` | `openai-responses`）。`key from` 是凭据来源（§12 P-A 身份可见）：环境变量名或 `inline [provider] api_key`——只报来源与变量名，**永不打印值**；端点与凭据「各来自哪一层」一眼可辨（config 层端点配 builtin 层 key 环境变量的 401 交叉事故由此直接可见）。`known models` 来自 provider/模型目录（`~/.heartflow/provider.toml` + 内置种子）；`hf models` 自举发现与 `/model NAME` 切换都会把模型回写进目录，下一回合即可补全。切换同时持久化：`/model NAME` 与 `/provider NAME [MODEL]` 成功后把 `name`/`model` 写回用户层 `~/.heartflow/config.toml` 的 `[provider]`（toml_edit 注释保留式，只动这两键，其余表与注释字节不变；项目层 config.toml 带 `[provider]` 覆盖时打印提示），下次启动仍在切换后的 provider/模型上。传输失败时看这里的 `protocol`/`base_url` 就能确认真正在用哪个协议，不会被 "anthropic" 之类字样误导。
 
 补全不止命令名：在 `/model `、`/mode `、`/open ` 后敲空格，会按命令弹出参数候选表格——分别是当前 provider 的目录模型（附上下文窗口与来源）、权限三档、近期会话序号。↑/↓ 选择，Tab 或 Enter 只补全当前参数位（不整行重置），Esc 取消高亮；候选多时表格随高亮滚动。
 

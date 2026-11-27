@@ -64,6 +64,38 @@ pub struct ProviderProfile {
     pub context_window: Option<u32>,
     /// User-configured sampling knobs; an all-None value changes nothing.
     pub sampling: SamplingParams,
+    /// Where `api_key` came from (§12 P-A: the credential source is part of
+    /// the provider identity). Identity surfaces print this — masked, the
+    /// value never — so a config-layer endpoint paired with a builtin-layer
+    /// key env (the observed 401 cross-wiring) is visible at a glance.
+    pub credential_source: CredentialSource,
+}
+
+/// Provenance of the active `api_key` (§12 P-A). The two-source guardrail in
+/// [`materialize`] guarantees one of exactly two variants — env-var-wins-then
+/// inline — so `Missing` is unreachable there and exists only for
+/// hand-constructed profiles (tests, cassettes) that skip resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialSource {
+    /// The environment variable named by `api_key_env` supplied the key.
+    Env { var: String },
+    /// An inline `[provider] api_key` in a config file supplied the key.
+    Inline,
+    /// No credential (never produced by `materialize`).
+    Missing,
+}
+
+impl CredentialSource {
+    /// Masked one-line description for identity surfaces (`/model`, doctor):
+    /// names the source, never the value.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Env { var } => format!("env var {var}"),
+            Self::Inline => String::from("inline [provider] api_key"),
+            Self::Missing => String::from("missing"),
+        }
+    }
 }
 
 /// What the CLI resolved for the API transport before constructing a client.
@@ -911,10 +943,11 @@ pub fn materialize(spec: ProviderSpec) -> Result<ProviderSelection, String> {
             // same blank-is-unset rule `env_base_url_override` applies.
             let from_env = env::var(&api_key_env).unwrap_or_default();
             let from_env = from_env.trim().to_string();
-            let api_key = if from_env.is_empty() {
-                api_key.unwrap_or_default()
-            } else {
+            let env_supplied = !from_env.is_empty();
+            let api_key = if env_supplied {
                 from_env
+            } else {
+                api_key.unwrap_or_default()
             };
             if api_key.is_empty() {
                 let env_state = if env::var(&api_key_env).is_ok() {
@@ -934,6 +967,13 @@ pub fn materialize(spec: ProviderSpec) -> Result<ProviderSelection, String> {
             let auth_token = auth_token_env
                 .and_then(|name| env::var(name).ok())
                 .filter(|token| !token.is_empty());
+            let credential_source = if env_supplied {
+                CredentialSource::Env {
+                    var: api_key_env.clone(),
+                }
+            } else {
+                CredentialSource::Inline
+            };
             Ok(ProviderSelection::Profile(ProviderProfile {
                 protocol,
                 base_url,
@@ -944,6 +984,7 @@ pub fn materialize(spec: ProviderSpec) -> Result<ProviderSelection, String> {
                 reasoning_effort,
                 context_window,
                 sampling,
+                credential_source,
             }))
         }
     }
@@ -1033,8 +1074,9 @@ pub fn load_merged_settings(cwd: &Path, home: &Path) -> ProviderSettings {
 #[cfg(test)]
 mod tests {
     use super::{
-        materialize, resolve_spec, ProviderProfile, ProviderProtocol, ProviderSelection,
-        ProviderSettings, ProviderSpec, CONFIG_VERSION, DEFAULT_MAX_TOKENS, DEFAULT_MODEL,
+        materialize, resolve_spec, CredentialSource, ProviderProfile, ProviderProtocol,
+        ProviderSelection, ProviderSettings, ProviderSpec, CONFIG_VERSION, DEFAULT_MAX_TOKENS,
+        DEFAULT_MODEL,
     };
     use api::SamplingParams;
     use std::fs;
@@ -1524,7 +1566,20 @@ mod tests {
             sampling: SamplingParams::default(),
         };
         match materialize(spec).expect("inline fallback should materialize") {
-            ProviderSelection::Profile(profile) => assert_eq!(profile.api_key, "sk-fallback"),
+            ProviderSelection::Profile(profile) => {
+                assert_eq!(profile.api_key, "sk-fallback");
+                // §12 P-A: the env var named by api_key_env was unset, so the
+                // inline config key is the recorded source.
+                assert_eq!(
+                    profile.credential_source,
+                    CredentialSource::Inline,
+                    "source follows the value that actually won"
+                );
+                assert_eq!(
+                    profile.credential_source.describe(),
+                    "inline [provider] api_key"
+                );
+            }
             other @ ProviderSelection::Env { .. } => panic!("unexpected {other:?}"),
         }
     }
@@ -1538,7 +1593,13 @@ mod tests {
         )
         .expect("inline-only custom should resolve");
         match materialize(resolved).expect("materialize inline-only custom") {
-            ProviderSelection::Profile(profile) => assert_eq!(profile.api_key, "sk-abc"),
+            ProviderSelection::Profile(profile) => {
+                assert_eq!(profile.api_key, "sk-abc");
+                // An inline-only custom endpoint resolves to an empty env
+                // name; the source must still read Inline, not leak the
+                // empty-name placeholder into an Env variant.
+                assert_eq!(profile.credential_source, CredentialSource::Inline);
+            }
             other @ ProviderSelection::Env { .. } => panic!("unexpected {other:?}"),
         }
     }
@@ -1570,6 +1631,17 @@ mod tests {
             ProviderSelection::Profile(profile) => {
                 assert_ne!(profile.api_key, "sk-should-lose");
                 assert_eq!(profile.api_key, value);
+                // §12 P-A: the winning env var is the recorded source.
+                assert_eq!(
+                    profile.credential_source,
+                    CredentialSource::Env {
+                        var: ambient.to_string()
+                    }
+                );
+                assert_eq!(
+                    profile.credential_source.describe(),
+                    format!("env var {ambient}")
+                );
             }
             other @ ProviderSelection::Env { .. } => panic!("unexpected {other:?}"),
         }
@@ -1611,6 +1683,7 @@ mod tests {
             reasoning_effort: None,
             context_window: None,
             sampling: SamplingParams::default(),
+            credential_source: CredentialSource::Inline,
         });
         selection.set_model("new");
         assert_eq!(selection.model(), "new");

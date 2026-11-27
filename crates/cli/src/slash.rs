@@ -2467,6 +2467,10 @@ fn print_model_status(selection: &ProviderSelection, catalog: &ProviderCatalog) 
             println!("protocol: {}", profile.protocol.as_str());
             println!("base_url: {}", profile.base_url);
             println!("model: {}", profile.model);
+            // §12 P-A: the credential source is part of the identity — show
+            // it masked so a config-layer endpoint paired with a builtin-layer
+            // key env (the observed 401 cross-wiring) is visible at a glance.
+            println!("key from: {}", profile.credential_source.describe());
             match catalog.provider_by_host(&profile.base_url) {
                 Some(entry) if !entry.models.is_empty() => {
                     let names: Vec<&str> = entry

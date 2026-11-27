@@ -2833,8 +2833,8 @@ mod tests {
     fn active_model_price_requires_both_sides_and_a_catalog_hit() {
         use super::active_model_price;
         use provider::{
-            CatalogModel, CatalogProvider, ModelSource, ProviderCatalog, ProviderProfile,
-            ProviderProtocol, ProviderSelection,
+            CatalogModel, CatalogProvider, CredentialSource, ModelSource, ProviderCatalog,
+            ProviderProfile, ProviderProtocol, ProviderSelection,
         };
         let mut catalog = ProviderCatalog::default();
         let mut provider = CatalogProvider {
@@ -2864,6 +2864,7 @@ mod tests {
             reasoning_effort: None,
             context_window: None,
             sampling: api::SamplingParams::default(),
+            credential_source: CredentialSource::Missing,
         });
         // price_out is None -> no cost segment, even though the model matched.
         assert_eq!(active_model_price(&profile, &catalog), None);

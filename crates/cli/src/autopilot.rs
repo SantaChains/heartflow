@@ -44,8 +44,9 @@ const MAX_AUTOPILOT_TURNS: usize = 64;
 /// count as blocked claims. Instead the autopilot retries the same nudge with
 /// exponential backoff up to this many times; only after exhausting the
 /// retries does one blocked claim get recorded. Auth/overflow/model failures
-/// still count immediately (a blocked mission is a *real* block).
-const MAX_TRANSPORT_RETRIES: usize = 3;
+/// still count immediately (a blocked mission is a *real* block). The TUI's
+/// loop autopilot (`tui/stream.rs`) shares this budget and schedule.
+pub(crate) const MAX_TRANSPORT_RETRIES: usize = 3;
 
 /// Backoff schedule for transport retries: 30s -> 2m -> 8m (capped).
 #[must_use]
@@ -68,6 +69,17 @@ pub(crate) fn single_active_mission_id(ledger: &MissionLedger) -> Option<u64> {
         .map(|mission| mission.id)
         .collect();
     (active.len() == 1).then(|| active[0])
+}
+
+/// The driving half of D1.2: an exhausted budget keeps the mission `Active`
+/// (the reminder goes quiet, the mission survives for `/mission resume` or a
+/// raised budget) — but the autopilot must stop nudging it. A spent budget is
+/// the operator's cap, not a suggestion; driving on burns tokens for work
+/// that was capped.
+pub(crate) fn budget_stop(ledger: &MissionLedger, mission_id: u64) -> bool {
+    ledger
+        .get(mission_id)
+        .is_some_and(|mission| mission.budget_exhausted)
 }
 
 /// The continuation nudge for an auto-continue turn. The per-turn mission
@@ -105,7 +117,17 @@ pub(crate) async fn run_loop_autopilot(
                 println!("loop: mission m{mission_id} complete - stopping.");
                 return Ok(());
             }
-            Err(MissionError::Unsatisfied { .. }) => {}
+            Err(MissionError::Unsatisfied { .. }) => {
+                // D1.2 driving half: the criteria are not met, but a spent
+                // budget stops the driver — the mission stays open for the
+                // operator; it just stops spending on its own.
+                if budget_stop(&ledger, mission_id) {
+                    println!(
+                        "loop: mission m{mission_id} budget exhausted - stopping (raise the budget with /mission or finish the remaining criteria manually)."
+                    );
+                    return Ok(());
+                }
+            }
             Err(MissionError::WeakOnly { .. }) => {
                 println!(
                     "loop: mission m{mission_id} has only weak (claimed) evidence - add a mechanical criterion or approve it manually; stopping."
@@ -183,7 +205,7 @@ pub(crate) async fn run_loop_autopilot(
 
 #[cfg(test)]
 mod tests {
-    use super::{continue_nudge, single_active_mission_id};
+    use super::{budget_stop, continue_nudge, single_active_mission_id};
     use runtime::{CompletionCriterion, MissionBudget, MissionLedger, MissionStatus};
 
     #[test]
@@ -236,6 +258,33 @@ mod tests {
         let nudge = continue_nudge(7);
         assert!(nudge.contains("m7"));
         assert!(nudge.contains("AUTO-CONTINUE"));
+    }
+
+    #[test]
+    fn budget_stop_trips_only_when_the_budget_is_actually_spent() {
+        let ledger = MissionLedger::new();
+        let mission = ledger.create(
+            "capped work",
+            vec![CompletionCriterion::FreeText {
+                check: "claimed".to_string(),
+            }],
+            MissionBudget {
+                tokens: Some(100),
+                turns: None,
+                wall_ms: None,
+            },
+        );
+        // Fresh budget: keep driving.
+        assert!(!budget_stop(&ledger, mission.id));
+        // Partial spend (below the attention fraction): keep driving.
+        let _ = ledger.record_turn(mission.id, 10);
+        assert!(!budget_stop(&ledger, mission.id));
+        // Fully spent: the mission stays Active (D1.2) but the driver stops.
+        let (spent, _) = ledger
+            .record_turn(mission.id, 100)
+            .expect("second turn records");
+        assert_eq!(spent.status, MissionStatus::Active);
+        assert!(budget_stop(&ledger, mission.id));
     }
 
     #[test]

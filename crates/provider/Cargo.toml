@@ -32,6 +32,12 @@ tracing = "0.1"
 # ConversationRuntime, which needs a runtime and a cancellation token.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tokio-util = { version = "0.7", default-features = false }
+# Test-only: building `ApiError::Api` in the structured-kind mapping tests
+# needs a real `StatusCode`; reqwest never enters the production dependency
+# face of this crate.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+] }
 
 [lints]
 workspace = true

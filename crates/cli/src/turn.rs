@@ -11,8 +11,8 @@ use std::io::{self, Write};
 use crossterm::style::Stylize;
 use provider::StatusConfig;
 use runtime::{
-    auto_record_turn, truncate_chars, turn_reminder, AgentEvent, ContentBlock, ConversationMessage,
-    ErrorKind, MessageRole, MissionLedger, PermissionPrompter, TokenUsage,
+    auto_record_turn, truncate_chars, turn_reminder, turn_token_budget, AgentEvent, ContentBlock,
+    ConversationMessage, ErrorKind, MessageRole, MissionLedger, PermissionPrompter, TokenUsage,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -456,7 +456,8 @@ pub(crate) async fn run_turn_interactive(
     // system prompt. The section is a per-turn projection — set, never
     // persisted — so a mission edited mid-turn is picked up next turn.
     let missions_root = crate::storage::sessions_dir().join("missions");
-    let mission_section = turn_reminder(&MissionLedger::load(&missions_root).list());
+    let missions = MissionLedger::load(&missions_root).list();
+    let mission_section = turn_reminder(&missions);
     // C-1 mode segment: the session's permission mode carries its own contract
     // (plan token-frugal / spec research-first / loop autonomous drive).
     let mode_section = mode_prompt_segment(&crate::storage::lock_state(state).mode);
@@ -471,6 +472,9 @@ pub(crate) async fn run_turn_interactive(
         (None, None) => None,
     };
     runtime.set_turn_context(merged);
+    // D1.2 mid-turn half: arm the token guard with the single active
+    // mission's remaining budget (uncapped when there is none).
+    runtime.set_turn_token_budget(turn_token_budget(&missions));
     let mut notify = |event: &AgentEvent| turn.render(event);
     let result = runtime
         .run_turn_with_blocks(
@@ -481,13 +485,16 @@ pub(crate) async fn run_turn_interactive(
         )
         .await;
     runtime.set_turn_context(None);
+    runtime.set_turn_token_budget(None);
 
     // Auto-account the finished turn against the single active mission
-    // (§11.3). Success only: a failed turn is not productive work, so it
-    // must not reset a blocked streak or advance the turn budget.
+    // (§11.3). Success only: a failed turn is not productive work, so it must
+    // not reset a blocked streak or advance the turn budget. `turn_usage` is
+    // this turn's own spend — the ledger debits per turn, so a session
+    // cumulative here would re-bill every earlier turn (review, 2026-11-27).
     if let Ok(summary) = &result {
-        let tokens = u64::from(summary.usage.input_tokens)
-            .saturating_add(u64::from(summary.usage.output_tokens));
+        let tokens = u64::from(summary.turn_usage.input_tokens)
+            .saturating_add(u64::from(summary.turn_usage.output_tokens));
         if let Some(attention) = auto_record_turn(&missions_root, tokens) {
             println!("{}", format!("· {attention}").with(turn.theme.muted()));
         }

@@ -44,6 +44,13 @@ impl UsageTracker {
         Self::default()
     }
 
+    /// Rebuild the tracker from the usage attached to a session's messages.
+    ///
+    /// Best-effort after a reload: usage recorded for requests that never
+    /// landed a message (a transport attempt whose blocks were dropped for
+    /// the retry, the compaction-summary side call) has no on-disk anchor and
+    /// drops out of the rebuilt totals — the in-memory tracker is the
+    /// accurate view until the process exits.
     #[must_use]
     pub fn from_session(session: &Session) -> Self {
         let mut tracker = Self::new();

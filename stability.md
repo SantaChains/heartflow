@@ -207,3 +207,42 @@ REPL 主循环（`cli/main.rs:1047-1108`）→ `run_turn_interactive`（`cli/tur
   - `overflow_fails_after_two_degradation_levels...`：三连 overflow 断言 3 次请求后失败（原「二次即失败」语义更新）；
   - `transport_error_retries_then_recovers` / `transport_retry_exhausts_after_two_attempts`：重试恢复 + 预算耗尽。
 - StopPolicy token 预算臂未随本批（仍待 usage_tracker 跨迭代口径）。
+
+## 9. 落地记录（2026-11-27 批次：长任务韧性与错误分类治理）
+
+全部离线可测（runtime 298 / cli 341 / provider 65 测试全绿），TUI 改动按铁律挂真机冒烟清单（见文末）。
+
+### 本批修复
+- **悬空 `tool_use` 毒化会话（P0）**：熔断/流错误/取消三种收尾点当场补记 `[not executed: …; it had no effect]` 错误结果（`conversation.rs::record_unexecuted_tools`）；`repair_tool_pairing` 升级为双向安全网——任何来路的未答广告在下一次请求前闭合（含旧会话恢复）。此前一次熔断/断流后该会话**每一回合**都被 provider 400 拒绝。
+- **错误分类健壮化 + 结构化优先（§12 P-B 提前）**：`classify_stream_error` 三层化（重试耗尽报告 → 权威状态码 `api returned NNN` → 文本标记 → 独立数字，排除 line/column 序数与 ID 内数字）；`AgentEvent::Error` 增 `kind` 字段（serde default，旧 cassette 夹具回放零破坏——8+2+4 夹具测试全过），三个 adapter 从 `ApiError` 变体直接映射，runtime 优先结构化、字符串只兜底。消灭「新 provider 措辞不识别 → 误分类 → autopilot 误计 claim」的整类事故面。
+- **C1**：流错误/流中断路径的已收 usage 入账（此前中途失败的那次请求不进成本账）。
+- **C3**：被拒（权限）与无效（schema）工具批次计入 8 连熔断——「请求→全拒」循环此前只受 64 迭代上限兜底。
+- **C4**：压缩模型摘要边路请求响应取消令牌；取消时跳过本次压缩（不用有损确定性摘要顶替操作者刚叫停的工作），下一回合重试。
+- **reflection 回注（学习闭环补环）**：`plan.rs::reflection_seed_note`——任务环每个 fresh context（`reset_for_task`）注入最近 2 份复盘（每份截 4096 字符），「持久 → 执行 → 自纠 → 避坑」的最后一环闭合。
+
+### 长任务驱动治理（D1.2 双半边）
+- **驱动半边——预算耗尽停止驱动**：`budget_exhausted` 此前只停提醒不停驱动（autopilot 最多再烧 64 回合）。REPL `run_loop_autopilot` 与 TUI settle/timer 三处补 `budget_stop` 检查——判据未满足且预算耗尽 → 停驱、mission 保持 Active 供 `/mission` 提额或手动收尾。
+- **回合半边——回合内 token 保险丝**：`ConversationRuntime::set_turn_token_budget`（软着陆语义，与迭代上限同型——已完成工作保留 + `Truncated` 说明）；双宿主每回合从账本武装（`mission::turn_token_budget`：单一 Active mission 的剩余 token 轴，无预算/多活跃/已耗尽 → 不设限）。耗尽 mission 不设限（操作者交互回合是操作者的选择），由驱动半边停 autopilot——两半边合起来：自主驱动的超支被钳制在「一次软着陆」内。
+
+### 三层传输重试叠加——裁决记录（2026-11-27 用户定夺：维持三层）
+各层各接一种故障形态：api 层（请求建立，3 次快败退避）× 回合内步级（流中故障，120s idle 检测 + 1.5s/3s 两次重生成）× autopilot（整回合级与长限流窗口，30s→2m→8m 三次退避）。真死上游最坏墙钟（全链串行、无人工干预）：
+
+| 层 | 最坏墙钟 |
+|---|---|
+| 单回合（api 层 3 次 × connect 15s 超时 + 步级 3 请求 × 120s idle + 1.5s/3s 退避） | ≈ 6 分钟/回合 |
+| autopilot 4 回合（3 次退避 30s+2m+8m） | ≈ 24 分钟回合 + 10.5 分钟退避 ≈ **35 分钟落第一个 claim** |
+| 3 claim → Blocked | ≈ **1.75 小时** |
+
+全程 Ctrl+C 可停（退避与流消费都竞速取消令牌）。裁决依据：砍层降低对应故障形态的自愈率，步级重试比回合重启便宜（不重发整提示词）；数字有界可接受。`with_transport_retry_policy(0)` 逃生门保留给宿主（jobs worker 等自层重试者），当前生产宿主未接——若未来实测 35 分钟过痛，接线是一行级改动。
+
+### TUI autopilot S2 补齐（挂真机冒烟）
+`tui/stream.rs`：传输类失败经退避定时臂（select 第四臂，`sleep_until` 到期重验再入队）续跑，真失败记 blocked claim（与 REPL 三分语义对齐）；nudge 改入 section 自身队列走 §11.4 轮转（此前推入 loop 级队列会在活动 section 乱跑）；退避期间 §11.4 不热重排队同一条目（防双投递）。
+
+**真机冒烟清单（TUI 本批）**：
+1. loop 模式跑一个 mission，回合中途断网/杀代理 → transcript 出现 `transport failure; retrying in 30s` → 恢复网络 → 循环自动续跑完成；
+2. 退避等待中 Ctrl+C → `auto-continue paused`，不卡死不丢会话；
+3. mission 设 100 token 预算 → 回合中出现 `turn token budget (100) reached` 软着陆 → autopilot 停驱并显示 `budget exhausted - stopping`；
+4. 真失败（如坏 API key）三次 → `blocked after 3 consecutive failed turns`，mission 状态 Blocked。
+
+### KI 登记
+- KI-005：TUI 会话内 schedule（interval/once）永不触发——`drain_due_schedules` 无 TUI 调用点、无周期 tick；修复需 TUI 启动路径装配四件套 + select tick 臂，与 S2 同批真机陪测（见 known-issues.md）。

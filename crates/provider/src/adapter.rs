@@ -20,6 +20,38 @@ use crate::config::{ProviderProfile, ProviderProtocol};
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
+/// Structured failure class for an [`ApiError`], straight from the variant —
+/// no text guessing (§12 P-B). `None` marks genuine ambiguity: the runtime's
+/// `classify_stream_error` then decides from the message (the only case today
+/// is a plain 400, where gateways disagree — some report a bad key as a 400,
+/// others mean a real bad request).
+fn structured_error_kind(error: &ApiError) -> Option<runtime::ErrorKind> {
+    let kind = match error {
+        ApiError::Http(e) if e.is_timeout() || e.is_connect() || e.is_request() => {
+            runtime::ErrorKind::Transport
+        }
+        ApiError::Http(_) => runtime::ErrorKind::Other,
+        ApiError::Api { status, .. } => match status.as_u16() {
+            401 | 403 | 407 => runtime::ErrorKind::Auth,
+            400 if runtime::is_context_overflow_error(&error.to_string()) => {
+                runtime::ErrorKind::Overflow
+            }
+            // Ambiguous: auth-as-400 gateways vs real bad requests.
+            400 => return None,
+            408 | 409 | 425 | 429 => runtime::ErrorKind::Transport,
+            500..=599 => runtime::ErrorKind::Transport,
+            _ => runtime::ErrorKind::Other,
+        },
+        ApiError::RetriesExhausted { .. }
+        | ApiError::StreamIdle { .. }
+        | ApiError::InvalidSseFrame(_)
+        | ApiError::Io(_) => runtime::ErrorKind::Transport,
+        ApiError::MissingApiKey | ApiError::InvalidApiKeyEnv(_) => runtime::ErrorKind::Auth,
+        ApiError::Json(_) | ApiError::BackoffOverflow { .. } => runtime::ErrorKind::Other,
+    };
+    Some(kind)
+}
+
 /// Shared producer-task bridge for all three wire dialects (D3, ai-rust-hygiene):
 /// spawn a task, drive the dialect stream into a bounded channel, and wrap any
 /// transport error as a terminal `AgentEvent::Error` (the runtime's
@@ -35,10 +67,12 @@ where
     let handle = tokio::spawn(async move {
         if let Err(error) = drive(tx.clone()).await {
             let hint = error.suggestion().map(str::to_string);
+            let kind = structured_error_kind(&error);
             let _ = tx
                 .send(AgentEvent::Error {
                     message: error.to_string(),
                     hint,
+                    kind,
                 })
                 .await;
         }
@@ -989,10 +1023,14 @@ async fn drive_responses_stream(
 
     match terminal {
         Some(ResponsesTerminal::Failed(reason)) => {
+            // The provider failed the response; its reason may name the real
+            // class (rate limit, quota) — leave `kind` unset so the runtime's
+            // text markers read the reason.
             let _ = tx
                 .send(AgentEvent::Error {
                     message: format!("responses request failed: {reason}"),
                     hint: None,
+                    kind: None,
                 })
                 .await;
             return Ok(());
@@ -1000,10 +1038,14 @@ async fn drive_responses_stream(
         // Nothing usable arrived, so the truncation is the only thing worth
         // reporting; surfacing the partial stream would just fail downstream.
         Some(ResponsesTerminal::Incomplete(reason)) if !saw_content => {
+            // A response cut before any content is a premature wire end:
+            // structured Transport so the step-level retry gets one clean
+            // regeneration.
             let _ = tx
                 .send(AgentEvent::Error {
                     message: format!("responses response ended incomplete: {reason}"),
                     hint: None,
+                    kind: Some(runtime::ErrorKind::Transport),
                 })
                 .await;
             return Ok(());
@@ -1067,10 +1109,76 @@ mod tests {
     use super::{
         anthropic_thinking, append_tool_input, build_chat_request, build_message_request,
         build_responses_body, chat_content, convert_chat_messages, convert_messages,
-        responses_input_items,
+        responses_input_items, structured_error_kind,
     };
-    use api::{ChatContent, ChatContentPart, ChatRole, ChatToolCallType, SamplingParams};
-    use runtime::{ApiRequest, ContentBlock, ConversationMessage, MessageRole, ToolSpec};
+    use api::{ApiError, ChatContent, ChatContentPart, ChatRole, ChatToolCallType, SamplingParams};
+    use runtime::{
+        ApiRequest, ContentBlock, ConversationMessage, ErrorKind, MessageRole, ToolSpec,
+    };
+
+    #[test]
+    fn structured_kinds_come_straight_from_the_api_error() {
+        let api = |status: u16, body: &str| ApiError::Api {
+            status: reqwest::StatusCode::from_u16(status).expect("valid status"),
+            error_type: None,
+            message: None,
+            body: body.to_string(),
+            retryable: false,
+            retry_after: None,
+        };
+        // Transport shapes straight from the variant — no text involved.
+        assert_eq!(
+            structured_error_kind(&ApiError::StreamIdle {
+                idle: std::time::Duration::from_secs(1)
+            }),
+            Some(ErrorKind::Transport)
+        );
+        assert_eq!(
+            structured_error_kind(&ApiError::RetriesExhausted {
+                attempts: 3,
+                last_error: Box::new(ApiError::MissingApiKey),
+            }),
+            Some(ErrorKind::Transport)
+        );
+        // Statuses map without reading the body.
+        assert_eq!(structured_error_kind(&api(401, "")), Some(ErrorKind::Auth));
+        assert_eq!(structured_error_kind(&api(403, "")), Some(ErrorKind::Auth));
+        assert_eq!(
+            structured_error_kind(&api(429, "")),
+            Some(ErrorKind::Transport)
+        );
+        assert_eq!(
+            structured_error_kind(&api(500, "")),
+            Some(ErrorKind::Transport)
+        );
+        assert_eq!(structured_error_kind(&api(404, "")), Some(ErrorKind::Other));
+        assert_eq!(
+            structured_error_kind(&api(402, "insufficient balance")),
+            Some(ErrorKind::Other)
+        );
+        // A plain 400 stays ambiguous (gateways report bad keys as 400s) —
+        // the runtime's text fallback decides.
+        assert_eq!(structured_error_kind(&api(400, "")), None);
+        // ...unless the body names the context window, which is unambiguous.
+        assert_eq!(
+            structured_error_kind(&api(
+                400,
+                "prompt is too long: 210000 tokens > 200000 maximum"
+            )),
+            Some(ErrorKind::Overflow)
+        );
+        // Credential and decode shapes.
+        assert_eq!(
+            structured_error_kind(&ApiError::MissingApiKey),
+            Some(ErrorKind::Auth)
+        );
+        assert_eq!(
+            structured_error_kind(&ApiError::Json(
+                serde_json::from_str::<serde_json::Value>("").unwrap_err()
+            )),
+            Some(ErrorKind::Other)
+        );
+    }
 
     #[test]
     fn tool_input_delta_replaces_empty_placeholder() {

@@ -848,6 +848,32 @@ pub fn budget_attention(mission: &Mission) -> Option<String> {
     None
 }
 
+/// The per-turn token guard for autonomous driving (the mid-turn half of
+/// D1.2's budget semantics): when exactly one Active mission carries a token
+/// budget, the unspent remainder caps the *next* turn — a mid-turn runaway
+/// soft-lands at an iteration boundary instead of burning past the operator's
+/// budget by up to a full turn. `None` (uncapped, the historical behavior)
+/// when there is no single active mission, no token axis, or the budget is
+/// already exhausted: an exhausted mission stops the *autopilot* (the driving
+/// half, in the CLI), while an interactive turn stays the operator's choice.
+#[must_use]
+pub fn turn_token_budget(missions: &[Mission]) -> Option<u64> {
+    let active: Vec<&Mission> = missions
+        .iter()
+        .filter(|mission| mission.status == MissionStatus::Active)
+        .collect();
+    // Exactly one active mission: with several, the budget attribution of a
+    // turn is a guess, so the guard stays off (mirrors `auto_record_turn`).
+    let [mission] = &active[..] else {
+        return None;
+    };
+    mission
+        .budget
+        .tokens
+        .filter(|limit| *limit > mission.used.tokens)
+        .map(|limit| limit.saturating_sub(mission.used.tokens))
+}
+
 /// Build the per-turn mission reminder (D1.3, kimi goal injection): the open
 /// missions as one system-prompt section — status, criteria progress, budget
 /// remaining and the `goal_continue` contract ("the previous turn did not
@@ -1515,6 +1541,52 @@ mod tests {
             ledger.get(made.id).expect("exists").status,
             MissionStatus::Active
         );
+    }
+
+    #[test]
+    fn turn_token_budget_tracks_the_single_active_mission() {
+        use super::turn_token_budget;
+
+        let _guard = root_guard();
+        let ledger = MissionLedger::new();
+        let weak = || {
+            vec![CompletionCriterion::FreeText {
+                check: "claimed".to_string(),
+            }]
+        };
+        // No missions: uncapped.
+        assert_eq!(turn_token_budget(&ledger.list()), None);
+
+        // Single active with a token budget: the remainder.
+        let m1 = ledger.create(
+            "capped",
+            weak(),
+            MissionBudget {
+                tokens: Some(1_000),
+                turns: None,
+                wall_ms: None,
+            },
+        );
+        assert_eq!(turn_token_budget(&ledger.list()), Some(1_000));
+        let _ = ledger.record_turn(m1.id, 250);
+        assert_eq!(turn_token_budget(&ledger.list()), Some(750));
+
+        // A second active mission makes attribution ambiguous: uncapped.
+        let _m2 = ledger.create("other", weak(), MissionBudget::default());
+        assert_eq!(turn_token_budget(&ledger.list()), None);
+
+        // Back to one active, budget spent: uncapped again — an exhausted
+        // mission stops the *autopilot* (the driving half, in the CLI), while
+        // an interactive turn stays the operator's choice.
+        ledger.pause(_m2.id).expect("pause");
+        let _ = ledger.record_turn(m1.id, 1_000);
+        assert!(ledger.get(m1.id).expect("exists").budget_exhausted);
+        assert_eq!(turn_token_budget(&ledger.list()), None);
+
+        // No token axis on the single active mission: uncapped.
+        let m3 = ledger.create("free", weak(), MissionBudget::default());
+        let _ = ledger.record_turn(m3.id, 5);
+        assert_eq!(turn_token_budget(&ledger.list()), None);
     }
 
     #[test]
