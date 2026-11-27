@@ -39,7 +39,7 @@ cargo run -p heartflow -- system-prompt
 
 提交信息遵循 Conventional Commits，它直接驱动发版链（git-cliff），不是风格偏好：
 
-- `feat:` 触发 minor，`fix:` 触发 patch，`!` 或 `BREAKING CHANGE:` 触发 major
+- `feat:` 触发 minor，`fix:` 触发 patch；`!` 或 `BREAKING CHANGE:` 同样只进 minor（中间位 0..99，99 进位时才升 major）
 - `chore` / `docs` / `test` / `ci` / `style` / `build` 不触发发版
 - 版本号唯一维护点是根 `Cargo.toml` 的 `[workspace.package]`，不要手动改各 crate 版本
 

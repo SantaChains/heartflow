@@ -1,5 +1,6 @@
 # git-cliff —— heartflow 发布日志与 GitHub Release Notes 规则
-# 版本语义与 .github/workflows/release.yml 对齐:feat→minor、fix→patch、!/BREAKING CHANGE→major
+# 版本语义:feat→minor、fix→patch;!/BREAKING CHANGE 由 release.sh 统一归入 minor,
+# 中间位 0..99 用尽才升 major(git-cliff 仍会先给出 major,plan 阶段改写)
 # chore/docs/test/ci/style/build 及 chore(release) 机器人提交不入正文
 # 提交 scope 约定为 crate 名:runtime / api / tools / mcp / store / commands / cli
 
