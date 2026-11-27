@@ -64,9 +64,9 @@ static DEG_DETAIL: Mutex<Option<String>> = Mutex::new(None);
 
 fn bump(counter: &AtomicU64, detail: Option<String>) -> String {
     if let Some(text) = detail {
-        if let Ok(mut slot) = DEG_DETAIL.lock() {
-            *slot = Some(text);
-        }
+        *DEG_DETAIL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(text);
     }
     counter.fetch_add(1, Ordering::Relaxed);
     "degraded".to_string()
@@ -93,7 +93,10 @@ pub fn diagnostics_ledger() -> DiagnosticsLedger {
 
 #[must_use]
 pub fn diagnostics_degradation_detail() -> Option<String> {
-    DEG_DETAIL.lock().ok().and_then(|slot| slot.clone())
+    DEG_DETAIL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 /// Resolve the cargo binary: `CARGO` env (set whenever we ourselves were

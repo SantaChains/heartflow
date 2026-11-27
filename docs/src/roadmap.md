@@ -625,6 +625,63 @@ enum CredentialSource {
 **明确不做**：不做多文件原子事务、不做 CRDT/内容合并、不锁读工具（读脏页由 checkpoint + 重读兜底）。
 
 
+### 18. 会话回溯、自动命名与任务调度治理（2026-11-27 批次，网络调研定案，未落地）
+
+**背景（用户提出三课题）**：① 任务要有计时/并行不阻塞——等待并行任务时不得堵死主流程；② 历史会话、用户输入、之前的回答要不要以轻量接口暴露给 agent 自行调用回溯；③ 会话像豆包一样取大标题命名，子任务可存档/调取，以轻量方式提供给 agent。
+
+**现状盘点（源码实证）**：
+- 检索后端**已存在**：`heartflow-store`（SQLite + FTS5 trigram，CJK 免分词）已覆盖全部历史会话的全文检索、token 用量分析（`store/src/lib.rs`）；`hf search` CLI 子命令已接——**但只是操作者命令，不在 `mvp_tool_specs` 工具面**，agent 自己无法调用。
+- 会话：JSONL 落盘 + `/sessions [F]`/`/open N|TOPIC`（以**开场消息主题**截断为名，无生成式标题）。
+- 任务：jobs 已有 wall-clock watchdog（默认 30min）+ slots 并发 + timeout 事件（jobs.rs:488-527）；bash 工具有 `timeout` + `run_in_background`；mission criterion 有 `CRITERION_COMMAND_TIMEOUT`。缺：前台命令超时**转后台**语义、任务耗时在 UI 的显式呈现、TUI 的 schedule drain（KI-005）。
+- 记忆：reflections 是 plan 环专属自动注入；无 agent 自主的跨会话 memory 工具。
+
+**外部对标（2026-11-27 调研，官方文档优先）**：
+- **Claude Code**：前台命令到 timeout **自动转后台**而非终止（`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` 可关），后台完成后通知主循环；`parallel()`/`pipeline()` 工作流中单个 agent 失败置 `null` 续跑不阻塞整体；MCP 请求双层超时（连接 + 首字节，取 60s/tool timeout/`MCP_TIMEOUT` 最大值）；subagent `isolation: worktree` 并行隔离。
+- **Cursor Cloud Agents**：每 agent 独立 VM 并行无人值守；planner/worker 角色分离流水线（planner 探索并出任务，worker 只管完成不协调）；生产编排用 Temporal（持久化、超时、重试、断点恢复）。
+- **Manus**：文件系统是终极上下文——外部化记忆层，压缩必可恢复（URL 留、正文可丢）；todo.md 持续重写把目标推进到注意力末段；工具用 **masking 不增删**（保 KV cache，避免中途改工具定义打爆缓存）。
+- **Anthropic Memory tool**（官方 API 工具）：客户端 `/memories` 目录，agent 跨会话 CRUD 记忆文件；新会话开局自动读记忆恢复完整状态，不用重探重推。
+- **Claude Agent SDK**：会话 JSONL 自动落盘 + `SessionStore` 接口（append/load + 4 可选方法）+ 官方 session browser cookbook——会话管理是「产品的另一半」。
+- **会话自动命名**（豆包/ChatGPT 同型，pi-session-rename 实现可考）：首条用户消息 → **独立 best-effort 后台小模型请求**生成 3-8 词短标题；请求退出 prompt caching，不污染主对话缓存，不阻塞主回合。
+
+**设计定案（三面，全部轻量、复用现有存储）**：
+
+1. **任务计时与并行不阻塞（A 面）**：
+   - A1 前台转后台（对标 Claude Code）：bash 前台命令到 timeout 不终止——转 `run_in_background` 语义继续跑，job registry 记账，回合边界以系统事件通知完成/超时；sleep 类命令除外。
+   - A2 计时可见：回合内每工具耗时入 usage 行；job/mission 剩余 wall 预算在状态呈现（watchdog 已有，缺的是把剩余时间给人看）。
+   - A3 调度不堵主循环：TUI schedule drain 接线（KI-005 修复方向）+ 周期 tick 臂；并行等待统一走「完成事件在回合边界投递」，不在事件循环里轮询阻塞。
+2. **会话回溯工具（B 面，本批核心）**：
+   - B1 `session_search(query, limit, filter)` 原生工具：**直接复用 store FTS5**——后端零新依赖，只加工具壳 + 结果截断（每命中至多 N 行上下文，总预算封顶防撑爆上下文）。只读。
+   - B2 `session_read(session_id, offset, limit)`：按会话分页读历史片段（JSONL 已有 `read_entries` 语义）；与 B1 组成「先搜后读」回溯闭环——覆盖「之前说过什么/之前的回答怎么写的」两类诉求。
+   - B3 `memory_read/memory_write` 工具（对标 Anthropic memory tool）：`~/.heartflow/memory/` 目录文件化 CRUD，开局把目录索引注入系统提示；与 reflections 分层——reflections 是 plan 环自动注入的执行复盘，memory 是 agent 自主维护的长期事实（用户偏好、项目约定）。
+   - **接口边界原则（用户明令）**：只暴露**语义面**（搜历史/读会话/读写记忆），不暴露系统内部设计——store 的 schema、mission/job registry 内部结构、runtime 状态一律不进工具面；权限走既有 PermissionPolicy（memory_write 默认需批准或配额限制）；工具描述写「做什么」不写「怎么实现的」。
+3. **自动命名与子任务存档（C 面）**：
+   - C1 生成式标题：首回合落定后，后台 best-effort 请求（便宜参数：低 max_tokens、退出 caching）把首条用户消息压成 3-8 字标题，写进 session meta；失败/超时静默回退现有开场消息截断。不阻塞、不占回合。
+   - C2 子任务归档：mission 摘要与 job verdict 已落盘——补一个挂接点把它们关联到所属会话 meta，使 B1/B2 搜到的会话能带出其子任务记录；不做新存储，只做关联字段。
+   - C3 `/sessions` 升级：过滤从「开场消息前缀匹配」扩到「标题 + FTS5 内容命中」（后端同一 store）。
+
+**分相路线**：S1 B1+B2（工具壳，后端全现成，价值最大）→ S2 C1 自动标题（后台请求 + meta 字段）→ S3 A1 前台转后台 + A2 计时呈现 → S4 B3 memory 工具（写权限/配额面要设计）→ S5 A3/C2/C3 收尾。验收 = 工具面测试（搜得到、读得对、截得住）+ 真机：「上次怎么改的」一问能回溯。
+
+**明确不做**：向量/embedding 记忆（C 组保留候选，FTS5 先行够用）；不把 mission ledger/job registry 暴露为 agent 工具（内部面）；不做跨设备同步；标题不做多轮改写（首回合一次定稿）。
+
+
+### 19. 压缩可恢复性与持久记录面（2026-11-27 真机事故定案，未落地）
+
+**背景（真机事故，archive/会话.md 存档）**：agent 在压缩过的会话中无法还原此前用过的工具——先声称「本会话只用过 bash」后被迫收回。快照 `~/.heartflow/sessions/1795784782269-17808.json` 仅存压缩后 9 条消息，无 `.jsonl` 附加段，压缩前记录不在任何盘上；能确认的只有可见窗口事实与三个文件的改写时间戳，写入走编辑工具还是 bash 重定向无从查证。
+
+**根因（结构性，非偶发）**：R1 **压缩即销毁**——compaction 丢弃的消息没有先归档，工作上下文与持久记录没有分离，压掉即永久丢失；R2 **运行中无独立持久面**——快照 JSON 只在保存点写、只含压缩后状态，被压内容既不进 SQLite store（FTS5）也不进 sidecar；R3 **agent 无自检索工具**——`hf search`/FTS5 只是操作者 CLI，`mvp_tool_specs` 无 session 工具（§18 B 面缺口）；R4 **压缩摘要不带档案指针**——agent 不知道「更早记录在可取处」，只能基于可见窗口断言。
+
+**设计判决（对标）**：Manus「压缩策略必须可恢复」（URL 留、正文可丢）——heartflow 违反此底线；Claude Agent SDK 会话 JSONL 自动落盘是「产品的另一半」，压缩与分支都基于持久 transcript 而非工作上下文；Anthropic memory tool 状态外置文件化。判决：问题不在「要不要压缩」，而在**压缩不可逆 + 记录无独立持久面 + agent 无回溯接口**三者叠加——agent 对自己历史的认知残缺，只能猜。
+
+**方案（最小改动，三动作，与 §18 S1 互为前置）**：
+1. **压缩前归档（P0）**：compaction 落定丢弃范围时，先把被丢消息 append 到 sidecar `sessions/<id>-archive.jsonl`（复用 `read_entries` 语义）。工作上下文缩短，持久记录不缩。
+2. **运行中落盘**：每回合结算把新增消息同步进 SQLite store——schema/FTS5 全现成，缺的只是运行时写入路径接线。
+3. **摘要带指针**：压缩摘要末尾固定注明「更早记录已归档，可用 session_search / session_read 取回」——回溯接口即 §18 S1（B1+B2）。
+
+**分相路线**：P1 压缩前归档（先于 §18 工具面，否则接口是空检索）→ P2 运行中落盘接线 → P3 摘要指针文案。验收 = 复现同场景：压缩后问「本会话用过哪些工具」，agent 经工具取回归档答对，不再需要收回。
+
+**明确不做**：不取消压缩、不无限保留上下文；归档不做全文即时索引（P2 落 store 后天然可搜）；不改快照 JSON 语义。
+
+
 ## B. 研究存档与先不做清单
 
 已整体迁出至 [roadmap-deferred.md](roadmap-deferred.md)——外部调研（§2/3/5/7/8/9/10 含 Edit 深挖与 CLI 全景）、「不做」判决（beam search/LSP/ds4 引擎/对抗绕过等）与次级待评估项。以下原 C 组活动候选保留：
